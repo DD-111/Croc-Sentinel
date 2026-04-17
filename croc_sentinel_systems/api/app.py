@@ -1,18 +1,26 @@
+import collections
 import json
 import logging
 import os
+import queue as _stdqueue
 import secrets
 import sqlite3
 import threading
 import time
+import base64
+import hashlib
+import hmac
+import re
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
-from fastapi.responses import Response
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
+from fastapi.responses import RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import paho.mqtt.client as mqtt
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, padding
 
 from security import (
     Principal,
@@ -26,6 +34,7 @@ from security import (
     verify_password,
     zones_from_json,
 )
+from notifier import notifier, render_alarm_email
 
 
 def utc_now_iso() -> str:
@@ -52,6 +61,98 @@ MESSAGE_RETENTION_DAYS = int(os.getenv("MESSAGE_RETENTION_DAYS", "14"))
 JWT_SECRET = os.getenv("JWT_SECRET", "")
 BOOTSTRAP_DASHBOARD_SUPERADMIN_USERNAME = os.getenv("BOOTSTRAP_DASHBOARD_SUPERADMIN_USERNAME", "superadmin").strip()
 BOOTSTRAP_DASHBOARD_SUPERADMIN_PASSWORD = os.getenv("BOOTSTRAP_DASHBOARD_SUPERADMIN_PASSWORD", "")
+ENFORCE_PER_DEVICE_CREDS = os.getenv("ENFORCE_PER_DEVICE_CREDS", "0") == "1"
+ENFORCE_DEVICE_CHALLENGE = os.getenv("ENFORCE_DEVICE_CHALLENGE", "0") == "1"
+DEVICE_CHALLENGE_TTL_SECONDS = int(os.getenv("DEVICE_CHALLENGE_TTL_SECONDS", "300"))
+DEVICE_ID_REGEX = os.getenv("DEVICE_ID_REGEX", r"^SN-[A-Z2-7]{16}$")
+QR_CODE_REGEX = os.getenv("QR_CODE_REGEX", r"^CROC\|SN-[A-Z2-7]{16}\|\d{10}\|[A-Za-z0-9_-]{20,120}$")
+QR_SIGN_SECRET = os.getenv("QR_SIGN_SECRET", "")
+ALLOW_LEGACY_UNOWNED = os.getenv("ALLOW_LEGACY_UNOWNED", "1") == "1"
+OTA_FIRMWARE_DIR = os.getenv("OTA_FIRMWARE_DIR", "/opt/sentinel/firmware")
+OTA_PUBLIC_BASE_URL = os.getenv("OTA_PUBLIC_BASE_URL", "").rstrip("/")
+OTA_TOKEN = os.getenv("OTA_TOKEN", "")
+ALARM_FANOUT_DURATION_MS = int(os.getenv("ALARM_FANOUT_DURATION_MS", "8000"))
+ALARM_FANOUT_MAX_TARGETS = int(os.getenv("ALARM_FANOUT_MAX_TARGETS", "200"))
+ALARM_FANOUT_SELF = os.getenv("ALARM_FANOUT_SELF", "0") == "1"
+LOGIN_RATE_MAX_FAILS = int(os.getenv("LOGIN_RATE_MAX_FAILS", "5"))
+LOGIN_RATE_WINDOW_SECONDS = int(os.getenv("LOGIN_RATE_WINDOW_SECONDS", "900"))
+
+# --- Signup / user activation ---
+# If 1, a superadmin must approve each admin signup before they can log in.
+ADMIN_SIGNUP_REQUIRE_APPROVAL = os.getenv("ADMIN_SIGNUP_REQUIRE_APPROVAL", "1") == "1"
+# If 0, new public admin signups are refused entirely (for private deployments).
+ALLOW_PUBLIC_ADMIN_SIGNUP = os.getenv("ALLOW_PUBLIC_ADMIN_SIGNUP", "1") == "1"
+REQUIRE_EMAIL_VERIFICATION = os.getenv("REQUIRE_EMAIL_VERIFICATION", "1") == "1"
+REQUIRE_PHONE_VERIFICATION = os.getenv("REQUIRE_PHONE_VERIFICATION", "0") == "1"
+SIGNUP_RATE_MAX = int(os.getenv("SIGNUP_RATE_MAX", "5"))
+SIGNUP_RATE_WINDOW_SECONDS = int(os.getenv("SIGNUP_RATE_WINDOW_SECONDS", "3600"))
+OTP_TTL_SECONDS = int(os.getenv("OTP_TTL_SECONDS", "900"))
+OTP_RESEND_COOLDOWN_SECONDS = int(os.getenv("OTP_RESEND_COOLDOWN_SECONDS", "60"))
+# SMS: by default we run in email-only mode. If your VPS wires up a provider
+# (Twilio / Aliyun / Tencent / Bandwidth), set SMS_PROVIDER to its name and
+# implement the corresponding handler in notifier_sms.py. Absent that, phone
+# verifications are a no-op and REQUIRE_PHONE_VERIFICATION must stay 0.
+SMS_PROVIDER = os.getenv("SMS_PROVIDER", "none").strip().lower()
+
+# --- Factory device registry (unguessable serial model) ---
+# When ENFORCE_FACTORY_REGISTRATION=1 the API will refuse to record a
+# pending_claims row for any device whose (serial, mac_nocolon) pair is not
+# already listed in factory_devices. This is what makes serials truly
+# unguessable in production.
+ENFORCE_FACTORY_REGISTRATION = os.getenv("ENFORCE_FACTORY_REGISTRATION", "0") == "1"
+FACTORY_API_TOKEN = os.getenv("FACTORY_API_TOKEN", "")
+
+# --- Presence probe (replaces firmware-side periodic heartbeat) ---
+# Devices in EVENT mode only publish heartbeats on state change. If we haven't
+# heard from a device in IDLE_SECONDS, the API publishes a single `ping`
+# command. Every probe (outgoing + ack) is recorded in presence_probes so ops
+# can audit "why is device X marked offline?".
+PRESENCE_PROBE_IDLE_SECONDS = int(os.getenv("PRESENCE_PROBE_IDLE_SECONDS", str(12 * 3600)))
+# How often the background worker scans for stale devices.
+PRESENCE_PROBE_SCAN_SECONDS = int(os.getenv("PRESENCE_PROBE_SCAN_SECONDS", "300"))
+# Rate limit: don't probe the same device more than once per this window.
+PRESENCE_PROBE_COOLDOWN_SECONDS = int(os.getenv("PRESENCE_PROBE_COOLDOWN_SECONDS", "1800"))
+# After N consecutive failed probes, the device is flagged offline and we back
+# off to stop spamming the broker for obviously dead hardware.
+PRESENCE_PROBE_MAX_CONSECUTIVE = int(os.getenv("PRESENCE_PROBE_MAX_CONSECUTIVE", "3"))
+
+# --- OTA campaigns (superadmin -> admin approve -> per-device rollout) ---
+# Per-device URL HEAD check timeout.
+OTA_URL_VERIFY_TIMEOUT_SECONDS = float(os.getenv("OTA_URL_VERIFY_TIMEOUT_SECONDS", "10"))
+# Max time we wait for a device to ack ota.result before marking it failed.
+OTA_DEVICE_ACK_TIMEOUT_SECONDS = int(os.getenv("OTA_DEVICE_ACK_TIMEOUT_SECONDS", str(15 * 60)))
+# If set, any device failure in a campaign auto-rolls-back the whole admin fleet.
+OTA_AUTO_ROLLBACK_ON_FAILURE = os.getenv("OTA_AUTO_ROLLBACK_ON_FAILURE", "1") == "1"
+
+# --- Event center (global log + SSE stream) ---
+# In-memory ring buffer size. ~500 B × N ≈ RAM footprint. 2000 ≈ 1 MB.
+EVENT_RING_SIZE = int(os.getenv("EVENT_RING_SIZE", "2000"))
+# Per-SSE-subscriber queue. Slow client → oldest events dropped with warning.
+EVENT_SUB_QUEUE_SIZE = int(os.getenv("EVENT_SUB_QUEUE_SIZE", "500"))
+# SSE keepalive comment frequency (browsers kill idle SSE around 30s).
+EVENT_SSE_KEEPALIVE_SECONDS = int(os.getenv("EVENT_SSE_KEEPALIVE_SECONDS", "20"))
+# Hard cap on concurrent SSE subscribers (cheap, but bound the damage).
+EVENT_MAX_SUBSCRIBERS = int(os.getenv("EVENT_MAX_SUBSCRIBERS", "128"))
+# Level-based retention days. Debug rows go first; critical stays for audits.
+EVENT_RETAIN_DAYS_DEBUG = int(os.getenv("EVENT_RETAIN_DAYS_DEBUG", "3"))
+EVENT_RETAIN_DAYS_INFO = int(os.getenv("EVENT_RETAIN_DAYS_INFO", "14"))
+EVENT_RETAIN_DAYS_WARN = int(os.getenv("EVENT_RETAIN_DAYS_WARN", "30"))
+EVENT_RETAIN_DAYS_ERROR = int(os.getenv("EVENT_RETAIN_DAYS_ERROR", "90"))
+EVENT_RETAIN_DAYS_CRITICAL = int(os.getenv("EVENT_RETAIN_DAYS_CRITICAL", "365"))
+# Absolute backstop: delete any event older than this regardless of level.
+EVENT_RETAIN_DAYS_MAX = int(os.getenv("EVENT_RETAIN_DAYS_MAX", "400"))
+# How often the retention worker runs.
+EVENT_RETENTION_SCAN_SECONDS = int(os.getenv("EVENT_RETENTION_SCAN_SECONDS", "3600"))
+DASHBOARD_PATH = os.getenv("DASHBOARD_PATH", "/console").strip() or "/console"
+if not DASHBOARD_PATH.startswith("/"):
+    DASHBOARD_PATH = "/" + DASHBOARD_PATH
+DASHBOARD_PATH = DASHBOARD_PATH.rstrip("/") or "/console"
+# Guard: refuse to mount over known API prefixes.
+_RESERVED_PREFIXES = ("/auth", "/devices", "/commands", "/alerts", "/admin",
+                      "/provision", "/health", "/dashboard", "/logs", "/audit", "/ui")
+if any(DASHBOARD_PATH == p or DASHBOARD_PATH.startswith(p + "/") for p in _RESERVED_PREFIXES):
+    # Fallback silently to /console to avoid shadowing API routes.
+    DASHBOARD_PATH = "/console"
 
 TOPIC_HEARTBEAT = f"{TOPIC_ROOT}/+/heartbeat"
 TOPIC_STATUS = f"{TOPIC_ROOT}/+/status"
@@ -112,6 +213,10 @@ def validate_production_env() -> None:
         errors.append("MAX_BULK_TARGETS out of allowed range")
     if MESSAGE_RETENTION_DAYS < 1:
         errors.append("MESSAGE_RETENTION_DAYS must be >= 1")
+    if ENFORCE_DEVICE_CHALLENGE and DEVICE_CHALLENGE_TTL_SECONDS < 30:
+        errors.append("DEVICE_CHALLENGE_TTL_SECONDS must be >= 30 when ENFORCE_DEVICE_CHALLENGE=1")
+    if ENFORCE_DEVICE_CHALLENGE and (not QR_SIGN_SECRET or len(QR_SIGN_SECRET) < 24):
+        errors.append("QR_SIGN_SECRET must be set (>=24 chars) when ENFORCE_DEVICE_CHALLENGE=1")
     if BOOTSTRAP_DASHBOARD_SUPERADMIN_PASSWORD:
         if not JWT_SECRET or len(JWT_SECRET) < 32:
             errors.append("JWT_SECRET must be set (>=32 chars) when BOOTSTRAP_DASHBOARD_SUPERADMIN_PASSWORD is used")
@@ -148,9 +253,40 @@ def cache_invalidate(prefix: str = "") -> None:
 
 
 def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10.0)
     conn.row_factory = sqlite3.Row
+    # Per-connection pragmas. WAL + synchronous are set once in init_db_pragmas
+    # because they're persistent; these here are per-connection tuning.
+    try:
+        cur = conn.cursor()
+        cur.execute("PRAGMA busy_timeout = 5000")
+        cur.execute("PRAGMA cache_size = -32768")   # 32 MB page cache / conn
+        cur.execute("PRAGMA temp_store = MEMORY")
+        cur.execute("PRAGMA foreign_keys = ON")
+    except Exception:
+        pass
     return conn
+
+
+def init_db_pragmas() -> None:
+    """Persistent, one-shot PRAGMA setup. Called once from init_db() after
+    all CREATE TABLE statements so we don't race with schema migration.
+    Tuned for an 8 GB / 100 GB NVMe VPS: WAL mode is ~5x faster for the
+    write-heavy event pipeline and multi-reader friendly; mmap avoids
+    copying hot pages between kernel and user space.
+    """
+    try:
+        with db_lock:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute("PRAGMA journal_mode = WAL")
+            cur.execute("PRAGMA synchronous = NORMAL")
+            cur.execute("PRAGMA wal_autocheckpoint = 1000")
+            cur.execute("PRAGMA mmap_size = 268435456")  # 256 MB
+            conn.commit()
+            conn.close()
+    except Exception as exc:
+        logger.warning("init_db_pragmas failed: %s", exc)
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, col_def: str) -> None:
@@ -251,10 +387,284 @@ def init_db() -> None:
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS device_identities (
+                device_id TEXT PRIMARY KEY,
+                mac_nocolon TEXT,
+                public_key_pem TEXT NOT NULL,
+                attestation_json TEXT,
+                registered_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS provision_challenges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mac_nocolon TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                nonce TEXT NOT NULL,
+                expires_at_ts INTEGER NOT NULL,
+                verified_at TEXT,
+                used INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS revoked_devices (
+                device_id TEXT PRIMARY KEY,
+                reason TEXT,
+                revoked_by TEXT,
+                revoked_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                actor TEXT NOT NULL,
+                action TEXT NOT NULL,
+                target TEXT,
+                detail_json TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS role_policies (
+                username TEXT PRIMARY KEY,
+                can_alert INTEGER NOT NULL DEFAULT 0,
+                can_send_command INTEGER NOT NULL DEFAULT 0,
+                can_claim_device INTEGER NOT NULL DEFAULT 0,
+                can_manage_users INTEGER NOT NULL DEFAULT 0,
+                can_backup_restore INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS device_ownership (
+                device_id TEXT PRIMARY KEY,
+                owner_admin TEXT NOT NULL,
+                assigned_by TEXT NOT NULL,
+                assigned_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS alarms (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id TEXT NOT NULL,
+                owner_admin TEXT,
+                zone TEXT,
+                triggered_by TEXT NOT NULL,   -- remote_button | network | api
+                ts_device INTEGER,
+                nonce TEXT,
+                sig TEXT,
+                fanout_count INTEGER NOT NULL DEFAULT 0,
+                email_sent INTEGER NOT NULL DEFAULT 0,
+                email_detail TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_alarms_source ON alarms(source_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_alarms_owner ON alarms(owner_admin)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_alarms_created ON alarms(created_at)")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admin_alert_recipients (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_admin TEXT NOT NULL,
+                email TEXT NOT NULL,
+                label TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                UNIQUE(owner_admin, email)
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS login_failures (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip TEXT NOT NULL,
+                username TEXT NOT NULL,
+                ts_epoch INTEGER NOT NULL
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_login_failures_ip_ts ON login_failures(ip, ts_epoch)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_login_failures_user_ts ON login_failures(username, ts_epoch)")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS verifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                channel TEXT NOT NULL,          -- email | phone
+                target TEXT NOT NULL,           -- the email address / phone number
+                purpose TEXT NOT NULL,          -- signup | activate | reset
+                code_hash TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                used INTEGER NOT NULL DEFAULT 0,
+                expires_at_ts INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_verifications_lookup ON verifications(username, channel, purpose, used)")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS signup_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip TEXT NOT NULL,
+                email TEXT NOT NULL,
+                ts_epoch INTEGER NOT NULL
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_signup_attempts_ip_ts ON signup_attempts(ip, ts_epoch)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_signup_attempts_email_ts ON signup_attempts(email, ts_epoch)")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS factory_devices (
+                serial TEXT PRIMARY KEY,
+                mac_nocolon TEXT,
+                qr_code TEXT,
+                batch TEXT,
+                status TEXT NOT NULL DEFAULT 'unclaimed',  -- unclaimed | claimed | blocked
+                note TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_factory_devices_mac ON factory_devices(mac_nocolon)")
+        # --- Presence probes (12h idle ping log) ---
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS presence_probes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL,
+                owner_admin TEXT,
+                probe_ts TEXT NOT NULL,
+                idle_seconds INTEGER,
+                outcome TEXT NOT NULL DEFAULT 'sent',   -- sent | acked | timeout | skipped
+                detail TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_presence_probes_dev_ts ON presence_probes(device_id, probe_ts DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_presence_probes_admin_ts ON presence_probes(owner_admin, probe_ts DESC)")
+        # --- OTA campaigns (superadmin dispatch -> admin accept -> device rollout) ---
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ota_campaigns (
+                id TEXT PRIMARY KEY,
+                created_by TEXT NOT NULL,            -- superadmin username
+                fw_version TEXT NOT NULL,
+                url TEXT NOT NULL,
+                sha256 TEXT,
+                notes TEXT,
+                target_admins_json TEXT NOT NULL,    -- JSON list, or ["*"] for all admins
+                state TEXT NOT NULL DEFAULT 'dispatched',  -- dispatched | running | success | partial | failed | rolled_back | cancelled
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ota_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                campaign_id TEXT NOT NULL,
+                admin_username TEXT NOT NULL,
+                action TEXT NOT NULL,        -- accepted | declined | rolled_back
+                decided_at TEXT NOT NULL,
+                detail TEXT,
+                UNIQUE(campaign_id, admin_username)
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ota_device_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                campaign_id TEXT NOT NULL,
+                admin_username TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                prev_fw TEXT,
+                prev_url TEXT,
+                target_fw TEXT NOT NULL,
+                target_url TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'pending',  -- pending | dispatched | success | failed | rolled_back
+                error TEXT,
+                started_at TEXT,
+                finished_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(campaign_id, device_id)
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_ota_runs_campaign ON ota_device_runs(campaign_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_ota_runs_admin ON ota_device_runs(admin_username)")
+
+        # --- Global event center (unified log for SSE + historical query) ---
+        # Every meaningful action in the system (auth, alarm fan-out, ota
+        # campaign transitions, presence probes, claims, revokes, system
+        # warnings) gets one row here. Rows are compact (< ~500 B on avg).
+        # With 100 GB NVMe and default level-based retention, this handles
+        # tens of millions of events comfortably.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                ts_epoch_ms INTEGER NOT NULL,
+                level TEXT NOT NULL,           -- debug | info | warn | error | critical
+                category TEXT NOT NULL,        -- auth | alarm | ota | presence | provision | device | system | audit
+                event_type TEXT NOT NULL,      -- eg. 'ota.campaign.accept'
+                actor TEXT,                    -- user or 'system' or 'device:<id>'
+                target TEXT,                   -- user or device id
+                owner_admin TEXT,              -- tenant this event belongs to; NULL = global/system
+                device_id TEXT,
+                summary TEXT NOT NULL,         -- one-line human-readable
+                detail_json TEXT,
+                ref_table TEXT,                -- where the full payload lives (alarms|messages|audit_events|...)
+                ref_id INTEGER
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_events_ts ON events(ts_epoch_ms DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_events_owner_ts ON events(owner_admin, ts_epoch_ms DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_events_category_ts ON events(category, ts_epoch_ms DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_events_level_ts ON events(level, ts_epoch_ms DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_events_device_ts ON events(device_id, ts_epoch_ms DESC)")
         ensure_column(conn, "device_state", "chip_target", "TEXT")
         ensure_column(conn, "device_state", "board_profile", "TEXT")
         ensure_column(conn, "device_state", "net_type", "TEXT")
         ensure_column(conn, "device_state", "provisioned", "INTEGER")
+        ensure_column(conn, "dashboard_users", "manager_admin", "TEXT")
+        ensure_column(conn, "dashboard_users", "tenant", "TEXT")
+        ensure_column(conn, "dashboard_users", "email", "TEXT")
+        ensure_column(conn, "dashboard_users", "phone", "TEXT")
+        ensure_column(conn, "dashboard_users", "email_verified_at", "TEXT")
+        ensure_column(conn, "dashboard_users", "phone_verified_at", "TEXT")
+        # status ∈ pending | active | disabled | awaiting_approval
+        ensure_column(conn, "dashboard_users", "status", "TEXT")
+        cur.execute("UPDATE dashboard_users SET status='active' WHERE status IS NULL OR status = ''")
+        cur.execute("SELECT mac_nocolon, COUNT(*) AS c FROM provisioned_credentials GROUP BY mac_nocolon HAVING c > 1")
+        dup = cur.fetchone()
+        if not dup:
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_provisioned_mac_nocolon ON provisioned_credentials(mac_nocolon)")
         cur.execute("SELECT COUNT(*) AS c FROM dashboard_users")
         n_users = int(cur.fetchone()["c"])
         if n_users == 0 and BOOTSTRAP_DASHBOARD_SUPERADMIN_PASSWORD:
@@ -270,10 +680,31 @@ def init_db() -> None:
                     utc_now_iso(),
                 ),
             )
+        cur.execute("SELECT username, role FROM dashboard_users")
+        for ur in cur.fetchall():
+            pol = default_policy_for_role(str(ur["role"]))
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO role_policies
+                (username, can_alert, can_send_command, can_claim_device, can_manage_users, can_backup_restore, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(ur["username"]),
+                    pol["can_alert"],
+                    pol["can_send_command"],
+                    pol["can_claim_device"],
+                    pol["can_manage_users"],
+                    pol["can_backup_restore"],
+                    utc_now_iso(),
+                ),
+            )
         conn.commit()
         conn.close()
     cache_invalidate("devices")
     cache_invalidate("overview")
+    # After all schema is in place, enable WAL + mmap one-shot.
+    init_db_pragmas()
 
 
 def zone_sql_suffix(principal: Principal, column: str = "zone") -> tuple[str, list[Any]]:
@@ -285,6 +716,456 @@ def zone_sql_suffix(principal: Principal, column: str = "zone") -> tuple[str, li
         f" AND ({column} IN ({placeholders}) OR IFNULL({column},'') IN ('all','')) "
     )
     return frag, list(principal.zones)
+
+
+# ═══════════════════════════════════════════════
+#  Event center — global real-time log bus
+#
+#  Two sinks for every emitted event:
+#    (a) SQLite row in `events` (durable, indexed by time + owner_admin
+#        + category + level + device_id)
+#    (b) broadcast to every subscribed SSE queue
+#
+#  Memory budget: each subscriber holds up to EVENT_SUB_QUEUE_SIZE events,
+#  the ring buffer holds EVENT_RING_SIZE, events are ≤ ~500 B JSON.
+#  Default 2000 + 128 × 500 ≈ 33 MB worst-case — well within the 8 GB VPS.
+# ═══════════════════════════════════════════════
+
+_VALID_LEVELS = ("debug", "info", "warn", "error", "critical")
+_VALID_CATEGORIES = ("auth", "alarm", "ota", "presence", "provision", "device", "system", "audit")
+
+
+class _EventBus:
+    def __init__(self, ring_size: int = 2000) -> None:
+        self._lock = threading.Lock()
+        self._ring: collections.deque[dict[str, Any]] = collections.deque(maxlen=ring_size)
+        self._subs: dict[int, _EventSub] = {}
+        self._next_sub_id = 1
+
+    def subscribe(self, principal: "Principal", filters: dict[str, Any]) -> "_EventSub":
+        with self._lock:
+            if len(self._subs) >= EVENT_MAX_SUBSCRIBERS:
+                raise HTTPException(status_code=503, detail="event subscribers at capacity")
+            sid = self._next_sub_id
+            self._next_sub_id += 1
+            sub = _EventSub(sid, principal, filters)
+            self._subs[sid] = sub
+            return sub
+
+    def unsubscribe(self, sub: "_EventSub") -> None:
+        with self._lock:
+            self._subs.pop(sub.id, None)
+
+    def backlog(self, principal: "Principal", filters: dict[str, Any], limit: int) -> list[dict[str, Any]]:
+        """Return recent ring-buffer events the principal is allowed to see."""
+        with self._lock:
+            items = list(self._ring)
+        out: list[dict[str, Any]] = []
+        for ev in reversed(items):
+            if not _event_visible(principal, ev):
+                continue
+            if not _event_matches_filters(ev, filters):
+                continue
+            out.append(ev)
+            if len(out) >= limit:
+                break
+        return list(reversed(out))
+
+    def publish(self, ev: dict[str, Any]) -> None:
+        with self._lock:
+            self._ring.append(ev)
+            for sub in list(self._subs.values()):
+                if not _event_visible(sub.principal, ev):
+                    continue
+                if not _event_matches_filters(ev, sub.filters):
+                    continue
+                try:
+                    sub.q.put_nowait(ev)
+                except _stdqueue.Full:
+                    # Slow consumer. Drop one oldest event, signal backpressure.
+                    try:
+                        sub.q.get_nowait()
+                        sub.q.put_nowait(ev)
+                        sub.dropped += 1
+                    except Exception:
+                        sub.dropped += 1
+
+
+class _EventSub:
+    def __init__(self, sid: int, principal: "Principal", filters: dict[str, Any]) -> None:
+        self.id = sid
+        self.principal = principal
+        self.filters = filters
+        self.q: _stdqueue.Queue[dict[str, Any]] = _stdqueue.Queue(maxsize=EVENT_SUB_QUEUE_SIZE)
+        self.dropped = 0
+        self.created_at = time.time()
+
+
+def _event_visible(principal: "Principal", ev: dict[str, Any]) -> bool:
+    """Tenant isolation: superadmin sees everything; admin sees events where
+    owner_admin == self OR actor == self; user sees only events in its
+    manager_admin's tenant (and that involve it)."""
+    if principal.role == "superadmin":
+        return True
+    owner = str(ev.get("owner_admin") or "")
+    actor = str(ev.get("actor") or "")
+    target = str(ev.get("target") or "")
+    if principal.role == "admin":
+        if owner == principal.username:
+            return True
+        if actor == principal.username or target == principal.username:
+            return True
+        # system-global events (owner_admin='') are hidden from admins by
+        # default to avoid spamming every tenant with cross-cutting noise.
+        return False
+    # user
+    my_admin = get_manager_admin(principal.username) or ""
+    if my_admin and owner == my_admin and (actor == principal.username or target == principal.username or str(ev.get("level")) in ("warn", "error", "critical")):
+        return True
+    return False
+
+
+def _event_matches_filters(ev: dict[str, Any], filters: dict[str, Any]) -> bool:
+    lvl = filters.get("level")
+    if lvl and ev.get("level") != lvl:
+        # Allow "at least X" too if it was passed in {'min_level': ...}.
+        pass
+    min_lvl = filters.get("min_level")
+    if min_lvl:
+        try:
+            if _VALID_LEVELS.index(str(ev.get("level") or "info")) < _VALID_LEVELS.index(str(min_lvl)):
+                return False
+        except ValueError:
+            pass
+    cat = filters.get("category")
+    if cat and ev.get("category") != cat:
+        return False
+    device_id = filters.get("device_id")
+    if device_id and ev.get("device_id") != device_id:
+        return False
+    q = filters.get("q")
+    if q:
+        q_lc = str(q).lower()
+        blob = " ".join(str(ev.get(k) or "") for k in ("event_type", "actor", "target", "summary", "device_id")).lower()
+        if q_lc not in blob:
+            return False
+    return True
+
+
+event_bus = _EventBus(ring_size=EVENT_RING_SIZE)
+
+
+def _insert_event_row(ev: dict[str, Any]) -> int:
+    """Append to the events table. Returns row id (0 on failure)."""
+    try:
+        with db_lock:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO events
+                    (ts, ts_epoch_ms, level, category, event_type, actor, target, owner_admin, device_id, summary, detail_json, ref_table, ref_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ev["ts"], ev["ts_epoch_ms"], ev["level"], ev["category"], ev["event_type"],
+                    ev.get("actor"), ev.get("target"), ev.get("owner_admin"), ev.get("device_id"),
+                    ev.get("summary") or "", json.dumps(ev.get("detail") or {}, ensure_ascii=True),
+                    ev.get("ref_table"), ev.get("ref_id"),
+                ),
+            )
+            rid = int(cur.lastrowid or 0)
+            conn.commit()
+            conn.close()
+        return rid
+    except Exception as exc:
+        logger.warning("event insert failed: %s (%s)", exc, ev.get("event_type"))
+        return 0
+
+
+def emit_event(
+    *,
+    level: str,
+    category: str,
+    event_type: str,
+    summary: str = "",
+    actor: Optional[str] = None,
+    target: Optional[str] = None,
+    owner_admin: Optional[str] = None,
+    device_id: Optional[str] = None,
+    detail: Optional[dict[str, Any]] = None,
+    ref_table: Optional[str] = None,
+    ref_id: Optional[int] = None,
+) -> None:
+    """Write one event to the DB AND broadcast it to every subscribed SSE.
+
+    This is the single shared entry-point used by audit / alarm / ota /
+    presence / provision / device / system / auth paths.
+    """
+    if level not in _VALID_LEVELS:
+        level = "info"
+    if category not in _VALID_CATEGORIES:
+        category = "system"
+    now = datetime.now(timezone.utc)
+    ts_iso = now.isoformat()
+    ts_ms = int(now.timestamp() * 1000)
+    ev: dict[str, Any] = {
+        "ts": ts_iso,
+        "ts_epoch_ms": ts_ms,
+        "level": level,
+        "category": category,
+        "event_type": event_type,
+        "actor": actor or "",
+        "target": target or "",
+        "owner_admin": owner_admin or "",
+        "device_id": device_id or "",
+        "summary": summary or event_type,
+        "detail": detail or {},
+        "ref_table": ref_table,
+        "ref_id": ref_id,
+    }
+    rid = _insert_event_row(ev)
+    ev["id"] = rid
+    event_bus.publish(ev)
+
+
+def audit_event(actor: str, action: str, target: str = "", detail: Optional[dict[str, Any]] = None) -> None:
+    """Legacy audit log helper — kept for compatibility but now ALSO mirrors
+    the entry into the unified event center so the superadmin sees it live.
+    """
+    audit_id = 0
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO audit_events (actor, action, target, detail_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                actor,
+                action,
+                target,
+                json.dumps(detail or {}, ensure_ascii=True),
+                utc_now_iso(),
+            ),
+        )
+        audit_id = int(cur.lastrowid or 0)
+        conn.commit()
+        conn.close()
+
+    # Infer tenant / level / category from the action string.
+    parts = str(action).split(".", 1)
+    cat_hint = parts[0] if parts else "audit"
+    category = cat_hint if cat_hint in _VALID_CATEGORIES else "audit"
+    # Heuristic severity: *.fail / rollback / revoke / reject → warn; error → error.
+    low = action.lower()
+    if "fail" in low or "reject" in low or "revoke" in low or "rollback" in low or "block" in low:
+        level = "warn"
+    elif "error" in low or "crash" in low:
+        level = "error"
+    else:
+        level = "info"
+    owner_admin = None
+    device_id = None
+    if isinstance(detail, dict):
+        owner_admin = detail.get("owner_admin") or None
+        device_id = detail.get("device_id") or None
+    # "device:<id>" actor convention used elsewhere.
+    if not device_id and str(actor).startswith("device:"):
+        device_id = actor.split(":", 1)[1]
+    emit_event(
+        level=level,
+        category=category,
+        event_type=f"audit.{action}",
+        summary=f"{actor} {action} {target}".strip(),
+        actor=actor,
+        target=target,
+        owner_admin=owner_admin,
+        device_id=device_id,
+        detail=detail or {},
+        ref_table="audit_events",
+        ref_id=audit_id,
+    )
+
+
+def is_device_revoked(device_id: str) -> bool:
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM revoked_devices WHERE device_id = ?", (device_id,))
+        row = cur.fetchone()
+        conn.close()
+    return row is not None
+
+
+def ensure_not_revoked(device_id: str) -> None:
+    if is_device_revoked(device_id):
+        raise HTTPException(status_code=403, detail="device is revoked")
+
+
+def verify_device_signature(public_key_pem: str, nonce: str, signature_b64: str) -> bool:
+    try:
+        pub = serialization.load_pem_public_key(public_key_pem.encode("utf-8"))
+        sig = base64.b64decode(signature_b64)
+        msg = nonce.encode("utf-8")
+        if isinstance(pub, ec.EllipticCurvePublicKey):
+            pub.verify(sig, msg, ec.ECDSA(hashes.SHA256()))
+            return True
+        pub.verify(sig, msg, padding.PKCS1v15(), hashes.SHA256())
+        return True
+    except Exception:
+        return False
+
+
+def verify_qr_signature(qr_code: str) -> bool:
+    if not QR_SIGN_SECRET:
+        return True
+    parts = qr_code.split("|")
+    if len(parts) != 4:
+        return False
+    prefix, device_id, ts_str, sig = parts
+    if prefix != "CROC":
+        return False
+    if not ts_str.isdigit():
+        return False
+    raw = f"{device_id}|{ts_str}"
+    expect = base64.urlsafe_b64encode(
+        hmac.new(QR_SIGN_SECRET.encode("utf-8"), raw.encode("utf-8"), hashlib.sha256).digest()
+    ).decode("ascii").rstrip("=")
+    return hmac.compare_digest(expect, sig)
+
+
+def get_manager_admin(username: str) -> str:
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT manager_admin FROM dashboard_users WHERE username = ?", (username,))
+        row = cur.fetchone()
+        conn.close()
+    if not row:
+        return ""
+    return str(row["manager_admin"] or "")
+
+
+def default_policy_for_role(role: str) -> dict[str, int]:
+    if role == "superadmin":
+        return {
+            "can_alert": 1,
+            "can_send_command": 1,
+            "can_claim_device": 1,
+            "can_manage_users": 1,
+            "can_backup_restore": 1,
+        }
+    if role == "admin":
+        return {
+            "can_alert": 1,
+            "can_send_command": 1,
+            "can_claim_device": 1,
+            "can_manage_users": 1,
+            "can_backup_restore": 0,
+        }
+    return {
+        "can_alert": 0,
+        "can_send_command": 0,
+        "can_claim_device": 0,
+        "can_manage_users": 0,
+        "can_backup_restore": 0,
+    }
+
+
+def get_effective_policy(principal: Principal) -> dict[str, int]:
+    base = default_policy_for_role(principal.role)
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT can_alert, can_send_command, can_claim_device, can_manage_users, can_backup_restore
+            FROM role_policies WHERE username = ?
+            """,
+            (principal.username,),
+        )
+        row = cur.fetchone()
+        conn.close()
+    if not row:
+        return base
+    out = dict(base)
+    for k in out.keys():
+        out[k] = int(row[k]) if k in row.keys() else out[k]
+    return out
+
+
+def require_capability(principal: Principal, capability: str) -> None:
+    if principal.role == "superadmin":
+        return
+    pol = get_effective_policy(principal)
+    if int(pol.get(capability, 0)) != 1:
+        raise HTTPException(status_code=403, detail=f"capability denied: {capability}")
+
+
+def assert_device_owner(principal: Principal, device_id: str) -> None:
+    if principal.role == "superadmin":
+        return
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT owner_admin FROM device_ownership WHERE device_id = ?", (device_id,))
+        row = cur.fetchone()
+        conn.close()
+    if not row:
+        if ALLOW_LEGACY_UNOWNED:
+            return
+        raise HTTPException(status_code=403, detail="device ownership missing")
+    owner = str(row["owner_admin"])
+    if principal.role == "admin":
+        if owner != principal.username:
+            raise HTTPException(status_code=403, detail="device owned by another admin")
+        return
+    manager = get_manager_admin(principal.username)
+    if not manager or owner != manager:
+        raise HTTPException(status_code=403, detail="device not in your admin scope")
+
+
+def owner_sql_suffix(principal: Principal, alias: str = "d") -> tuple[str, list[Any]]:
+    if principal.role == "superadmin":
+        return "", []
+    col = f"{alias}.owner_admin"
+    if principal.role == "admin":
+        return f" AND ({col} = ? {'OR '+col+' IS NULL' if ALLOW_LEGACY_UNOWNED else ''}) ", [principal.username]
+    manager = get_manager_admin(principal.username)
+    if not manager:
+        return " AND 1=0 ", []
+    return f" AND ({col} = ? {'OR '+col+' IS NULL' if ALLOW_LEGACY_UNOWNED else ''}) ", [manager]
+
+
+def owner_scope_clause_for_device_state(principal: Principal) -> tuple[str, list[Any]]:
+    if principal.role == "superadmin":
+        return "", []
+    if principal.role == "admin":
+        if ALLOW_LEGACY_UNOWNED:
+            return (
+                " AND ((EXISTS (SELECT 1 FROM device_ownership o WHERE o.device_id=device_state.device_id AND o.owner_admin=?)) "
+                "OR (NOT EXISTS (SELECT 1 FROM device_ownership o2 WHERE o2.device_id=device_state.device_id))) ",
+                [principal.username],
+            )
+        return (
+            " AND EXISTS (SELECT 1 FROM device_ownership o WHERE o.device_id=device_state.device_id AND o.owner_admin=?) ",
+            [principal.username],
+        )
+    manager = get_manager_admin(principal.username)
+    if not manager:
+        return " AND 1=0 ", []
+    if ALLOW_LEGACY_UNOWNED:
+        return (
+            " AND ((EXISTS (SELECT 1 FROM device_ownership o WHERE o.device_id=device_state.device_id AND o.owner_admin=?)) "
+            "OR (NOT EXISTS (SELECT 1 FROM device_ownership o2 WHERE o2.device_id=device_state.device_id))) ",
+            [manager],
+        )
+    return (
+        " AND EXISTS (SELECT 1 FROM device_ownership o WHERE o.device_id=device_state.device_id AND o.owner_admin=?) ",
+        [manager],
+    )
 
 
 def parse_topic(topic: str) -> tuple[Optional[str], Optional[str]]:
@@ -301,6 +1182,32 @@ def upsert_pending_claim(payload: dict[str, Any]) -> None:
     claim_nonce = str(payload.get("claim_nonce", ""))
     if len(mac_nocolon) != 12 or len(claim_nonce) != 16:
         return
+    # Production mode: the device must be listed in factory_devices. This is
+    # the mechanism that makes the serial number "unguessable": an attacker
+    # who types a random serial on the dashboard will 404 because there is no
+    # matching factory row AND because the real devices are the only ones that
+    # ever get into pending_claims via the bootstrap MQTT credential.
+    serial = str(payload.get("serial", "")).strip().upper()
+    if ENFORCE_FACTORY_REGISTRATION:
+        with db_lock:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT serial, mac_nocolon, status FROM factory_devices "
+                "WHERE mac_nocolon = ? OR serial = ? LIMIT 1",
+                (mac_nocolon, serial),
+            )
+            fdev = cur.fetchone()
+            conn.close()
+        if not fdev:
+            logger.warning(
+                "pending_claims rejected: MAC %s serial %s not in factory_devices (ENFORCE_FACTORY_REGISTRATION=1)",
+                mac_nocolon, serial or "-",
+            )
+            return
+        if str(fdev["status"] or "unclaimed") == "blocked":
+            logger.warning("pending_claims rejected: serial %s is blocked", serial or fdev["serial"])
+            return
 
     mac = str(payload.get("mac", ""))
     qr_code = str(payload.get("qr_code", ""))
@@ -463,6 +1370,640 @@ def on_disconnect(_client: mqtt.Client, _userdata: Any, _disconnect_flags: Any, 
     logger.warning("MQTT disconnected")
 
 
+def _lookup_owner_admin(device_id: str) -> Optional[str]:
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT owner_admin FROM device_ownership WHERE device_id = ?", (device_id,))
+        row = cur.fetchone()
+        conn.close()
+    if row and row["owner_admin"]:
+        return str(row["owner_admin"])
+    return None
+
+
+def _tenant_siblings(owner_admin: Optional[str], source_id: str) -> list[tuple[str, str]]:
+    """Siblings in the same tenant to fan out an alarm to.
+
+    Returns list of (device_id, zone). Excludes revoked devices. If
+    ALARM_FANOUT_SELF is false, the source is also excluded (default: the
+    source device already sounded its siren locally).
+    """
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        if owner_admin:
+            cur.execute(
+                """
+                SELECT d.device_id, d.zone
+                FROM device_state d
+                JOIN device_ownership o ON o.device_id = d.device_id
+                LEFT JOIN revoked_devices r ON r.device_id = d.device_id
+                WHERE o.owner_admin = ? AND r.device_id IS NULL
+                """,
+                (owner_admin,),
+            )
+        else:
+            # No owner: treat as legacy-unowned pool. Only fan out to other
+            # legacy-unowned devices to avoid leaking into tenants.
+            cur.execute(
+                """
+                SELECT d.device_id, d.zone
+                FROM device_state d
+                LEFT JOIN device_ownership o ON o.device_id = d.device_id
+                LEFT JOIN revoked_devices r ON r.device_id = d.device_id
+                WHERE o.device_id IS NULL AND r.device_id IS NULL
+                """
+            )
+        rows = cur.fetchall()
+        conn.close()
+    out: list[tuple[str, str]] = []
+    for r in rows:
+        did = str(r["device_id"])
+        if did == source_id and not ALARM_FANOUT_SELF:
+            continue
+        out.append((did, str(r["zone"] or "")))
+    return out[:ALARM_FANOUT_MAX_TARGETS]
+
+
+def _recipients_for_admin(owner_admin: Optional[str]) -> list[str]:
+    if not owner_admin:
+        return []
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT email FROM admin_alert_recipients WHERE owner_admin = ? AND enabled = 1",
+            (owner_admin,),
+        )
+        rows = cur.fetchall()
+        conn.close()
+    return [str(r["email"]) for r in rows if r["email"]]
+
+
+def _insert_alarm(source_id: str, owner_admin: Optional[str], zone: str,
+                  triggered_by: str, payload: dict[str, Any]) -> int:
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO alarms
+                (source_id, owner_admin, zone, triggered_by, ts_device, nonce, sig,
+                 fanout_count, email_sent, email_detail, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, NULL, ?)
+            """,
+            (
+                source_id,
+                owner_admin,
+                zone,
+                triggered_by,
+                int(payload.get("ts") or 0) or None,
+                str(payload.get("nonce") or "") or None,
+                str(payload.get("sig") or "") or None,
+                utc_now_iso(),
+            ),
+        )
+        alarm_id = int(cur.lastrowid)
+        conn.commit()
+        conn.close()
+    return alarm_id
+
+
+def _update_alarm(alarm_id: int, fanout_count: int, email_sent: bool, email_detail: str) -> None:
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE alarms SET fanout_count = ?, email_sent = ?, email_detail = ? WHERE id = ?
+            """,
+            (fanout_count, 1 if email_sent else 0, email_detail[:400], alarm_id),
+        )
+        conn.commit()
+        conn.close()
+
+
+# ═══════════════════════════════════════════════
+#  Presence probes (12h idle → server-initiated ping)
+# ═══════════════════════════════════════════════
+
+def _insert_presence_probe(device_id: str, owner_admin: Optional[str], idle_seconds: int, outcome: str, detail: str) -> int:
+    now_iso = utc_now_iso()
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO presence_probes (device_id, owner_admin, probe_ts, idle_seconds, outcome, detail, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (device_id, owner_admin, now_iso, idle_seconds, outcome, detail, now_iso),
+        )
+        pid = int(cur.lastrowid or 0)
+        conn.commit()
+        conn.close()
+    return pid
+
+
+def _mark_presence_probe_acked(device_id: str) -> None:
+    """Flip the most recent 'sent' probe for this device to 'acked'."""
+    flipped_id = 0
+    owner = None
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, owner_admin FROM presence_probes
+            WHERE device_id = ? AND outcome = 'sent'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (device_id,),
+        )
+        row = cur.fetchone()
+        if row:
+            flipped_id = int(row["id"])
+            owner = str(row["owner_admin"] or "") or None
+            cur.execute(
+                "UPDATE presence_probes SET outcome='acked', updated_at=? WHERE id=?",
+                (utc_now_iso(), flipped_id),
+            )
+            conn.commit()
+        conn.close()
+    if flipped_id:
+        emit_event(
+            level="info",
+            category="presence",
+            event_type="presence.probe.acked",
+            summary=f"{device_id} came back",
+            actor=f"device:{device_id}",
+            owner_admin=owner,
+            device_id=device_id,
+            detail={"probe_id": flipped_id},
+        )
+
+
+def _find_stale_devices(idle_seconds: int, cooldown_seconds: int, limit: int = 100) -> list[tuple[str, Optional[str], int]]:
+    """Return [(device_id, owner_admin, idle_seconds_actual), ...] for devices
+    whose last message is older than idle_seconds, excluding devices we already
+    probed within cooldown_seconds.
+    """
+    now_ts = int(time.time())
+    idle_cutoff_iso = datetime.fromtimestamp(now_ts - idle_seconds, tz=timezone.utc).isoformat()
+    cooldown_cutoff_iso = datetime.fromtimestamp(now_ts - cooldown_seconds, tz=timezone.utc).isoformat()
+
+    results: list[tuple[str, Optional[str], int]] = []
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT d.device_id, d.updated_at,
+                   (SELECT o.owner_admin FROM device_ownership o WHERE o.device_id = d.device_id) AS owner_admin,
+                   (SELECT MAX(p.probe_ts) FROM presence_probes p WHERE p.device_id = d.device_id) AS last_probe_ts
+            FROM device_state d
+            WHERE d.updated_at IS NOT NULL AND d.updated_at < ?
+            ORDER BY d.updated_at ASC
+            LIMIT ?
+            """,
+            (idle_cutoff_iso, limit),
+        )
+        rows = cur.fetchall()
+        conn.close()
+    for r in rows:
+        last_probe = str(r["last_probe_ts"] or "")
+        if last_probe and last_probe > cooldown_cutoff_iso:
+            continue
+        updated = _parse_iso(str(r["updated_at"] or ""))
+        idle_actual = int(time.time() - (updated.timestamp() if updated else 0))
+        results.append((str(r["device_id"]), (str(r["owner_admin"]) if r["owner_admin"] else None), idle_actual))
+    return results
+
+
+def _send_presence_probe(device_id: str, owner_admin: Optional[str], idle_seconds: int) -> None:
+    """Publish a `ping` command and log the probe."""
+    try:
+        publish_command(
+            topic=f"{TOPIC_ROOT}/{device_id}/cmd",
+            cmd="ping",
+            params={},
+            target_id=device_id,
+            proto=CMD_PROTO,
+            cmd_key=get_cmd_key_for_device(device_id),
+        )
+        _insert_presence_probe(device_id, owner_admin, idle_seconds, "sent", f"idle>{PRESENCE_PROBE_IDLE_SECONDS}s")
+        emit_event(
+            level="warn",
+            category="presence",
+            event_type="presence.probe.sent",
+            summary=f"{device_id} silent {idle_seconds}s → ping",
+            actor="system",
+            target=device_id,
+            owner_admin=owner_admin,
+            device_id=device_id,
+            detail={"idle_seconds": idle_seconds},
+        )
+    except Exception as exc:
+        logger.warning("presence probe publish failed dev=%s err=%s", device_id, exc)
+        _insert_presence_probe(device_id, owner_admin, idle_seconds, "skipped", f"publish_err:{exc}")
+
+
+def _events_retention_tick() -> None:
+    """Delete old rows from the `events` table according to the level-based
+    retention windows. Runs every EVENT_RETENTION_SCAN_SECONDS."""
+    retention_map = {
+        "debug": EVENT_RETAIN_DAYS_DEBUG,
+        "info": EVENT_RETAIN_DAYS_INFO,
+        "warn": EVENT_RETAIN_DAYS_WARN,
+        "error": EVENT_RETAIN_DAYS_ERROR,
+        "critical": EVENT_RETAIN_DAYS_CRITICAL,
+    }
+    now_ms = int(time.time() * 1000)
+    try:
+        total_deleted = 0
+        with db_lock:
+            conn = get_conn()
+            cur = conn.cursor()
+            for level, days in retention_map.items():
+                if days <= 0:
+                    continue
+                cutoff = now_ms - (days * 86400 * 1000)
+                cur.execute("DELETE FROM events WHERE level = ? AND ts_epoch_ms < ?", (level, cutoff))
+                total_deleted += cur.rowcount or 0
+            if EVENT_RETAIN_DAYS_MAX > 0:
+                hard_cut = now_ms - (EVENT_RETAIN_DAYS_MAX * 86400 * 1000)
+                cur.execute("DELETE FROM events WHERE ts_epoch_ms < ?", (hard_cut,))
+                total_deleted += cur.rowcount or 0
+            conn.commit()
+            conn.close()
+        if total_deleted:
+            logger.info("events retention: pruned %d rows", total_deleted)
+    except Exception as exc:
+        logger.warning("events retention failed: %s", exc)
+
+
+def _presence_probe_tick() -> None:
+    """One pass of the stale-device scanner. Called from scheduler_loop."""
+    try:
+        stale = _find_stale_devices(PRESENCE_PROBE_IDLE_SECONDS, PRESENCE_PROBE_COOLDOWN_SECONDS, limit=200)
+    except Exception as exc:
+        logger.warning("presence probe scan failed: %s", exc)
+        return
+    for device_id, owner_admin, idle_seconds in stale:
+        _send_presence_probe(device_id, owner_admin, idle_seconds)
+
+
+# ═══════════════════════════════════════════════
+#  OTA campaigns (superadmin -> admin accept -> per-device rollout)
+# ═══════════════════════════════════════════════
+
+def _verify_ota_url(url: str) -> tuple[bool, str]:
+    """HEAD the firmware URL so we fail fast if the superadmin typoed it.
+    Returns (ok, detail)."""
+    if not url.startswith(("http://", "https://")):
+        return False, "scheme_not_http"
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, method="HEAD")
+        with urllib.request.urlopen(req, timeout=OTA_URL_VERIFY_TIMEOUT_SECONDS) as resp:
+            code = int(getattr(resp, "status", 200))
+            length = resp.headers.get("content-length", "")
+            if 200 <= code < 400:
+                return True, f"http_{code} size={length or '?'}"
+            return False, f"http_{code}"
+    except Exception as exc:
+        return False, f"head_err:{exc.__class__.__name__}:{exc}"
+
+
+def _ota_campaign_targets_for_admin(admin_username: str, fw_version: str, target_url: str) -> list[dict[str, Any]]:
+    """Return the list of device rows that belong to `admin_username` along
+    with their current fw/url so we can roll them back if needed."""
+    rows: list[dict[str, Any]] = []
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT d.device_id, d.fw, d.last_status_json
+            FROM device_state d
+            JOIN device_ownership o ON o.device_id = d.device_id
+            WHERE o.owner_admin = ?
+            """,
+            (admin_username,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        prev_fw = str(r.get("fw") or "")
+        prev_url = ""
+        raw_status = r.get("last_status_json") or ""
+        if raw_status:
+            try:
+                js = json.loads(str(raw_status))
+                prev_url = str(js.get("ota_source_url") or "")
+            except Exception:
+                pass
+        out.append({"device_id": str(r["device_id"]), "prev_fw": prev_fw, "prev_url": prev_url})
+    return out
+
+
+def _dispatch_ota_to_device(campaign_id: str, device_id: str, target_fw: str, target_url: str) -> None:
+    publish_command(
+        topic=f"{TOPIC_ROOT}/{device_id}/cmd",
+        cmd="ota",
+        params={"url": target_url, "fw": target_fw, "campaign_id": campaign_id},
+        target_id=device_id,
+        proto=CMD_PROTO,
+        cmd_key=get_cmd_key_for_device(device_id),
+    )
+
+
+def _start_ota_rollout_for_admin(campaign_id: str, admin_username: str) -> tuple[int, list[str]]:
+    """Dispatch the OTA command to every device owned by admin_username.
+    Returns (dispatched_count, failures)."""
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT fw_version, url FROM ota_campaigns WHERE id = ?", (campaign_id,),
+        )
+        camp = cur.fetchone()
+        if not camp:
+            conn.close()
+            return 0, ["campaign_not_found"]
+        target_fw = str(camp["fw_version"])
+        target_url = str(camp["url"])
+
+        cur.execute(
+            "SELECT device_id, target_fw, target_url FROM ota_device_runs WHERE campaign_id = ? AND admin_username = ?",
+            (campaign_id, admin_username),
+        )
+        device_rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+
+    dispatched = 0
+    failures: list[str] = []
+    for r in device_rows:
+        did = str(r["device_id"])
+        try:
+            _dispatch_ota_to_device(campaign_id, did, target_fw, target_url)
+            with db_lock:
+                conn = get_conn()
+                cur = conn.cursor()
+                cur.execute(
+                    "UPDATE ota_device_runs SET state='dispatched', started_at=?, updated_at=? WHERE campaign_id=? AND device_id=?",
+                    (utc_now_iso(), utc_now_iso(), campaign_id, did),
+                )
+                conn.commit()
+                conn.close()
+            dispatched += 1
+        except Exception as exc:
+            failures.append(f"{did}:{exc}")
+            with db_lock:
+                conn = get_conn()
+                cur = conn.cursor()
+                cur.execute(
+                    "UPDATE ota_device_runs SET state='failed', error=?, finished_at=?, updated_at=? WHERE campaign_id=? AND device_id=?",
+                    (str(exc)[:240], utc_now_iso(), utc_now_iso(), campaign_id, did),
+                )
+                conn.commit()
+                conn.close()
+    return dispatched, failures
+
+
+def _rollback_admin_devices(campaign_id: str, admin_username: str, reason: str) -> int:
+    """Send OTA with the previously-known url/fw to every device that had
+    already flipped to success for this campaign under this admin."""
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT device_id, prev_fw, prev_url
+            FROM ota_device_runs
+            WHERE campaign_id = ? AND admin_username = ? AND state = 'success'
+            """,
+            (campaign_id, admin_username),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+
+    rolled = 0
+    for r in rows:
+        did = str(r["device_id"])
+        prev_url = str(r.get("prev_url") or "")
+        prev_fw = str(r.get("prev_fw") or "")
+        if not prev_url:
+            continue
+        try:
+            _dispatch_ota_to_device(f"{campaign_id}#rollback", did, prev_fw or "rollback", prev_url)
+            with db_lock:
+                conn = get_conn()
+                cur = conn.cursor()
+                cur.execute(
+                    "UPDATE ota_device_runs SET state='rolled_back', error=?, updated_at=? WHERE campaign_id=? AND device_id=?",
+                    (reason[:240], utc_now_iso(), campaign_id, did),
+                )
+                conn.commit()
+                conn.close()
+            rolled += 1
+        except Exception:
+            pass
+
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO ota_decisions (campaign_id, admin_username, action, decided_at, detail)
+            VALUES (?, ?, 'rolled_back', ?, ?)
+            ON CONFLICT(campaign_id, admin_username) DO UPDATE SET
+              action='rolled_back', decided_at=excluded.decided_at, detail=excluded.detail
+            """,
+            (campaign_id, admin_username, utc_now_iso(), reason[:240]),
+        )
+        conn.commit()
+        conn.close()
+
+    try:
+        audit_event("system", "ota.rollback", target=admin_username, detail={"campaign_id": campaign_id, "reason": reason, "rolled": rolled})
+    except Exception:
+        pass
+    return rolled
+
+
+def _handle_ota_result_safe(device_id: str, payload: dict[str, Any]) -> None:
+    try:
+        _handle_ota_result(device_id, payload)
+    except Exception as exc:
+        logger.exception("ota result handling failed for %s: %s", device_id, exc)
+
+
+def _handle_ota_result(device_id: str, payload: dict[str, Any]) -> None:
+    campaign_id = str(payload.get("campaign_id") or "").strip()
+    if not campaign_id or campaign_id.endswith("#rollback"):
+        return
+    ok = bool(payload.get("ok"))
+    detail = str(payload.get("detail") or "")[:240]
+    now_iso = utc_now_iso()
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE ota_device_runs
+            SET state = ?, error = ?, finished_at = ?, updated_at = ?
+            WHERE campaign_id = ? AND device_id = ?
+            """,
+            ("success" if ok else "failed", "" if ok else detail, now_iso, now_iso, campaign_id, device_id),
+        )
+        # Find admin for rollback logic.
+        cur.execute(
+            "SELECT admin_username FROM ota_device_runs WHERE campaign_id = ? AND device_id = ?",
+            (campaign_id, device_id),
+        )
+        row = cur.fetchone()
+        admin_username = str(row["admin_username"]) if row else ""
+
+        # Aggregate campaign state.
+        cur.execute(
+            "SELECT state, COUNT(*) AS c FROM ota_device_runs WHERE campaign_id = ? GROUP BY state",
+            (campaign_id,),
+        )
+        agg = {str(r["state"]): int(r["c"]) for r in cur.fetchall()}
+        conn.commit()
+        conn.close()
+
+    emit_event(
+        level="info" if ok else "error",
+        category="ota",
+        event_type="ota.device.result",
+        summary=f"{device_id} ota {'ok' if ok else 'FAILED'} [{campaign_id}]",
+        actor=f"device:{device_id}",
+        target=admin_username or None,
+        owner_admin=admin_username or None,
+        device_id=device_id,
+        detail={"campaign_id": campaign_id, "ok": ok, "detail": detail},
+    )
+
+    if not ok and OTA_AUTO_ROLLBACK_ON_FAILURE and admin_username:
+        _rollback_admin_devices(campaign_id, admin_username, reason=f"device {device_id} failed: {detail}")
+
+    # Update top-level campaign state for the dashboard.
+    total = sum(agg.values())
+    if total:
+        failed = agg.get("failed", 0)
+        success = agg.get("success", 0)
+        pending = agg.get("pending", 0) + agg.get("dispatched", 0)
+        rolled = agg.get("rolled_back", 0)
+        if pending == 0 and failed == 0 and rolled == 0 and success == total:
+            new_state = "success"
+        elif pending == 0 and rolled > 0:
+            new_state = "rolled_back"
+        elif pending == 0 and failed > 0:
+            new_state = "partial" if success > 0 else "failed"
+        else:
+            new_state = "running"
+        with db_lock:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE ota_campaigns SET state=?, updated_at=? WHERE id=?",
+                (new_state, utc_now_iso(), campaign_id),
+            )
+            conn.commit()
+            conn.close()
+
+
+def _fan_out_alarm(device_id: str, payload: dict[str, Any]) -> None:
+    """Called from the MQTT thread when an `alarm.trigger` event arrives.
+
+    Steps:
+      1. Determine owner_admin (tenant).
+      2. Find sibling devices with the same owner_admin (revoked excluded).
+      3. Publish siren_on command to each sibling, with that device's cmd_key.
+      4. Insert alarm record, queue email to the tenant's recipients.
+    """
+    source_zone = str(payload.get("source_zone") or "all")
+    local_trigger = bool(payload.get("local_trigger"))
+    triggered_by = str(payload.get("trigger_kind") or ("remote_button" if local_trigger else "network"))
+    owner_admin = _lookup_owner_admin(device_id)
+
+    alarm_id = _insert_alarm(device_id, owner_admin, source_zone, triggered_by, payload)
+    emit_event(
+        level="warn",
+        category="alarm",
+        event_type="alarm.trigger",
+        summary=f"alarm from {device_id} ({triggered_by})",
+        actor=f"device:{device_id}",
+        target=owner_admin or "",
+        owner_admin=owner_admin,
+        device_id=device_id,
+        detail={"alarm_id": alarm_id, "zone": source_zone, "trigger_kind": triggered_by},
+        ref_table="alarms",
+        ref_id=alarm_id,
+    )
+
+    targets = _tenant_siblings(owner_admin, device_id)
+    sent = 0
+    failures: list[str] = []
+    for did, _z in targets:
+        try:
+            publish_command(
+                topic=f"{TOPIC_ROOT}/{did}/cmd",
+                cmd="siren_on",
+                params={"duration_ms": ALARM_FANOUT_DURATION_MS},
+                target_id=did,
+                proto=CMD_PROTO,
+                cmd_key=get_cmd_key_for_device(did),
+            )
+            sent += 1
+        except Exception as exc:
+            failures.append(f"{did}:{exc}")
+
+    email_sent = False
+    email_detail = ""
+    try:
+        recipients = _recipients_for_admin(owner_admin)
+        if recipients and notifier.enabled():
+            subject, text, html = render_alarm_email({
+                "source_id": device_id,
+                "zone": source_zone,
+                "triggered_by": triggered_by,
+                "created_at": utc_now_iso(),
+                "fanout_count": sent,
+            })
+            email_sent = notifier.enqueue(recipients, subject, text, html)
+            email_detail = f"queued={email_sent} to={len(recipients)}"
+        elif recipients:
+            email_detail = "smtp_disabled"
+        else:
+            email_detail = "no_recipients"
+    except Exception as exc:
+        email_detail = f"queue_err:{exc}"
+
+    _update_alarm(alarm_id, sent, email_sent, email_detail)
+
+    try:
+        audit_event(
+            f"device:{device_id}",
+            "alarm.fanout",
+            target=owner_admin or "(unowned)",
+            detail={
+                "alarm_id": alarm_id,
+                "triggered_by": triggered_by,
+                "fanout_count": sent,
+                "target_total": len(targets),
+                "failures": failures[:5],
+                "email": email_detail,
+            },
+        )
+    except Exception:
+        pass
+
+
 def on_message(_client: mqtt.Client, _userdata: Any, msg: mqtt.MQTTMessage) -> None:
     topic = msg.topic
 
@@ -476,6 +2017,16 @@ def on_message(_client: mqtt.Client, _userdata: Any, msg: mqtt.MQTTMessage) -> N
     if topic == TOPIC_BOOTSTRAP_REGISTER:
         upsert_pending_claim(payload)
         insert_message(topic, "bootstrap_register", str(payload.get("device_id", "")), payload)
+        did_try = str(payload.get("device_id", ""))
+        emit_event(
+            level="info",
+            category="provision",
+            event_type="provision.bootstrap_register",
+            summary=f"{did_try} bootstrap register",
+            actor=f"device:{did_try}",
+            device_id=did_try,
+            detail={"serial": payload.get("serial"), "mac": payload.get("mac"), "qr_code": payload.get("qr_code")},
+        )
         return
 
     device_id, channel = parse_topic(topic)
@@ -485,6 +2036,79 @@ def on_message(_client: mqtt.Client, _userdata: Any, msg: mqtt.MQTTMessage) -> N
     insert_message(topic, channel, device_id, payload)
     if device_id:
         upsert_device_state(device_id, channel, payload)
+
+    # Flow EVERY device channel into the unified event stream (at debug
+    # level so subscribers can opt in). This gives the superadmin a true
+    # firehose while staying out of the tenant admin's default view.
+    if device_id and channel in ("heartbeat", "status", "ack", "event"):
+        try:
+            owner = _lookup_owner_admin(device_id) if "lookup_owner" not in payload else None
+        except Exception:
+            owner = None
+        ev_level = "debug"
+        ev_type = f"device.{channel}"
+        ev_sum = f"{device_id} {channel}"
+        # Elevate important ones.
+        if channel == "event":
+            p_type = str(payload.get("type") or "")
+            if p_type:
+                ev_type = f"device.event.{p_type}"
+                ev_sum = f"{device_id} event {p_type}"
+                if p_type.startswith("alarm."):
+                    ev_level = "warn"
+        elif channel == "ack":
+            if str(payload.get("type") or "") == "ota.result":
+                ev_level = "warn" if not bool(payload.get("ok")) else "info"
+                ev_type = "device.ota.result"
+                ev_sum = f"{device_id} ota {'ok' if payload.get('ok') else 'FAIL'}"
+        emit_event(
+            level=ev_level,
+            category="device",
+            event_type=ev_type,
+            summary=ev_sum,
+            actor=f"device:{device_id}",
+            owner_admin=owner,
+            device_id=device_id,
+            detail={"topic": topic, **{k: v for k, v in payload.items() if k in ("type", "ok", "detail", "campaign_id", "rssi", "vbat", "net_type", "fw", "throughput_rx_bps", "throughput_tx_bps")}},
+        )
+
+    if channel == "event" and device_id and str(payload.get("type") or "") == "alarm.trigger":
+        # Dispatch fan-out to a worker thread so the MQTT loop keeps draining.
+        # With 200 siblings at ~100 ms each, publish_command could otherwise
+        # block the on_message callback for tens of seconds.
+        t = threading.Thread(
+            target=_fan_out_alarm_safe,
+            name=f"alarm-fanout-{device_id}",
+            args=(device_id, payload),
+            daemon=True,
+        )
+        t.start()
+
+    if channel == "ack" and device_id and str(payload.get("type") or "") == "ota.result":
+        # Feed into the OTA campaign state machine on a worker thread to
+        # avoid blocking on_message if a rollback has to fan out.
+        t = threading.Thread(
+            target=_handle_ota_result_safe,
+            name=f"ota-result-{device_id}",
+            args=(device_id, payload),
+            daemon=True,
+        )
+        t.start()
+
+    if channel in ("heartbeat", "status", "ack", "event") and device_id:
+        # Any freshly-received message from the device resolves an outstanding
+        # presence probe, so the dashboard can flip it back to "online" fast.
+        try:
+            _mark_presence_probe_acked(device_id)
+        except Exception:
+            logger.debug("presence probe ack update failed for %s", device_id, exc_info=True)
+
+
+def _fan_out_alarm_safe(device_id: str, payload: dict[str, Any]) -> None:
+    try:
+        _fan_out_alarm(device_id, payload)
+    except Exception as exc:
+        logger.exception("alarm fan-out failed for %s: %s", device_id, exc)
 
 
 def start_mqtt_loop() -> mqtt.Client:
@@ -560,23 +2184,71 @@ class BulkAlertRequest(BaseModel):
     device_ids: list[str] = Field(default_factory=list)
 
 
+class DeviceChallengeRequest(BaseModel):
+    mac_nocolon: str = Field(min_length=12, max_length=12)
+    device_id: str = Field(min_length=8, max_length=40)
+    public_key_pem: str = Field(min_length=64, max_length=4096)
+    attestation: Optional[dict[str, Any]] = None
+
+
+class DeviceChallengeVerifyRequest(BaseModel):
+    challenge_id: int = Field(ge=1)
+    signature_b64: str = Field(min_length=32, max_length=1024)
+
+
+class DeviceRevokeRequest(BaseModel):
+    reason: str = Field(default="manual revoke", min_length=3, max_length=200)
+
+
 class LoginRequest(BaseModel):
     username: str = Field(min_length=1, max_length=64)
     password: str = Field(min_length=1, max_length=128)
 
 
 class UserCreateRequest(BaseModel):
+    # NOTE: superadmin is NEVER creatable through the API. It is seeded once
+    # from BOOTSTRAP_DASHBOARD_SUPERADMIN_PASSWORD on first boot and that's it.
     username: str = Field(min_length=2, max_length=64)
     password: str = Field(min_length=8, max_length=128)
-    role: str = Field(pattern="^(superadmin|admin|user)$")
+    role: str = Field(pattern="^(admin|user)$")
     zones: list[str] = Field(default_factory=lambda: ["*"])
+    manager_admin: Optional[str] = Field(default=None, min_length=2, max_length=64)
+    tenant: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    email: Optional[str] = Field(default=None, min_length=3, max_length=254)
+    phone: Optional[str] = Field(default=None, min_length=4, max_length=32)
 
 
-app = FastAPI(title="Croc Sentinel API", version="1.0.0")
+class UserPolicyUpdateRequest(BaseModel):
+    can_alert: Optional[bool] = None
+    can_send_command: Optional[bool] = None
+    can_claim_device: Optional[bool] = None
+    can_manage_users: Optional[bool] = None
+    can_backup_restore: Optional[bool] = None
+
+
+app = FastAPI(title="Croc Sentinel API", version="1.1.0")
 
 _dash_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard")
 if os.path.isdir(_dash_dir):
-    app.mount("/dashboard", StaticFiles(directory=_dash_dir, html=True), name="dashboard")
+    app.mount(DASHBOARD_PATH, StaticFiles(directory=_dash_dir, html=True), name="dashboard")
+
+
+@app.get("/", include_in_schema=False)
+def _root_redirect() -> RedirectResponse:
+    return RedirectResponse(url=DASHBOARD_PATH + "/", status_code=302)
+
+
+@app.get("/ui", include_in_schema=False)
+@app.get("/ui/", include_in_schema=False)
+@app.get("/dashboard", include_in_schema=False)
+@app.get("/dashboard/", include_in_schema=False)
+def _legacy_ui_redirect() -> RedirectResponse:
+    return RedirectResponse(url=DASHBOARD_PATH + "/", status_code=301)
+
+
+@app.get("/ui/{path:path}", include_in_schema=False)
+def _legacy_ui_deep_redirect(path: str) -> RedirectResponse:
+    return RedirectResponse(url=f"{DASHBOARD_PATH}/{path}", status_code=301)
 
 
 @app.on_event("startup")
@@ -584,11 +2256,15 @@ def startup() -> None:
     global mqtt_client, scheduler_thread
     validate_production_env()
     init_db()
+    notifier.start()
     mqtt_client = start_mqtt_loop()
     scheduler_stop.clear()
     scheduler_thread = threading.Thread(target=scheduler_loop, name="cmd-scheduler", daemon=True)
     scheduler_thread.start()
-    logger.info("API started mqtt_host=%s mqtt_port=%s db=%s", MQTT_HOST, MQTT_PORT, DB_PATH)
+    logger.info(
+        "API started mqtt_host=%s mqtt_port=%s db=%s notifier_enabled=%s",
+        MQTT_HOST, MQTT_PORT, DB_PATH, notifier.enabled(),
+    )
 
 
 @app.on_event("shutdown")
@@ -600,10 +2276,553 @@ def shutdown() -> None:
         scheduler_thread = None
     if mqtt_client is not None:
         stop_mqtt_loop(mqtt_client)
+    notifier.stop()
+
+
+def _client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    if request.client and request.client.host:
+        return request.client.host
+    return "?"
+
+
+def _check_login_rate(ip: str, username: str) -> None:
+    """Raise 429 if the ip OR username has too many recent failures."""
+    cutoff = int(time.time()) - LOGIN_RATE_WINDOW_SECONDS
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM login_failures WHERE ts_epoch < ?", (cutoff,))
+        cur.execute(
+            "SELECT COUNT(*) AS c FROM login_failures WHERE ip = ? AND ts_epoch >= ?",
+            (ip, cutoff),
+        )
+        ip_fails = int(cur.fetchone()["c"])
+        cur.execute(
+            "SELECT COUNT(*) AS c FROM login_failures WHERE username = ? AND ts_epoch >= ?",
+            (username, cutoff),
+        )
+        user_fails = int(cur.fetchone()["c"])
+        conn.commit()
+        conn.close()
+    if ip_fails >= LOGIN_RATE_MAX_FAILS or user_fails >= LOGIN_RATE_MAX_FAILS:
+        emit_event(
+            level="error",
+            category="auth",
+            event_type="auth.login.rate_limited",
+            summary=f"rate-limit {username}@{ip}",
+            actor=f"ip:{ip}",
+            target=username,
+            detail={"ip_fails": ip_fails, "user_fails": user_fails},
+        )
+        raise HTTPException(
+            status_code=429,
+            detail=f"too many login attempts — locked for up to {LOGIN_RATE_WINDOW_SECONDS}s",
+        )
+
+
+def _record_login_failure(ip: str, username: str) -> None:
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO login_failures (ip, username, ts_epoch) VALUES (?, ?, ?)",
+            (ip, username, int(time.time())),
+        )
+        conn.commit()
+        conn.close()
+
+
+def _clear_login_failures(username: str) -> None:
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM login_failures WHERE username = ?", (username,))
+        conn.commit()
+        conn.close()
+
+
+# ────────────────────────────────────────────────────────────────────
+#  Signup / activation helpers
+# ────────────────────────────────────────────────────────────────────
+
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{2,64}$")
+# Loose phone normalizer: keep + and digits only. Callers still have to pick a
+# country prefix for SMS delivery; we don't do E.164 validation because the
+# SMS provider will reject anything unusable.
+_PHONE_RE = re.compile(r"[^\d+]")
+
+
+def _looks_like_email(s: str) -> bool:
+    return bool(_EMAIL_RE.match(s or ""))
+
+
+def _normalize_phone(s: Optional[str]) -> Optional[str]:
+    if not s:
+        return None
+    cleaned = _PHONE_RE.sub("", s.strip())
+    return cleaned if 4 <= len(cleaned) <= 32 else None
+
+
+def _hash_otp(code: str) -> str:
+    """One-way hash so we never store plaintext OTPs at rest."""
+    return hashlib.sha256((code + "|" + (JWT_SECRET or "jwt-unset")).encode("utf-8")).hexdigest()
+
+
+def _generate_otp() -> str:
+    """6-digit numeric OTP, CSPRNG backed."""
+    n = secrets.randbelow(1_000_000)
+    return f"{n:06d}"
+
+
+def _check_signup_rate(ip: str, email: str) -> None:
+    cutoff = int(time.time()) - SIGNUP_RATE_WINDOW_SECONDS
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM signup_attempts WHERE ts_epoch < ?", (cutoff,))
+        cur.execute(
+            "SELECT COUNT(*) AS c FROM signup_attempts WHERE ip = ? AND ts_epoch >= ?",
+            (ip, cutoff),
+        )
+        ip_c = int(cur.fetchone()["c"])
+        cur.execute(
+            "SELECT COUNT(*) AS c FROM signup_attempts WHERE email = ? AND ts_epoch >= ?",
+            (email, cutoff),
+        )
+        email_c = int(cur.fetchone()["c"])
+        conn.commit()
+        conn.close()
+    if ip_c >= SIGNUP_RATE_MAX or email_c >= SIGNUP_RATE_MAX:
+        raise HTTPException(status_code=429, detail="too many signup attempts — slow down")
+
+
+def _record_signup_attempt(ip: str, email: str) -> None:
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO signup_attempts (ip, email, ts_epoch) VALUES (?, ?, ?)",
+            (ip, email, int(time.time())),
+        )
+        conn.commit()
+        conn.close()
+
+
+def _send_email_otp(to: str, code: str, purpose: str) -> None:
+    subject_prefix = os.getenv("SMTP_SUBJECT_PREFIX", "[Sentinel]")
+    purpose_zh = {
+        "signup": "账号注册",
+        "activate": "账号激活",
+        "reset": "重置密码",
+    }.get(purpose, purpose)
+    subject = f"{subject_prefix} {purpose_zh} 验证码: {code}"
+    body = (
+        f"您的 Croc Sentinel {purpose_zh} 验证码是：\n\n"
+        f"    {code}\n\n"
+        f"该验证码 {OTP_TTL_SECONDS // 60} 分钟内有效。若非本人操作，请忽略此邮件。\n"
+        "Your verification code for Croc Sentinel is above.\n"
+    )
+    ok = notifier.enqueue(to=[to], subject=subject, body_text=body)
+    if not ok:
+        raise RuntimeError("notifier queue full or SMTP not configured")
+
+
+def _send_sms_otp(phone: str, code: str, purpose: str) -> None:
+    if SMS_PROVIDER in ("", "none"):
+        # In email-only mode we silently skip — callers already checked
+        # REQUIRE_PHONE_VERIFICATION, so this branch is only reached when the
+        # admin provided a phone but no provider is installed.
+        logger.info("sms provider not configured; skipping %s otp for %s", purpose, phone)
+        return
+    raise NotImplementedError(
+        f"SMS_PROVIDER={SMS_PROVIDER} is not implemented in this build; "
+        f"wire up notifier_sms.py or keep SMS_PROVIDER=none"
+    )
+
+
+def _issue_verification(username: str, channel: str, target: str, purpose: str) -> int:
+    """Create and deliver a fresh OTP. Returns remaining TTL in seconds."""
+    if channel not in ("email", "phone"):
+        raise ValueError("channel must be email|phone")
+    code = _generate_otp()
+    code_hash = _hash_otp(code)
+    expires_at = int(time.time()) + OTP_TTL_SECONDS
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        # Cooldown: prevent hammering the mailer.
+        cur.execute(
+            """SELECT created_at FROM verifications
+               WHERE username = ? AND channel = ? AND purpose = ? AND used = 0
+               ORDER BY id DESC LIMIT 1""",
+            (username, channel, purpose),
+        )
+        last = cur.fetchone()
+        if last:
+            try:
+                last_ts = int(datetime.fromisoformat(str(last["created_at"])).timestamp())
+            except Exception:
+                last_ts = 0
+            if int(time.time()) - last_ts < OTP_RESEND_COOLDOWN_SECONDS:
+                conn.close()
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"请稍候 {OTP_RESEND_COOLDOWN_SECONDS - (int(time.time()) - last_ts)} 秒再重试",
+                )
+        # Invalidate previous pending codes for this (user, channel, purpose).
+        cur.execute(
+            "UPDATE verifications SET used = 1 WHERE username = ? AND channel = ? AND purpose = ? AND used = 0",
+            (username, channel, purpose),
+        )
+        cur.execute(
+            """INSERT INTO verifications
+               (username, channel, target, purpose, code_hash, expires_at_ts, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (username, channel, target, purpose, code_hash, expires_at, utc_now_iso()),
+        )
+        conn.commit()
+        conn.close()
+    if channel == "email":
+        _send_email_otp(target, code, purpose)
+    else:
+        _send_sms_otp(target, code, purpose)
+    return OTP_TTL_SECONDS
+
+
+def _consume_verification(username: str, channel: str, purpose: str, code: str) -> bool:
+    """Check code; mark used if it matches. Return True/False."""
+    code_hash = _hash_otp(code or "")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT id, code_hash, attempts, expires_at_ts, used FROM verifications
+               WHERE username = ? AND channel = ? AND purpose = ?
+               ORDER BY id DESC LIMIT 1""",
+            (username, channel, purpose),
+        )
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            return False
+        if int(row["used"]) == 1:
+            conn.close()
+            return False
+        if int(time.time()) > int(row["expires_at_ts"]):
+            conn.close()
+            return False
+        if int(row["attempts"]) >= 5:
+            conn.close()
+            return False
+        if not secrets.compare_digest(str(row["code_hash"]), code_hash):
+            cur.execute("UPDATE verifications SET attempts = attempts + 1 WHERE id = ?", (int(row["id"]),))
+            conn.commit()
+            conn.close()
+            return False
+        cur.execute("UPDATE verifications SET used = 1 WHERE id = ?", (int(row["id"]),))
+        conn.commit()
+        conn.close()
+    return True
+
+
+class SignupStartRequest(BaseModel):
+    username: str = Field(min_length=2, max_length=64)
+    password: str = Field(min_length=8, max_length=128)
+    email: str = Field(min_length=3, max_length=254)
+    phone: Optional[str] = Field(default=None, min_length=4, max_length=32)
+
+
+class VerifyCodeRequest(BaseModel):
+    username: str = Field(min_length=2, max_length=64)
+    email_code: Optional[str] = Field(default=None, min_length=4, max_length=12)
+    phone_code: Optional[str] = Field(default=None, min_length=4, max_length=12)
+
+
+class ResendCodeRequest(BaseModel):
+    username: str = Field(min_length=2, max_length=64)
+    channel: str = Field(pattern="^(email|phone)$")
+    purpose: str = Field(default="activate", pattern="^(signup|activate|reset)$")
+
+
+@app.post("/auth/signup/start")
+def auth_signup_start(body: SignupStartRequest, request: Request) -> dict[str, Any]:
+    """Public admin self-signup (role=admin only, never superadmin).
+
+    Creates a `dashboard_users` row in status='pending' and emails an OTP.
+    The account becomes usable only after /auth/signup/verify succeeds AND,
+    when ADMIN_SIGNUP_REQUIRE_APPROVAL=1, a superadmin approves it.
+    """
+    if not ALLOW_PUBLIC_ADMIN_SIGNUP:
+        raise HTTPException(status_code=403, detail="public signup disabled")
+    ip = _client_ip(request)
+    username = body.username.strip()
+    if not _USERNAME_RE.match(username):
+        raise HTTPException(status_code=400, detail="username must be 2–64 chars of [A-Za-z0-9_.-]")
+    email_norm = body.email.strip().lower()
+    if not _looks_like_email(email_norm):
+        raise HTTPException(status_code=400, detail="email format invalid")
+    phone_norm = _normalize_phone(body.phone)
+    if REQUIRE_PHONE_VERIFICATION and not phone_norm:
+        raise HTTPException(status_code=400, detail="phone is required")
+    _check_signup_rate(ip, email_norm)
+    _record_signup_attempt(ip, email_norm)
+    initial_status = "pending"
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT username, status FROM dashboard_users WHERE username = ?", (username,))
+        existing = cur.fetchone()
+        if existing:
+            conn.close()
+            # Don't disclose why it failed beyond a generic conflict.
+            raise HTTPException(status_code=409, detail="username not available")
+        cur.execute("SELECT username FROM dashboard_users WHERE LOWER(email) = ?", (email_norm,))
+        if cur.fetchone():
+            conn.close()
+            raise HTTPException(status_code=409, detail="email already registered")
+        try:
+            cur.execute(
+                """INSERT INTO dashboard_users (
+                       username, password_hash, role, allowed_zones_json,
+                       manager_admin, tenant, email, phone, status, created_at
+                   ) VALUES (?, ?, 'admin', '["*"]', '', ?, ?, ?, ?, ?)""",
+                (
+                    username,
+                    hash_password(body.password),
+                    username,  # tenant defaults to self
+                    email_norm,
+                    phone_norm,
+                    initial_status,
+                    utc_now_iso(),
+                ),
+            )
+            pol = default_policy_for_role("admin")
+            cur.execute(
+                """INSERT OR IGNORE INTO role_policies
+                   (username, can_alert, can_send_command, can_claim_device,
+                    can_manage_users, can_backup_restore, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    username,
+                    pol["can_alert"], pol["can_send_command"], pol["can_claim_device"],
+                    pol["can_manage_users"], pol["can_backup_restore"], utc_now_iso(),
+                ),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            conn.close()
+            raise HTTPException(status_code=409, detail="username not available")
+        conn.close()
+    try:
+        _issue_verification(username, "email", email_norm, purpose="signup")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("signup email OTP failed for %s: %s", username, exc)
+        raise HTTPException(status_code=502, detail=f"failed to send email verification: {exc}")
+    if phone_norm and REQUIRE_PHONE_VERIFICATION:
+        try:
+            _issue_verification(username, "phone", phone_norm, purpose="signup")
+        except Exception as exc:
+            logger.warning("signup phone OTP failed for %s: %s", username, exc)
+            raise HTTPException(status_code=502, detail=f"failed to send SMS verification: {exc}")
+    audit_event(username, "signup.start", username, {"email": email_norm, "phone": bool(phone_norm), "ip": ip})
+    return {
+        "ok": True,
+        "username": username,
+        "email_otp_sent": True,
+        "phone_otp_sent": bool(phone_norm and REQUIRE_PHONE_VERIFICATION),
+        "ttl_seconds": OTP_TTL_SECONDS,
+        "requires_approval": ADMIN_SIGNUP_REQUIRE_APPROVAL,
+    }
+
+
+@app.post("/auth/signup/verify")
+def auth_signup_verify(body: VerifyCodeRequest) -> dict[str, Any]:
+    username = body.username.strip()
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT username, role, status, email, phone, email_verified_at, phone_verified_at "
+            "FROM dashboard_users WHERE username = ?",
+            (username,),
+        )
+        u = cur.fetchone()
+        conn.close()
+    if not u:
+        raise HTTPException(status_code=404, detail="user not found")
+    if u["role"] != "admin":
+        # Users go through /auth/activate, which is semantically identical but
+        # a separate route so future logic can diverge cleanly.
+        raise HTTPException(status_code=400, detail="wrong verification route for this user")
+    if str(u["status"]) in ("active", "disabled"):
+        return {"ok": True, "already_verified": True, "status": str(u["status"])}
+    if REQUIRE_EMAIL_VERIFICATION:
+        if not body.email_code:
+            raise HTTPException(status_code=400, detail="email_code required")
+        if not _consume_verification(username, "email", "signup", body.email_code):
+            raise HTTPException(status_code=401, detail="invalid or expired email code")
+    if REQUIRE_PHONE_VERIFICATION and u["phone"]:
+        if not body.phone_code:
+            raise HTTPException(status_code=400, detail="phone_code required")
+        if not _consume_verification(username, "phone", "signup", body.phone_code):
+            raise HTTPException(status_code=401, detail="invalid or expired phone code")
+    next_status = "awaiting_approval" if ADMIN_SIGNUP_REQUIRE_APPROVAL else "active"
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """UPDATE dashboard_users
+               SET email_verified_at = ?,
+                   phone_verified_at = CASE WHEN phone IS NOT NULL AND phone <> '' AND ? <> '' THEN ? ELSE phone_verified_at END,
+                   status = ?
+               WHERE username = ?""",
+            (
+                utc_now_iso(),
+                (body.phone_code or ""),
+                utc_now_iso(),
+                next_status,
+                username,
+            ),
+        )
+        conn.commit()
+        conn.close()
+    audit_event(username, "signup.verify", username, {"next_status": next_status})
+    return {"ok": True, "status": next_status, "requires_approval": ADMIN_SIGNUP_REQUIRE_APPROVAL}
+
+
+@app.post("/auth/activate")
+def auth_activate_user(body: VerifyCodeRequest) -> dict[str, Any]:
+    """Admin-created users activate themselves with the OTP the admin triggered."""
+    username = body.username.strip()
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT username, role, status, email, phone FROM dashboard_users WHERE username = ?",
+            (username,),
+        )
+        u = cur.fetchone()
+        conn.close()
+    if not u:
+        raise HTTPException(status_code=404, detail="user not found")
+    if str(u["status"]) == "active":
+        return {"ok": True, "already_active": True}
+    if REQUIRE_EMAIL_VERIFICATION:
+        if not body.email_code:
+            raise HTTPException(status_code=400, detail="email_code required")
+        if not _consume_verification(username, "email", "activate", body.email_code):
+            raise HTTPException(status_code=401, detail="invalid or expired email code")
+    if REQUIRE_PHONE_VERIFICATION and u["phone"]:
+        if not body.phone_code:
+            raise HTTPException(status_code=400, detail="phone_code required")
+        if not _consume_verification(username, "phone", "activate", body.phone_code):
+            raise HTTPException(status_code=401, detail="invalid or expired phone code")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """UPDATE dashboard_users
+               SET email_verified_at = ?, status = 'active'
+               WHERE username = ?""",
+            (utc_now_iso(), username),
+        )
+        conn.commit()
+        conn.close()
+    audit_event(username, "account.activate", username, {})
+    return {"ok": True, "status": "active"}
+
+
+@app.post("/auth/code/resend")
+def auth_code_resend(body: ResendCodeRequest) -> dict[str, Any]:
+    username = body.username.strip()
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT role, status, email, phone FROM dashboard_users WHERE username = ?",
+            (username,),
+        )
+        u = cur.fetchone()
+        conn.close()
+    if not u:
+        raise HTTPException(status_code=404, detail="user not found")
+    if str(u["status"]) == "active" and body.purpose != "reset":
+        return {"ok": True, "already_active": True}
+    target = str(u["email"] or "") if body.channel == "email" else str(u["phone"] or "")
+    if not target:
+        raise HTTPException(status_code=400, detail=f"{body.channel} not on file")
+    _issue_verification(username, body.channel, target, purpose=body.purpose)
+    return {"ok": True, "ttl_seconds": OTP_TTL_SECONDS}
+
+
+@app.get("/auth/signup/pending")
+def auth_signup_pending(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    """Superadmin queue: admins who passed OTP but await approval."""
+    assert_min_role(principal, "superadmin")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT username, email, phone, created_at, email_verified_at
+               FROM dashboard_users
+               WHERE role = 'admin' AND status = 'awaiting_approval'
+               ORDER BY created_at ASC"""
+        )
+        items = [dict(r) for r in cur.fetchall()]
+        conn.close()
+    return {"items": items}
+
+
+@app.post("/auth/signup/approve/{username}")
+def auth_signup_approve(username: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "superadmin")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE dashboard_users SET status='active' WHERE username = ? AND role='admin' AND status='awaiting_approval'",
+            (username,),
+        )
+        n = cur.rowcount
+        conn.commit()
+        conn.close()
+    if n == 0:
+        raise HTTPException(status_code=404, detail="no pending admin with that username")
+    audit_event(principal.username, "signup.approve", username, {})
+    return {"ok": True, "username": username}
+
+
+@app.post("/auth/signup/reject/{username}")
+def auth_signup_reject(username: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "superadmin")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM dashboard_users WHERE username = ? AND role='admin' AND status='awaiting_approval'",
+            (username,),
+        )
+        n = cur.rowcount
+        cur.execute("DELETE FROM role_policies WHERE username = ?", (username,))
+        cur.execute("DELETE FROM verifications WHERE username = ?", (username,))
+        conn.commit()
+        conn.close()
+    if n == 0:
+        raise HTTPException(status_code=404, detail="no pending admin with that username")
+    audit_event(principal.username, "signup.reject", username, {})
+    return {"ok": True}
 
 
 @app.post("/auth/login")
-def auth_login(body: LoginRequest) -> dict[str, Any]:
+def auth_login(body: LoginRequest, request: Request) -> dict[str, Any]:
+    ip = _client_ip(request)
+    _check_login_rate(ip, body.username)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -611,27 +2830,74 @@ def auth_login(body: LoginRequest) -> dict[str, Any]:
         row = cur.fetchone()
         conn.close()
     if not row or not verify_password(body.password, str(row["password_hash"])):
+        _record_login_failure(ip, body.username)
+        audit_event(f"ip:{ip}", "auth.login.fail", body.username, {})
         raise HTTPException(status_code=401, detail="invalid credentials")
+    # Status gate: pending / awaiting_approval / disabled cannot log in.
+    status = str(row["status"] if "status" in row.keys() else "active") or "active"
+    if status == "disabled":
+        audit_event(f"ip:{ip}", "auth.login.disabled", body.username, {})
+        raise HTTPException(status_code=403, detail="account disabled")
+    if status == "pending":
+        raise HTTPException(status_code=403, detail="account not activated yet — please enter the verification code sent to your email")
+    if status == "awaiting_approval":
+        raise HTTPException(status_code=403, detail="account awaiting superadmin approval")
+    _clear_login_failures(body.username)
     zones = zones_from_json(str(row["allowed_zones_json"]))
     token = issue_jwt(str(row["username"]), str(row["role"]), zones)
+    audit_event(str(row["username"]), "auth.login.ok", "", {"ip": ip})
     return {"access_token": token, "token_type": "bearer", "role": row["role"], "zones": zones}
 
 
 @app.get("/auth/me")
 def auth_me(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     assert_min_role(principal, "user")
-    return {"username": principal.username, "role": principal.role, "zones": principal.zones}
+    return {
+        "username": principal.username,
+        "role": principal.role,
+        "zones": principal.zones,
+        "policy": get_effective_policy(principal),
+        "manager_admin": get_manager_admin(principal.username) if principal.role == "user" else "",
+    }
 
 
-@app.get("/auth/users")
-def auth_list_users(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+@app.get("/auth/admins")
+def auth_list_admins(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    """For superadmin only. Returns admins usable as manager_admin."""
     assert_min_role(principal, "superadmin")
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
         cur.execute(
-            "SELECT username, role, allowed_zones_json, created_at FROM dashboard_users ORDER BY username ASC"
+            "SELECT username FROM dashboard_users WHERE role IN ('admin','superadmin') ORDER BY username ASC"
         )
+        rows = [str(r["username"]) for r in cur.fetchall()]
+        conn.close()
+    return {"items": rows}
+
+
+@app.get("/auth/users")
+def auth_list_users(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "admin")
+    if principal.role == "admin":
+        require_capability(principal, "can_manage_users")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        if principal.role == "superadmin":
+            cur.execute(
+                "SELECT username, role, allowed_zones_json, manager_admin, tenant, created_at FROM dashboard_users ORDER BY username ASC"
+            )
+        else:
+            cur.execute(
+                """
+                SELECT username, role, allowed_zones_json, manager_admin, tenant, created_at
+                FROM dashboard_users
+                WHERE role = 'user' AND manager_admin = ?
+                ORDER BY username ASC
+                """,
+                (principal.username,),
+            )
         rows = [dict(r) for r in cur.fetchall()]
         conn.close()
     for r in rows:
@@ -641,19 +2907,91 @@ def auth_list_users(principal: Principal = Depends(require_principal)) -> dict[s
 
 @app.post("/auth/users")
 def auth_create_user(req: UserCreateRequest, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_min_role(principal, "superadmin")
+    assert_min_role(principal, "admin")
+    if principal.role == "admin":
+        require_capability(principal, "can_manage_users")
+    # Hard guard: nobody can make a superadmin via the API even by forging role.
+    if req.role == "superadmin":
+        raise HTTPException(status_code=403, detail="superadmin is not creatable via API")
+    if principal.role == "admin" and req.role != "user":
+        raise HTTPException(status_code=403, detail="admin can only create user role")
+    # admin-created users MUST have an email so the activation code can be sent.
+    # (phone is optional; see REQUIRE_PHONE_VERIFICATION env flag)
+    if not req.email:
+        raise HTTPException(status_code=400, detail="email is required")
+    email_norm = req.email.strip().lower()
+    if not _looks_like_email(email_norm):
+        raise HTTPException(status_code=400, detail="email format invalid")
+    phone_norm = _normalize_phone(req.phone) if req.phone else None
+    if REQUIRE_PHONE_VERIFICATION and not phone_norm:
+        raise HTTPException(status_code=400, detail="phone is required")
     now = utc_now_iso()
     zones_json = json.dumps(req.zones, ensure_ascii=True)
+    manager_admin = req.manager_admin or (principal.username if principal.role == "admin" else "")
+    if req.role == "admin":
+        manager_admin = ""
+    if req.role == "user" and not manager_admin:
+        raise HTTPException(status_code=400, detail="manager_admin is required when creating a user role")
+    if req.role == "user":
+        with db_lock:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT role FROM dashboard_users WHERE username = ?",
+                (manager_admin,),
+            )
+            mrow = cur.fetchone()
+            conn.close()
+        if not mrow or str(mrow["role"]) not in ("admin", "superadmin"):
+            raise HTTPException(status_code=400, detail="manager_admin must be an existing admin/superadmin")
+    tenant = req.tenant or (principal.username if principal.role == "admin" else (manager_admin or req.username))
+    initial_status = "pending"  # activation code will flip to 'active'
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
         try:
             cur.execute(
                 """
-                INSERT INTO dashboard_users (username, password_hash, role, allowed_zones_json, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO dashboard_users (
+                    username, password_hash, role, allowed_zones_json,
+                    manager_admin, tenant, email, phone, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (req.username, hash_password(req.password), req.role, zones_json, now),
+                (
+                    req.username,
+                    hash_password(req.password),
+                    req.role,
+                    zones_json,
+                    manager_admin,
+                    tenant,
+                    email_norm,
+                    phone_norm,
+                    initial_status,
+                    now,
+                ),
+            )
+            pol = default_policy_for_role(req.role)
+            cur.execute(
+                """
+                INSERT INTO role_policies (username, can_alert, can_send_command, can_claim_device, can_manage_users, can_backup_restore, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(username) DO UPDATE SET
+                  can_alert=excluded.can_alert,
+                  can_send_command=excluded.can_send_command,
+                  can_claim_device=excluded.can_claim_device,
+                  can_manage_users=excluded.can_manage_users,
+                  can_backup_restore=excluded.can_backup_restore,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    req.username,
+                    pol["can_alert"],
+                    pol["can_send_command"],
+                    pol["can_claim_device"],
+                    pol["can_manage_users"],
+                    pol["can_backup_restore"],
+                    now,
+                ),
             )
             conn.commit()
         except sqlite3.IntegrityError:
@@ -661,24 +2999,168 @@ def auth_create_user(req: UserCreateRequest, principal: Principal = Depends(requ
             raise HTTPException(status_code=409, detail="username exists")
         conn.close()
     cache_invalidate("devices")
-    return {"ok": True, "username": req.username}
+    audit_event(principal.username, "user.create", req.username, {
+        "role": req.role, "zones": req.zones, "email": email_norm, "phone": bool(phone_norm),
+    })
+    # Send activation OTPs. We don't fail user creation if SMTP is down — the
+    # admin can click "re-send code" from the dashboard.
+    activation_msg = ""
+    try:
+        _issue_verification(req.username, "email", email_norm, purpose="activate")
+        activation_msg = "已向邮箱发送验证码"
+    except Exception as exc:
+        logger.warning("email OTP issue failed for %s: %s", req.username, exc)
+        activation_msg = f"邮件验证码未发送：{exc}"
+    if phone_norm:
+        try:
+            _issue_verification(req.username, "phone", phone_norm, purpose="activate")
+            activation_msg += "；短信验证码已发送"
+        except Exception as exc:
+            logger.warning("phone OTP issue failed for %s: %s", req.username, exc)
+    return {
+        "ok": True,
+        "username": req.username,
+        "status": initial_status,
+        "message": activation_msg,
+    }
 
 
 @app.delete("/auth/users/{username}")
 def auth_delete_user(username: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_min_role(principal, "superadmin")
+    assert_min_role(principal, "admin")
+    if principal.role == "admin":
+        require_capability(principal, "can_manage_users")
     if secrets.compare_digest(username, principal.username):
         raise HTTPException(status_code=400, detail="cannot delete self")
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
+        if principal.role == "admin":
+            cur.execute("SELECT role, manager_admin FROM dashboard_users WHERE username = ?", (username,))
+            row = cur.fetchone()
+            if not row:
+                conn.close()
+                raise HTTPException(status_code=404, detail="user not found")
+            if str(row["role"]) != "user" or str(row["manager_admin"] or "") != principal.username:
+                conn.close()
+                raise HTTPException(status_code=403, detail="cannot delete this user")
         cur.execute("DELETE FROM dashboard_users WHERE username = ?", (username,))
+        cur.execute("DELETE FROM role_policies WHERE username = ?", (username,))
         conn.commit()
         deleted = cur.rowcount
         conn.close()
     if deleted == 0:
         raise HTTPException(status_code=404, detail="user not found")
+    audit_event(principal.username, "user.delete", username, {})
     return {"ok": True}
+
+
+@app.get("/auth/users/{username}/policy")
+def auth_get_user_policy(username: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "admin")
+    if principal.role == "admin":
+        require_capability(principal, "can_manage_users")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT username, role, manager_admin FROM dashboard_users WHERE username = ?", (username,))
+        u = cur.fetchone()
+        if not u:
+            conn.close()
+            raise HTTPException(status_code=404, detail="user not found")
+        if principal.role == "admin" and (str(u["role"]) != "user" or str(u["manager_admin"] or "") != principal.username):
+            conn.close()
+            raise HTTPException(status_code=403, detail="not your managed user")
+        cur.execute(
+            """
+            SELECT can_alert, can_send_command, can_claim_device, can_manage_users, can_backup_restore, updated_at
+            FROM role_policies WHERE username = ?
+            """,
+            (username,),
+        )
+        p = cur.fetchone()
+        conn.close()
+    if not p:
+        out = default_policy_for_role(str(u["role"]))
+        out["updated_at"] = ""
+        return out
+    return dict(p)
+
+
+@app.put("/auth/users/{username}/policy")
+def auth_set_user_policy(
+    username: str,
+    req: UserPolicyUpdateRequest,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    assert_min_role(principal, "admin")
+    if principal.role == "admin":
+        require_capability(principal, "can_manage_users")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT username, role, manager_admin FROM dashboard_users WHERE username = ?", (username,))
+        u = cur.fetchone()
+        if not u:
+            conn.close()
+            raise HTTPException(status_code=404, detail="user not found")
+        if str(u["role"]) != "user":
+            conn.close()
+            raise HTTPException(status_code=400, detail="policy endpoint is for user role")
+        if principal.role == "admin" and str(u["manager_admin"] or "") != principal.username:
+            conn.close()
+            raise HTTPException(status_code=403, detail="not your managed user")
+        base = default_policy_for_role("user")
+        cur.execute(
+            """
+            SELECT can_alert, can_send_command, can_claim_device, can_manage_users, can_backup_restore
+            FROM role_policies WHERE username = ?
+            """,
+            (username,),
+        )
+        curp = cur.fetchone()
+        if curp:
+            for k in base.keys():
+                base[k] = int(curp[k])
+        updates = {
+            "can_alert": req.can_alert,
+            "can_send_command": req.can_send_command,
+            "can_claim_device": req.can_claim_device,
+            "can_manage_users": req.can_manage_users,
+            "can_backup_restore": req.can_backup_restore,
+        }
+        for k, v in updates.items():
+            if v is not None:
+                base[k] = 1 if v else 0
+        # guardrail: regular users never get backup/manage_users
+        base["can_backup_restore"] = 0
+        base["can_manage_users"] = 0
+        cur.execute(
+            """
+            INSERT INTO role_policies (username, can_alert, can_send_command, can_claim_device, can_manage_users, can_backup_restore, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(username) DO UPDATE SET
+                can_alert=excluded.can_alert,
+                can_send_command=excluded.can_send_command,
+                can_claim_device=excluded.can_claim_device,
+                can_manage_users=excluded.can_manage_users,
+                can_backup_restore=excluded.can_backup_restore,
+                updated_at=excluded.updated_at
+            """,
+            (
+                username,
+                base["can_alert"],
+                base["can_send_command"],
+                base["can_claim_device"],
+                base["can_manage_users"],
+                base["can_backup_restore"],
+                utc_now_iso(),
+            ),
+        )
+        conn.commit()
+        conn.close()
+    audit_event(principal.username, "user.policy.update", username, base)
+    return {"ok": True, "username": username, "policy": base}
 
 
 @app.get("/admin/backup/export")
@@ -722,6 +3204,169 @@ async def admin_backup_import(
     }
 
 
+@app.post("/provision/challenge/request")
+def provision_challenge_request(
+    req: DeviceChallengeRequest,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    assert_min_role(principal, "admin")
+    require_capability(principal, "can_claim_device")
+    device_id = req.device_id.strip().upper()
+    mac_nocolon = req.mac_nocolon.strip().upper()
+    if not re.fullmatch(DEVICE_ID_REGEX, device_id):
+        raise HTTPException(status_code=400, detail="device_id format rejected by policy")
+    nonce = secrets.token_urlsafe(32)
+    expires_at = int(time.time()) + DEVICE_CHALLENGE_TTL_SECONDS
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO device_identities (device_id, mac_nocolon, public_key_pem, attestation_json, registered_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(device_id) DO UPDATE SET
+                mac_nocolon = excluded.mac_nocolon,
+                public_key_pem = excluded.public_key_pem,
+                attestation_json = excluded.attestation_json,
+                registered_at = excluded.registered_at
+            """,
+            (
+                device_id,
+                mac_nocolon,
+                req.public_key_pem,
+                json.dumps(req.attestation or {}, ensure_ascii=True),
+                utc_now_iso(),
+            ),
+        )
+        cur.execute(
+            """
+            INSERT INTO provision_challenges (mac_nocolon, device_id, nonce, expires_at_ts, verified_at, used)
+            VALUES (?, ?, ?, ?, NULL, 0)
+            """,
+            (mac_nocolon, device_id, nonce, expires_at),
+        )
+        challenge_id = int(cur.lastrowid)
+        conn.commit()
+        conn.close()
+    audit_event(principal.username, "challenge.request", device_id, {"challenge_id": challenge_id})
+    return {"challenge_id": challenge_id, "nonce": nonce, "expires_at_ts": expires_at}
+
+
+@app.post("/provision/challenge/verify")
+def provision_challenge_verify(
+    req: DeviceChallengeVerifyRequest,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    assert_min_role(principal, "admin")
+    require_capability(principal, "can_claim_device")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT c.id, c.device_id, c.nonce, c.expires_at_ts, c.used, i.public_key_pem
+            FROM provision_challenges c
+            JOIN device_identities i ON c.device_id = i.device_id
+            WHERE c.id = ?
+            """,
+            (req.challenge_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(status_code=404, detail="challenge not found")
+        if int(row["used"]) == 1:
+            conn.close()
+            raise HTTPException(status_code=409, detail="challenge already used")
+        if int(time.time()) > int(row["expires_at_ts"]):
+            conn.close()
+            raise HTTPException(status_code=410, detail="challenge expired")
+        ok = verify_device_signature(str(row["public_key_pem"]), str(row["nonce"]), req.signature_b64)
+        if not ok:
+            conn.close()
+            raise HTTPException(status_code=401, detail="device signature verification failed")
+        cur.execute(
+            "UPDATE provision_challenges SET verified_at = ? WHERE id = ?",
+            (utc_now_iso(), req.challenge_id),
+        )
+        conn.commit()
+        conn.close()
+    audit_event(principal.username, "challenge.verify", str(row["device_id"]), {"challenge_id": req.challenge_id})
+    return {"ok": True, "device_id": row["device_id"], "challenge_id": req.challenge_id}
+
+
+@app.get("/devices/revoked")
+def list_revoked_devices(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "admin")
+    if principal.role == "admin":
+        require_capability(principal, "can_send_command")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        if principal.role == "superadmin":
+            cur.execute("SELECT device_id, reason, revoked_by, revoked_at FROM revoked_devices ORDER BY revoked_at DESC")
+        else:
+            cur.execute(
+                """
+                SELECT r.device_id, r.reason, r.revoked_by, r.revoked_at
+                FROM revoked_devices r
+                JOIN device_ownership o ON r.device_id = o.device_id
+                WHERE o.owner_admin = ?
+                ORDER BY r.revoked_at DESC
+                """,
+                (principal.username,),
+            )
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+    return {"items": rows}
+
+
+@app.post("/devices/{device_id}/revoke")
+def revoke_device(
+    device_id: str,
+    req: DeviceRevokeRequest,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    assert_min_role(principal, "admin")
+    if principal.role == "admin":
+        require_capability(principal, "can_send_command")
+    assert_device_owner(principal, device_id)
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO revoked_devices (device_id, reason, revoked_by, revoked_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(device_id) DO UPDATE SET
+                reason = excluded.reason,
+                revoked_by = excluded.revoked_by,
+                revoked_at = excluded.revoked_at
+            """,
+            (device_id, req.reason, principal.username, utc_now_iso()),
+        )
+        conn.commit()
+        conn.close()
+    audit_event(principal.username, "device.revoke", device_id, {"reason": req.reason})
+    return {"ok": True, "device_id": device_id}
+
+
+@app.post("/devices/{device_id}/unrevoke")
+def unrevoke_device(device_id: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "admin")
+    if principal.role == "admin":
+        require_capability(principal, "can_send_command")
+    assert_device_owner(principal, device_id)
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM revoked_devices WHERE device_id = ?", (device_id,))
+        conn.commit()
+        conn.close()
+    audit_event(principal.username, "device.unrevoke", device_id, {})
+    return {"ok": True, "device_id": device_id}
+
+
 @app.get("/health")
 def health(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     assert_min_role(principal, "user")
@@ -732,6 +3377,16 @@ def health(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     }
 
 
+OFFLINE_THRESHOLD_SECONDS = int(os.getenv("OFFLINE_THRESHOLD_SECONDS", "90"))
+
+
+def _parse_iso(ts: str) -> float:
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
 @app.get("/dashboard/overview")
 def dashboard_overview(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     assert_min_role(principal, "user")
@@ -740,36 +3395,104 @@ def dashboard_overview(principal: Principal = Depends(require_principal)) -> dic
     if cached is not None:
         return cached
     zs, za = zone_sql_suffix(principal)
+    osf, osa = owner_scope_clause_for_device_state(principal)
+    args = tuple(za + osa)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute(f"SELECT COUNT(*) AS c FROM device_state WHERE 1=1 {zs}", tuple(za))
+        cur.execute(f"SELECT COUNT(*) AS c FROM device_state WHERE 1=1 {zs} {osf}", args)
         total = int(cur.fetchone()["c"])
         cur.execute(
             f"""
             SELECT COUNT(*) AS c FROM device_state
-            WHERE last_status_json IS NOT NULL {zs}
+            WHERE last_status_json IS NOT NULL {zs} {osf}
             """,
-            tuple(za),
+            args,
         )
         with_status = int(cur.fetchone()["c"])
         cur.execute(
             f"""
             SELECT fw, chip_target, board_profile, net_type, COUNT(*) AS c
             FROM device_state
-            WHERE 1=1 {zs}
+            WHERE 1=1 {zs} {osf}
             GROUP BY fw, chip_target, board_profile, net_type
             ORDER BY c DESC
             """,
-            tuple(za),
+            args,
         )
         grouped = [dict(r) for r in cur.fetchall()]
+        cur.execute(
+            f"""
+            SELECT device_id, updated_at, last_status_json
+            FROM device_state
+            WHERE 1=1 {zs} {osf}
+            """,
+            args,
+        )
+        presence_rows = cur.fetchall()
+        cur.execute(
+            f"""
+            SELECT COUNT(*) AS c FROM alarms
+            WHERE created_at >= datetime('now', '-24 hours')
+              AND (? = '' OR owner_admin = ?)
+            """,
+            ("" if principal.is_superadmin() else "x",
+             "" if principal.is_superadmin() else (
+                 principal.username if principal.role == "admin"
+                 else get_manager_admin(principal.username)
+             )),
+        )
+        alarms_24h = int(cur.fetchone()["c"])
         conn.close()
+    now_s = time.time()
+    presence = {
+        "online": 0,
+        "offline_total": 0,
+        "reason_power_low": 0,
+        "reason_network_lost": 0,
+        "reason_signal_weak": 0,
+        "reason_unknown": 0,
+    }
+    tx_bps_total = 0.0
+    rx_bps_total = 0.0
+    for r in presence_rows:
+        raw = r["last_status_json"] or ""
+        try:
+            s = json.loads(raw) if raw else {}
+        except Exception:
+            s = {}
+        updated = _parse_iso(str(r["updated_at"] or ""))
+        is_online = bool(s.get("online")) and (now_s - updated) < OFFLINE_THRESHOLD_SECONDS
+        if is_online:
+            presence["online"] += 1
+            try:
+                tx_bps_total += float(s.get("tx_bps") or 0)
+                rx_bps_total += float(s.get("rx_bps") or 0)
+            except (TypeError, ValueError):
+                pass
+        else:
+            presence["offline_total"] += 1
+            reason = str(s.get("disconnect_reason") or "")
+            if reason == "power_low":
+                presence["reason_power_low"] += 1
+            elif reason == "network_lost" or (now_s - updated) >= OFFLINE_THRESHOLD_SECONDS:
+                presence["reason_network_lost"] += 1
+            elif reason == "signal_weak":
+                presence["reason_signal_weak"] += 1
+            else:
+                presence["reason_unknown"] += 1
     out = {
         "total_devices": total,
         "devices_with_status": with_status,
         "groups": grouped,
         "mqtt_connected": mqtt_connected,
+        "presence": presence,
+        "throughput": {
+            "tx_bps_total": round(tx_bps_total, 1),
+            "rx_bps_total": round(rx_bps_total, 1),
+        },
+        "alarms_24h": alarms_24h,
+        "notifier": notifier.status() if principal.is_adminish() else {"enabled": notifier.enabled()},
         "ts": int(time.time()),
     }
     cache_put(cache_key, out)
@@ -784,6 +3507,7 @@ def list_devices(principal: Principal = Depends(require_principal)) -> dict[str,
     if cached is not None:
         return cached
     zs, za = zone_sql_suffix(principal)
+    osf, osa = owner_scope_clause_for_device_state(principal)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -791,10 +3515,10 @@ def list_devices(principal: Principal = Depends(require_principal)) -> dict[str,
             f"""
             SELECT device_id, fw, chip_target, board_profile, net_type, zone, provisioned, updated_at
             FROM device_state
-            WHERE 1=1 {zs}
+            WHERE 1=1 {zs} {osf}
             ORDER BY updated_at DESC
             """,
-            tuple(za),
+            tuple(za + osa),
         )
         rows = [dict(r) for r in cur.fetchall()]
         conn.close()
@@ -806,6 +3530,7 @@ def list_devices(principal: Principal = Depends(require_principal)) -> dict[str,
 @app.get("/devices/{device_id}")
 def get_device(device_id: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     assert_min_role(principal, "user")
+    assert_device_owner(principal, device_id)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -831,6 +3556,7 @@ def get_device_messages(
     principal: Principal = Depends(require_principal),
 ) -> dict[str, Any]:
     assert_min_role(principal, "user")
+    assert_device_owner(principal, device_id)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -866,7 +3592,7 @@ def get_device_messages(
 
 
 def generate_device_credentials(device_id: str) -> tuple[str, str, str]:
-    if PROVISION_USE_SHARED_MQTT_CREDS and MQTT_USERNAME:
+    if (not ENFORCE_PER_DEVICE_CREDS) and PROVISION_USE_SHARED_MQTT_CREDS and MQTT_USERNAME:
         mqtt_username = MQTT_USERNAME
         mqtt_password = MQTT_PASSWORD
     else:
@@ -974,17 +3700,33 @@ def enqueue_scheduled_command(device_id: str, cmd: str, params: dict[str, Any], 
 def resolve_target_devices(device_ids: list[str], principal: Optional[Principal] = None) -> list[str]:
     unique = sorted(set([d for d in device_ids if d]))
     zs, za = zone_sql_suffix(principal) if principal else ("", [])
+    osf, osa = owner_sql_suffix(principal, "o") if principal else ("", [])
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
         if unique:
             placeholders = ",".join(["?"] * len(unique))
             cur.execute(
-                f"SELECT device_id, zone FROM device_state WHERE device_id IN ({placeholders}){zs}",
-                tuple(unique) + tuple(za),
+                f"""
+                SELECT d.device_id, d.zone
+                FROM device_state d
+                LEFT JOIN revoked_devices r ON d.device_id = r.device_id
+                LEFT JOIN device_ownership o ON d.device_id = o.device_id
+                WHERE d.device_id IN ({placeholders}){zs} {osf} AND r.device_id IS NULL
+                """,
+                tuple(unique) + tuple(za) + tuple(osa),
             )
         else:
-            cur.execute(f"SELECT device_id, zone FROM device_state WHERE 1=1 {zs}", tuple(za))
+            cur.execute(
+                f"""
+                SELECT d.device_id, d.zone
+                FROM device_state d
+                LEFT JOIN revoked_devices r ON d.device_id = r.device_id
+                LEFT JOIN device_ownership o ON d.device_id = o.device_id
+                WHERE 1=1 {zs} {osf} AND r.device_id IS NULL
+                """,
+                tuple(za) + tuple(osa),
+            )
         rows = cur.fetchall()
         conn.close()
     out: list[str] = []
@@ -1000,6 +3742,8 @@ def resolve_target_devices(device_ids: list[str], principal: Optional[Principal]
 
 def scheduler_loop() -> None:
     next_cleanup_at = time.time() + 60
+    next_probe_at = time.time() + 30  # kick probe worker ~30s after boot
+    next_events_retention_at = time.time() + 300  # first retention pass ~5 min after boot
     while not scheduler_stop.is_set():
         now_ts = int(time.time())
         jobs: list[sqlite3.Row] = []
@@ -1070,6 +3814,20 @@ def scheduler_loop() -> None:
                 conn.close()
             next_cleanup_at = now + 3600
 
+        if now >= next_probe_at:
+            try:
+                _presence_probe_tick()
+            except Exception as exc:
+                logger.warning("presence probe tick failed: %s", exc)
+            next_probe_at = now + max(30, PRESENCE_PROBE_SCAN_SECONDS)
+
+        if now >= next_events_retention_at:
+            try:
+                _events_retention_tick()
+            except Exception as exc:
+                logger.warning("events retention tick failed: %s", exc)
+            next_events_retention_at = now + max(300, EVENT_RETENTION_SCAN_SECONDS)
+
         scheduler_stop.wait(SCHEDULER_POLL_SECONDS)
 
 
@@ -1079,6 +3837,8 @@ def list_pending_claims(
     q: Optional[str] = Query(default=None, max_length=64, description="Filter by MAC (no colon) or QR substring"),
 ) -> dict[str, Any]:
     assert_min_role(principal, "admin")
+    if principal.role == "admin":
+        require_capability(principal, "can_claim_device")
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -1110,11 +3870,15 @@ def list_pending_claims(
 @app.post("/provision/claim")
 def claim_device(req: ClaimDeviceRequest, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     assert_min_role(principal, "admin")
+    require_capability(principal, "can_claim_device")
     mac_nocolon = req.mac_nocolon.upper()
     if len(mac_nocolon) != 12:
         raise HTTPException(status_code=400, detail="invalid mac_nocolon")
+    if not re.fullmatch(DEVICE_ID_REGEX, req.device_id.strip().upper()):
+        raise HTTPException(status_code=400, detail="device_id format rejected by policy")
     if not BOOTSTRAP_BIND_KEY:
         raise HTTPException(status_code=500, detail="server BOOTSTRAP_BIND_KEY not configured")
+    ensure_not_revoked(req.device_id)
 
     with db_lock:
         conn = get_conn()
@@ -1124,9 +3888,43 @@ def claim_device(req: ClaimDeviceRequest, principal: Principal = Depends(require
         if not pending:
             conn.close()
             raise HTTPException(status_code=404, detail="pending device not found")
+        cur.execute("SELECT mac_nocolon FROM provisioned_credentials WHERE device_id = ?", (req.device_id,))
+        exist_id = cur.fetchone()
+        if exist_id:
+            conn.close()
+            raise HTTPException(status_code=409, detail="device_id already registered")
+        cur.execute(
+            "SELECT device_id FROM provisioned_credentials WHERE mac_nocolon = ?",
+            (mac_nocolon,),
+        )
+        existing = cur.fetchone()
+        if existing:
+            conn.close()
+            raise HTTPException(status_code=409, detail=f"device already claimed as {existing['device_id']}")
 
         claim_nonce = str(pending["claim_nonce"])
         qr_code = req.qr_code if req.qr_code else (str(pending["qr_code"] or "") or f"CROC-{mac_nocolon}")
+        if req.qr_code:
+            if not re.fullmatch(QR_CODE_REGEX, req.qr_code):
+                conn.close()
+                raise HTTPException(status_code=400, detail="qr_code format rejected by policy")
+            if QR_SIGN_SECRET and not verify_qr_signature(req.qr_code):
+                conn.close()
+                raise HTTPException(status_code=401, detail="qr_code signature invalid")
+        if ENFORCE_DEVICE_CHALLENGE:
+            cur.execute(
+                """
+                SELECT id, verified_at, used
+                FROM provision_challenges
+                WHERE mac_nocolon = ? AND device_id = ? AND expires_at_ts >= ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (mac_nocolon, req.device_id.strip().upper(), int(time.time())),
+            )
+            ch = cur.fetchone()
+            if not ch or not ch["verified_at"] or int(ch["used"]) == 1:
+                conn.close()
+                raise HTTPException(status_code=412, detail="verified device challenge required before claim")
         mqtt_username, mqtt_password, cmd_key = generate_device_credentials(req.device_id)
 
         cur.execute(
@@ -1156,6 +3954,36 @@ def claim_device(req: ClaimDeviceRequest, principal: Principal = Depends(require
         )
         conn.commit()
         conn.close()
+    owner_admin = principal.username
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO device_ownership (device_id, owner_admin, assigned_by, assigned_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(device_id) DO UPDATE SET
+              owner_admin = excluded.owner_admin,
+              assigned_by = excluded.assigned_by,
+              assigned_at = excluded.assigned_at
+            """,
+            (req.device_id, owner_admin, principal.username, utc_now_iso()),
+        )
+        conn.commit()
+        conn.close()
+    if ENFORCE_DEVICE_CHALLENGE:
+        with db_lock:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE provision_challenges SET used = 1
+                WHERE mac_nocolon = ? AND device_id = ? AND verified_at IS NOT NULL AND used = 0
+                """,
+                (mac_nocolon, req.device_id.strip().upper()),
+            )
+            conn.commit()
+            conn.close()
 
     publish_bootstrap_claim(
         mac_nocolon=mac_nocolon,
@@ -1176,7 +4004,65 @@ def claim_device(req: ClaimDeviceRequest, principal: Principal = Depends(require
         "mqtt_password": mqtt_password if CLAIM_RESPONSE_INCLUDE_SECRETS else "***",
         "cmd_key": cmd_key if CLAIM_RESPONSE_INCLUDE_SECRETS else "***",
     }
+    audit_event(principal.username, "provision.claim", req.device_id, {"mac_nocolon": mac_nocolon, "zone": req.zone})
     return resp
+
+
+@app.get("/audit")
+def list_audit_events(
+    limit: int = Query(default=100, ge=1, le=500),
+    actor: Optional[str] = Query(default=None, max_length=64),
+    action: Optional[str] = Query(default=None, max_length=64),
+    target: Optional[str] = Query(default=None, max_length=128),
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    assert_min_role(principal, "admin")
+    clauses: list[str] = ["1=1"]
+    args: list[Any] = []
+    if principal.role == "admin":
+        # admin only sees:
+        #   - own actions
+        #   - actions on users they manage
+        #   - actions on devices they own (or legacy unowned if allowed)
+        owned_sub = (
+            "SELECT username FROM dashboard_users WHERE manager_admin = ?"
+        )
+        clauses.append(
+            "(actor = ? OR target IN (" + owned_sub + ") OR target IN "
+            "(SELECT device_id FROM device_ownership WHERE owner_admin = ?))"
+        )
+        args.extend([principal.username, principal.username, principal.username])
+    if actor:
+        clauses.append("actor = ?")
+        args.append(actor)
+    if action:
+        clauses.append("action LIKE ?")
+        args.append(f"{action}%")
+    if target:
+        clauses.append("target = ?")
+        args.append(target)
+    where = " AND ".join(clauses)
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT id, actor, action, target, detail_json, created_at
+            FROM audit_events
+            WHERE {where}
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            tuple(args + [limit]),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+    for r in rows:
+        try:
+            r["detail"] = json.loads(r.pop("detail_json") or "{}")
+        except Exception:
+            r["detail"] = {}
+    return {"items": rows}
 
 
 @app.get("/logs/messages")
@@ -1203,6 +4089,7 @@ def get_logs_messages(
         query += " AND m.channel = ?"
         args.append(channel)
     if device_id:
+        assert_device_owner(principal, device_id)
         query += " AND m.device_id = ?"
         args.append(device_id)
         with db_lock:
@@ -1245,6 +4132,9 @@ def get_log_file_tail(
 @app.post("/devices/{device_id}/commands")
 def send_device_command(device_id: str, req: CommandRequest, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     assert_min_role(principal, "admin")
+    require_capability(principal, "can_send_command")
+    ensure_not_revoked(device_id)
+    assert_device_owner(principal, device_id)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -1267,6 +4157,9 @@ def device_alert_on(
     principal: Principal = Depends(require_principal),
 ) -> dict[str, Any]:
     assert_min_role(principal, "user")
+    require_capability(principal, "can_alert")
+    ensure_not_revoked(device_id)
+    assert_device_owner(principal, device_id)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -1291,6 +4184,9 @@ def device_alert_on(
 @app.post("/devices/{device_id}/alert/off")
 def device_alert_off(device_id: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     assert_min_role(principal, "user")
+    require_capability(principal, "can_alert")
+    ensure_not_revoked(device_id)
+    assert_device_owner(principal, device_id)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -1315,6 +4211,7 @@ def device_alert_off(device_id: str, principal: Principal = Depends(require_prin
 @app.post("/alerts")
 def bulk_alert(req: BulkAlertRequest, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     assert_min_role(principal, "user")
+    require_capability(principal, "can_alert")
     targets = resolve_target_devices(req.device_ids, principal)
     if not targets:
         return {"ok": True, "sent_count": 0, "device_ids": []}
@@ -1353,6 +4250,9 @@ def bulk_alert(req: BulkAlertRequest, principal: Principal = Depends(require_pri
 @app.post("/devices/{device_id}/self-test")
 def device_self_test(device_id: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     assert_min_role(principal, "admin")
+    require_capability(principal, "can_send_command")
+    ensure_not_revoked(device_id)
+    assert_device_owner(principal, device_id)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -1377,6 +4277,9 @@ def device_self_test(device_id: str, principal: Principal = Depends(require_prin
 @app.post("/devices/{device_id}/schedule-reboot")
 def device_schedule_reboot(device_id: str, req: ScheduleRebootRequest, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     assert_min_role(principal, "admin")
+    require_capability(principal, "can_send_command")
+    ensure_not_revoked(device_id)
+    assert_device_owner(principal, device_id)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -1409,6 +4312,9 @@ def device_schedule_reboot(device_id: str, req: ScheduleRebootRequest, principal
 @app.get("/devices/{device_id}/scheduled-jobs")
 def device_scheduled_jobs(device_id: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     assert_min_role(principal, "admin")
+    require_capability(principal, "can_send_command")
+    ensure_not_revoked(device_id)
+    assert_device_owner(principal, device_id)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -1442,16 +4348,1157 @@ def device_scheduled_jobs(device_id: str, principal: Principal = Depends(require
 @app.post("/commands/broadcast")
 def send_broadcast_command(req: BroadcastCommandRequest, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     assert_min_role(principal, "admin")
+    require_capability(principal, "can_send_command")
     zs, za = zone_sql_suffix(principal)
+    osf, osa = owner_scope_clause_for_device_state(principal)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute(f"SELECT device_id FROM device_state WHERE 1=1 {zs}", tuple(za))
+        cur.execute(
+            f"""
+            SELECT device_id FROM device_state
+            WHERE 1=1 {zs} {osf}
+              AND device_id NOT IN (SELECT device_id FROM revoked_devices)
+            """,
+            tuple(za + osa),
+        )
         device_ids = [r["device_id"] for r in cur.fetchall()]
         conn.close()
+
+    if len(device_ids) > MAX_BULK_TARGETS:
+        raise HTTPException(status_code=413, detail=f"target set too large (> {MAX_BULK_TARGETS})")
 
     for did in device_ids:
         topic = f"{TOPIC_ROOT}/{did}/cmd"
         publish_command(topic, req.cmd, req.params, req.target_id, req.proto, get_cmd_key_for_device(did))
 
+    audit_event(principal.username, "command.broadcast", req.target_id, {
+        "cmd": req.cmd,
+        "sent_count": len(device_ids),
+    })
     return {"ok": True, "target_id": req.target_id, "sent_count": len(device_ids)}
+
+
+# =====================================================================
+#  Alarms (server-side fan-out history)
+# =====================================================================
+
+def _alarm_scope_for(principal: Principal) -> tuple[str, list[Any]]:
+    """SQL fragment restricting alarms to what the principal may see."""
+    if principal.is_superadmin():
+        return "", []
+    if principal.role == "admin":
+        if ALLOW_LEGACY_UNOWNED:
+            return " AND (owner_admin = ? OR owner_admin IS NULL) ", [principal.username]
+        return " AND owner_admin = ? ", [principal.username]
+    manager = get_manager_admin(principal.username)
+    if not manager:
+        return " AND 1=0 ", []
+    if ALLOW_LEGACY_UNOWNED:
+        return " AND (owner_admin = ? OR owner_admin IS NULL) ", [manager]
+    return " AND owner_admin = ? ", [manager]
+
+
+@app.get("/alarms")
+def list_alarms(
+    limit: int = Query(default=100, ge=1, le=500),
+    since_hours: int = Query(default=168, ge=1, le=720),
+    source_id: Optional[str] = Query(default=None),
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    assert_min_role(principal, "user")
+    scope_sql, scope_args = _alarm_scope_for(principal)
+    args: list[Any] = list(scope_args)
+    where_extra = ""
+    if source_id:
+        where_extra += " AND source_id = ? "
+        args.append(source_id)
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT id, source_id, owner_admin, zone, triggered_by, ts_device,
+                   fanout_count, email_sent, email_detail, created_at
+            FROM alarms
+            WHERE created_at >= datetime('now', ?)
+            {scope_sql}
+            {where_extra}
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            tuple([f"-{since_hours} hours"] + args + [limit]),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+    return {"items": rows}
+
+
+@app.get("/alarms/summary")
+def alarms_summary(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "user")
+    scope_sql, scope_args = _alarm_scope_for(principal)
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT COUNT(*) AS c FROM alarms WHERE created_at >= datetime('now','-24 hours') {scope_sql}",
+            tuple(scope_args),
+        )
+        last24 = int(cur.fetchone()["c"])
+        cur.execute(
+            f"SELECT COUNT(*) AS c FROM alarms WHERE created_at >= datetime('now','-7 days') {scope_sql}",
+            tuple(scope_args),
+        )
+        last7 = int(cur.fetchone()["c"])
+        cur.execute(
+            f"""
+            SELECT source_id, COUNT(*) AS c
+            FROM alarms
+            WHERE created_at >= datetime('now','-7 days') {scope_sql}
+            GROUP BY source_id
+            ORDER BY c DESC
+            LIMIT 10
+            """,
+            tuple(scope_args),
+        )
+        top = [dict(r) for r in cur.fetchall()]
+        conn.close()
+    return {"last_24h": last24, "last_7d": last7, "top_sources_7d": top}
+
+
+# =====================================================================
+#  Email recipients (per-tenant) & SMTP test
+# =====================================================================
+
+class RecipientCreateRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=120)
+    label: Optional[str] = Field(default=None, max_length=80)
+    enabled: bool = True
+
+
+class RecipientUpdateRequest(BaseModel):
+    enabled: Optional[bool] = None
+    label: Optional[str] = Field(default=None, max_length=80)
+
+
+def _admin_scope_for(principal: Principal) -> str:
+    """Resolve which owner_admin the principal manages recipients for."""
+    if principal.role == "superadmin":
+        return ""  # superadmin must pick via ?for_admin=
+    if principal.role == "admin":
+        return principal.username
+    return ""  # users can only view, not edit
+
+
+@app.get("/admin/alert-recipients")
+def list_recipients(
+    for_admin: Optional[str] = Query(default=None),
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    assert_min_role(principal, "user")
+    if principal.role == "user":
+        target = get_manager_admin(principal.username)
+    elif principal.role == "admin":
+        target = principal.username
+    else:
+        target = (for_admin or "").strip()
+        if not target:
+            return {"items": [], "scope": ""}
+    if not target:
+        return {"items": [], "scope": ""}
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, owner_admin, email, label, enabled, created_at
+            FROM admin_alert_recipients
+            WHERE owner_admin = ?
+            ORDER BY id ASC
+            """,
+            (target,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+    return {"items": rows, "scope": target}
+
+
+@app.post("/admin/alert-recipients")
+def create_recipient(
+    req: RecipientCreateRequest,
+    for_admin: Optional[str] = Query(default=None),
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    assert_min_role(principal, "admin")
+    if principal.role == "superadmin":
+        target = (for_admin or "").strip()
+        if not target:
+            raise HTTPException(status_code=400, detail="for_admin query param required for superadmin")
+    else:
+        target = principal.username
+    if "@" not in req.email:
+        raise HTTPException(status_code=400, detail="email is not valid")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO admin_alert_recipients (owner_admin, email, label, enabled, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (target, req.email.strip(), req.label or "", 1 if req.enabled else 0, utc_now_iso()),
+            )
+            new_id = int(cur.lastrowid)
+            conn.commit()
+        except sqlite3.IntegrityError:
+            conn.close()
+            raise HTTPException(status_code=409, detail="email already registered for this admin")
+        conn.close()
+    audit_event(principal.username, "recipient.add", target, {"email": req.email})
+    return {"ok": True, "id": new_id}
+
+
+@app.patch("/admin/alert-recipients/{rid}")
+def update_recipient(
+    rid: int,
+    req: RecipientUpdateRequest,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    assert_min_role(principal, "admin")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT owner_admin FROM admin_alert_recipients WHERE id = ?", (rid,))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(status_code=404, detail="recipient not found")
+        owner = str(row["owner_admin"])
+        if principal.role == "admin" and owner != principal.username:
+            conn.close()
+            raise HTTPException(status_code=403, detail="not yours")
+        fields: list[str] = []
+        args: list[Any] = []
+        if req.enabled is not None:
+            fields.append("enabled = ?")
+            args.append(1 if req.enabled else 0)
+        if req.label is not None:
+            fields.append("label = ?")
+            args.append(req.label)
+        if not fields:
+            conn.close()
+            return {"ok": True, "noop": True}
+        args.append(rid)
+        cur.execute(f"UPDATE admin_alert_recipients SET {', '.join(fields)} WHERE id = ?", tuple(args))
+        conn.commit()
+        conn.close()
+    audit_event(principal.username, "recipient.update", owner, {"id": rid})
+    return {"ok": True}
+
+
+@app.delete("/admin/alert-recipients/{rid}")
+def delete_recipient(rid: int, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "admin")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT owner_admin FROM admin_alert_recipients WHERE id = ?", (rid,))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(status_code=404, detail="recipient not found")
+        owner = str(row["owner_admin"])
+        if principal.role == "admin" and owner != principal.username:
+            conn.close()
+            raise HTTPException(status_code=403, detail="not yours")
+        cur.execute("DELETE FROM admin_alert_recipients WHERE id = ?", (rid,))
+        conn.commit()
+        conn.close()
+    audit_event(principal.username, "recipient.delete", owner, {"id": rid})
+    return {"ok": True}
+
+
+@app.get("/admin/smtp/status")
+def smtp_status(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "admin")
+    return notifier.status()
+
+
+class SmtpTestRequest(BaseModel):
+    to: str = Field(min_length=3, max_length=120)
+    subject: Optional[str] = Field(default=None, max_length=200)
+
+
+@app.post("/admin/smtp/test")
+def smtp_test(req: SmtpTestRequest, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "admin")
+    if "@" not in req.to:
+        raise HTTPException(status_code=400, detail="invalid recipient")
+    subject = req.subject or f"[Croc Sentinel] SMTP test by {principal.username}"
+    text = (
+        f"This is a test email sent by {principal.username} at {utc_now_iso()}.\n"
+        "If you received this, your SMTP configuration is working.\n"
+    )
+    try:
+        notifier.send_sync([req.to], subject, text)
+    except Exception as exc:
+        audit_event(principal.username, "smtp.test.fail", req.to, {"error": str(exc)})
+        raise HTTPException(status_code=502, detail=f"SMTP error: {exc}")
+    audit_event(principal.username, "smtp.test.ok", req.to, {})
+    return {"ok": True, "status": notifier.status()}
+
+
+# =====================================================================
+#  OTA — firmware listing & tenant-scoped broadcast
+# =====================================================================
+
+class OtaBroadcastRequest(BaseModel):
+    url: str = Field(min_length=8, max_length=400)
+    fw: str = Field(default="", max_length=40)
+    device_ids: list[str] = Field(default_factory=list)
+
+
+def _sha256_for(path: str) -> Optional[str]:
+    sidecar = path + ".sha256"
+    if os.path.isfile(sidecar):
+        try:
+            with open(sidecar, "r", encoding="utf-8", errors="ignore") as f:
+                line = f.readline().strip()
+            if line:
+                return line.split()[0]
+        except Exception:
+            return None
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+@app.get("/ota/firmwares")
+def list_firmwares(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    # Only superadmin can even see the firmware inventory.
+    assert_min_role(principal, "superadmin")
+    items: list[dict[str, Any]] = []
+    base = OTA_FIRMWARE_DIR
+    if os.path.isdir(base):
+        for name in sorted(os.listdir(base)):
+            if not name.endswith(".bin"):
+                continue
+            path = os.path.join(base, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            url = ""
+            if OTA_PUBLIC_BASE_URL:
+                url = f"{OTA_PUBLIC_BASE_URL}/fw/{name}"
+            items.append({
+                "name": name,
+                "size": st.st_size,
+                "mtime": int(st.st_mtime),
+                "sha256": _sha256_for(path),
+                "download_url": url,
+            })
+    return {"dir": base, "public_base": OTA_PUBLIC_BASE_URL, "items": items}
+
+
+@app.post("/ota/broadcast")
+def ota_broadcast(req: OtaBroadcastRequest, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    # OTA is sensitive: the .bin can brick the fleet. Only superadmin may
+    # dispatch it, and because superadmin's scope is global the resulting
+    # target set is "every non-revoked device" (or the explicit subset).
+    assert_min_role(principal, "superadmin")
+    if not req.url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="url must be http(s)")
+    targets = resolve_target_devices(req.device_ids, principal)
+    if not targets:
+        return {"ok": True, "sent_count": 0, "device_ids": []}
+    params: dict[str, Any] = {"url": req.url}
+    if req.fw:
+        params["fw"] = req.fw
+    sent = 0
+    for did in targets:
+        try:
+            publish_command(
+                topic=f"{TOPIC_ROOT}/{did}/cmd",
+                cmd="ota",
+                params=params,
+                target_id=did,
+                proto=CMD_PROTO,
+                cmd_key=get_cmd_key_for_device(did),
+            )
+            sent += 1
+        except Exception as exc:
+            logger.warning("ota broadcast to %s failed: %s", did, exc)
+    audit_event(principal.username, "ota.broadcast", req.fw or req.url, {
+        "sent_count": sent,
+        "target_count": len(targets),
+        "fw": req.fw,
+    })
+    return {"ok": True, "sent_count": sent, "device_ids": targets}
+
+
+# =====================================================================
+#  OTA CAMPAIGNS (new 2-stage flow: superadmin → admin → devices)
+#
+#   1. superadmin POST /ota/campaigns   -> creates campaign, picks target admins
+#   2. each admin sees pending campaign on their dashboard
+#   3. admin POST /ota/campaigns/{id}/accept  -> server HEAD-checks url,
+#      fills ota_device_runs, dispatches ota cmd to every owned device
+#   4. devices emit ota.result; _handle_ota_result drives the state machine
+#   5. if any device fails and OTA_AUTO_ROLLBACK_ON_FAILURE=1, every already-
+#      upgraded device under that admin is pushed back to prev_url
+#   6. admin may POST /ota/campaigns/{id}/decline to opt out
+# =====================================================================
+
+class OtaCampaignCreateRequest(BaseModel):
+    fw_version: str = Field(min_length=1, max_length=40)
+    url: str = Field(min_length=8, max_length=400)
+    sha256: Optional[str] = Field(default=None, max_length=128)
+    notes: Optional[str] = Field(default=None, max_length=500)
+    # ["*"] = every admin; otherwise an explicit list.
+    target_admins: list[str] = Field(default_factory=lambda: ["*"], max_length=256)
+
+
+def _list_all_admin_usernames() -> list[str]:
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT username FROM dashboard_users WHERE role = 'admin' AND (status IS NULL OR status='' OR status='active')",
+        )
+        rows = cur.fetchall()
+        conn.close()
+    return [str(r["username"]) for r in rows]
+
+
+@app.post("/ota/campaigns")
+def create_ota_campaign(req: OtaCampaignCreateRequest, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "superadmin")
+    if not req.url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="url must be http(s)")
+
+    if req.target_admins == ["*"] or not req.target_admins:
+        admins = _list_all_admin_usernames()
+    else:
+        admins = [a for a in req.target_admins if a and a != "*"]
+        if not admins:
+            raise HTTPException(status_code=400, detail="no target admins")
+
+    campaign_id = "otac-" + secrets.token_urlsafe(10)
+    now_iso = utc_now_iso()
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO ota_campaigns (id, created_by, fw_version, url, sha256, notes, target_admins_json, state, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'dispatched', ?, ?)
+            """,
+            (campaign_id, principal.username, req.fw_version, req.url, req.sha256 or "", req.notes or "", json.dumps(admins), now_iso, now_iso),
+        )
+        conn.commit()
+        conn.close()
+
+    audit_event(principal.username, "ota.campaign.create", campaign_id, {
+        "fw_version": req.fw_version, "url": req.url, "target_admins": admins,
+    })
+    return {"ok": True, "campaign_id": campaign_id, "target_admins": admins, "state": "dispatched"}
+
+
+@app.get("/ota/campaigns")
+def list_ota_campaigns(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    """Superadmin sees every campaign; admin sees only campaigns that list them."""
+    items: list[dict[str, Any]] = []
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, created_by, fw_version, url, sha256, notes, target_admins_json, state, created_at, updated_at FROM ota_campaigns ORDER BY created_at DESC LIMIT 200",
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        # Enrich with per-admin decision + counters.
+        for r in rows:
+            r["target_admins"] = json.loads(str(r.pop("target_admins_json") or "[]"))
+            cur.execute(
+                "SELECT admin_username, action, decided_at, detail FROM ota_decisions WHERE campaign_id = ?",
+                (r["id"],),
+            )
+            r["decisions"] = [dict(x) for x in cur.fetchall()]
+            cur.execute(
+                "SELECT state, COUNT(*) AS c FROM ota_device_runs WHERE campaign_id = ? GROUP BY state",
+                (r["id"],),
+            )
+            counters = {str(x["state"]): int(x["c"]) for x in cur.fetchall()}
+            r["counters"] = counters
+        conn.close()
+
+    if principal.role == "superadmin":
+        items = rows
+    else:
+        user = principal.username
+        for r in rows:
+            if "*" in r["target_admins"] or user in r["target_admins"]:
+                items.append(r)
+    return {"items": items}
+
+
+@app.get("/ota/campaigns/{campaign_id}")
+def get_ota_campaign(campaign_id: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM ota_campaigns WHERE id = ?", (campaign_id,))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(status_code=404, detail="campaign not found")
+        camp = dict(row)
+        camp["target_admins"] = json.loads(str(camp.pop("target_admins_json") or "[]"))
+
+        visible = principal.role == "superadmin" or "*" in camp["target_admins"] or principal.username in camp["target_admins"]
+        if not visible:
+            conn.close()
+            raise HTTPException(status_code=403, detail="not your campaign")
+
+        cur.execute("SELECT admin_username, action, decided_at, detail FROM ota_decisions WHERE campaign_id = ?", (campaign_id,))
+        camp["decisions"] = [dict(x) for x in cur.fetchall()]
+
+        runs_query = "SELECT campaign_id, admin_username, device_id, prev_fw, prev_url, target_fw, target_url, state, error, started_at, finished_at FROM ota_device_runs WHERE campaign_id = ?"
+        runs_args: list[Any] = [campaign_id]
+        if principal.role == "admin":
+            runs_query += " AND admin_username = ?"
+            runs_args.append(principal.username)
+        runs_query += " ORDER BY admin_username, device_id"
+        cur.execute(runs_query, tuple(runs_args))
+        camp["device_runs"] = [dict(x) for x in cur.fetchall()]
+        conn.close()
+    return camp
+
+
+@app.post("/ota/campaigns/{campaign_id}/accept")
+def accept_ota_campaign(campaign_id: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    """Admin accepts the campaign → server verifies URL then fans OTA cmd out
+    to every device the admin owns."""
+    assert_min_role(principal, "admin")
+    admin_username = principal.username
+
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM ota_campaigns WHERE id = ?", (campaign_id,))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(status_code=404, detail="campaign not found")
+        camp = dict(row)
+        targets = json.loads(str(camp.get("target_admins_json") or "[]"))
+        if "*" not in targets and admin_username not in targets:
+            conn.close()
+            raise HTTPException(status_code=403, detail="not your campaign")
+
+        cur.execute(
+            "SELECT action FROM ota_decisions WHERE campaign_id = ? AND admin_username = ?",
+            (campaign_id, admin_username),
+        )
+        prev = cur.fetchone()
+        if prev and str(prev["action"]) in ("accepted",):
+            conn.close()
+            raise HTTPException(status_code=409, detail="already accepted")
+        conn.close()
+
+    ok, detail = _verify_ota_url(str(camp["url"]))
+    if not ok:
+        audit_event(admin_username, "ota.campaign.url_verify_fail", campaign_id, {"detail": detail})
+        raise HTTPException(status_code=400, detail=f"url verify failed: {detail}")
+
+    # Pre-populate ota_device_runs with every device this admin owns.
+    targets_rows = _ota_campaign_targets_for_admin(admin_username, str(camp["fw_version"]), str(camp["url"]))
+    if not targets_rows:
+        # Still mark decision as accepted so superadmin can see the admin reacted.
+        now_iso = utc_now_iso()
+        with db_lock:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO ota_decisions (campaign_id, admin_username, action, decided_at, detail)
+                VALUES (?, ?, 'accepted', ?, 'no devices')
+                ON CONFLICT(campaign_id, admin_username) DO UPDATE SET
+                  action='accepted', decided_at=excluded.decided_at, detail=excluded.detail
+                """,
+                (campaign_id, admin_username, now_iso),
+            )
+            conn.commit()
+            conn.close()
+        return {"ok": True, "dispatched": 0, "note": "no devices owned by this admin"}
+
+    now_iso = utc_now_iso()
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        for t in targets_rows:
+            cur.execute(
+                """
+                INSERT INTO ota_device_runs
+                    (campaign_id, admin_username, device_id, prev_fw, prev_url, target_fw, target_url, state, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                ON CONFLICT(campaign_id, device_id) DO UPDATE SET
+                    admin_username = excluded.admin_username,
+                    prev_fw        = excluded.prev_fw,
+                    prev_url       = excluded.prev_url,
+                    target_fw      = excluded.target_fw,
+                    target_url     = excluded.target_url,
+                    state          = CASE WHEN ota_device_runs.state IN ('success','failed','rolled_back') THEN ota_device_runs.state ELSE 'pending' END,
+                    updated_at     = excluded.updated_at
+                """,
+                (campaign_id, admin_username, t["device_id"], t["prev_fw"], t["prev_url"], str(camp["fw_version"]), str(camp["url"]), now_iso, now_iso),
+            )
+        cur.execute(
+            """
+            INSERT INTO ota_decisions (campaign_id, admin_username, action, decided_at, detail)
+            VALUES (?, ?, 'accepted', ?, ?)
+            ON CONFLICT(campaign_id, admin_username) DO UPDATE SET
+              action='accepted', decided_at=excluded.decided_at, detail=excluded.detail
+            """,
+            (campaign_id, admin_username, now_iso, detail),
+        )
+        cur.execute("UPDATE ota_campaigns SET state='running', updated_at=? WHERE id=?", (now_iso, campaign_id))
+        conn.commit()
+        conn.close()
+
+    dispatched, failures = _start_ota_rollout_for_admin(campaign_id, admin_username)
+    audit_event(admin_username, "ota.campaign.accept", campaign_id, {
+        "dispatched": dispatched,
+        "failures": failures[:5],
+        "target_count": len(targets_rows),
+        "verify": detail,
+    })
+    return {"ok": True, "dispatched": dispatched, "target_count": len(targets_rows), "verify": detail, "failures": failures[:5]}
+
+
+@app.post("/ota/campaigns/{campaign_id}/decline")
+def decline_ota_campaign(campaign_id: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "admin")
+    admin_username = principal.username
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT target_admins_json FROM ota_campaigns WHERE id = ?", (campaign_id,))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(status_code=404, detail="campaign not found")
+        targets = json.loads(str(row["target_admins_json"] or "[]"))
+        if "*" not in targets and admin_username not in targets:
+            conn.close()
+            raise HTTPException(status_code=403, detail="not your campaign")
+        cur.execute(
+            """
+            INSERT INTO ota_decisions (campaign_id, admin_username, action, decided_at, detail)
+            VALUES (?, ?, 'declined', ?, '')
+            ON CONFLICT(campaign_id, admin_username) DO UPDATE SET
+              action='declined', decided_at=excluded.decided_at
+            """,
+            (campaign_id, admin_username, utc_now_iso()),
+        )
+        conn.commit()
+        conn.close()
+    audit_event(admin_username, "ota.campaign.decline", campaign_id, {})
+    return {"ok": True}
+
+
+@app.post("/ota/campaigns/{campaign_id}/rollback")
+def rollback_ota_campaign(campaign_id: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    """Explicit rollback trigger (in addition to automatic rollback on failure)."""
+    assert_min_role(principal, "admin")
+    admin_username = principal.username
+    if principal.role == "superadmin":
+        with db_lock:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute("SELECT DISTINCT admin_username FROM ota_device_runs WHERE campaign_id = ?", (campaign_id,))
+            admins = [str(r["admin_username"]) for r in cur.fetchall()]
+            conn.close()
+        rolled_total = 0
+        for a in admins:
+            rolled_total += _rollback_admin_devices(campaign_id, a, reason=f"manual rollback by superadmin {principal.username}")
+        return {"ok": True, "rolled_back": rolled_total, "admins": admins}
+    rolled = _rollback_admin_devices(campaign_id, admin_username, reason=f"manual rollback by admin {admin_username}")
+    return {"ok": True, "rolled_back": rolled}
+
+
+# =====================================================================
+#  Presence probes (admin-facing read-only view of the 12h ping log)
+# =====================================================================
+
+@app.get("/admin/presence-probes")
+def list_presence_probes(
+    principal: Principal = Depends(require_principal),
+    device_id: Optional[str] = Query(default=None, min_length=2, max_length=64),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> dict[str, Any]:
+    assert_min_role(principal, "admin")
+    sql = (
+        "SELECT id, device_id, owner_admin, probe_ts, idle_seconds, outcome, detail "
+        "FROM presence_probes WHERE 1=1 "
+    )
+    args: list[Any] = []
+    if device_id:
+        sql += "AND device_id = ? "
+        args.append(device_id)
+    if principal.role == "admin":
+        sql += "AND (owner_admin = ? OR owner_admin IS NULL) "
+        args.append(principal.username)
+    sql += "ORDER BY probe_ts DESC LIMIT ?"
+    args.append(limit)
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(sql, tuple(args))
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+    return {"items": rows}
+
+
+# =====================================================================
+#  Event center — historical query + live SSE stream
+#
+#  Tenant isolation:
+#    * superadmin  → every event in the system
+#    * admin       → events where owner_admin = self OR actor/target = self
+#    * user        → events in their manager_admin's tenant that mention them
+#                    or are warn+
+#
+#  Two transports:
+#    GET /events              paginated history (DB-backed)
+#    GET /events/stream       Server-Sent Events, real-time
+# =====================================================================
+
+def _event_scope_sql(principal: Principal) -> tuple[str, list[Any]]:
+    """Return WHERE fragment + args for the events table based on role."""
+    if principal.role == "superadmin":
+        return "", []
+    if principal.role == "admin":
+        frag = " AND (owner_admin = ? OR actor = ? OR target = ?) "
+        return frag, [principal.username, principal.username, principal.username]
+    my_admin = get_manager_admin(principal.username) or ""
+    if not my_admin:
+        return " AND 1=0 ", []
+    frag = " AND (owner_admin = ? AND (actor = ? OR target = ? OR level IN ('warn','error','critical'))) "
+    return frag, [my_admin, principal.username, principal.username]
+
+
+@app.get("/events")
+def list_events(
+    principal: Principal = Depends(require_principal),
+    min_level: Optional[str] = Query(default=None, pattern="^(debug|info|warn|error|critical)$"),
+    category: Optional[str] = Query(default=None, max_length=32),
+    device_id: Optional[str] = Query(default=None, min_length=2, max_length=64),
+    q: Optional[str] = Query(default=None, max_length=120),
+    since_id: int = Query(default=0, ge=0),
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> dict[str, Any]:
+    """Paginated read-only access to the events table."""
+    sql = (
+        "SELECT id, ts, ts_epoch_ms, level, category, event_type, actor, target, owner_admin, device_id, summary, detail_json, ref_table, ref_id "
+        "FROM events WHERE 1=1 "
+    )
+    args: list[Any] = []
+    scope_frag, scope_args = _event_scope_sql(principal)
+    sql += scope_frag
+    args.extend(scope_args)
+    if min_level:
+        try:
+            idx = _VALID_LEVELS.index(min_level)
+            allowed = _VALID_LEVELS[idx:]
+            ph = ",".join(["?"] * len(allowed))
+            sql += f" AND level IN ({ph}) "
+            args.extend(allowed)
+        except ValueError:
+            pass
+    if category:
+        sql += " AND category = ? "
+        args.append(category)
+    if device_id:
+        sql += " AND device_id = ? "
+        args.append(device_id)
+    if q:
+        sql += " AND (event_type LIKE ? OR summary LIKE ? OR actor LIKE ? OR target LIKE ? OR device_id LIKE ?) "
+        like = f"%{q}%"
+        args.extend([like, like, like, like, like])
+    if since_id > 0:
+        sql += " AND id > ? "
+        args.append(since_id)
+    sql += " ORDER BY id DESC LIMIT ? "
+    args.append(limit)
+
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(sql, tuple(args))
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+    for r in rows:
+        raw = r.pop("detail_json", None)
+        try:
+            r["detail"] = json.loads(raw) if raw else {}
+        except Exception:
+            r["detail"] = {"_raw": raw}
+    return {"items": rows, "count": len(rows)}
+
+
+@app.get("/events/categories")
+def event_categories(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "user")
+    return {"levels": list(_VALID_LEVELS), "categories": list(_VALID_CATEGORIES)}
+
+
+def _sse_format(ev: dict[str, Any]) -> str:
+    """Serialize one event as an SSE frame."""
+    ev_out = {
+        "id": ev.get("id"),
+        "ts": ev.get("ts"),
+        "ts_epoch_ms": ev.get("ts_epoch_ms"),
+        "level": ev.get("level"),
+        "category": ev.get("category"),
+        "event_type": ev.get("event_type"),
+        "actor": ev.get("actor"),
+        "target": ev.get("target"),
+        "owner_admin": ev.get("owner_admin"),
+        "device_id": ev.get("device_id"),
+        "summary": ev.get("summary"),
+        "detail": ev.get("detail") or {},
+    }
+    return f"id: {ev.get('id') or ''}\nevent: {ev.get('event_type') or 'event'}\ndata: {json.dumps(ev_out, ensure_ascii=False)}\n\n"
+
+
+def _principal_from_sse_headers_or_query(authorization: Optional[str], token: Optional[str]) -> Principal:
+    """Browsers can't set Authorization on EventSource, so fall back to ?token=."""
+    auth_header = authorization
+    if not auth_header and token:
+        auth_header = f"Bearer {token}"
+    if not auth_header:
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    return require_principal(authorization=auth_header)
+
+
+@app.get("/events/stream")
+def events_stream(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+    token: Optional[str] = Query(default=None, description="Fallback auth for EventSource which cannot set headers"),
+    min_level: Optional[str] = Query(default=None, pattern="^(debug|info|warn|error|critical)$"),
+    category: Optional[str] = Query(default=None, max_length=32),
+    device_id: Optional[str] = Query(default=None, min_length=2, max_length=64),
+    q: Optional[str] = Query(default=None, max_length=120),
+    backlog: int = Query(default=100, ge=0, le=500),
+) -> StreamingResponse:
+    principal = _principal_from_sse_headers_or_query(authorization, token)
+    assert_min_role(principal, "user")
+
+    filters: dict[str, Any] = {
+        "min_level": min_level,
+        "category": category,
+        "device_id": device_id,
+        "q": q,
+    }
+    filters = {k: v for k, v in filters.items() if v}
+
+    sub = event_bus.subscribe(principal, filters)
+
+    def generator():
+        # Initial hello frame — tells the UI which role is connected and
+        # flushes any proxy buffering.
+        hello = {
+            "event_type": "stream.hello",
+            "level": "info",
+            "category": "system",
+            "ts": utc_now_iso(),
+            "ts_epoch_ms": int(time.time() * 1000),
+            "summary": f"connected as {principal.role}",
+            "actor": "system",
+            "detail": {"role": principal.role, "filters": filters},
+            "id": 0,
+        }
+        yield _sse_format(hello)
+        # Replay recent backlog so the dashboard isn't empty on first load.
+        if backlog:
+            for ev in event_bus.backlog(principal, filters, backlog):
+                yield _sse_format(ev)
+        last_keepalive = time.time()
+        # NOTE: we rely on Starlette closing the generator when the client
+        # disconnects (the write yield will raise and our `finally` fires).
+        while True:
+            try:
+                ev = sub.q.get(timeout=1.0)
+                yield _sse_format(ev)
+            except _stdqueue.Empty:
+                pass
+            now = time.time()
+            if now - last_keepalive >= EVENT_SSE_KEEPALIVE_SECONDS:
+                last_keepalive = now
+                yield f": keepalive {int(now)} dropped={sub.dropped}\n\n"
+
+    def close():
+        event_bus.unsubscribe(sub)
+
+    headers = {
+        "Cache-Control": "no-cache, no-store, no-transform",
+        "X-Accel-Buffering": "no",  # Nginx: disable proxy buffering
+        "Connection": "keep-alive",
+    }
+    # Wrap generator so we unsubscribe on client disconnect.
+    def wrapped():
+        try:
+            for chunk in generator():
+                yield chunk
+        finally:
+            close()
+
+    return StreamingResponse(wrapped(), media_type="text/event-stream", headers=headers)
+
+
+# =====================================================================
+#  Factory device registry & /provision/identify (the "unguessable" story)
+# =====================================================================
+
+# Serial format: SN-<16 uppercase base32 chars>. 80 bits of CSPRNG entropy.
+# The factory side generates these, never the device. Device only uses
+# (serial, mac_nocolon) tuples that were uploaded to /factory/devices.
+FACTORY_SERIAL_RE = re.compile(r"^SN-[A-Z2-7]{16}$")
+# QR format: "CROC|<serial>|<unix_ts>|<base64_hmac_sha256(QR_SIGN_SECRET)>"
+FACTORY_QR_RE = re.compile(r"^CROC\|SN-[A-Z2-7]{16}\|\d{10}\|[A-Za-z0-9_\-]{20,120}$")
+
+
+class FactoryDeviceItem(BaseModel):
+    serial: str = Field(pattern=r"^SN-[A-Z2-7]{16}$")
+    mac_nocolon: Optional[str] = Field(default=None, min_length=12, max_length=12)
+    qr_code: Optional[str] = Field(default=None, max_length=512)
+    batch: Optional[str] = Field(default=None, max_length=64)
+    note: Optional[str] = Field(default=None, max_length=256)
+
+
+class FactoryBulkRequest(BaseModel):
+    items: list[FactoryDeviceItem] = Field(min_length=1, max_length=2000)
+
+
+def _require_factory_auth(request: Request) -> str:
+    """Either superadmin JWT OR X-Factory-Token header matches FACTORY_API_TOKEN.
+
+    We do the auth by hand here so that CI / factory scripts can use only the
+    token and skip the JWT flow entirely.
+    """
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        try:
+            token = auth.split(" ", 1)[1].strip()
+            claims = decode_jwt(token)
+            if claims and str(claims.get("role", "")) == "superadmin":
+                return str(claims.get("sub", "superadmin"))
+        except Exception:
+            pass
+    token = request.headers.get("x-factory-token", "")
+    if FACTORY_API_TOKEN and token and secrets.compare_digest(token, FACTORY_API_TOKEN):
+        return "factory-token"
+    raise HTTPException(status_code=403, detail="factory auth required (superadmin JWT or X-Factory-Token)")
+
+
+@app.post("/factory/devices")
+def factory_register_bulk(body: FactoryBulkRequest, request: Request) -> dict[str, Any]:
+    """Bulk-register (serial, mac, qr) tuples produced at manufacturing time.
+
+    Authenticate as superadmin (JWT) **or** supply X-Factory-Token equal to
+    FACTORY_API_TOKEN. Existing rows are updated in place.
+    """
+    actor = _require_factory_auth(request)
+    now = utc_now_iso()
+    written = 0
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        for it in body.items:
+            mac = (it.mac_nocolon or "").upper() or None
+            if mac and (len(mac) != 12 or not re.fullmatch(r"^[0-9A-F]{12}$", mac)):
+                conn.close()
+                raise HTTPException(status_code=400, detail=f"invalid mac for {it.serial}")
+            cur.execute(
+                """INSERT INTO factory_devices (serial, mac_nocolon, qr_code, batch, status, note, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, 'unclaimed', ?, ?, ?)
+                   ON CONFLICT(serial) DO UPDATE SET
+                       mac_nocolon = COALESCE(excluded.mac_nocolon, factory_devices.mac_nocolon),
+                       qr_code     = COALESCE(excluded.qr_code,     factory_devices.qr_code),
+                       batch       = COALESCE(excluded.batch,       factory_devices.batch),
+                       note        = COALESCE(excluded.note,        factory_devices.note),
+                       updated_at  = excluded.updated_at""",
+                (it.serial, mac, it.qr_code, it.batch, it.note, now, now),
+            )
+            written += 1
+        conn.commit()
+        conn.close()
+    audit_event(actor, "factory.register.bulk", f"count={written}", {"batch": body.items[0].batch if body.items else ""})
+    return {"ok": True, "written": written}
+
+
+@app.get("/factory/devices")
+def factory_list(
+    request: Request,
+    status: Optional[str] = Query(default=None, pattern="^(unclaimed|claimed|blocked)$"),
+    batch: Optional[str] = Query(default=None, max_length=64),
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    assert_min_role(principal, "superadmin")
+    sql = "SELECT serial, mac_nocolon, qr_code, batch, status, note, created_at, updated_at FROM factory_devices WHERE 1=1"
+    args: list[Any] = []
+    if status:
+        sql += " AND status = ?"
+        args.append(status)
+    if batch:
+        sql += " AND batch = ?"
+        args.append(batch)
+    sql += " ORDER BY created_at DESC LIMIT 1000"
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(sql, tuple(args))
+        items = [dict(r) for r in cur.fetchall()]
+        conn.close()
+    return {"items": items}
+
+
+@app.post("/factory/devices/{serial}/block")
+def factory_block_device(serial: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "superadmin")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("UPDATE factory_devices SET status='blocked', updated_at=? WHERE serial=?", (utc_now_iso(), serial))
+        n = cur.rowcount
+        conn.commit()
+        conn.close()
+    if n == 0:
+        raise HTTPException(status_code=404, detail="serial not found")
+    audit_event(principal.username, "factory.block", serial, {})
+    return {"ok": True}
+
+
+class IdentifyRequest(BaseModel):
+    serial: Optional[str] = Field(default=None, max_length=64)
+    qr_code: Optional[str] = Field(default=None, max_length=512)
+
+
+@app.post("/provision/identify")
+def provision_identify(
+    body: IdentifyRequest,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    """Answer "what state is this device in right now?" for the claim UI.
+
+    The operator either scans the factory QR sticker or types the serial. We
+    return one of:
+
+      - unknown_serial       -> the serial is not in our factory registry
+      - blocked              -> factory revoked this serial (RMA etc.)
+      - already_registered   -> device is claimed; caller learns who owns it
+      - offline              -> device is in factory registry but has never
+                                published bootstrap.register, i.e. it was
+                                never online. Operator must power it up and
+                                connect it to the network first.
+      - ready                -> factory-registered, has bootstrap row, not
+                                yet claimed. Caller can POST /provision/claim
+                                with the returned mac_nocolon.
+    """
+    assert_min_role(principal, "admin")
+    require_capability(principal, "can_claim_device")
+    serial = (body.serial or "").strip().upper()
+    qr = (body.qr_code or "").strip()
+    if qr:
+        # QR can optionally be HMAC-signed; the claim step verifies the sig.
+        # For identify we only need to pluck the serial out of the QR string.
+        m = re.match(r"^CROC\|(SN-[A-Z2-7]{16})\|", qr)
+        if m:
+            serial = m.group(1)
+    if not serial:
+        raise HTTPException(status_code=400, detail="serial or qr_code is required")
+    if not FACTORY_SERIAL_RE.match(serial):
+        raise HTTPException(status_code=400, detail="serial format invalid")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT serial, mac_nocolon, qr_code, status FROM factory_devices WHERE serial = ?",
+            (serial,),
+        )
+        fdev = cur.fetchone()
+        conn.close()
+    if not fdev:
+        return {"status": "unknown_serial", "serial": serial,
+                "message": "该序列号不在出厂清单，请确认扫描的是正品贴纸或联系管理员"}
+    if str(fdev["status"] or "unclaimed") == "blocked":
+        return {"status": "blocked", "serial": serial,
+                "message": "该设备已被出厂侧禁用（RMA / 质量问题）"}
+    # Already registered?
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT device_id, mac_nocolon, claimed_at FROM provisioned_credentials WHERE device_id = ?",
+            (serial,),
+        )
+        prov = cur.fetchone()
+        owner = None
+        if prov:
+            cur.execute("SELECT owner_admin FROM device_ownership WHERE device_id = ?", (serial,))
+            ow = cur.fetchone()
+            owner = str(ow["owner_admin"]) if ow else None
+        conn.close()
+    if prov:
+        you = owner and (owner == principal.username or (
+            principal.role == "user" and owner == get_manager_admin(principal.username)
+        ))
+        return {
+            "status": "already_registered",
+            "serial": serial,
+            "device_id": str(prov["device_id"]),
+            "mac_nocolon": str(prov["mac_nocolon"]),
+            "claimed_at": str(prov["claimed_at"]),
+            "owner_admin": owner,
+            "by_you": bool(you),
+            "message": "设备已被登记" + ("（属于你）" if you else "（属于其他管理员，无法再次注册）"),
+        }
+    # Does it appear in pending_claims? That only happens after the device
+    # comes online and publishes bootstrap.register on MQTT.
+    mac_for_lookup = str(fdev["mac_nocolon"] or "").upper()
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        if mac_for_lookup:
+            cur.execute("SELECT mac_nocolon, last_seen_at, fw FROM pending_claims WHERE mac_nocolon = ?", (mac_for_lookup,))
+        else:
+            cur.execute(
+                "SELECT mac_nocolon, last_seen_at, fw FROM pending_claims WHERE proposed_device_id = ? ORDER BY last_seen_at DESC LIMIT 1",
+                (serial,),
+            )
+        pend = cur.fetchone()
+        conn.close()
+    if not pend:
+        return {
+            "status": "offline",
+            "serial": serial,
+            "mac_hint": mac_for_lookup,
+            "message": "设备未联网。请先通电、连上 WiFi/网线，看到状态灯稳定后再扫码激活。",
+        }
+    return {
+        "status": "ready",
+        "serial": serial,
+        "mac_nocolon": str(pend["mac_nocolon"]),
+        "fw": str(pend["fw"] or ""),
+        "last_seen_at": str(pend["last_seen_at"]),
+        "message": "设备在线且尚未登记，可点击确认注册",
+    }

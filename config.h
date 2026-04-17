@@ -28,14 +28,25 @@
 #define WIFI_CONNECT_WAIT_MS 8000
 
 // ── Network interface mode ──
+// WIFI=1, ETHERNET=2, AUTO=3 (prefer Ethernet on ETH boards, fall back to WiFi).
+// AUTO requires BOARD_HAS_ETH; on WiFi-only boards it collapses to WIFI.
 #define NETIF_MODE_WIFI 1
 #define NETIF_MODE_ETHERNET 2
+#define NETIF_MODE_AUTO 3
+#ifndef BOARD_HAS_ETH
+#define BOARD_HAS_ETH 0
+#endif
 #ifndef NETIF_MODE
 #ifdef BOARD_DEFAULT_NETIF_MODE
 #define NETIF_MODE BOARD_DEFAULT_NETIF_MODE
 #else
-#define NETIF_MODE NETIF_MODE_WIFI
+#define NETIF_MODE NETIF_MODE_AUTO
 #endif
+#endif
+// Collapse AUTO to WIFI when the board has no Ethernet PHY.
+#if NETIF_MODE == NETIF_MODE_AUTO && !BOARD_HAS_ETH
+#undef NETIF_MODE
+#define NETIF_MODE NETIF_MODE_WIFI
 #endif
 
 // ── MQTT broker / VPS ──
@@ -124,8 +135,12 @@
 #define NTP_RESYNC_INTERVAL_MS 3600000UL
 
 // ── Topics ──
+// NOTE: Cross-device alarm fan-out is done by the API (server-side), so devices
+// never subscribe to a global broadcast topic. Tenant isolation is enforced by
+// the server (owner_admin). The legacy broadcast topic is left defined only for
+// backward compatibility with very old firmware binaries.
 #define TOPIC_ROOT "sentinel"
-#define TOPIC_BROADCAST_ALARM "sentinel/broadcast/alarm"
+#define TOPIC_BROADCAST_ALARM "sentinel/broadcast/alarm"  // DEPRECATED, unused
 #define TOPIC_BOOTSTRAP_REGISTER "sentinel/bootstrap/register"
 #define TOPIC_BOOTSTRAP_ASSIGN_PREFIX "sentinel/bootstrap/assign"
 
@@ -147,7 +162,27 @@
 #define ALARM_COOLDOWN_MS 5000
 
 // ── Task intervals (milliseconds) ──
+// Heartbeat policy:
+//   0 = PERIODIC  (legacy; one heartbeat every HEARTBEAT_INTERVAL_MS)
+//   1 = EVENT     (DEFAULT for production fleets; heartbeat goes out only on
+//                  state change, alarm, siren on/off, net reconnect, boot,
+//                  OTA finish, and in response to a server `ping` probe.
+//                  MQTT broker-level keepalive still detects TCP-loss.)
+//   2 = HYBRID    (event-triggered but also a slow keepalive every
+//                  HEARTBEAT_IDLE_KEEPALIVE_MS, default 15 min)
+#define HEARTBEAT_MODE_PERIODIC 0
+#define HEARTBEAT_MODE_EVENT 1
+#define HEARTBEAT_MODE_HYBRID 2
+#ifndef HEARTBEAT_MODE
+#define HEARTBEAT_MODE HEARTBEAT_MODE_EVENT
+#endif
+// Used only when HEARTBEAT_MODE == HEARTBEAT_MODE_PERIODIC.
 #define HEARTBEAT_INTERVAL_MS 2000
+// Used only when HEARTBEAT_MODE == HEARTBEAT_MODE_HYBRID.
+#define HEARTBEAT_IDLE_KEEPALIVE_MS 900000UL   // 15 min
+// Minimum gap between two heartbeats regardless of mode — guards against
+// event storms (e.g. flaky switch on TRIGGER_GPIO) melting the broker.
+#define HEARTBEAT_MIN_INTERVAL_MS 1000
 #define STATUS_INTERVAL_MS 5000
 #define THROUGHPUT_WINDOW_MS 10000
 #define WIFI_RECONNECT_BASE_MS 2000
@@ -158,6 +193,9 @@
 #define OFFLINE_QUEUE_MAX 20
 
 // ── Power / signal thresholds ──
+#ifndef BOARD_HAS_VBAT_ADC
+#define BOARD_HAS_VBAT_ADC 0
+#endif
 #ifndef VBAT_SENSOR_ENABLED
 #define VBAT_SENSOR_ENABLED BOARD_HAS_VBAT_ADC
 #endif

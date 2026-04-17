@@ -66,15 +66,29 @@ void macToDeviceId(char *out, size_t len) {
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
+// Serial priority order:
+//   1. NVS key "serial"   — burned at factory flashing time (RECOMMENDED for
+//                           production: SN-<16 base32> uploaded to the server's
+//                           factory_devices table).
+//   2. NVS key "dev_id"   — assigned by a successful bootstrap claim.
+//   3. DEVICE_ID_MANUAL   — dev/lab builds with DEVICE_ID_AUTO=0.
+//   4. mac-derived fallback "croc-<mac>" — ONLY for pre-factory development.
+//
+// This means a stolen firmware binary on its own cannot impersonate a real
+// device, because its NVS `serial` slot would be empty and the server will
+// refuse to admit it into pending_claims (ENFORCE_FACTORY_REGISTRATION=1).
 void buildDeviceId() {
   getMacString();
   getMacNoColon(deviceMacNoColon, sizeof(deviceMacNoColon));
 #if DEVICE_ID_AUTO
   Preferences p;
   p.begin(NVS_NAMESPACE, true);
+  String factorySerial = p.getString("serial", "");
   String assigned = p.getString("dev_id", "");
   p.end();
-  if (assigned.length() > 0) {
+  if (factorySerial.length() > 0 && factorySerial.length() < sizeof(deviceId)) {
+    strlcpy(deviceId, factorySerial.c_str(), sizeof(deviceId));
+  } else if (assigned.length() > 0) {
     strlcpy(deviceId, assigned.c_str(), sizeof(deviceId));
   } else {
     macToDeviceId(deviceId, sizeof(deviceId));
@@ -120,6 +134,68 @@ class WiFiNetIf : public NetIf {
   int rssi() override { return connected() ? WiFi.RSSI() : -127; }
   const char *type() override { return "wifi"; }
 };
+#elif NETIF_MODE == NETIF_MODE_AUTO
+// AUTO: bring up both Ethernet and Wi-Fi; prefer whichever is currently linked.
+// Link switching is transparent to the MQTT client because the underlying
+// socket layer (NetworkClient / WiFiClientSecure) is interface-agnostic.
+class AutoNetIf : public NetIf {
+ public:
+  void begin() override {
+  #if BOARD_HAS_ETH
+    ETH.begin(ETH_PHY_TYPE, ETH_PHY_ADDR, ETH_MDC_PIN, ETH_MDIO_PIN, ETH_POWER_PIN, ETH_CLK_MODE);
+  #endif
+  #if !defined(CONFIG_IDF_TARGET_ESP32P4)
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    if (strlen(WIFI_SSID) > 0) WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  #endif
+  }
+  bool connected() override {
+  #if BOARD_HAS_ETH
+    if (ETH.linkUp()) { _active = "ethernet"; return true; }
+  #endif
+  #if !defined(CONFIG_IDF_TARGET_ESP32P4)
+    if (WiFi.status() == WL_CONNECTED) { _active = "wifi"; return true; }
+  #endif
+    _active = "none";
+    return false;
+  }
+  bool reconnect() override {
+    if (connected()) return true;
+  #if BOARD_HAS_ETH
+    if (!ETH.linkUp()) {
+      ETH.stop();
+      delay(50);
+      ETH.begin(ETH_PHY_TYPE, ETH_PHY_ADDR, ETH_MDC_PIN, ETH_MDIO_PIN, ETH_POWER_PIN, ETH_CLK_MODE);
+    }
+  #endif
+  #if !defined(CONFIG_IDF_TARGET_ESP32P4)
+    if (WiFi.status() != WL_CONNECTED) {
+      WiFi.disconnect(false, true);
+      if (strlen(WIFI_SSID) > 0) WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    }
+  #endif
+    return false;
+  }
+  String localIP() override {
+  #if BOARD_HAS_ETH
+    if (strcmp(_active, "ethernet") == 0) return ETH.localIP().toString();
+  #endif
+  #if !defined(CONFIG_IDF_TARGET_ESP32P4)
+    if (strcmp(_active, "wifi") == 0) return WiFi.localIP().toString();
+  #endif
+    return String("0.0.0.0");
+  }
+  int rssi() override {
+  #if !defined(CONFIG_IDF_TARGET_ESP32P4)
+    if (strcmp(_active, "wifi") == 0) return WiFi.RSSI();
+  #endif
+    return 0;  // wired link: treat as "perfect" so signal_weak never fires
+  }
+  const char *type() override { return _active; }
+ private:
+  const char *_active = "none";
+};
 #else
 class EthernetNetIf : public NetIf {
  public:
@@ -149,6 +225,9 @@ class EthernetNetIf : public NetIf {
 #if NETIF_MODE == NETIF_MODE_WIFI
 WiFiNetIf wifiIf;
 NetIf *netIf = &wifiIf;
+#elif NETIF_MODE == NETIF_MODE_AUTO
+AutoNetIf autoIf;
+NetIf *netIf = &autoIf;
 #else
 EthernetNetIf ethIf;
 NetIf *netIf = &ethIf;
@@ -465,6 +544,9 @@ void publishBootstrapRegister() {
   StaticJsonDocument<384> doc;
   doc["type"] = "bootstrap.register";
   doc["device_id"] = deviceId;
+  // Explicit serial (mirrors device_id when factory-burned). Server uses this
+  // to cross-check against factory_devices so a rogue MAC can't masquerade.
+  doc["serial"] = deviceId;
   doc["mac"] = deviceMac;
   doc["mac_nocolon"] = deviceMacNoColon;
   doc["qr_code"] = deviceQrCode;
@@ -564,11 +646,12 @@ void requestRestartWithAck(const char *cmd, const char *detail) {
   ESP.restart();
 }
 
-void setOtaPendingState(const char *targetFw) {
+void setOtaPendingState(const char *targetFw, const char *campaignId) {
   prefs.begin(NVS_NAMESPACE, false);
   prefs.putBool("ota_pend", true);
   prefs.putUInt("ota_fail", 0);
   prefs.putString("ota_tgt", targetFw);
+  prefs.putString("ota_cid", campaignId ? campaignId : "");
   prefs.end();
 }
 
@@ -577,6 +660,7 @@ void clearOtaPendingState() {
   prefs.putBool("ota_pend", false);
   prefs.putUInt("ota_fail", 0);
   prefs.remove("ota_tgt");
+  prefs.remove("ota_cid");
   prefs.end();
 }
 
@@ -616,9 +700,18 @@ void confirmOtaIfHealthy() {
     return;
   }
 
+  // Read campaign id BEFORE we wipe the pending state so we can tell the
+  // server which rollout this success belongs to.
+  prefs.begin(NVS_NAMESPACE, true);
+  String cid = prefs.getString("ota_cid", "");
+  String tgt = prefs.getString("ota_tgt", "");
+  prefs.end();
+
   clearOtaPendingState();
   otaPendingValidation = false;
   logLine("[ota] validated");
+  publishOtaResult(cid.c_str(), tgt.c_str(), true, "post-reboot validated");
+  publishHeartbeatEvent("ota_success");
 }
 
 void commitNvsSave() {
@@ -738,16 +831,20 @@ const char *resolveDisconnectReason(float vbat, int rssi) {
 // ═══════════════════════════════════════════════
 
 void activateSiren(uint32_t durationMs) {
+  bool wasActive = sirenActive;
   digitalWrite(SIREN_GPIO, HIGH);
   sirenActive = true;
   sirenStartAt = millis();
   sirenDurationMs = durationMs;
+  if (!wasActive) publishHeartbeatEvent("siren_on");
 }
 
 void deactivateSiren() {
+  bool wasActive = sirenActive;
   digitalWrite(SIREN_GPIO, LOW);
   sirenActive = false;
   sirenDurationMs = 0;
+  if (wasActive) publishHeartbeatEvent("siren_off");
 }
 
 bool sirenExpired() {
@@ -773,6 +870,41 @@ void publishAck(const char *cmd, bool ok, const char *detail) {
   char buf[256];
   serializeJson(doc, buf, sizeof(buf));
   publishRaw(topicAck, buf, false);
+}
+
+// Dedicated OTA result event. Carries campaign_id + target fw so the API can
+// drive the campaign state machine and know whether a rollback is needed.
+void publishOtaResult(const char *campaignId,
+                      const char *targetFw,
+                      bool ok,
+                      const char *detail) {
+  StaticJsonDocument<384> doc;
+  doc["type"]        = "ota.result";
+  doc["device_id"]   = deviceId;
+  doc["campaign_id"] = campaignId ? campaignId : "";
+  doc["target_fw"]   = targetFw   ? targetFw   : "";
+  doc["current_fw"]  = FW_VERSION;
+  doc["ok"]          = ok;
+  doc["detail"]      = detail ? detail : "";
+  doc["ts"]          = tsNow();
+
+  char buf[384];
+  serializeJson(doc, buf, sizeof(buf));
+  publishRaw(topicAck, buf, false);
+}
+
+// Emit heartbeat ONLY if enough time has elapsed since the last one. This is
+// the throttled entrypoint that event sites (alarm, siren, reconnect, OTA
+// finish, boot) should call — it keeps EVENT-mode fleets from melting the
+// broker if a noisy GPIO starts flapping.
+void publishHeartbeatEvent(const char *reason) {
+  unsigned long now = millis();
+  if (lastHeartbeatAt != 0 && now - lastHeartbeatAt < HEARTBEAT_MIN_INTERVAL_MS) {
+    return;
+  }
+  lastHeartbeatAt = now;
+  (void)reason;  // reserved for future tagged telemetry
+  publishHeartbeat();
 }
 
 void publishHeartbeat() {
@@ -848,11 +980,17 @@ void publishStatus() {
 }
 
 void publishAlarmEvent(bool localTrigger) {
+  // NOTE: server-side fan-out model.
+  // Device publishes the alarm only on its own /event topic. The API verifies
+  // ownership (owner_admin) and dispatches siren_on commands to all sibling
+  // devices in the same tenant. This guarantees strict cross-admin isolation
+  // that no shared MQTT credential setup could provide.
   StaticJsonDocument<320> doc;
   doc["type"]           = "alarm.trigger";
   doc["source_id"]      = deviceId;
   doc["source_zone"]    = deviceZone;
   doc["local_trigger"]  = localTrigger;
+  doc["trigger_kind"]   = localTrigger ? "remote_button" : "network";
   unsigned long nowTs   = tsNow();
   uint32_t nonce        = esp_random();
   char sig[17];
@@ -865,7 +1003,6 @@ void publishAlarmEvent(bool localTrigger) {
   serializeJson(doc, buf, sizeof(buf));
 
   publishRaw(topicEvent, buf, false);
-  publishRaw(TOPIC_BROADCAST_ALARM, buf, false);
   lastAlarmAt = millis();
 }
 
@@ -874,11 +1011,12 @@ void publishAlarmEvent(bool localTrigger) {
 // ═══════════════════════════════════════════════
 
 #if OTA_ENABLED
-void performOTA(const char *url, const char *targetFw) {
+void performOTA(const char *url, const char *targetFw, const char *campaignId) {
   logLine(String("[ota] from: ") + stripQuery(url));
   publishAck("ota", true, "ota starting");
+  publishHeartbeatEvent("ota_start");
 
-  setOtaPendingState(targetFw);
+  setOtaPendingState(targetFw, campaignId);
   esp_task_wdt_delete(NULL);
 
   NetworkClient otaClient;
@@ -888,16 +1026,21 @@ void performOTA(const char *url, const char *targetFw) {
   esp_task_wdt_add(NULL);
 
   switch (ret) {
-    case HTTP_UPDATE_FAILED:
+    case HTTP_UPDATE_FAILED: {
+      String err = httpUpdate.getLastErrorString();
+      logLine(String("[ota] FAILED: ") + err);
+      publishAck("ota", false, err.c_str());
+      publishOtaResult(campaignId, targetFw, false, err.c_str());
       clearOtaPendingState();
-      logLine(String("[ota] FAILED: ") + httpUpdate.getLastErrorString());
-      publishAck("ota", false, httpUpdate.getLastErrorString().c_str());
       break;
+    }
     case HTTP_UPDATE_NO_UPDATES:
       clearOtaPendingState();
       publishAck("ota", false, "no update");
+      publishOtaResult(campaignId, targetFw, false, "no update");
       break;
     case HTTP_UPDATE_OK:
+      // Success is announced after reboot by confirmOtaIfHealthy().
       break;
   }
 }
@@ -1078,8 +1221,9 @@ void executeCommand(const char *cmd, JsonVariant params) {
     } else {
       snprintf(fullUrl, sizeof(fullUrl), "%s?token=%s", url, OTA_TOKEN);
     }
-    const char *targetFw = params["fw"] | "unknown";
-    performOTA(fullUrl, targetFw);
+    const char *targetFw    = params["fw"] | "unknown";
+    const char *campaignId  = params["campaign_id"] | "";
+    performOTA(fullUrl, targetFw, campaignId);
     return;
   }
 #endif
@@ -1093,6 +1237,17 @@ void executeCommand(const char *cmd, JsonVariant params) {
   if (strcmp(resolvedCmd, "get_cmd_table") == 0) {
     publishCommandTable();
     publishAck(resolvedCmd, true, "command table published");
+    return;
+  }
+
+  // Server-initiated liveness probe. Triggered automatically by the API when
+  // a device has been silent for ~12h; in EVENT mode the device otherwise
+  // never emits a heartbeat. Reply with a heartbeat + status snapshot so the
+  // server can re-sync presence/throughput/vbat/etc in a single round-trip.
+  if (strcmp(resolvedCmd, "ping") == 0) {
+    publishHeartbeat();
+    publishStatus();
+    publishAck(resolvedCmd, true, "pong");
     return;
   }
 
@@ -1141,6 +1296,7 @@ void publishCommandTable() {
 #endif
   arr.add("get_info");
   arr.add("get_cmd_table");
+  arr.add("ping");
   doc["aliases"] = "set_params->set_param,info->get_info,reboot_now->reboot,ota_update->ota,red_alert->siren_on,cancel_alert->siren_off,self_check->self_test";
   doc["ts"] = tsNow();
 
@@ -1208,30 +1364,6 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
     return;
   }
 
-  if (strcmp(topic, TOPIC_BROADCAST_ALARM) == 0) {
-    const char *source     = doc["source_id"] | "";
-    const char *sourceZone = doc["source_zone"] | "all";
-    unsigned long ts       = doc["ts"] | 0;
-    uint32_t nonce         = doc["nonce"] | 0;
-    const char *sig        = doc["sig"] | "";
-
-    if (strlen(source) == 0 || !isHexStr(sig, 16)) return;
-    char expectedSig[17];
-    buildAlarmSignature(source, sourceZone, ts, nonce, expectedSig, sizeof(expectedSig));
-    if (!secureEquals(sig, expectedSig)) {
-      strlcpy(lastError, "alarm_sig_fail", sizeof(lastError));
-      return;
-    }
-
-    if (strcmp(source, deviceId) == 0 && !TRIGGER_SELF_SIREN) return;
-    if (!zoneMatch(sourceZone)) return;
-    if (alarmInCooldown()) return;
-
-    activateSiren(rtSirenMs);
-    lastAlarmAt = millis();
-    logLine(String("[alarm] from ") + source + " z=" + sourceZone);
-    return;
-  }
 }
 
 // ═══════════════════════════════════════════════
@@ -1316,7 +1448,7 @@ void ensureMqtt() {
   logLine("[mqtt] connected");
   if (isProvisioned) {
     mqttClient.subscribe(topicCmd, 1);
-    mqttClient.subscribe(TOPIC_BROADCAST_ALARM, 1);
+    // NOTE: no global alarm topic; server fans out siren_on via our /cmd topic.
   } else {
     mqttClient.subscribe(topicBootstrapAssign, 1);
     publishBootstrapRegister();
@@ -1328,6 +1460,9 @@ void ensureMqtt() {
   }
 
   publishStatus();
+  // Announce presence on (re)connect so the server flips us back to online
+  // without having to wait for the next event or 12h probe.
+  publishHeartbeatEvent("mqtt_connected");
 }
 
 // ═══════════════════════════════════════════════
@@ -1368,6 +1503,7 @@ void handleTriggerInput() {
 
   logLine("[trigger] alarm");
   publishAlarmEvent(true);
+  publishHeartbeatEvent("alarm");
   if (TRIGGER_SELF_SIREN) activateSiren(rtSirenMs);
 }
 
@@ -1492,10 +1628,20 @@ void loop() {
 
   checkNTPSync();
 
+  // Heartbeat policy — see config.h. EVENT mode leaves this loop silent and
+  // only reacts to state changes (see publishHeartbeatEvent). HYBRID sends a
+  // slow keepalive to stop the server from having to probe.
+#if HEARTBEAT_MODE == HEARTBEAT_MODE_PERIODIC
   if (now - lastHeartbeatAt >= rtHeartbeatMs) {
     lastHeartbeatAt = now;
     publishHeartbeat();
   }
+#elif HEARTBEAT_MODE == HEARTBEAT_MODE_HYBRID
+  if (now - lastHeartbeatAt >= HEARTBEAT_IDLE_KEEPALIVE_MS) {
+    lastHeartbeatAt = now;
+    publishHeartbeat();
+  }
+#endif
 
   updateThroughput();
 

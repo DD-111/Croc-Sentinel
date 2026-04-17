@@ -1,146 +1,56 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Croc Sentinel — 设备总览</title>
-  <link rel="stylesheet" href="styles.css" />
-</head>
-<body>
-  <header>
-    <h1>Croc Sentinel · 设备卡片</h1>
-    <nav>
-      <a href="index.html">设备</a>
-      <a href="alerts.html">红色警报</a>
-      <a href="activate.html">激活 / Claim</a>
-    </nav>
-  </header>
-  <div class="panel">
-    <div class="row">
-      <label>API Token / JWT
-        <input type="password" id="token" placeholder="Bearer 用本地保存" style="min-width:280px" />
-      </label>
-      <button type="button" id="saveTok">保存到浏览器</button>
-      <button type="button" class="secondary" id="clrTok">清除</button>
-      <label>用户名
-        <input type="text" id="user" placeholder="superadmin" autocomplete="username" />
-      </label>
-      <label>密码
-        <input type="password" id="pass" placeholder="登录获取 JWT" autocomplete="current-password" />
-      </label>
-      <button type="button" class="secondary" id="loginBtn">登录</button>
-    </div>
-    <div class="row">
-      <button type="button" id="refresh">刷新设备</button>
-      <span class="meta" id="ov"></span>
-    </div>
-    <div id="err" class="err"></div>
-    <div class="grid" id="grid"></div>
-  </div>
-  <script src="api.js"></script>
-  <script>
-    const $ = (id) => document.getElementById(id);
-    const OFFLINE_MS = 90000;
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#0f172a" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#f8fafc" media="(prefers-color-scheme: light)" />
+    <title>Croc Sentinel Console</title>
+    <link rel="stylesheet" href="assets/app.css" />
+    <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='14' fill='%23111827' stroke='%2338bdf8' stroke-width='2'/><circle cx='16' cy='16' r='4' fill='%2338bdf8'/></svg>" />
+  </head>
+  <body class="app-shell" data-auth="unknown">
+    <aside class="sidebar" id="sidebar" aria-label="主导航">
+      <div class="brand">
+        <span class="logo" aria-hidden="true"></span>
+        <div class="brand-text">
+          <strong>Croc Sentinel</strong>
+          <span class="brand-sub">Operations Console</span>
+        </div>
+        <button class="icon-btn sidebar-close" id="sidebarClose" aria-label="关闭导航">✕</button>
+      </div>
+      <nav class="nav" id="nav"></nav>
+      <div class="sidebar-foot">
+        <div class="who" id="who">未登录</div>
+        <div class="sidebar-actions">
+          <button class="btn ghost" id="themeBtn" type="button" title="切换主题">
+            <span aria-hidden="true">◐</span><span>主题</span>
+          </button>
+          <button class="btn ghost" id="logoutBtn" type="button">退出</button>
+        </div>
+      </div>
+    </aside>
 
-    function loadTok() {
-      $("token").value = CrocApi.getToken();
-      $("user").value = localStorage.getItem(CrocApi.LS_USER) || "";
-    }
-    function saveTok() {
-      CrocApi.setToken($("token").value.trim());
-      localStorage.setItem(CrocApi.LS_USER, $("user").value.trim());
-    }
+    <div class="sidebar-backdrop" id="sidebarBackdrop" hidden></div>
 
-    function parseTs(iso) {
-      if (!iso) return null;
-      const t = Date.parse(iso);
-      return Number.isFinite(t) ? t : null;
-    }
+    <main class="main">
+      <header class="topbar">
+        <button class="icon-btn menu-btn" id="menuBtn" aria-label="展开导航">☰</button>
+        <div class="crumb" id="crumb">总览</div>
+        <div class="topbar-actions">
+          <span class="dot-status" id="mqttDot" title="MQTT"></span>
+          <button class="btn ghost" id="refreshBtn" type="button" title="刷新">
+            <span aria-hidden="true">↻</span><span class="hide-sm">刷新</span>
+          </button>
+        </div>
+      </header>
 
-    function isOnline(row) {
-      const t = parseTs(row.updated_at);
-      if (t == null) return false;
-      return Date.now() - t < OFFLINE_MS;
-    }
+      <section id="view" class="view"></section>
 
-    async function refresh() {
-      $("err").textContent = "";
-      try {
-        const ov = await CrocApi.apiFetch("/dashboard/overview");
-        $("ov").textContent = "在线概览: 设备 " + ov.total_devices + " · 有状态 " + ov.devices_with_status + " · MQTT " + (ov.mqtt_connected ? "已连" : "断开");
-        const data = await CrocApi.apiFetch("/devices");
-        const grid = $("grid");
-        grid.innerHTML = "";
-        (data.items || []).forEach((d) => {
-          const online = isOnline(d);
-          const card = document.createElement("div");
-          card.className = "card";
-          card.innerHTML =
-            "<h2>" +
-            escapeHtml(d.device_id) +
-            '</h2><div><span class="badge ' +
-            (online ? "online" : "offline") +
-            '">' +
-            (online ? "在线" : "离线") +
-            "</span></div>" +
-            '<p class="meta">FW: ' +
-            escapeHtml(d.fw || "—") +
-            "<br/>芯片: " +
-            escapeHtml(d.chip_target || "—") +
-            "<br/>板型: " +
-            escapeHtml(d.board_profile || "—") +
-            "<br/>网络: " +
-            escapeHtml(d.net_type || "—") +
-            "<br/>分区: " +
-            escapeHtml(d.zone || "—") +
-            "<br/>更新: " +
-            escapeHtml(d.updated_at || "—") +
-            "</p>";
-          grid.appendChild(card);
-        });
-      } catch (e) {
-        $("err").textContent = String(e.message || e);
-      }
-    }
+      <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    </main>
 
-    function escapeHtml(s) {
-      return String(s)
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;");
-    }
-
-    $("saveTok").onclick = () => {
-      saveTok();
-      refresh();
-    };
-    $("clrTok").onclick = () => {
-      CrocApi.setToken("");
-      $("token").value = "";
-    };
-    $("refresh").onclick = refresh;
-    $("loginBtn").onclick = async () => {
-      $("err").textContent = "";
-      try {
-        const body = { username: $("user").value.trim(), password: $("pass").value };
-        const r = await fetch(CrocApi.apiBase() + "/auth/login", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        });
-        if (!r.ok) throw new Error(await r.text());
-        const j = await r.json();
-        $("token").value = j.access_token;
-        saveTok();
-        refresh();
-      } catch (e) {
-        $("err").textContent = String(e.message || e);
-      }
-    };
-
-    loadTok();
-    refresh();
-  </script>
-</body>
+    <script src="assets/app.js"></script>
+  </body>
 </html>

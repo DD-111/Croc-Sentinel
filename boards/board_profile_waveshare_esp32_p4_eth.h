@@ -2,6 +2,8 @@
 #define BOARD_PROFILE_WAVESHARE_ESP32_P4_ETH_H
 
 #define BOARD_PROFILE_NAME "waveshare_esp32_p4_eth"
+#define BOARD_HAS_ETH 1
+// ESP32-P4 has no WiFi radio in the stock Arduino core — keep ETHERNET only.
 #define BOARD_DEFAULT_NETIF_MODE 2
 #define BOARD_DEFAULT_SIREN_GPIO 25
 #define BOARD_DEFAULT_TRIGGER_GPIO 33

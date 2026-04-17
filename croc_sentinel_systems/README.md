@@ -1,5 +1,9 @@
 # Croc Sentinel Systems (Ubuntu Server Part)
 
+> **新来的请先看 [`docs/OVERVIEW_CN.md`](docs/OVERVIEW_CN.md)** — 用大白话把这套系统能做 / 不能做 / 怎么部署讲清楚（3 分钟读完）。
+>
+> **前端 / 第三方对接**：端点清单见 [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md)（含 OTA 活动流程、presence probe、预留的 `/subscribe` 窗口）。
+
 This folder contains a production-oriented server stack for your ESP32 fleet:
 
 - MQTT broker (Mosquitto)
@@ -94,10 +98,26 @@ docker compose ps
 - MQTT broker (TLS): `tls://<your-vps>:8883`
 - OTA file URL: `http://<your-vps>:8070/fw/<firmware>.bin?token=<OTA_TOKEN>`
 - API base: `http://<your-vps>:8088`
-- **Dashboard (static UI):** `http://<your-vps>:8088/dashboard/` (device cards, alerts page 2, activate/claim helper)
+- **Operations Console (SPA)**: `http://<your-vps>:8088${DASHBOARD_PATH}/`  
+  Default is `http://<your-vps>:8088/console/` — total refresh: 侧边栏 + 移动端汉堡菜单 + 浅色/暗色主题 + 单页路由。  
+  旧路径 `/ui`、`/dashboard` 会被 301 到 `DASHBOARD_PATH`；你可以改 `.env` 里的 `DASHBOARD_PATH`（建议自选一个不常见路径用于轻度混淆，例如 `/app`、`/c`、`/ops`、`/manage`）。
 
 Auth: legacy `Authorization: Bearer <API_TOKEN>` (superadmin) **or** `POST /auth/login` JWT.  
 RBAC + backup details: `docs/DASHBOARD_RBAC_BACKUP_SPEC.md`.
+
+**用户能力模型（角色贯穿每个角落）**  
+- **superadmin**：全局可见，所有能力默认 `1`；可为 admin/user 随意调整。
+- **admin**：只能看到 `manager_admin = 自己` 的 user，和 `owner_admin = 自己` 的设备；具备 `can_manage_users` 时可在控制台为 user 逐项开关：  
+  `can_alert`（警报）/ `can_send_command`（命令）/ `can_claim_device`（激活）；  
+  `can_manage_users` / `can_backup_restore` 对 user 级别始终为 0。
+- **user**：仅能对自己归属 admin 名下的设备做已被授权的操作（警报/命令等）。
+
+**审计与广播**  
+所有设备命令、警报、用户/策略变更、广播、吊销都会写入 `audit_events`；在控制台 **审计** 页可按 actor / action / target 过滤（admin 只见自身域内）。  
+`POST /commands/broadcast` 已增强：按 zone 与 **owner 范围**过滤，超过 `MAX_BULK_TARGETS` 直接 413。
+
+**迁移提示**  
+历史「无 owner」设备在 `ALLOW_LEGACY_UNOWNED=1` 时仍可被本归属 admin 兼容访问；完成迁移后请设为 `0` 并重启 API。
 
 ## 3) API auth
 
@@ -117,6 +137,8 @@ Authorization: Bearer <API_TOKEN>
 - `POST /commands/broadcast`
 - `GET /provision/pending`
 - `POST /provision/claim`
+- `POST /provision/challenge/request`
+- `POST /provision/challenge/verify`
 - `GET /dashboard/overview`
 - `POST /devices/{device_id}/alert/on`
 - `POST /devices/{device_id}/alert/off`
@@ -124,8 +146,31 @@ Authorization: Bearer <API_TOKEN>
 - `POST /devices/{device_id}/self-test`
 - `POST /devices/{device_id}/schedule-reboot`
 - `GET /devices/{device_id}/scheduled-jobs`
+- `GET /devices/revoked`
+- `POST /devices/{device_id}/revoke`
+- `POST /devices/{device_id}/unrevoke`
+- `GET /audit` (admin+, filterable)
+- `GET /auth/me`
+- `GET /auth/users` · `POST /auth/users` · `DELETE /auth/users/{u}` · `GET/PUT /auth/users/{u}/policy`
+- `GET /auth/admins` (superadmin only, for console pickers)
+- `GET /admin/backup/export` · `POST /admin/backup/import` (superadmin, header `X-Backup-Encryption-Key`)
 - `GET /logs/messages`
 - `GET /logs/file`
+- `GET /alarms` · `GET /alarms/summary` — tenant-scoped alarm history
+- `GET/POST/PATCH/DELETE /admin/alert-recipients` — per-admin email inbox list
+- `GET /admin/smtp/status` · `POST /admin/smtp/test` — notifier diagnostics
+- `GET /ota/firmwares` · `POST /ota/broadcast` — list `*.bin` with SHA-256, dispatch OTA within ownership scope
+
+## 4.2 Siren mesh / notifications / OTA mesh
+
+See `docs/MESH_AND_OTA.md` for:
+
+- the server-side alarm fan-out model (no MQTT broadcast topic; strict per-admin isolation),
+- `AutoNetIf` behaviour on ETH boards (prefer Ethernet, fall back to WiFi) and per-board defaults,
+- presence / disconnect-reason semantics surfaced in the dashboard overview,
+- SMTP notifier queue + `admin_alert_recipients`,
+- login rate-limit knobs (`LOGIN_RATE_MAX_FAILS`, `LOGIN_RATE_WINDOW_SECONDS`),
+- the OTA firmware directory layout and `OTA_PUBLIC_BASE_URL` contract.
 
 ## 4.1 API quick test
 
