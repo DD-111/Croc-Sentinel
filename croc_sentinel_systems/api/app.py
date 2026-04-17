@@ -38,7 +38,7 @@ from security import (
     verify_password,
     zones_from_json,
 )
-from notifier import notifier, render_alarm_email
+from api.notifier import notifier, render_alarm_email
 
 
 def utc_now_iso() -> str:
