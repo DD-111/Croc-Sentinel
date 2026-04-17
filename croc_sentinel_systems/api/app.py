@@ -1,4 +1,6 @@
 import collections
+import csv
+import io
 import json
 import logging
 import os
@@ -11,6 +13,7 @@ import base64
 import hashlib
 import hmac
 import re
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -20,7 +23,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import paho.mqtt.client as mqtt
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, padding
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from security import (
     Principal,
@@ -143,6 +147,19 @@ EVENT_RETAIN_DAYS_CRITICAL = int(os.getenv("EVENT_RETAIN_DAYS_CRITICAL", "365"))
 EVENT_RETAIN_DAYS_MAX = int(os.getenv("EVENT_RETAIN_DAYS_MAX", "400"))
 # How often the retention worker runs.
 EVENT_RETENTION_SCAN_SECONDS = int(os.getenv("EVENT_RETENTION_SCAN_SECONDS", "3600"))
+
+# --- Offline password recovery (RSA public on server, private key only in
+#     password_recovery_offline/ on the operator's air-gapped machine) ---
+PASSWORD_RECOVERY_PUBLIC_KEY_PATH = os.getenv("PASSWORD_RECOVERY_PUBLIC_KEY_PATH", "").strip()
+PASSWORD_RECOVERY_PUBLIC_KEY_PEM = os.getenv("PASSWORD_RECOVERY_PUBLIC_KEY_PEM", "").strip()
+# Fixed-size inner plaintext so every blob is the same length (anti user-enumeration).
+PASSWORD_RECOVERY_PLAINTEXT_PAD = int(os.getenv("PASSWORD_RECOVERY_PLAINTEXT_PAD", "512"))
+FORGOT_PASSWORD_TOKEN_TTL_SECONDS = int(os.getenv("FORGOT_PASSWORD_TOKEN_TTL_SECONDS", str(24 * 3600)))
+FORGOT_PASSWORD_IP_WINDOW_SECONDS = int(os.getenv("FORGOT_PASSWORD_IP_WINDOW_SECONDS", "3600"))
+FORGOT_PASSWORD_IP_MAX = int(os.getenv("FORGOT_PASSWORD_IP_MAX", "12"))
+# Magic header on the binary blob before hex-encoding for the dashboard.
+PASSWORD_RECOVERY_BLOB_MAGIC = b"CRPW"
+PASSWORD_RECOVERY_BLOB_VERSION = 1
 DASHBOARD_PATH = os.getenv("DASHBOARD_PATH", "/console").strip() or "/console"
 if not DASHBOARD_PATH.startswith("/"):
     DASHBOARD_PATH = "/" + DASHBOARD_PATH
@@ -502,6 +519,32 @@ def init_db() -> None:
         )
         cur.execute("CREATE INDEX IF NOT EXISTS ix_login_failures_ip_ts ON login_failures(ip, ts_epoch)")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_login_failures_user_ts ON login_failures(username, ts_epoch)")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                jti TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                secret_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at_ts INTEGER NOT NULL,
+                used INTEGER NOT NULL DEFAULT 0,
+                request_ip TEXT,
+                used_at TEXT
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_pwd_reset_user_exp ON password_reset_tokens(username, expires_at_ts)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_pwd_reset_exp ON password_reset_tokens(expires_at_ts)")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS forgot_password_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip TEXT NOT NULL,
+                ts_epoch INTEGER NOT NULL
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_forgot_ip_ts ON forgot_password_attempts(ip, ts_epoch)")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS verifications (
@@ -2205,6 +2248,17 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=128)
 
 
+class ForgotStartRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+
+
+class ForgotCompleteRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    recovery_plain: str = Field(min_length=8, max_length=4096)
+    password: str = Field(min_length=8, max_length=128)
+    password_confirm: str = Field(min_length=8, max_length=128)
+
+
 class UserCreateRequest(BaseModel):
     # NOTE: superadmin is NEVER creatable through the API. It is seeded once
     # from BOOTSTRAP_DASHBOARD_SUPERADMIN_PASSWORD on first boot and that's it.
@@ -2816,6 +2870,293 @@ def auth_signup_reject(username: str, principal: Principal = Depends(require_pri
     if n == 0:
         raise HTTPException(status_code=404, detail="no pending admin with that username")
     audit_event(principal.username, "signup.reject", username, {})
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Offline password recovery — RSA public key on server, private key only in
+# `password_recovery_offline/` (never committed). User copies hex blob →
+# operator runs decrypt script → user pastes JSON plaintext + new password.
+# ---------------------------------------------------------------------------
+
+_pwrec_pubkey_lock = threading.Lock()
+_pwrec_pubkey_cache: Any = None  # None=unset, False=missing, else RSAPublicKey
+
+
+def _password_recovery_load_public() -> Optional[Any]:
+    """Lazy-load PEM from PASSWORD_RECOVERY_PUBLIC_KEY_PEM or *_PATH."""
+    global _pwrec_pubkey_cache
+    with _pwrec_pubkey_lock:
+        if _pwrec_pubkey_cache is not None:
+            if _pwrec_pubkey_cache is False:
+                return None
+            return _pwrec_pubkey_cache
+        pem = (PASSWORD_RECOVERY_PUBLIC_KEY_PEM or "").replace("\\n", "\n").strip()
+        if not pem and PASSWORD_RECOVERY_PUBLIC_KEY_PATH:
+            try:
+                from pathlib import Path
+
+                pem = Path(PASSWORD_RECOVERY_PUBLIC_KEY_PATH).expanduser().read_text(encoding="utf-8").strip()
+            except Exception as exc:
+                logger.warning("PASSWORD_RECOVERY_PUBLIC_KEY_PATH read failed: %s", exc)
+                pem = ""
+        if not pem:
+            _pwrec_pubkey_cache = False
+            return None
+        try:
+            key = serialization.load_pem_public_key(pem.encode("utf-8"))
+            if not isinstance(key, rsa.RSAPublicKey):
+                logger.warning("password recovery: PEM must be an RSA public key")
+                _pwrec_pubkey_cache = False
+                return None
+            if key.key_size < 2048:
+                logger.warning("password recovery: RSA key must be >= 2048 bits")
+                _pwrec_pubkey_cache = False
+                return None
+            _pwrec_pubkey_cache = key
+            return key
+        except Exception as exc:
+            logger.warning("password recovery: invalid PEM: %s", exc)
+            _pwrec_pubkey_cache = False
+            return None
+
+
+def _password_recovery_blob_byte_len(pub: rsa.RSAPublicKey) -> int:
+    rsa_len = pub.key_size // 8
+    return len(PASSWORD_RECOVERY_BLOB_MAGIC) + 1 + rsa_len + 12 + (PASSWORD_RECOVERY_PLAINTEXT_PAD + 16)
+
+
+def _encrypt_password_recovery_payload(pub: rsa.RSAPublicKey, inner: dict[str, Any]) -> bytes:
+    pad = int(PASSWORD_RECOVERY_PLAINTEXT_PAD)
+    pt = json.dumps(inner, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    if len(pt) > pad:
+        raise ValueError("inner JSON exceeds PASSWORD_RECOVERY_PLAINTEXT_PAD")
+    pt = pt + (b"\x00" * (pad - len(pt)))
+    aes_key = os.urandom(32)
+    iv = os.urandom(12)
+    aesgcm = AESGCM(aes_key)
+    ct = aesgcm.encrypt(iv, pt, None)
+    rsa_cipher = pub.encrypt(
+        aes_key,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        ),
+    )
+    if len(rsa_cipher) != pub.key_size // 8:
+        raise ValueError("RSA ciphertext length mismatch")
+    return PASSWORD_RECOVERY_BLOB_MAGIC + bytes([PASSWORD_RECOVERY_BLOB_VERSION]) + rsa_cipher + iv + ct
+
+
+def _fake_password_recovery_hex(pub: rsa.RSAPublicKey) -> str:
+    return secrets.token_bytes(_password_recovery_blob_byte_len(pub)).hex()
+
+
+def _check_forgot_ip_rate(ip: str) -> None:
+    now = int(time.time())
+    cut = now - FORGOT_PASSWORD_IP_WINDOW_SECONDS
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM forgot_password_attempts WHERE ts_epoch < ?", (cut,))
+        cur.execute(
+            "SELECT COUNT(*) AS c FROM forgot_password_attempts WHERE ip = ? AND ts_epoch >= ?",
+            (ip, cut),
+        )
+        c = int(cur.fetchone()["c"])
+        if c >= FORGOT_PASSWORD_IP_MAX:
+            conn.commit()
+            conn.close()
+            raise HTTPException(
+                status_code=429,
+                detail=f"too many recovery attempts from this IP — try again in {FORGOT_PASSWORD_IP_WINDOW_SECONDS}s",
+            )
+        cur.execute("INSERT INTO forgot_password_attempts (ip, ts_epoch) VALUES (?, ?)", (ip, now))
+        conn.commit()
+        conn.close()
+
+
+def _prune_password_reset_tokens() -> None:
+    """Drop expired rows (used or unused) older than 7 days past expiry."""
+    now = int(time.time())
+    cut = now - 7 * 86400
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM password_reset_tokens WHERE expires_at_ts < ?", (cut,))
+        conn.commit()
+        conn.close()
+
+
+@app.get("/auth/forgot/enabled")
+def auth_forgot_enabled() -> dict[str, Any]:
+    return {"enabled": bool(_password_recovery_load_public())}
+
+
+@app.post("/auth/forgot/start")
+def auth_forgot_start(body: ForgotStartRequest, request: Request) -> dict[str, Any]:
+    """Return a hex-encoded blob. Only blobs tied to a real account can be
+    completed; invalid usernames still receive a same-length random blob."""
+    ip = _client_ip(request)
+    pub = _password_recovery_load_public()
+    if not pub:
+        raise HTTPException(
+            status_code=503,
+            detail="password recovery is not configured (missing PASSWORD_RECOVERY_PUBLIC_KEY_*)",
+        )
+    _check_forgot_ip_rate(ip)
+    un = body.username.strip()
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT username, status, role FROM dashboard_users WHERE username = ?", (un,))
+        row = cur.fetchone()
+        conn.close()
+    blob_hex = _fake_password_recovery_hex(pub)
+    if not row:
+        return {
+            "ok": True,
+            "recovery_blob_hex": blob_hex,
+            "ttl_seconds": FORGOT_PASSWORD_TOKEN_TTL_SECONDS,
+            "blob_byte_len": _password_recovery_blob_byte_len(pub),
+        }
+    status = str(row["status"] or "active")
+    if status == "disabled":
+        return {
+            "ok": True,
+            "recovery_blob_hex": blob_hex,
+            "ttl_seconds": FORGOT_PASSWORD_TOKEN_TTL_SECONDS,
+            "blob_byte_len": _password_recovery_blob_byte_len(pub),
+        }
+    secret = os.urandom(32)
+    secret_hash = hashlib.sha256(secret).hexdigest()
+    jti = str(uuid.uuid4())
+    exp_ts = int(time.time()) + FORGOT_PASSWORD_TOKEN_TTL_SECONDS
+    inner = {
+        "jti": jti,
+        "u": un,
+        "s": base64.urlsafe_b64encode(secret).decode("ascii").rstrip("="),
+        "e": exp_ts,
+    }
+    try:
+        raw = _encrypt_password_recovery_payload(pub, inner)
+    except Exception as exc:
+        logger.error("password recovery encrypt failed: %s", exc)
+        raise HTTPException(status_code=500, detail="could not build recovery blob") from exc
+    now_iso = utc_now_iso()
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO password_reset_tokens (jti, username, secret_hash, created_at, expires_at_ts, used, request_ip)
+            VALUES (?, ?, ?, ?, ?, 0, ?)
+            """,
+            (jti, un, secret_hash, now_iso, exp_ts, ip),
+        )
+        conn.commit()
+        conn.close()
+    emit_event(
+        level="info",
+        category="auth",
+        event_type="auth.password_reset.started",
+        summary=f"recovery blob issued for {un}",
+        actor=f"ip:{ip}",
+        target=un,
+        owner_admin=un if str(row["role"]) == "admin" else get_manager_admin(un),
+        detail={"jti": jti},
+    )
+    return {
+        "ok": True,
+        "recovery_blob_hex": raw.hex(),
+        "ttl_seconds": FORGOT_PASSWORD_TOKEN_TTL_SECONDS,
+        "blob_byte_len": len(raw),
+    }
+
+
+@app.post("/auth/forgot/complete")
+def auth_forgot_complete(body: ForgotCompleteRequest, request: Request) -> dict[str, Any]:
+    if body.password != body.password_confirm:
+        raise HTTPException(status_code=400, detail="passwords do not match")
+    pub = _password_recovery_load_public()
+    if not pub:
+        raise HTTPException(status_code=503, detail="password recovery is not configured")
+    un = body.username.strip()
+    try:
+        data = json.loads(body.recovery_plain.strip())
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="recovery_plain must be valid JSON — paste the entire single-line output from decrypt_recovery_blob.py",
+        ) from exc
+    jti = str(data.get("jti") or "")
+    u = str(data.get("u") or "")
+    s_b64 = str(data.get("s") or "")
+    exp = int(data.get("e") or 0)
+    if not jti or not u or not s_b64:
+        raise HTTPException(status_code=400, detail="recovery JSON missing jti / u / s")
+    if u != un:
+        raise HTTPException(status_code=400, detail="username does not match recovery token (u field)")
+    if int(time.time()) > exp:
+        raise HTTPException(status_code=400, detail="recovery token expired")
+    pad = "=" * ((4 - len(s_b64) % 4) % 4)
+    try:
+        secret = base64.urlsafe_b64decode((s_b64 + pad).encode("ascii"))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid secret field in recovery JSON") from exc
+    if len(secret) != 32:
+        raise HTTPException(status_code=400, detail="invalid secret length")
+    digest = hashlib.sha256(secret).hexdigest()
+    ip = _client_ip(request)
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM password_reset_tokens WHERE jti = ? AND username = ? AND used = 0",
+            (jti, un),
+        )
+        tok = cur.fetchone()
+        if not tok or not secrets.compare_digest(str(tok["secret_hash"]), digest):
+            conn.close()
+            audit_event(f"ip:{ip}", "auth.password_reset.fail", un, {"reason": "bad token"})
+            raise HTTPException(status_code=400, detail="invalid or already-used recovery token")
+        if int(time.time()) > int(tok["expires_at_ts"]):
+            conn.close()
+            raise HTTPException(status_code=400, detail="recovery token expired")
+        cur.execute("SELECT status, role FROM dashboard_users WHERE username = ?", (un,))
+        urow = cur.fetchone()
+        if not urow:
+            conn.close()
+            raise HTTPException(status_code=404, detail="user not found")
+        st = str(urow["status"] or "active")
+        role = str(urow["role"] or "")
+        if st == "disabled":
+            conn.close()
+            raise HTTPException(status_code=403, detail="account disabled")
+        new_hash = hash_password(body.password)
+        cur.execute(
+            "UPDATE dashboard_users SET password_hash = ? WHERE username = ?",
+            (new_hash, un),
+        )
+        cur.execute(
+            "UPDATE password_reset_tokens SET used = 1, used_at = ? WHERE jti = ?",
+            (utc_now_iso(), jti),
+        )
+        conn.commit()
+        conn.close()
+    _clear_login_failures(un)
+    audit_event(un, "auth.password_reset.ok", "", {"ip": ip})
+    emit_event(
+        level="warn",
+        category="auth",
+        event_type="auth.password_reset.completed",
+        summary=f"password reset for {un}",
+        actor=un,
+        target=un,
+        owner_admin=un if role == "admin" else get_manager_admin(un),
+        detail={"ip": ip},
+    )
     return {"ok": True}
 
 
@@ -3744,6 +4085,7 @@ def scheduler_loop() -> None:
     next_cleanup_at = time.time() + 60
     next_probe_at = time.time() + 30  # kick probe worker ~30s after boot
     next_events_retention_at = time.time() + 300  # first retention pass ~5 min after boot
+    next_pwd_prune_at = time.time() + 900
     while not scheduler_stop.is_set():
         now_ts = int(time.time())
         jobs: list[sqlite3.Row] = []
@@ -3827,6 +4169,13 @@ def scheduler_loop() -> None:
             except Exception as exc:
                 logger.warning("events retention tick failed: %s", exc)
             next_events_retention_at = now + max(300, EVENT_RETENTION_SCAN_SECONDS)
+
+        if now >= next_pwd_prune_at:
+            try:
+                _prune_password_reset_tokens()
+            except Exception as exc:
+                logger.warning("password reset token prune failed: %s", exc)
+            next_pwd_prune_at = now + 21600  # every 6h
 
         scheduler_stop.wait(SCHEDULER_POLL_SECONDS)
 
@@ -5095,21 +5444,18 @@ def _event_scope_sql(principal: Principal) -> tuple[str, list[Any]]:
     return frag, [my_admin, principal.username, principal.username]
 
 
-@app.get("/events")
-def list_events(
-    principal: Principal = Depends(require_principal),
-    min_level: Optional[str] = Query(default=None, pattern="^(debug|info|warn|error|critical)$"),
-    category: Optional[str] = Query(default=None, max_length=32),
-    device_id: Optional[str] = Query(default=None, min_length=2, max_length=64),
-    q: Optional[str] = Query(default=None, max_length=120),
-    since_id: int = Query(default=0, ge=0),
-    limit: int = Query(default=200, ge=1, le=1000),
-) -> dict[str, Any]:
-    """Paginated read-only access to the events table."""
-    sql = (
-        "SELECT id, ts, ts_epoch_ms, level, category, event_type, actor, target, owner_admin, device_id, summary, detail_json, ref_table, ref_id "
-        "FROM events WHERE 1=1 "
-    )
+def _events_filter_sql_args(
+    principal: Principal,
+    *,
+    min_level: Optional[str],
+    category: Optional[str],
+    device_id: Optional[str],
+    q: Optional[str],
+    since_id: int,
+    ts_epoch_min: Optional[int] = None,
+) -> tuple[str, list[Any]]:
+    """Shared WHERE clause + bind values for `/events*` queries."""
+    sql = "WHERE 1=1"
     args: list[Any] = []
     scope_frag, scope_args = _event_scope_sql(principal)
     sql += scope_frag
@@ -5136,7 +5482,36 @@ def list_events(
     if since_id > 0:
         sql += " AND id > ? "
         args.append(since_id)
-    sql += " ORDER BY id DESC LIMIT ? "
+    if ts_epoch_min is not None:
+        sql += " AND ts_epoch_ms >= ? "
+        args.append(int(ts_epoch_min))
+    return sql, args
+
+
+@app.get("/events")
+def list_events(
+    principal: Principal = Depends(require_principal),
+    min_level: Optional[str] = Query(default=None, pattern="^(debug|info|warn|error|critical)$"),
+    category: Optional[str] = Query(default=None, max_length=32),
+    device_id: Optional[str] = Query(default=None, min_length=2, max_length=64),
+    q: Optional[str] = Query(default=None, max_length=120),
+    since_id: int = Query(default=0, ge=0),
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> dict[str, Any]:
+    """Paginated read-only access to the events table."""
+    wf, wa = _events_filter_sql_args(
+        principal,
+        min_level=min_level,
+        category=category,
+        device_id=device_id,
+        q=q,
+        since_id=since_id,
+    )
+    sql = (
+        "SELECT id, ts, ts_epoch_ms, level, category, event_type, actor, target, owner_admin, device_id, summary, detail_json, ref_table, ref_id "
+        f"FROM events {wf} ORDER BY id DESC LIMIT ? "
+    )
+    args = list(wa)
     args.append(limit)
 
     with db_lock:
@@ -5152,6 +5527,101 @@ def list_events(
         except Exception:
             r["detail"] = {"_raw": raw}
     return {"items": rows, "count": len(rows)}
+
+
+@app.get("/events/export.csv")
+def export_events_csv(
+    principal: Principal = Depends(require_principal),
+    min_level: Optional[str] = Query(default=None, pattern="^(debug|info|warn|error|critical)$"),
+    category: Optional[str] = Query(default=None, max_length=32),
+    device_id: Optional[str] = Query(default=None, min_length=2, max_length=64),
+    q: Optional[str] = Query(default=None, max_length=120),
+    limit: int = Query(default=5000, ge=1, le=20000),
+) -> StreamingResponse:
+    """Download a UTF-8 CSV snapshot (same visibility rules as GET /events)."""
+    wf, wa = _events_filter_sql_args(
+        principal,
+        min_level=min_level,
+        category=category,
+        device_id=device_id,
+        q=q,
+        since_id=0,
+    )
+    sql = (
+        "SELECT id, ts, level, category, event_type, actor, target, owner_admin, device_id, summary, detail_json "
+        f"FROM events {wf} ORDER BY id DESC LIMIT ? "
+    )
+    args = list(wa)
+    args.append(limit)
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(sql, tuple(args))
+        rows = list(cur.fetchall())
+        conn.close()
+
+    def gen():
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["id", "ts", "level", "category", "event_type", "actor", "target", "owner_admin", "device_id", "summary", "detail_json"])
+        yield buf.getvalue()
+        buf.seek(0)
+        buf.truncate(0)
+        for r in rows:
+            w.writerow(
+                [
+                    r["id"],
+                    r["ts"],
+                    r["level"],
+                    r["category"],
+                    r["event_type"],
+                    r["actor"] or "",
+                    r["target"] or "",
+                    r["owner_admin"] or "",
+                    r["device_id"] or "",
+                    r["summary"] or "",
+                    (r["detail_json"] or "").replace("\r\n", " ").replace("\n", " "),
+                ]
+            )
+            yield buf.getvalue()
+            buf.seek(0)
+            buf.truncate(0)
+
+    headers = {"Content-Disposition": 'attachment; filename="croc_sentinel_events.csv"'}
+    return StreamingResponse(gen(), media_type="text/csv; charset=utf-8", headers=headers)
+
+
+@app.get("/events/stats/by-device")
+def events_stats_by_device(
+    principal: Principal = Depends(require_principal),
+    hours: int = Query(default=168, ge=1, le=24 * 365),
+    limit: int = Query(default=200, ge=1, le=500),
+) -> dict[str, Any]:
+    """Aggregate event counts per device_id over the last `hours` hours."""
+    ts_min = int(time.time() * 1000) - hours * 3600 * 1000
+    wf, wa = _events_filter_sql_args(
+        principal,
+        min_level=None,
+        category=None,
+        device_id=None,
+        q=None,
+        since_id=0,
+        ts_epoch_min=ts_min,
+    )
+    sql = (
+        f"SELECT device_id, COUNT(*) AS cnt FROM events {wf} "
+        "AND IFNULL(device_id,'') != '' "
+        "GROUP BY device_id ORDER BY cnt DESC LIMIT ? "
+    )
+    args = list(wa)
+    args.append(limit)
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(sql, tuple(args))
+        rows = [{"device_id": r["device_id"], "count": int(r["cnt"])} for r in cur.fetchall()]
+        conn.close()
+    return {"hours": hours, "items": rows}
 
 
 @app.get("/events/categories")

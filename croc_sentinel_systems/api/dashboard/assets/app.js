@@ -212,7 +212,7 @@
     toggleNav(false);
     if (window.__evSSE) { try { window.__evSSE.close(); } catch {} window.__evSSE = null; }
 
-    const publicRoutes = new Set(["login", "register", "account-activate"]);
+    const publicRoutes = new Set(["login", "register", "account-activate", "forgot-password"]);
     if (!state.me && !publicRoutes.has(id)) {
       location.hash = "#/login";
       return;
@@ -259,6 +259,9 @@
             <a class="muted" href="#/register">没有账号？注册管理员</a>
             <a class="muted" href="#/account-activate">有激活码？</a>
           </div>
+          <p class="muted" style="margin-top:10px;text-align:center">
+            <a href="#/forgot-password" title="离线 RSA 解密；编码为长十六进制（约千位以上），非短验证码">忘记密码（离线解密找回）</a>
+          </p>
         </form>
       </div>`;
     const form = $("#loginForm", view);
@@ -275,6 +278,121 @@
       } catch (e) {
         msg.textContent = String(e.message || e);
       }
+    });
+  });
+
+  // Forgot password — offline RSA decrypt flow
+  registerRoute("forgot-password", async (view) => {
+    setCrumb("忘记密码");
+    document.body.dataset.auth = "none";
+    let enabled = true;
+    try {
+      const r = await fetch(apiBase() + "/auth/forgot/enabled");
+      const j = await r.json();
+      enabled = !!j.enabled;
+    } catch { enabled = false; }
+    view.innerHTML = `
+      <div class="login-wrap">
+        <div class="login-card" style="max-width:520px">
+          <h1>忘记密码</h1>
+          <p class="muted">
+            本流程用于<strong>未配置邮箱自助重置</strong>或<strong>更高安全要求</strong>的部署。
+            点击「获取编码」后，会得到字段 <span class="mono">recovery_blob_hex</span>：
+            它是<strong>纯十六进制</strong>字符串，字符数 ≈ <strong>2 × blob_byte_len</strong>（与接口返回的
+            <span class="mono">blob_byte_len</span> 一致）。当前服务端为 RSA-2048 且
+            <span class="mono">PASSWORD_RECOVERY_PLAINTEXT_PAD=512</span> 时，长度约为 <strong>1602</strong> 个字符
+            ——不是「64 位短码」，请务必<strong>整段复制</strong>、勿换行截断、勿夹空格。
+            把整段发给运维；运维在<strong>离线机</strong>用
+            <span class="mono">password_recovery_offline/decrypt_recovery_blob.py</span>
+            + <span class="mono">private.pem</span> 解密后，将输出的一行 JSON 粘贴到下方「解密明文」，
+            再输入两次新密码即可写入数据库。
+          </p>
+          ${enabled ? "" : `<p class="badge revoked" style="margin:10px 0">当前服务器未配置公钥（<span class="mono">PASSWORD_RECOVERY_PUBLIC_KEY_*</span>），无法发起找回。</p>`}
+          <div id="fpStep1">
+            <label class="field"><span>用户名</span><input id="fp_user" autocomplete="username" /></label>
+            <div class="row between" style="margin-top:14px">
+              <a class="muted" href="#/login">返回登录</a>
+              <button class="btn" id="fp_go" ${enabled ? "" : "disabled"}>获取编码</button>
+            </div>
+            <p class="muted" id="fp_msg1" style="margin-top:10px"></p>
+          </div>
+          <div id="fpStep2" style="display:none">
+            <label class="field"><span>recovery_blob_hex（整段复制）</span>
+              <textarea id="fp_blob" readonly rows="6" class="mono" style="width:100%;font-size:11px"></textarea>
+            </label>
+            <p class="muted" id="fp_blob_hint" style="margin-top:6px;font-size:12px"></p>
+            <p class="muted" id="fp_meta"></p>
+            <label class="field"><span>解密明文（一行 JSON）</span>
+              <textarea id="fp_plain" rows="3" placeholder='{"jti":"...","u":"...","s":"...","e":...}' style="width:100%"></textarea>
+            </label>
+            <label class="field"><span>新密码（≥8 位）</span><input id="fp_p1" type="password" autocomplete="new-password" /></label>
+            <label class="field"><span>确认新密码</span><input id="fp_p2" type="password" autocomplete="new-password" /></label>
+            <div class="row between" style="margin-top:14px">
+              <button class="btn ghost" id="fp_back">上一步</button>
+              <button class="btn" id="fp_done">更新密码</button>
+            </div>
+            <p class="muted" id="fp_msg2" style="margin-top:10px"></p>
+          </div>
+        </div>
+      </div>`;
+    const m1 = $("#fp_msg1"), m2 = $("#fp_msg2");
+    $("#fp_go").addEventListener("click", async () => {
+      m1.textContent = "";
+      const username = $("#fp_user").value.trim();
+      if (!username) { m1.textContent = "请输入用户名"; return; }
+      try {
+        const r = await fetch(apiBase() + "/auth/forgot/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          const det = d.detail;
+          const msg = Array.isArray(det) ? det.map((x) => x.msg || JSON.stringify(x)).join("; ") : (det || r.statusText);
+          throw new Error(msg);
+        }
+        const hex = d.recovery_blob_hex || "";
+        $("#fp_blob").value = hex;
+        const bl = d.blob_byte_len;
+        const hexLen = hex.length;
+        $("#fp_blob_hint").textContent =
+          bl != null
+            ? `当前编码：十六进制 ${hexLen} 个字符（应等于 2×${bl}=${2 * Number(bl)}）。请完整复制到解密脚本，不要只复制前几行。`
+            : `当前编码：十六进制 ${hexLen} 个字符。请完整复制，不要截断。`;
+        $("#fp_meta").textContent = `有效时间约 ${((d.ttl_seconds || 0) / 3600).toFixed(1)} 小时 · 二进制长度 ${bl != null ? bl + " 字节" : "—"}`;
+        $("#fpStep1").style.display = "none";
+        $("#fpStep2").style.display = "block";
+      } catch (e) { m1.textContent = String(e.message || e); }
+    });
+    $("#fp_back").addEventListener("click", () => {
+      $("#fpStep2").style.display = "none";
+      $("#fpStep1").style.display = "block";
+      m2.textContent = "";
+    });
+    $("#fp_done").addEventListener("click", async () => {
+      m2.textContent = "";
+      const username = $("#fp_user").value.trim();
+      const recovery_plain = ($("#fp_plain").value || "").trim();
+      const password = $("#fp_p1").value;
+      const password_confirm = $("#fp_p2").value;
+      if (!recovery_plain || !password) { m2.textContent = "请填写解密明文与密码"; return; }
+      if (password !== password_confirm) { m2.textContent = "两次密码不一致"; return; }
+      try {
+        const r = await fetch(apiBase() + "/auth/forgot/complete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username, recovery_plain, password, password_confirm }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          const det = d.detail;
+          const msg = Array.isArray(det) ? det.map((x) => x.msg || JSON.stringify(x)).join("; ") : (det || r.statusText);
+          throw new Error(msg);
+        }
+        m2.textContent = "密码已更新，请返回登录。";
+        toast("密码已更新", "ok");
+      } catch (e) { m2.textContent = String(e.message || e); }
     });
   });
 
@@ -849,11 +967,19 @@
           </label>
           <label class="field"><span>设备 ID</span><input id="evDevice" placeholder="SN-... 或 dev_id" /></label>
           <label class="field wide"><span>关键词</span><input id="evQ" placeholder="搜索摘要 / actor / event_type" /></label>
-          <div class="row wide" style="justify-content:flex-end;gap:8px">
+          <div class="row wide" style="justify-content:flex-end;gap:8px;flex-wrap:wrap">
             <button class="btn sm secondary" id="evApply">应用筛选</button>
             <button class="btn sm" id="evReload">历史 200 条</button>
+            <button class="btn sm secondary" id="evStats">设备统计(7天)</button>
+            <button class="btn sm secondary" id="evCsv">导出 CSV</button>
           </div>
         </div>
+      </div>
+      <div id="evStatsBox" class="card" style="margin-top:12px;display:none">
+        <h3 style="margin:0 0 8px">按设备事件数（最近 7 天）</h3>
+        <div id="evStatsInner" class="muted">—</div>
+      </div>
+      <div class="card" style="margin-top:12px">
         <div id="evList" class="events-list muted">连接中…</div>
       </div>`;
 
@@ -954,6 +1080,39 @@
     $("#evClear").addEventListener("click", () => { buffer = []; render(); });
     $("#evApply").addEventListener("click", () => { loadHistory().then(openStream); });
     $("#evReload").addEventListener("click", loadHistory);
+    $("#evStats").addEventListener("click", async () => {
+      try {
+        const r = await api("/events/stats/by-device?hours=168&limit=200");
+        const items = r.items || [];
+        $("#evStatsBox").style.display = "block";
+        if (items.length === 0) {
+          $("#evStatsInner").innerHTML = "<p class='muted'>无带 device_id 的事件。</p>";
+          return;
+        }
+        $("#evStatsInner").innerHTML = `<div class="table-wrap"><table class="t"><thead><tr><th>设备</th><th>条数</th></tr></thead><tbody>${
+          items.map((x) => `<tr><td class="mono">${escapeHtml(x.device_id)}</td><td>${x.count}</td></tr>`).join("")
+        }</tbody></table></div>`;
+      } catch (e) { toast(e.message || e, "err"); }
+    });
+    $("#evCsv").addEventListener("click", async () => {
+      try {
+        const p = currentFilters();
+        p.set("limit", "8000");
+        const url = apiBase() + "/events/export.csv?" + p.toString();
+        const r = await fetch(url, { headers: { Authorization: "Bearer " + getToken() } });
+        if (!r.ok) {
+          const t = await r.text();
+          throw new Error(t || r.statusText);
+        }
+        const blob = await r.blob();
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "croc_sentinel_events.csv";
+        a.click();
+        URL.revokeObjectURL(a.href);
+        toast("已下载 CSV", "ok");
+      } catch (e) { toast(e.message || e, "err"); }
+    });
 
     await loadHistory();
     openStream();

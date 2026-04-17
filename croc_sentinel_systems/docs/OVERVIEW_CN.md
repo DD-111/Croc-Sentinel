@@ -262,6 +262,20 @@ A：停服 → 在 `.env` 写 `BOOTSTRAP_DASHBOARD_SUPERADMIN_PASSWORD=新密码
    `dropped=N` 告诉客户端"你漏了 N 条，可以主动拉历史补齐"。
 5. **租户过滤走 SQL**：历史查询用 `(owner_admin, ts_epoch_ms DESC)` 索引直查，
    不会扫全表。
+6. **二级能力**：`GET /events/export.csv` 按当前筛选导出 CSV；`GET /events/stats/by-device` 按设备聚合最近 N 小时事件条数（仪表盘「设备统计 / 导出 CSV」按钮）。
+
+### 出厂序列号目录 + 离线找回密码（仓库根目录）
+
+- **`factory_serial_exports/`**：用 `tools/factory_pack/generate_serial_qr.py` 生成
+  `manifest.csv`、`factory_devices_bulk.json`、每机一张 `png/SN-....png` 二维码；
+  整个子目录可单独拷走产线使用（需与线上 `QR_SIGN_SECRET` 一致）。
+- **`password_recovery_offline/`**：运维离线机生成 RSA 密钥对（`gen_rsa_keys.py`），
+  公钥配进 API `.env`，私钥**永不**上服务器。用户忘记密码 → 网页拿 **整段** hex（字符数 = **2×blob_byte_len**，默认约 **1602**，非短验证码）→
+  离线 `decrypt_recovery_blob.py` 解出一行 JSON → 用户粘贴并输入两次新密码 →
+  `dashboard_users.password_hash` 更新。SQL 表：`password_reset_tokens`、
+  `forgot_password_attempts`（IP 限流）。
+- **OTA 与每台设备配置**：见仓库根目录 `DEVICE_CONFIG_AND_OTA.md`（NVS 与 app 分区
+  分离，正常 OTA 不擦配置）。
 
 ### ❌ 还没做 / 下一步建议
 

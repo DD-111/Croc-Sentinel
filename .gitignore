@@ -1,0 +1,5 @@
+# Generated factory bundles (serials + QR PNGs) — copy out of repo for production use
+factory_serial_exports/output_*/
+
+# Never commit RSA private key used for dashboard password recovery
+password_recovery_keys/private.pem

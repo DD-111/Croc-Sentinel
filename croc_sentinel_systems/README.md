@@ -3,6 +3,8 @@
 > **新来的请先看 [`docs/OVERVIEW_CN.md`](docs/OVERVIEW_CN.md)** — 用大白话把这套系统能做 / 不能做 / 怎么部署讲清楚（3 分钟读完）。
 >
 > **前端 / 第三方对接**：端点清单见 [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md)（含 OTA 活动流程、presence probe、预留的 `/subscribe` 窗口）。
+>
+> **固件 OTA 与 NVS 配置是否丢失**（设备侧）：见仓库根目录 [`../DEVICE_CONFIG_AND_OTA.md`](../DEVICE_CONFIG_AND_OTA.md)。
 
 This folder contains a production-oriented server stack for your ESP32 fleet:
 
@@ -92,6 +94,43 @@ Reference commands: `certs/README.md`
 docker compose up -d --build
 docker compose ps
 ```
+
+### 1.6 重新部署与调试（更新代码 / 看日志）
+
+在 **`croc_sentinel_systems/`** 目录下操作（与 `docker-compose.yml` 同级）。
+
+**中文 — 典型流程**
+
+1. 拉代码或覆盖 VPS 上的本目录后，确认 `.env` 仍完整（不要把生产 `.env` 覆盖成 example）。
+2. **重建并重启 API**（前端静态文件打进 API 镜像时必做）：
+   ```bash
+   docker compose build api --no-cache
+   docker compose up -d api
+   ```
+   若 MQTT / OTA 配置也有变，可全量：`docker compose up -d --build`。
+3. **看 API 日志**（实时）：
+   ```bash
+   docker compose logs -f api
+   ```
+4. **健康检查**（宿主机上，端口以 `.env` / compose 为准，默认 8088）：
+   ```bash
+   curl -sS http://127.0.0.1:8088/health
+   ```
+5. **浏览器强刷控制台**：`Ctrl+F5` 或清缓存，避免旧版 `app.js` 被缓存。
+6. **本机调试 API（不用 Docker）**：在 `api/` 下建虚拟环境、`pip install -r requirements.txt`，设置与线上一致的 `DB_PATH` / MQTT 等环境变量后：
+   ```bash
+   uvicorn app:app --host 0.0.0.0 --port 8088 --reload
+   ```
+   `--reload` 改代码即生效，适合排错；生产仍建议 Docker。
+
+**English — typical redeploy**
+
+1. After syncing files on the VPS, keep production `.env` intact.
+2. Rebuild the API image when Python or dashboard assets changed: `docker compose build api --no-cache && docker compose up -d api`, or `docker compose up -d --build` for everything.
+3. Tail logs: `docker compose logs -f api`.
+4. Smoke-test: `curl -sS http://127.0.0.1:8088/health` (adjust host/port if published differently).
+5. Hard-refresh the browser on the console URL so SPA assets update.
+6. Optional local dev: `uvicorn app:app --host 0.0.0.0 --port 8088 --reload` from `api/` with env vars pointing at a test DB/MQTT.
 
 ## 2) Service map
 
