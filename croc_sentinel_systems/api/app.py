@@ -3709,8 +3709,9 @@ def unrevoke_device(device_id: str, principal: Principal = Depends(require_princ
 
 
 @app.get("/health")
-def health(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_min_role(principal, "user")
+def health() -> dict[str, Any]:
+    """Liveness for load balancers / `curl` — intentionally **no** auth so Uptime
+    Kuma, Docker healthchecks, and reverse proxies can probe without a token."""
     return {
         "ok": True,
         "mqtt_connected": mqtt_connected,

@@ -116,8 +116,13 @@ docker compose ps
    ```bash
    curl -sS http://127.0.0.1:8088/health
    ```
-5. **浏览器强刷控制台**：`Ctrl+F5` 或清缓存，避免旧版 `app.js` 被缓存。
-6. **本机调试 API（不用 Docker）**：在 `api/` 下建虚拟环境、`pip install -r requirements.txt`，设置与线上一致的 `DB_PATH` / MQTT 等环境变量后：
+5. **确认容器内 Python 文件**（`*` 必须在容器里展开，否则宿主机 shell 会先展开成空并报错）：
+   ```bash
+   docker compose exec api sh -c 'ls -la /app/*.py'
+   ```
+   或先看目录：`docker compose exec api ls -la /app`
+6. **浏览器强刷控制台**：`Ctrl+F5` 或清缓存，避免旧版 `app.js` 被缓存。
+7. **本机调试 API（不用 Docker）**：在 `api/` 下建虚拟环境、`pip install -r requirements.txt`，设置与线上一致的 `DB_PATH` / MQTT 等环境变量后：
    ```bash
    uvicorn app:app --host 0.0.0.0 --port 8088 --reload
    ```
@@ -129,8 +134,10 @@ docker compose ps
 2. Rebuild the API image when Python or dashboard assets changed: `docker compose build api --no-cache && docker compose up -d api`, or `docker compose up -d --build` for everything.
 3. Tail logs: `docker compose logs -f api`.
 4. Smoke-test: `curl -sS http://127.0.0.1:8088/health` (adjust host/port if published differently).
-5. Hard-refresh the browser on the console URL so SPA assets update.
-6. Optional local dev: `uvicorn app:app --host 0.0.0.0 --port 8088 --reload` from `api/` with env vars pointing at a test DB/MQTT.
+5. List files **inside** the container (quote so `*` is not expanded on the host):  
+   `docker compose exec api sh -c 'ls -la /app/*.py'`
+6. Hard-refresh the browser on the console URL so SPA assets update.
+7. Optional local dev: `uvicorn app:app --host 0.0.0.0 --port 8088 --reload` from `api/` with env vars pointing at a test DB/MQTT.
 
 ## 2) Service map
 
