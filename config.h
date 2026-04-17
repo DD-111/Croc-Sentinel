@@ -40,7 +40,7 @@
 
 // ── MQTT broker / VPS ──
 #define MQTT_HOST "your.vps.domain"
-#define MQTT_PORT 8883
+#define MQTT_PORT 18962
 #define MQTT_USERNAME "mqtt_user"
 #define MQTT_PASSWORD "mqtt_pass"
 #define MQTT_USE_TLS 1
