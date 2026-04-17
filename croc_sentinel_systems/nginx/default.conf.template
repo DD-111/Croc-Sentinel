@@ -1,0 +1,12 @@
+server {
+    listen 8070;
+    server_name _;
+
+    location /fw/ {
+        if ($arg_token != "${OTA_TOKEN}") {
+            return 403;
+        }
+        alias /opt/sentinel/firmware/;
+        autoindex off;
+    }
+}

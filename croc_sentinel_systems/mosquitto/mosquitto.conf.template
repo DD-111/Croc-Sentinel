@@ -1,0 +1,18 @@
+listener ${MQTT_PORT}
+protocol mqtt
+allow_anonymous false
+password_file /mosquitto/config/passwd
+
+# TLS server certs
+cafile ${MQTT_TLS_CA_FILE}
+certfile ${MQTT_TLS_CERT_FILE}
+keyfile ${MQTT_TLS_KEY_FILE}
+tls_version tlsv1.2
+require_certificate ${MQTT_TLS_REQUIRE_CLIENT_CERT}
+
+persistence true
+persistence_location /mosquitto/data/
+
+log_dest stdout
+connection_messages true
+log_timestamp true

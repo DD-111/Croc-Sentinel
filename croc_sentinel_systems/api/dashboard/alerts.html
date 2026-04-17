@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Croc Sentinel — 红色警报</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <h1>Croc Sentinel · 红色警报（第二页）</h1>
+    <nav>
+      <a href="index.html">设备</a>
+      <a href="alerts.html">红色警报</a>
+      <a href="activate.html">激活 / Claim</a>
+    </nav>
+  </header>
+  <div class="panel">
+    <div class="row">
+      <label>API Token / JWT
+        <input type="password" id="token" style="min-width:280px" />
+      </label>
+      <button type="button" id="saveTok">保存</button>
+    </div>
+    <div class="row">
+      <label>持续时间 (ms)
+        <input type="number" id="dur" value="8000" min="500" max="120000" />
+      </label>
+      <label>目标 device_id（逗号分隔，留空=当前账号可见范围内全部）</label>
+      <input type="text" id="ids" placeholder="gate-01,gate-02" style="min-width:320px" />
+    </div>
+    <div class="row">
+      <button type="button" class="danger" id="onAll">警报 ON</button>
+      <button type="button" id="offAll">警报 OFF</button>
+    </div>
+    <div id="err" class="err"></div>
+    <div id="ok" class="okmsg"></div>
+  </div>
+  <script src="api.js"></script>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    function loadTok() {
+      $("token").value = CrocApi.getToken();
+    }
+    function saveTok() {
+      CrocApi.setToken($("token").value.trim());
+    }
+
+    async function postAlerts(action) {
+      $("err").textContent = "";
+      $("ok").textContent = "";
+      saveTok();
+      const raw = $("ids").value.trim();
+      const device_ids = raw
+        ? raw
+            .split(/[,;\s]+/)
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : [];
+      const body = {
+        action,
+        duration_ms: parseInt($("dur").value, 10) || 8000,
+        device_ids,
+      };
+      try {
+        const r = await CrocApi.apiFetch("/alerts", { method: "POST", body });
+        $("ok").textContent = "已下发: " + r.sent_count + " 台 · " + JSON.stringify(r.device_ids || []);
+      } catch (e) {
+        $("err").textContent = String(e.message || e);
+      }
+    }
+
+    $("saveTok").onclick = saveTok;
+    $("onAll").onclick = () => postAlerts("on");
+    $("offAll").onclick = () => postAlerts("off");
+    loadTok();
+  </script>
+</body>
+</html>

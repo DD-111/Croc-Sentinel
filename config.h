@@ -1,0 +1,210 @@
+#ifndef CONFIG_H
+#define CONFIG_H
+
+// Optional board overrides:
+// #define FORCE_BOARD_PROFILE_PRODINO_ESP32_ETH
+// #define FORCE_BOARD_PROFILE_WAVESHARE_ESP32_P4_ETH
+
+#include "board_select.h"
+
+// ── Firmware version (bump before each OTA release) ──
+#define FW_VERSION "2.1.0"
+// Production guardrails: set to 1 for strict startup validation.
+#define PROD_ENFORCE 1
+// Keep command compatibility with previous 2 protocol versions.
+#define CMD_PROTO_MIN 1
+#define CMD_PROTO_MAX 2
+
+// ── Device ID mode ──
+#define DEVICE_ID_AUTO 1
+#define DEVICE_ID_MANUAL "esp32-001"
+
+// ── Zone ──
+#define DEVICE_ZONE "all"
+
+// ── WiFi ──
+#define WIFI_SSID "YOUR_WIFI_SSID"
+#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#define WIFI_CONNECT_WAIT_MS 8000
+
+// ── Network interface mode ──
+#define NETIF_MODE_WIFI 1
+#define NETIF_MODE_ETHERNET 2
+#ifndef NETIF_MODE
+#ifdef BOARD_DEFAULT_NETIF_MODE
+#define NETIF_MODE BOARD_DEFAULT_NETIF_MODE
+#else
+#define NETIF_MODE NETIF_MODE_WIFI
+#endif
+#endif
+
+// ── MQTT broker / VPS ──
+#define MQTT_HOST "your.vps.domain"
+#define MQTT_PORT 8883
+#define MQTT_USERNAME "mqtt_user"
+#define MQTT_PASSWORD "mqtt_pass"
+#define MQTT_USE_TLS 1
+#define MQTT_CLEAN_SESSION false
+// Required when MQTT_USE_TLS=1 and PROD_ENFORCE=1.
+// For CA rotation: keep primary old CA, secondary new CA during transition.
+#define MQTT_CA_CERT_PRIMARY_PEM ""
+#define MQTT_CA_CERT_SECONDARY_PEM ""
+// Bootstrap credential used before dashboard claim/bind.
+#define BOOTSTRAP_MQTT_USERNAME "bootstrap_user"
+#define BOOTSTRAP_MQTT_PASSWORD "bootstrap_pass"
+// Shared bind key for bootstrap claim messages.
+#define BOOTSTRAP_BIND_KEY "CHANGE_ME_BOOTSTRAP_BIND_KEY"
+
+// ── Ethernet PHY (used when NETIF_MODE == NETIF_MODE_ETHERNET) ──
+#ifndef ETH_PHY_TYPE
+#ifdef BOARD_ETH_PHY_TYPE
+#define ETH_PHY_TYPE BOARD_ETH_PHY_TYPE
+#else
+#define ETH_PHY_TYPE ETH_PHY_LAN8720
+#endif
+#endif
+#ifndef ETH_PHY_ADDR
+#ifdef BOARD_ETH_PHY_ADDR
+#define ETH_PHY_ADDR BOARD_ETH_PHY_ADDR
+#else
+#define ETH_PHY_ADDR 0
+#endif
+#endif
+#ifndef ETH_MDC_PIN
+#ifdef BOARD_ETH_MDC_PIN
+#define ETH_MDC_PIN BOARD_ETH_MDC_PIN
+#else
+#define ETH_MDC_PIN 23
+#endif
+#endif
+#ifndef ETH_MDIO_PIN
+#ifdef BOARD_ETH_MDIO_PIN
+#define ETH_MDIO_PIN BOARD_ETH_MDIO_PIN
+#else
+#define ETH_MDIO_PIN 18
+#endif
+#endif
+#ifndef ETH_POWER_PIN
+#ifdef BOARD_ETH_POWER_PIN
+#define ETH_POWER_PIN BOARD_ETH_POWER_PIN
+#else
+#define ETH_POWER_PIN -1
+#endif
+#endif
+#ifndef ETH_CLK_MODE
+#ifdef BOARD_ETH_CLK_MODE
+#define ETH_CLK_MODE BOARD_ETH_CLK_MODE
+#else
+#define ETH_CLK_MODE ETH_CLOCK_GPIO17_OUT
+#endif
+#endif
+
+// ── Command authentication (64-bit hex key) ──
+// ALL commands require this key. Change before deployment.
+// Generate: openssl rand -hex 8   (produces 16 hex chars = 64 bits)
+#define CMD_AUTH_KEY "A7F3B2E91C04D568"
+
+// ── OTA firmware update ──
+#define OTA_ENABLED 1
+// Only accept OTA URLs starting with this prefix (your VPS).
+// Set to "" to disable domain lock (not recommended in production).
+#define OTA_ALLOWED_HOST "your.vps.domain"
+// Token appended as query param: http://host/fw/v2.1.bin?token=XXX
+// VPS nginx checks this token before serving the .bin file.
+#define OTA_TOKEN "CHANGE_ME_OTA_SECRET"
+// Mark OTA as healthy after continuous uptime.
+#define OTA_HEALTH_CONFIRM_MS 20000UL
+// Auto rollback after too many failed boots on new firmware.
+#define OTA_MAX_BOOT_FAILS 3
+
+// ── NTP ──
+#define NTP_SERVER "pool.ntp.org"
+#define NTP_GMT_OFFSET_S 0
+#define NTP_DAYLIGHT_OFFSET_S 0
+#define NTP_RESYNC_INTERVAL_MS 3600000UL
+
+// ── Topics ──
+#define TOPIC_ROOT "sentinel"
+#define TOPIC_BROADCAST_ALARM "sentinel/broadcast/alarm"
+#define TOPIC_BOOTSTRAP_REGISTER "sentinel/bootstrap/register"
+#define TOPIC_BOOTSTRAP_ASSIGN_PREFIX "sentinel/bootstrap/assign"
+
+// ── GPIO (board profile defaults, override per project if needed) ──
+#ifndef SIREN_GPIO
+#define SIREN_GPIO BOARD_DEFAULT_SIREN_GPIO
+#endif
+#ifndef TRIGGER_GPIO
+#define TRIGGER_GPIO BOARD_DEFAULT_TRIGGER_GPIO
+#endif
+#ifndef STATUS_LED_GPIO
+#define STATUS_LED_GPIO BOARD_DEFAULT_STATUS_LED_GPIO
+#endif
+
+// ── Behaviour ──
+#define TRIGGER_SELF_SIREN 0
+#define SIREN_ON_MS 8000
+#define DEBOUNCE_MS 80
+#define ALARM_COOLDOWN_MS 5000
+
+// ── Task intervals (milliseconds) ──
+#define HEARTBEAT_INTERVAL_MS 2000
+#define STATUS_INTERVAL_MS 5000
+#define THROUGHPUT_WINDOW_MS 10000
+#define WIFI_RECONNECT_BASE_MS 2000
+#define MQTT_RECONNECT_BASE_MS 2000
+#define RECONNECT_MAX_MS 60000
+
+// ── Offline event queue ──
+#define OFFLINE_QUEUE_MAX 20
+
+// ── Power / signal thresholds ──
+#ifndef VBAT_SENSOR_ENABLED
+#define VBAT_SENSOR_ENABLED BOARD_HAS_VBAT_ADC
+#endif
+#if VBAT_SENSOR_ENABLED
+#ifndef VBAT_ADC_PIN
+#define VBAT_ADC_PIN BOARD_DEFAULT_VBAT_ADC_PIN
+#endif
+#ifndef VBAT_ADC_ATTENUATION
+#define VBAT_ADC_ATTENUATION BOARD_DEFAULT_ADC_ATTENUATION
+#endif
+#endif
+#define VBAT_LOW_THRESHOLD 3.30f
+#define RSSI_WEAK_THRESHOLD -75
+
+// ── ADC calibration ──
+#define ADC_MAX 4095.0f
+#define ADC_VREF 3.30f
+#define VBAT_DIVIDER_RATIO 2.00f
+#define ADC_OVERSAMPLE 16
+
+// ── Watchdog timeout (seconds) ──
+#define WDT_TIMEOUT_S 30
+
+// ── NVS ──
+#define NVS_NAMESPACE "sentinel"
+
+// ── Parameter validation bounds ──
+#define PARAM_HB_MIN_MS 500
+#define PARAM_HB_MAX_MS 60000
+#define PARAM_ST_MIN_MS 1000
+#define PARAM_ST_MAX_MS 300000
+#define PARAM_SIREN_MIN_MS 500
+#define PARAM_SIREN_MAX_MS 120000
+#define PARAM_RSSI_MIN -100
+#define PARAM_RSSI_MAX -20
+#define PARAM_VBAT_MIN 2.0f
+#define PARAM_VBAT_MAX 5.0f
+
+// ── NVS write-wear protection ──
+#define NVS_SAVE_COOLDOWN_MS 10000
+
+// ── Bootstrap provisioning ──
+#define BOOTSTRAP_REGISTER_INTERVAL_MS 10000
+#define QR_DEFAULT_PREFIX "CROC"
+
+// ── MQTT JSON buffer sizing ──
+#define MQTT_RX_BUFFER_BYTES 2048
+#define MQTT_JSON_DOC_BYTES 1536
+
+#endif
