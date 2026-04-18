@@ -8,8 +8,7 @@
   --transition: 160ms cubic-bezier(0.4, 0, 0.2, 1);
   --sidebar-w: 248px;
   --topbar-h: 56px;
-  --font: "Inter", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", "PingFang SC",
-    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --font: system-ui, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "SF Mono", monospace;
 }
 

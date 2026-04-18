@@ -15,6 +15,7 @@ from factory_core import (
     DEFAULT_QR_POLICY,
     default_dotenv_path,
     generate_items,
+    get_factory_ping,
     post_factory_devices,
     read_dotenv_keys,
     repo_root,
@@ -45,6 +46,11 @@ def main() -> None:
         help="After writing files, POST items to server /factory/devices",
     )
     ap.add_argument(
+        "--ping",
+        action="store_true",
+        help="GET /factory/ping then exit (checks FACTORY_UI_API_BASE + FACTORY_API_TOKEN)",
+    )
+    ap.add_argument(
         "--api-base",
         default="",
         help="API root e.g. https://host:8088 (else FACTORY_UI_API_BASE from .env)",
@@ -58,7 +64,19 @@ def main() -> None:
 
     root = repo_root()
     dot = Path(args.dotenv).expanduser() if args.dotenv else default_dotenv_path()
-    env = read_dotenv_keys(dot, ("QR_SIGN_SECRET", "FACTORY_API_TOKEN", "FACTORY_UI_API_BASE"))
+    env = read_dotenv_keys(
+        dot,
+        ("QR_SIGN_SECRET", "FACTORY_API_TOKEN", "FACTORY_UI_API_BASE", "FACTORY_AUTO_PUSH"),
+    )
+    if args.ping:
+        api_base = (args.api_base or env["FACTORY_UI_API_BASE"] or "").strip().rstrip("/")
+        token = (env["FACTORY_API_TOKEN"] or "").strip()
+        if not api_base or not token:
+            print("Error: --ping needs --api-base + token or FACTORY_UI_API_BASE + FACTORY_API_TOKEN in .env", file=sys.stderr)
+            sys.exit(4)
+        code, body = get_factory_ping(api_base, token, insecure_ssl=args.insecure_ssl)
+        print(f"GET /factory/ping -> HTTP {code}\n{body}")
+        sys.exit(0 if code == 200 else 7)
     secret = (args.qr_secret or env["QR_SIGN_SECRET"] or "").strip()
     if not secret:
         print("Error: set QR_SIGN_SECRET in .env or pass --qr-secret", file=sys.stderr)
@@ -84,14 +102,15 @@ def main() -> None:
     write_batch_files(out, items, batch)
     print(f"Wrote {len(items)} devices to:\n  {out}")
 
-    if args.push:
+    do_push = bool(args.push) or (env.get("FACTORY_AUTO_PUSH") or "").strip() == "1"
+    if do_push:
         api_base = (args.api_base or env["FACTORY_UI_API_BASE"] or "").strip().rstrip("/")
         token = (env["FACTORY_API_TOKEN"] or "").strip()
         if not api_base:
-            print("Error: --push needs --api-base or FACTORY_UI_API_BASE in .env", file=sys.stderr)
+            print("Error: push needs --api-base or FACTORY_UI_API_BASE in .env", file=sys.stderr)
             sys.exit(4)
         if not token:
-            print("Error: --push needs FACTORY_API_TOKEN in .env", file=sys.stderr)
+            print("Error: push needs FACTORY_API_TOKEN in .env", file=sys.stderr)
             sys.exit(5)
         code, body = post_factory_devices(api_base, token, items, insecure_ssl=args.insecure_ssl)
         print(f"POST /factory/devices -> HTTP {code}\n{body}")

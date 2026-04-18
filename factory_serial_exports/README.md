@@ -50,6 +50,21 @@ python tools/factory_pack/generate_serial_qr.py --verify-qr "CROC|SN-....|....|.
 python tools/factory_pack/generate_serial_qr.py --count 5 --batch TEST001 --push
 ```
 
+**免每次手写 `--push`**：在 **`croc_sentinel_systems/.env`**（或 `--dotenv` 指向的文件）里设 **`FACTORY_AUTO_PUSH=1`** 且已配置 **`FACTORY_UI_API_BASE`** + **`FACTORY_API_TOKEN`**，则只运行：
+
+```bash
+python tools/factory_pack/generate_serial_qr.py --count 20 --batch LINE02
+```
+
+即会在写本地文件后 **自动 POST `/factory/devices`**。
+
+**先测连通再量产**：
+
+```bash
+python tools/factory_pack/generate_serial_qr.py --ping
+# 或指定 VPS：  --api-base https://YOUR_HOST:8088
+```
+
 部署新版 API 后，可用 **`GET /factory/ping`** + 头 **`X-Factory-Token`** 验证 Token 是否生效（**`factory_ui`「测试 API+Token」** 即调用此接口）。
 
 浏览器激活页支持深链预填：`#/activate?q=<序列号或整段CROC|...>`（需已登录）。

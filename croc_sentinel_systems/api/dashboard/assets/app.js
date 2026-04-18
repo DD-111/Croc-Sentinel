@@ -13,14 +13,14 @@
   const OFFLINE_MS = 90 * 1000;
 
   const NAV = [
-    { id: "overview",  label: "总览",     ico: "◎", path: "#/overview",   min: "user"  },
-    { id: "alerts",    label: "触发警报", ico: "!", path: "#/alerts",     min: "user"  },
-    { id: "alarm-log", label: "警报历史", ico: "⚑", path: "#/alarm-log",  min: "user"  },
-    { id: "activate",  label: "激活设备", ico: "+", path: "#/activate",   min: "admin" },
-    { id: "ota",       label: "OTA 更新", ico: "↑", path: "#/ota",        min: "admin" },
-    { id: "events",    label: "事件中心", ico: "≈", path: "#/events",     min: "user"  },
-    { id: "audit",     label: "审计",     ico: "≡", path: "#/audit",      min: "admin" },
-    { id: "admin",     label: "系统管理", ico: "☼", path: "#/admin",      min: "admin" },
+    { id: "overview",  label: "Overview",  ico: "◎", path: "#/overview",   min: "user"  },
+    { id: "signals",   label: "Signals",   ico: "◉", path: "#/signals",    min: "user"  },
+    { id: "alerts",    label: "Siren",     ico: "!", path: "#/alerts",     min: "user"  },
+    { id: "activate",  label: "Activate",  ico: "+", path: "#/activate",   min: "admin" },
+    { id: "ota",       label: "OTA",       ico: "↑", path: "#/ota",        min: "admin" },
+    { id: "events",    label: "Events",    ico: "≈", path: "#/events",     min: "user"  },
+    { id: "audit",     label: "Audit",     ico: "≡", path: "#/audit",      min: "admin" },
+    { id: "admin",     label: "Admin",     ico: "☼", path: "#/admin",      min: "admin" },
   ];
 
   const ROLE_WEIGHT = { user: 1, admin: 2, superadmin: 3 };
@@ -94,10 +94,10 @@
     const t = Date.parse(v);
     if (!Number.isFinite(t)) return String(v);
     const diff = Date.now() - t;
-    if (diff < 60_000) return "刚刚";
-    if (diff < 3600_000) return `${Math.floor(diff / 60000)} 分钟前`;
-    if (diff < 86400_000) return `${Math.floor(diff / 3600000)} 小时前`;
-    return `${Math.floor(diff / 86400000)} 天前`;
+    if (diff < 60_000) return "just now";
+    if (diff < 3600_000) return `${Math.floor(diff / 60000)}m ago`;
+    if (diff < 86400_000) return `${Math.floor(diff / 3600000)}h ago`;
+    return `${Math.floor(diff / 86400000)}d ago`;
   }
 
   function roleWeight(r) { return ROLE_WEIGHT[r] || 0; }
@@ -132,7 +132,7 @@
       setToken("");
       state.me = null;
       if (location.hash !== "#/login") location.hash = "#/login";
-      throw new Error("401 未授权或登录已过期");
+      throw new Error("401 Unauthorized or session expired");
     }
     if (!r.ok) {
       const t = await r.text().catch(() => "");
@@ -188,7 +188,7 @@
         `<div><strong>${escapeHtml(state.me.username)}</strong></div>` +
         `<div class="muted">${escapeHtml(state.me.role)} · ${escapeHtml((state.me.zones || []).join(", ") || "—")}</div>`;
     } else {
-      who.textContent = "未登录";
+      who.textContent = "Signed out";
     }
     renderNav();
   }
@@ -202,14 +202,14 @@
       const active = hash.startsWith(n.path) ? ` aria-current="page"` : "";
       return `<a href="${n.path}"${active}><span class="nav-ico">${n.ico}</span>${escapeHtml(n.label)}</a>`;
     }).join("");
-    nav.innerHTML = `<div class="nav-section">操作</div>${items}`;
+    nav.innerHTML = `<div class="nav-section">Menu</div>${items}`;
   }
 
   function renderMqttDot() {
     const dot = $("#mqttDot");
     if (!dot) return;
     dot.className = "dot-status " + (state.mqttConnected ? "ok" : "bad");
-    dot.title = state.mqttConnected ? "MQTT 已连接" : "MQTT 断开";
+    dot.title = state.mqttConnected ? "MQTT up" : "MQTT down";
   }
 
   function setCrumb(text) { const el = $("#crumb"); if (el) el.textContent = text; }
@@ -273,13 +273,14 @@
       location.hash = "#/overview";
       return;
     }
-    const handler = routes[id] || routes["overview"];
+    const routeId = id === "alarm-log" ? "signals" : id;
+    const handler = routes[routeId] || routes["overview"];
     try {
-      view.innerHTML = '<div class="card"><span class="muted">加载中…</span></div>';
+      view.innerHTML = '<div class="card"><span class="muted">Loading…</span></div>';
       await handler(view, args);
       renderNav();
     } catch (e) {
-      view.innerHTML = `<div class="card"><h2>加载失败</h2><p class="muted">${escapeHtml(e.message || e)}</p></div>`;
+      view.innerHTML = `<div class="card"><h2>Load failed</h2><p class="muted">${escapeHtml(e.message || e)}</p></div>`;
     }
   }
 
@@ -288,29 +289,29 @@
   // ------------------------------------------------------------------ pages
   // Login
   registerRoute("login", async (view) => {
-    setCrumb("登录");
+    setCrumb("Sign in");
     document.body.dataset.auth = "none";
     view.innerHTML = `
       <div class="login-wrap">
         <form class="login-card" id="loginForm" autocomplete="on">
           <h1>Croc Sentinel</h1>
-          <p class="muted">用用户名和密码进入控制台，管理设备与告警。</p>
+          <p class="muted">Sign in with username and password.</p>
           <label class="field">
-            <span>用户名</span>
+            <span>Username</span>
             <input name="username" autocomplete="username" required />
           </label>
           <label class="field" style="margin-top:10px">
-            <span>密码</span>
+            <span>Password</span>
             <input name="password" type="password" autocomplete="current-password" required />
           </label>
           <div style="margin-top:18px">
-            <button class="btn btn-tap btn-block" type="submit">登录</button>
+            <button class="btn btn-tap btn-block" type="submit">Sign in</button>
           </div>
           <p class="muted" id="loginMsg" style="margin-top:10px;min-height:1.4em"></p>
           <div class="login-link-stack">
-            <a class="link-tile" href="#/register">注册管理员（只用邮箱验证）</a>
-            <a class="link-tile" href="#/account-activate">激活账号（收邮件里的验证码）</a>
-            <a class="link-tile" href="#/forgot-password" title="离线 RSA 解密；长十六进制编码">忘记密码</a>
+            <a class="link-tile" href="#/register">Register admin (email OTP)</a>
+            <a class="link-tile" href="#/account-activate">Activate account (email code)</a>
+            <a class="link-tile" href="#/forgot-password" title="Offline RSA recovery">Forgot password</a>
           </div>
         </form>
       </div>`;
@@ -602,7 +603,7 @@
 
   // Overview
   registerRoute("overview", async (view) => {
-    setCrumb("总览");
+    setCrumb("Overview");
     const [ov, list] = await Promise.all([api("/dashboard/overview"), api("/devices")]);
     const devices = list.items || [];
     const online = (ov.presence && ov.presence.online != null) ? ov.presence.online : devices.filter(isOnline).length;
@@ -616,34 +617,34 @@
       return (v / 1024 / 1024).toFixed(2) + " MB/s";
     };
     const stats = [
-      ["设备总数", ov.total_devices ?? devices.length, "在你管辖范围内"],
-      ["在线",     online,                               "最近上报且 online=true"],
-      ["离线",     offline,                              "超 90s 未上报 / online=false"],
-      ["24h 警报", ov.alarms_24h ?? 0,                   "过去 24 小时触发次数"],
-      ["MQTT",     ov.mqtt_connected ? "已连接" : "断开",  "broker 状态"],
-      ["总吞吐",   `${bps(tp.tx_bps_total)} / ${bps(tp.rx_bps_total)}`, "Tx / Rx (在线设备合计)"],
+      ["Devices", ov.total_devices ?? devices.length, "in your scope"],
+      ["Online", online, "recent status online=true"],
+      ["Offline", offline, ">90s stale / online=false"],
+      ["Alarms 24h", ov.alarms_24h ?? 0, "device alarm count"],
+      ["MQTT", ov.mqtt_connected ? "up" : "down", "broker"],
+      ["Throughput", `${bps(tp.tx_bps_total)} / ${bps(tp.rx_bps_total)}`, "Tx / Rx sum"],
     ].map(([k, v, s]) => `<div class="stat"><div class="k">${escapeHtml(k)}</div><div class="v">${escapeHtml(v)}</div><div class="sub">${escapeHtml(s)}</div></div>`).join("");
     const presenceCards = `
-      <div class="stat"><div class="k">电量过低</div><div class="v">${pr.reason_power_low || 0}</div><div class="sub">vbat < 阈值</div></div>
-      <div class="stat"><div class="k">网络中断</div><div class="v">${pr.reason_network_lost || 0}</div><div class="sub">链路断开 / 超时</div></div>
-      <div class="stat"><div class="k">信号弱</div><div class="v">${pr.reason_signal_weak || 0}</div><div class="sub">RSSI 低于阈值</div></div>
-      <div class="stat"><div class="k">原因未知</div><div class="v">${pr.reason_unknown || 0}</div><div class="sub">尚无最新状态</div></div>`;
+      <div class="stat"><div class="k">Power low</div><div class="v">${pr.reason_power_low || 0}</div><div class="sub">vbat</div></div>
+      <div class="stat"><div class="k">Network lost</div><div class="v">${pr.reason_network_lost || 0}</div><div class="sub">link / timeout</div></div>
+      <div class="stat"><div class="k">Weak signal</div><div class="v">${pr.reason_signal_weak || 0}</div><div class="sub">RSSI</div></div>
+      <div class="stat"><div class="k">Unknown</div><div class="v">${pr.reason_unknown || 0}</div><div class="sub">no reason yet</div></div>`;
 
     view.innerHTML = `
       <section class="stats">${stats}</section>
       <section class="card">
         <div class="row">
-          <h3 style="margin:0">离线原因分布</h3>
-          <span class="muted">来自各设备上报的 disconnect_reason</span>
+          <h3 style="margin:0">Offline breakdown</h3>
+          <span class="muted">disconnect_reason from devices</span>
         </div>
         <div class="divider"></div>
         <section class="stats">${presenceCards}</section>
       </section>
       <section class="card">
         <div class="row" style="align-items:center">
-          <h2 style="margin:0">我的设备</h2>
-          <span class="muted">共 ${devices.length} 台</span>
-          <input id="q" placeholder="按 device_id / zone / fw 过滤" class="grow right" />
+          <h2 style="margin:0">Devices</h2>
+          <span class="muted">${devices.length} total</span>
+          <input id="q" placeholder="Filter id / name / zone / fw" class="grow right" />
         </div>
         <div class="divider"></div>
         <div class="device-grid" id="devGrid"></div>
@@ -653,22 +654,23 @@
       const grid = document.getElementById("devGrid");
       if (!grid) return;
       const q = ($("#q").value || "").toLowerCase().trim();
-      const rows = devices.filter((d) => !q || [d.device_id, d.zone, d.fw, d.board_profile, d.chip_target].join(" ").toLowerCase().includes(q));
+      const rows = devices.filter((d) => !q || [d.device_id, d.display_label, d.zone, d.fw, d.board_profile, d.chip_target].join(" ").toLowerCase().includes(q));
       grid.innerHTML = rows.length === 0
-        ? `<p class="muted">没有匹配的设备。</p>`
+        ? `<p class="muted">No matching devices.</p>`
         : rows.map((d) => {
           const on = isOnline(d);
+          const title = d.display_label ? `${escapeHtml(d.display_label)} · ${escapeHtml(d.device_id)}` : escapeHtml(d.device_id || "unknown");
           return `<a class="device-card" href="#/devices/${encodeURIComponent(d.device_id)}" style="text-decoration:none;color:inherit">
-            <h3>${escapeHtml(d.device_id || "unknown")}</h3>
-            <div><span class="badge ${on ? "online" : "offline"}">${on ? "在线" : "离线"}</span>
+            <h3>${title}</h3>
+            <div><span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>
               ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
               ${d.fw ? `<span class="chip">v${escapeHtml(d.fw)}</span>` : ""}
             </div>
             <div class="meta">
-              芯片: ${escapeHtml(d.chip_target || "—")}<br/>
-              板型: ${escapeHtml(d.board_profile || "—")}<br/>
-              网络: ${escapeHtml(d.net_type || "—")}<br/>
-              更新: ${escapeHtml(fmtRel(d.updated_at))}
+              Chip: ${escapeHtml(d.chip_target || "—")}<br/>
+              Board: ${escapeHtml(d.board_profile || "—")}<br/>
+              Net: ${escapeHtml(d.net_type || "—")}<br/>
+              Updated: ${escapeHtml(fmtRel(d.updated_at))}
             </div>
           </a>`;
         }).join("");
@@ -687,7 +689,7 @@
   registerRoute("devices", async (view, args) => {
     const id = decodeURIComponent(args[0] || "");
     if (!id) { location.hash = "#/overview"; return; }
-    setCrumb(`设备 · ${id}`);
+    setCrumb(`Device · ${id}`);
 
     const [d, msgs] = await Promise.all([
       api(`/devices/${encodeURIComponent(id)}`),
@@ -701,11 +703,11 @@
       if (v < 1024 * 1024) return (v / 1024).toFixed(1) + " KB/s";
       return (v / 1024 / 1024).toFixed(2) + " MB/s";
     };
-    const reasonZh = {
-      none: "正常",
-      power_low: "电量过低",
-      network_lost: "网络中断",
-      signal_weak: "信号弱",
+    const reasonEn = {
+      none: "OK",
+      power_low: "Power low",
+      network_lost: "Network lost",
+      signal_weak: "Weak signal",
     };
     const reason = s.disconnect_reason || (on ? "none" : "network_lost");
     const vbat = (s.vbat == null || s.vbat < 0) ? "—" : `${Number(s.vbat).toFixed(2)} V`;
@@ -715,78 +717,94 @@
       <div class="card">
         <div class="row">
           <h2 style="margin:0">${escapeHtml(id)}</h2>
-          <span class="badge ${on ? "online" : "offline"}">${on ? "在线" : "离线"}</span>
-          <span class="chip">${escapeHtml(reasonZh[reason] || reason)}</span>
+          <span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>
+          <span class="chip">${escapeHtml(reasonEn[reason] || reason)}</span>
           ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
-          <a href="#/overview" class="btn ghost right">← 返回总览</a>
+          <a href="#/overview" class="btn ghost right">← Overview</a>
         </div>
         <div class="divider"></div>
+        <div class="row" style="gap:10px;align-items:flex-end;flex-wrap:wrap;margin-bottom:10px">
+          <label class="field grow"><span>Display name</span>
+            <input id="dispLabel" value="${escapeHtml(d.display_label || "")}" maxlength="80" />
+          </label>
+          <button class="btn secondary" type="button" id="saveLabel">Save</button>
+        </div>
         <dl class="kv">
-          <dt>固件</dt><dd class="mono">${escapeHtml(d.fw || "—")}</dd>
-          <dt>芯片</dt><dd class="mono">${escapeHtml(d.chip_target || "—")}</dd>
-          <dt>板型</dt><dd class="mono">${escapeHtml(d.board_profile || "—")}</dd>
-          <dt>网络</dt><dd class="mono">${escapeHtml(d.net_type || "—")} · ${escapeHtml(s.ip || "—")}</dd>
+          <dt>Firmware</dt><dd class="mono">${escapeHtml(d.fw || "—")}</dd>
+          <dt>Chip</dt><dd class="mono">${escapeHtml(d.chip_target || "—")}</dd>
+          <dt>Board</dt><dd class="mono">${escapeHtml(d.board_profile || "—")}</dd>
+          <dt>Network</dt><dd class="mono">${escapeHtml(d.net_type || "—")} · ${escapeHtml(s.ip || "—")}</dd>
           <dt>RSSI</dt><dd class="mono">${escapeHtml(rssi)}</dd>
-          <dt>电池</dt><dd class="mono">${escapeHtml(vbat)}</dd>
-          <dt>吞吐 Tx / Rx</dt><dd class="mono">${escapeHtml(bps(s.tx_bps))} / ${escapeHtml(bps(s.rx_bps))}</dd>
-          <dt>离线原因</dt><dd class="mono">${escapeHtml(reason)}</dd>
-          <dt>已激活</dt><dd>${d.provisioned ? "是" : "否"}</dd>
-          <dt>运行时间</dt><dd class="mono">${escapeHtml((s.uptime_s ? `${Math.floor(s.uptime_s / 3600)}h ${Math.floor((s.uptime_s % 3600) / 60)}m` : "—"))}</dd>
-          <dt>空闲堆</dt><dd class="mono">${escapeHtml(s.free_heap ? `${s.free_heap} B (最低 ${s.min_free_heap || "?"} B)` : "—")}</dd>
-          <dt>更新时间</dt><dd>${escapeHtml(fmtTs(d.updated_at))} (${escapeHtml(fmtRel(d.updated_at))})</dd>
+          <dt>Battery</dt><dd class="mono">${escapeHtml(vbat)}</dd>
+          <dt>Tx / Rx</dt><dd class="mono">${escapeHtml(bps(s.tx_bps))} / ${escapeHtml(bps(s.rx_bps))}</dd>
+          <dt>Disconnect</dt><dd class="mono">${escapeHtml(reason)}</dd>
+          <dt>Provisioned</dt><dd>${d.provisioned ? "yes" : "no"}</dd>
+          <dt>Uptime</dt><dd class="mono">${escapeHtml((s.uptime_s ? `${Math.floor(s.uptime_s / 3600)}h ${Math.floor((s.uptime_s % 3600) / 60)}m` : "—"))}</dd>
+          <dt>Free heap</dt><dd class="mono">${escapeHtml(s.free_heap ? `${s.free_heap} B (min ${s.min_free_heap || "?"} B)` : "—")}</dd>
+          <dt>Updated</dt><dd>${escapeHtml(fmtTs(d.updated_at))} (${escapeHtml(fmtRel(d.updated_at))})</dd>
         </dl>
       </div>
 
       <div class="split">
         <div class="card">
-          <h3>快速操作</h3>
+          <h3>Quick actions</h3>
           <div class="row">
-            <button class="btn" id="alertOn" ${can("can_alert") ? "" : "disabled"}>触发警报</button>
-            <button class="btn secondary" id="alertOff" ${can("can_alert") ? "" : "disabled"}>取消警报</button>
-            <button class="btn secondary" id="selfTest" ${can("can_send_command") ? "" : "disabled"}>自检</button>
+            <button class="btn" id="alertOn" ${can("can_alert") ? "" : "disabled"}>Siren ON</button>
+            <button class="btn secondary" id="alertOff" ${can("can_alert") ? "" : "disabled"}>Siren OFF</button>
+            <button class="btn secondary" id="selfTest" ${can("can_send_command") ? "" : "disabled"}>Self-test</button>
           </div>
           <div class="row" style="margin-top:10px">
-            <input id="rebootDelay" placeholder="重启延迟秒(如 30)" style="max-width:200px" />
-            <button class="btn secondary" id="doReboot" ${can("can_send_command") ? "" : "disabled"}>定时重启</button>
+            <input id="rebootDelay" placeholder="Delay seconds (e.g. 30)" style="max-width:200px" />
+            <button class="btn secondary" id="doReboot" ${can("can_send_command") ? "" : "disabled"}>Schedule reboot</button>
           </div>
           <div class="row" style="margin-top:14px">
-            <button class="btn danger" id="revoke" ${can("can_send_command") ? "" : "disabled"}>吊销设备</button>
-            <button class="btn secondary" id="unrevoke" ${can("can_send_command") ? "" : "disabled"}>恢复设备</button>
+            <button class="btn danger" id="revoke" ${can("can_send_command") ? "" : "disabled"}>Revoke</button>
+            <button class="btn secondary" id="unrevoke" ${can("can_send_command") ? "" : "disabled"}>Unrevoke</button>
           </div>
         </div>
         <div class="card">
-          <h3>下发命令（高级）</h3>
-          <label class="field"><span>cmd</span><input id="cmdName" placeholder="如 get_info / ota" ${can("can_send_command") ? "" : "disabled"} /></label>
+          <h3>Raw command</h3>
+          <label class="field"><span>cmd</span><input id="cmdName" placeholder="get_info / ota" ${can("can_send_command") ? "" : "disabled"} /></label>
           <label class="field" style="margin-top:8px"><span>params (JSON)</span><textarea id="cmdParams" placeholder='{"key":"value"}' ${can("can_send_command") ? "" : "disabled"}></textarea></label>
           <div class="row" style="margin-top:8px;justify-content:flex-end">
-            <button class="btn" id="sendCmd" ${can("can_send_command") ? "" : "disabled"}>发送</button>
+            <button class="btn" id="sendCmd" ${can("can_send_command") ? "" : "disabled"}>Send</button>
           </div>
         </div>
       </div>
 
       <div class="card">
         <div class="row">
-          <h3 style="margin:0">最近消息</h3>
-          <span class="muted">最多 25 条</span>
+          <h3 style="margin:0">Recent messages</h3>
+          <span class="muted">last 25</span>
         </div>
         <div class="divider"></div>
         <div class="table-wrap">
           <table class="t">
-            <thead><tr><th>时间</th><th>通道</th><th>payload</th></tr></thead>
+            <thead><tr><th>Time</th><th>Channel</th><th>Payload</th></tr></thead>
             <tbody>
               ${(msgs.items || []).map((m) => `
                 <tr>
                   <td>${escapeHtml(fmtTs(m.ts_received))}</td>
                   <td><span class="chip">${escapeHtml(m.channel || "")}</span></td>
                   <td><pre class="code">${escapeHtml(JSON.stringify(m.payload || {}))}</pre></td>
-                </tr>`).join("") || `<tr><td colspan="3" class="muted">暂无消息</td></tr>`}
+                </tr>`).join("") || `<tr><td colspan="3" class="muted">No messages</td></tr>`}
             </tbody>
           </table>
         </div>
       </div>`;
 
+    $("#saveLabel").addEventListener("click", async () => {
+      try {
+        await api(`/devices/${encodeURIComponent(id)}/display-label`, {
+          method: "PATCH",
+          body: { display_label: ($("#dispLabel").value || "").trim() },
+        });
+        toast("Saved", "ok");
+      } catch (e) { toast(e.message || e, "err"); }
+    });
+
     const withDev = (fn) => async () => {
-      try { await fn(); toast("已发送", "ok"); }
+      try { await fn(); toast("Sent", "ok"); }
       catch (e) { toast(e.message || e, "err"); }
     };
 
@@ -798,14 +816,14 @@
       api(`/devices/${encodeURIComponent(id)}/self-test`, { method: "POST" })));
     $("#doReboot").addEventListener("click", withDev(() => {
       const v = parseInt($("#rebootDelay").value, 10);
-      if (!Number.isFinite(v) || v < 5) throw new Error("请输入 >= 5 的秒数");
+      if (!Number.isFinite(v) || v < 5) throw new Error("delay must be >= 5 seconds");
       return api(`/devices/${encodeURIComponent(id)}/schedule-reboot`, { method: "POST", body: { delay_s: v } });
     }));
     $("#revoke").addEventListener("click", async () => {
-      if (!confirm("确定吊销该设备？")) return;
+      if (!confirm("Revoke this device?")) return;
       try {
         await api(`/devices/${encodeURIComponent(id)}/revoke`, { method: "POST", body: { reason: "console manual" } });
-        toast("已吊销", "ok");
+        toast("Revoked", "ok");
       } catch (e) { toast(e.message || e, "err"); }
     });
     $("#unrevoke").addEventListener("click", withDev(() =>
@@ -813,58 +831,61 @@
 
     $("#sendCmd").addEventListener("click", async () => {
       const name = ($("#cmdName").value || "").trim();
-      if (!name) { toast("请输入 cmd", "err"); return; }
+      if (!name) { toast("Enter cmd", "err"); return; }
       let params = {};
       const raw = ($("#cmdParams").value || "").trim();
       if (raw) {
-        try { params = JSON.parse(raw); } catch { toast("params 不是合法 JSON", "err"); return; }
+        try { params = JSON.parse(raw); } catch { toast("Invalid JSON in params", "err"); return; }
       }
       try {
         await api(`/devices/${encodeURIComponent(id)}/commands`, { method: "POST", body: { cmd: name, params } });
-        toast("已下发命令", "ok");
+        toast("Command sent", "ok");
       } catch (e) { toast(e.message || e, "err"); }
     });
   });
 
   // Alerts
   registerRoute("alerts", async (view) => {
-    setCrumb("警报");
+    setCrumb("Siren");
     const enabled = can("can_alert");
     const list = await api("/devices").catch(() => ({ items: [] }));
     const devices = list.items || [];
 
     view.innerHTML = `
       <div class="card">
-        <h2>红色警报 / Siren</h2>
-        <p class="muted">按范围批量触发或取消报警；user 角色需具备 <span class="mono">can_alert</span> 能力。</p>
-        ${enabled ? "" : `<p class="badge revoked">当前账号未被授予警报能力。联系管理员在「系统管理 → 策略」中开启。</p>`}
+        <h2>Bulk siren</h2>
+        <p class="muted">MQTT <span class="mono">siren_on</span> / <span class="mono">siren_off</span>. Requires <span class="mono">can_alert</span>.</p>
+        ${enabled ? "" : `<p class="badge revoked">No can_alert — ask admin (Policies).</p>`}
         <div class="inline-form" style="margin-top:12px">
-          <label class="field"><span>动作</span>
-            <select id="action"><option value="on">开启 (on)</option><option value="off">关闭 (off)</option></select>
+          <label class="field"><span>Action</span>
+            <select id="action"><option value="on">ON</option><option value="off">OFF</option></select>
           </label>
-          <label class="field"><span>持续时长 (ms)</span>
+          <label class="field"><span>Duration (ms)</span>
             <input id="dur" type="number" value="10000" min="500" max="120000" />
           </label>
-          <label class="field wide"><span>目标设备（留空=全部我能看见的）</span>
+          <label class="field wide"><span>Targets (empty = all visible)</span>
             <select id="targets" multiple size="6"></select>
           </label>
           <div class="row wide" style="justify-content:flex-end">
-            <button class="btn danger" id="fire" ${enabled ? "" : "disabled"}>执行</button>
+            <button class="btn danger" id="fire" ${enabled ? "" : "disabled"}>Run</button>
           </div>
         </div>
       </div>`;
 
     const sel = $("#targets");
-    sel.innerHTML = devices.map((d) => `<option value="${escapeHtml(d.device_id)}">${escapeHtml(d.device_id)} · ${escapeHtml(d.zone || "")}</option>`).join("");
+    sel.innerHTML = devices.map((d) => {
+      const lab = d.display_label ? `${escapeHtml(d.display_label)} · ` : "";
+      return `<option value="${escapeHtml(d.device_id)}">${lab}${escapeHtml(d.device_id)} · ${escapeHtml(d.zone || "")}</option>`;
+    }).join("");
 
     $("#fire").addEventListener("click", async () => {
       const action = $("#action").value;
       const dur = parseInt($("#dur").value, 10) || 10000;
       const ids = Array.from(sel.selectedOptions).map((o) => o.value);
-      if (action === "on" && !confirm(`确认对 ${ids.length === 0 ? "全部设备" : ids.length + " 台设备"} 触发警报？`)) return;
+      if (action === "on" && !confirm(`Siren ON for ${ids.length === 0 ? "ALL visible devices" : ids.length + " device(s)"}?`)) return;
       try {
         const r = await api("/alerts", { method: "POST", body: { action, duration_ms: dur, device_ids: ids } });
-        toast(`已${action === "on" ? "触发" : "取消"} ${r.sent_count} 台`, "ok");
+        toast(`${action === "on" ? "ON" : "OFF"} → ${r.sent_count} device(s)`, "ok");
       } catch (e) { toast(e.message || e, "err"); }
     });
   });
@@ -1345,6 +1366,15 @@
         <div id="recipientList" style="margin-top:10px"></div>
       </div>
 
+      <div class="card">
+        <h3>Telegram</h3>
+        <p class="muted">Forwards <span class="mono">emit_event</span> from server env (<span class="mono">TELEGRAM_BOT_TOKEN</span>, <span class="mono">TELEGRAM_CHAT_IDS</span>). Test does not use the queue.</p>
+        <div id="tgStatus" class="row" style="gap:6px;flex-wrap:wrap"></div>
+        <div class="row" style="margin-top:10px">
+          <button class="btn secondary" id="tgTest" type="button">Send test to all chats</button>
+        </div>
+      </div>
+
       ${isSuper ? `<div class="card">
         <h3>数据库备份 / 恢复</h3>
         <p class="muted">调用 <span class="mono">/admin/backup/export</span> 与 <span class="mono">/admin/backup/import</span>：整库 SQLite 按口令加密为 .enc。导入会写入 <span class="mono">*.restored</span>，需按提示停机替换。</p>
@@ -1492,17 +1522,17 @@
     const loadSmtpStatus = async () => {
       try {
         const s = await api("/admin/smtp/status");
-        const okBadge = s.configured
-          ? `<span class="badge online">已配置</span>`
-          : `<span class="badge offline">未配置</span>`;
-        const running = s.running ? `<span class="chip">worker 运行中</span>` : `<span class="chip">worker 未启动</span>`;
-        const last = s.last_error ? `<span class="chip" title="最近错误">${escapeHtml(s.last_error)}</span>` : "";
-        $("#smtpStatus").innerHTML = `${okBadge} ${running}
-          <span class="chip">host: ${escapeHtml(s.host || "—")}:${escapeHtml(s.port || "—")}</span>
+        const okBadge = s.enabled
+          ? `<span class="badge online">SMTP on</span>`
+          : `<span class="badge offline">SMTP off</span>`;
+        const last = s.last_error ? `<span class="chip" title="last error">${escapeHtml(s.last_error)}</span>` : "";
+        $("#smtpStatus").innerHTML = `${okBadge}
+          <span class="chip">host: ${escapeHtml(s.host || "—")}:${escapeHtml(String(s.port || "—"))}</span>
           <span class="chip">mode: ${escapeHtml(s.mode || "—")}</span>
           <span class="chip">from: ${escapeHtml(s.sender || "—")}</span>
-          <span class="chip">已发送: ${s.sent_count || 0}</span>
-          <span class="chip">失败: ${s.failed_count || 0}</span>${last}`;
+          <span class="chip">sent: ${s.sent_count || 0}</span>
+          <span class="chip">failed: ${s.failed_count || 0}</span>
+          <span class="chip">queue: ${s.queue_size ?? 0}/${s.queue_max ?? ""}</span>${last}`;
       } catch (e) {
         $("#smtpStatus").innerHTML = `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`;
       }
@@ -1543,10 +1573,32 @@
     });
     $("#r_test").addEventListener("click", async () => {
       const email = ($("#r_email").value || "").trim();
+      if (!email) { toast("Enter recipient email first", "err"); return; }
       try {
-        const r = await api("/admin/smtp/test", { method: "POST", body: email ? { to: email } : {} });
-        toast(r.queued ? `已入队到 ${r.recipients} 个收件人` : "SMTP 未配置", r.queued ? "ok" : "err");
+        await api("/admin/smtp/test", { method: "POST", body: { to: email } });
+        toast("SMTP test sent", "ok");
         loadSmtpStatus();
+      } catch (e) { toast(e.message || e, "err"); }
+    });
+    const loadTgStatus = async () => {
+      try {
+        const t = await api("/admin/telegram/status");
+        const badge = t.enabled
+          ? `<span class="badge online">enabled</span>`
+          : `<span class="badge offline">disabled</span>`;
+        $("#tgStatus").innerHTML = `${badge}
+          <span class="chip">chats: ${t.chats ?? 0}</span>
+          <span class="chip">min_level: ${escapeHtml(t.min_level || "")}</span>
+          <span class="chip">queue: ${t.queue_size ?? 0}</span>`;
+      } catch (e) {
+        $("#tgStatus").innerHTML = `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`;
+      }
+    };
+    $("#tgTest").addEventListener("click", async () => {
+      try {
+        const r = await api("/admin/telegram/test", { method: "POST", body: { text: "Croc Sentinel UI test" } });
+        toast(r.detail || "ok", "ok");
+        loadTgStatus();
       } catch (e) { toast(e.message || e, "err"); }
     });
     $("#recipientList").addEventListener("click", async (ev) => {
@@ -1565,6 +1617,7 @@
     });
     loadSmtpStatus();
     loadRecipients();
+    loadTgStatus();
 
     // Pending admin signups (superadmin approval queue)
     const loadPendAdmins = async () => {
@@ -1609,59 +1662,69 @@
     loadUsers();
   });
 
-  // Alarm log (server-side fan-out history)
-  registerRoute("alarm-log", async (view) => {
-    setCrumb("警报历史");
+  // Unified: device alarms + dashboard/API remote siren (who / what / when / where / fan-out)
+  async function renderSignalsPage(view) {
+    setCrumb("Signals");
     view.innerHTML = `
       <div class="card">
         <div class="row">
-          <h2 style="margin:0">警报历史</h2>
-          <span class="muted">按租户(admin)隔离；user 仅能看到自己 manager_admin 下的记录</span>
-          <label class="field" style="max-width:160px"><span>最近 (小时)</span><input id="h_hours" type="number" value="168" min="1" max="720"/></label>
-          <label class="field" style="max-width:220px"><span>source_id</span><input id="h_src" /></label>
-          <button class="btn secondary right" id="h_reload">查询</button>
+          <h2 style="margin:0">Signal log</h2>
+          <span class="muted">Device alarms + remote siren from dashboard/API</span>
+          <label class="field" style="max-width:140px"><span>Hours</span><input id="sig_hours" type="number" value="168" min="1" max="720"/></label>
+          <button class="btn secondary right" id="sig_reload">Refresh</button>
         </div>
         <div class="divider"></div>
-        <div class="stats" id="alarmSummary"></div>
+        <div class="stats" id="sigSummary"></div>
         <div class="divider"></div>
-        <div id="alarmList"></div>
+        <div id="sigList"></div>
       </div>`;
     const reload = async () => {
-      const hours = parseInt($("#h_hours").value, 10) || 168;
-      const src = $("#h_src").value.trim();
+      const hours = parseInt($("#sig_hours").value, 10) || 168;
       const qs = new URLSearchParams({ limit: "200", since_hours: String(hours) });
-      if (src) qs.set("source_id", src);
       try {
         const [d, sumR] = await Promise.all([
-          api("/alarms?" + qs.toString()),
+          api("/activity/signals?" + qs.toString()),
           api("/alarms/summary").catch(() => ({ last_24h: 0, last_7d: 0, top_sources_7d: [] })),
         ]);
-        $("#alarmSummary").innerHTML = [
-          ["24 小时",   sumR.last_24h || 0, "警报触发次数"],
-          ["7 天",       sumR.last_7d || 0,  "警报触发次数"],
-          ["热点设备", (sumR.top_sources_7d || []).slice(0, 1).map((x) => `${x.source_id} × ${x.c}`).join("") || "—", "7 天 TOP 1"],
+        $("#sigSummary").innerHTML = [
+          ["Alarms 24h", sumR.last_24h || 0, "device-side alarm rows"],
+          ["Alarms 7d", sumR.last_7d || 0, "same scope"],
+          ["Top source 7d", (sumR.top_sources_7d || []).slice(0, 1).map((x) => `${x.source_id} × ${x.c}`).join("") || "—", "by count"],
         ].map(([k, v, s]) => `<div class="stat"><div class="k">${escapeHtml(k)}</div><div class="v">${escapeHtml(v)}</div><div class="sub">${escapeHtml(s)}</div></div>`).join("");
         const items = d.items || [];
-        const triggerZh = { remote_button: "遥控按键", network: "网络指令", api: "后台下发" };
-        $("#alarmList").innerHTML = items.length === 0
-          ? `<p class="muted">此时段内无警报。</p>`
+        const whoLbl = (w) => ({
+          remote_button: "GPIO / local button",
+          network: "MQTT / network",
+          api: "API / automation",
+        }[w] || w);
+        $("#sigList").innerHTML = items.length === 0
+          ? `<p class="muted">No rows in this window.</p>`
           : `<div class="table-wrap"><table class="t">
-              <thead><tr><th>时间</th><th>源设备</th><th>zone</th><th>触发方式</th><th>扇出</th><th>邮件</th><th>租户</th></tr></thead>
-              <tbody>${items.map((a) => `
-                <tr>
-                  <td>${escapeHtml(fmtTs(a.created_at))}</td>
-                  <td><a class="mono" href="#/devices/${encodeURIComponent(a.source_id)}">${escapeHtml(a.source_id)}</a></td>
+              <thead><tr><th>When (UTC)</th><th>What</th><th>Where</th><th>Device</th><th>Name</th><th>Who</th><th>Fan-out / targets</th><th>Email</th></tr></thead>
+              <tbody>${items.map((a) => {
+            const dev = a.device_id === "*" ? "(bulk)" : a.device_id;
+            const link = a.device_id && a.device_id !== "*"
+              ? `<a class="mono" href="#/devices/${encodeURIComponent(a.device_id)}">${escapeHtml(dev)}</a>`
+              : escapeHtml(dev);
+            const em = a.email_sent ? "queued" : (a.email_detail || "—");
+            const fo = a.kind && a.kind.startsWith("bulk") ? String(a.fanout_count || 0) : String(a.fanout_count ?? "—");
+            return `<tr>
+                  <td>${escapeHtml(fmtTs(a.ts))}</td>
+                  <td><span class="chip">${escapeHtml(a.what || a.kind || "")}</span></td>
                   <td><span class="chip">${escapeHtml(a.zone || "all")}</span></td>
-                  <td>${escapeHtml(triggerZh[a.triggered_by] || a.triggered_by)}</td>
-                  <td>${escapeHtml(a.fanout_count)}</td>
-                  <td class="mono">${a.email_sent ? `<span class="badge online">已入队</span>` : `<span class="chip">${escapeHtml(a.email_detail || "—")}</span>`}</td>
-                  <td class="mono">${escapeHtml(a.owner_admin || "(未归属)")}</td>
-                </tr>`).join("")}</tbody></table></div>`;
+                  <td class="mono">${link}</td>
+                  <td>${escapeHtml(a.display_label || "—")}</td>
+                  <td>${escapeHtml(a.kind === "device_alarm" ? whoLbl(a.who) : a.who)}</td>
+                  <td class="mono">${escapeHtml(fo)}</td>
+                  <td class="mono">${escapeHtml(em)}</td>
+                </tr>`;
+          }).join("")}</tbody></table></div>`;
       } catch (e) { toast(e.message || e, "err"); }
     };
-    $("#h_reload").addEventListener("click", reload);
+    $("#sig_reload").addEventListener("click", reload);
     reload();
-  });
+  }
+  registerRoute("signals", renderSignalsPage);
 
   // OTA (superadmin only)
   function renderOtaCampaignRow(c, me) {

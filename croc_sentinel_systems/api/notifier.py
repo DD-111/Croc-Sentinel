@@ -213,3 +213,49 @@ def render_alarm_email(alarm: dict) -> tuple[str, str, str]:
         "</div>"
     )
     return subject, text, html
+
+
+def render_remote_siren_email(
+    *,
+    action: str,
+    device_id: str,
+    display_label: str,
+    zone: str,
+    actor: str,
+    duration_ms: Optional[int],
+) -> tuple[str, str, str]:
+    """Dashboard / API remote siren (not the device physical alarm fan-out)."""
+    label = display_label.strip() or "—"
+    subject = f"[Croc Sentinel] Remote siren {action} on {device_id}"
+    lines = [
+        "A user triggered a remote siren command from the dashboard or API.",
+        "",
+        f"Action        : {action}",
+        f"Device id     : {device_id}",
+        f"Display name  : {label}",
+        f"Zone          : {zone or 'all'}",
+        f"Triggered by  : {actor}",
+    ]
+    if duration_ms is not None:
+        lines.append(f"Duration (ms) : {duration_ms}")
+    text = "\n".join(lines) + "\n"
+    rows = "".join(
+        f"<tr><td style='padding:4px 12px;color:#64748b'>{k}</td>"
+        f"<td style='padding:4px 12px'><code>{v}</code></td></tr>"
+        for k, v in (
+            ("Action", action),
+            ("Device id", device_id),
+            ("Display name", label),
+            ("Zone", zone or "all"),
+            ("Triggered by", actor),
+            ("Duration ms", duration_ms if duration_ms is not None else "—"),
+        )
+    )
+    html = (
+        "<div style='font-family:system-ui,sans-serif'>"
+        "<h2 style='color:#1e3a8a;margin:0 0 8px'>Remote siren</h2>"
+        f"<p style='margin:0 0 12px'>Operator action on a provisioned device.</p>"
+        f"<table style='border-collapse:collapse'>{rows}</table>"
+        "</div>"
+    )
+    return subject, text, html

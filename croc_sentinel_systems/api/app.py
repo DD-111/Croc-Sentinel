@@ -39,7 +39,7 @@ from security import (
     verify_password,
     zones_from_json,
 )
-from notifier import notifier, render_alarm_email
+from notifier import notifier, render_alarm_email, render_remote_siren_email
 
 
 def utc_now_iso() -> str:
@@ -503,6 +503,24 @@ def init_db() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS ix_alarms_created ON alarms(created_at)")
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS signal_triggers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                owner_admin TEXT,
+                zone TEXT,
+                actor_username TEXT NOT NULL,
+                duration_ms INTEGER,
+                target_count INTEGER NOT NULL DEFAULT 1,
+                detail_json TEXT
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_signal_triggers_created ON signal_triggers(created_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_signal_triggers_owner ON signal_triggers(owner_admin)")
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS admin_alert_recipients (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 owner_admin TEXT NOT NULL,
@@ -702,6 +720,7 @@ def init_db() -> None:
         ensure_column(conn, "device_state", "board_profile", "TEXT")
         ensure_column(conn, "device_state", "net_type", "TEXT")
         ensure_column(conn, "device_state", "provisioned", "INTEGER")
+        ensure_column(conn, "device_state", "display_label", "TEXT")
         ensure_column(conn, "dashboard_users", "manager_admin", "TEXT")
         ensure_column(conn, "dashboard_users", "tenant", "TEXT")
         ensure_column(conn, "dashboard_users", "email", "TEXT")
@@ -977,6 +996,12 @@ def emit_event(
     rid = _insert_event_row(ev)
     ev["id"] = rid
     event_bus.publish(ev)
+    try:
+        from telegram_notify import maybe_notify_telegram
+
+        maybe_notify_telegram(ev)
+    except Exception:
+        pass
 
 
 def audit_event(actor: str, action: str, target: str = "", detail: Optional[dict[str, Any]] = None) -> None:
@@ -1532,6 +1557,74 @@ def _update_alarm(alarm_id: int, fanout_count: int, email_sent: bool, email_deta
         )
         conn.commit()
         conn.close()
+
+
+def _log_signal_trigger(
+    kind: str,
+    device_id: str,
+    zone: str,
+    actor_username: str,
+    owner_admin: Optional[str],
+    duration_ms: Optional[int] = None,
+    target_count: int = 1,
+    detail: Optional[dict[str, Any]] = None,
+) -> None:
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO signal_triggers (
+                created_at, kind, device_id, owner_admin, zone, actor_username,
+                duration_ms, target_count, detail_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                utc_now_iso(),
+                kind,
+                device_id,
+                owner_admin,
+                zone,
+                actor_username,
+                duration_ms,
+                target_count,
+                json.dumps(detail or {}, ensure_ascii=True),
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+
+def _remote_siren_notify_email(
+    *,
+    action: str,
+    device_id: str,
+    zone: str,
+    actor: str,
+    owner_admin: Optional[str],
+    duration_ms: Optional[int],
+) -> None:
+    recipients = _recipients_for_admin(owner_admin) if owner_admin else []
+    disp = ""
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT IFNULL(display_label,'') FROM device_state WHERE device_id = ?", (device_id,))
+        r = cur.fetchone()
+        conn.close()
+    if r:
+        disp = str(r[0] or "")
+    if not recipients or not notifier.enabled():
+        return
+    subject, text, html = render_remote_siren_email(
+        action=action,
+        device_id=device_id,
+        display_label=disp,
+        zone=zone,
+        actor=actor,
+        duration_ms=duration_ms,
+    )
+    notifier.enqueue(recipients, subject, text, html)
 
 
 # ═══════════════════════════════════════════════
@@ -2326,25 +2419,41 @@ def _legacy_ui_deep_redirect(path: str) -> RedirectResponse:
     return RedirectResponse(url=f"{DASHBOARD_PATH}/{path}", status_code=301)
 
 
+def _telegram_enabled_safe() -> bool:
+    try:
+        from telegram_notify import telegram_status
+
+        return bool(telegram_status().get("enabled"))
+    except Exception:
+        return False
+
+
 @app.on_event("startup")
 def startup() -> None:
     global mqtt_client, scheduler_thread
     validate_production_env()
     init_db()
     notifier.start()
+    try:
+        from telegram_notify import start_telegram_worker
+
+        start_telegram_worker()
+    except Exception:
+        pass
     mqtt_client = start_mqtt_loop()
     scheduler_stop.clear()
     scheduler_thread = threading.Thread(target=scheduler_loop, name="cmd-scheduler", daemon=True)
     scheduler_thread.start()
     logger.info(
         "API started mqtt_host=%s mqtt_port=%s mqtt_tls=%s "
-        "mqtt_tls_verify_hostname=%s db=%s notifier_enabled=%s",
+        "mqtt_tls_verify_hostname=%s db=%s notifier_enabled=%s telegram=%s",
         MQTT_HOST,
         MQTT_PORT,
         MQTT_USE_TLS,
         MQTT_TLS_VERIFY_HOSTNAME,
         DB_PATH,
         notifier.enabled(),
+        _telegram_enabled_safe(),
     )
 
 
@@ -2357,6 +2466,12 @@ def shutdown() -> None:
         scheduler_thread = None
     if mqtt_client is not None:
         stop_mqtt_loop(mqtt_client)
+    try:
+        from telegram_notify import stop_telegram_worker
+
+        stop_telegram_worker()
+    except Exception:
+        pass
     notifier.stop()
 
 
@@ -3882,7 +3997,8 @@ def list_devices(principal: Principal = Depends(require_principal)) -> dict[str,
         cur = conn.cursor()
         cur.execute(
             f"""
-            SELECT device_id, fw, chip_target, board_profile, net_type, zone, provisioned, updated_at
+            SELECT device_id, fw, chip_target, board_profile, net_type, zone, provisioned,
+                   IFNULL(display_label, '') AS display_label, updated_at
             FROM device_state
             WHERE 1=1 {zs} {osf}
             ORDER BY updated_at DESC
@@ -3915,6 +4031,48 @@ def get_device(device_id: str, principal: Principal = Depends(require_principal)
         if out.get(key):
             out[key] = json.loads(out[key])
     return out
+
+
+class DeviceDisplayLabelBody(BaseModel):
+    display_label: str = Field(default="", max_length=80)
+
+
+@app.patch("/devices/{device_id}/display-label")
+def patch_device_display_label(
+    device_id: str,
+    body: DeviceDisplayLabelBody,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    assert_min_role(principal, "user")
+    assert_device_owner(principal, device_id)
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT zone FROM device_state WHERE device_id = ?", (device_id,))
+        zr = cur.fetchone()
+        if not zr:
+            conn.close()
+            raise HTTPException(status_code=404, detail="device not found")
+        assert_zone_for_device(principal, str(zr["zone"]) if zr["zone"] is not None else "")
+        cur.execute(
+            "UPDATE device_state SET display_label = ?, updated_at = ? WHERE device_id = ?",
+            (body.display_label.strip(), utc_now_iso(), device_id),
+        )
+        conn.commit()
+        conn.close()
+    cache_invalidate("devices")
+    cache_invalidate("overview")
+    emit_event(
+        level="info",
+        category="device",
+        event_type="device.display_label",
+        summary=f"display label updated for {device_id}",
+        actor=principal.username,
+        target=device_id,
+        device_id=device_id,
+        detail={"label": body.display_label.strip()},
+    )
+    return {"ok": True, "device_id": device_id, "display_label": body.display_label.strip()}
 
 
 @app.get("/devices/{device_id}/messages")
@@ -4555,6 +4713,36 @@ def device_alert_on(
         proto=CMD_PROTO,
         cmd_key=get_cmd_key_for_device(device_id),
     )
+    z = str(zr["zone"] if zr["zone"] is not None else "")
+    owner = _lookup_owner_admin(device_id)
+    _log_signal_trigger(
+        "remote_siren_on",
+        device_id,
+        z,
+        principal.username,
+        owner,
+        duration_ms=duration_ms,
+        target_count=1,
+    )
+    _remote_siren_notify_email(
+        action="ON",
+        device_id=device_id,
+        zone=z,
+        actor=principal.username,
+        owner_admin=owner,
+        duration_ms=duration_ms,
+    )
+    emit_event(
+        level="warn",
+        category="alarm",
+        event_type="remote.siren_on",
+        summary=f"Remote siren ON {device_id} by {principal.username}",
+        actor=principal.username,
+        target=device_id,
+        owner_admin=owner or "",
+        device_id=device_id,
+        detail={"duration_ms": duration_ms, "zone": z},
+    )
     return {"ok": True}
 
 
@@ -4581,6 +4769,36 @@ def device_alert_off(device_id: str, principal: Principal = Depends(require_prin
         target_id=device_id,
         proto=CMD_PROTO,
         cmd_key=get_cmd_key_for_device(device_id),
+    )
+    z = str(zr["zone"] if zr["zone"] is not None else "")
+    owner = _lookup_owner_admin(device_id)
+    _log_signal_trigger(
+        "remote_siren_off",
+        device_id,
+        z,
+        principal.username,
+        owner,
+        duration_ms=None,
+        target_count=1,
+    )
+    _remote_siren_notify_email(
+        action="OFF",
+        device_id=device_id,
+        zone=z,
+        actor=principal.username,
+        owner_admin=owner,
+        duration_ms=None,
+    )
+    emit_event(
+        level="info",
+        category="alarm",
+        event_type="remote.siren_off",
+        summary=f"Remote siren OFF {device_id} by {principal.username}",
+        actor=principal.username,
+        target=device_id,
+        owner_admin=owner or "",
+        device_id=device_id,
+        detail={"zone": z},
     )
     return {"ok": True}
 
@@ -4615,6 +4833,35 @@ def bulk_alert(req: BulkAlertRequest, principal: Principal = Depends(require_pri
                 cmd_key=get_cmd_key_for_device(did),
             )
         sent += 1
+
+    if sent > 0:
+        own = _lookup_owner_admin(targets[0])
+        _log_signal_trigger(
+            f"bulk_siren_{req.action}",
+            "*",
+            "",
+            principal.username,
+            own,
+            duration_ms=req.duration_ms if req.action == "on" else None,
+            target_count=sent,
+            detail={"device_ids": targets},
+        )
+        if notifier.enabled() and own:
+            rec = _recipients_for_admin(own)
+            if rec:
+                subj = f"[Croc Sentinel] Bulk siren {req.action} ×{sent} by {principal.username}"
+                body = "Targets:\n" + "\n".join(targets[:120])
+                notifier.enqueue(rec, subj, body, None)
+        emit_event(
+            level="warn" if req.action == "on" else "info",
+            category="alarm",
+            event_type=f"bulk.siren_{req.action}",
+            summary=f"Bulk siren {req.action} {sent} device(s) by {principal.username}",
+            actor=principal.username,
+            target=",".join(targets[:8]),
+            owner_admin=own or "",
+            detail={"count": sent, "device_ids": targets[:64]},
+        )
 
     return {
         "ok": True,
@@ -4844,6 +5091,93 @@ def alarms_summary(principal: Principal = Depends(require_principal)) -> dict[st
     return {"last_24h": last24, "last_7d": last7, "top_sources_7d": top}
 
 
+@app.get("/activity/signals")
+def list_activity_signals(
+    limit: int = Query(default=100, ge=1, le=500),
+    since_hours: int = Query(default=168, ge=1, le=720),
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    """Unified feed: physical device alarms + dashboard/API remote siren actions."""
+    assert_min_role(principal, "user")
+    scope_sql, scope_args = _alarm_scope_for(principal)
+    since_arg = f"-{since_hours} hours"
+    al_scope = scope_sql.replace("owner_admin", "a.owner_admin")
+    st_scope = scope_sql.replace("owner_admin", "s.owner_admin")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT a.id, a.created_at, 'device_alarm' AS kind, a.source_id AS device_id, a.zone,
+                   a.triggered_by AS actor, a.fanout_count, a.email_sent, a.email_detail,
+                   NULL AS duration_ms, IFNULL(d.display_label, '') AS display_label
+            FROM alarms a
+            LEFT JOIN device_state d ON d.device_id = a.source_id
+            WHERE a.created_at >= datetime('now', ?) {al_scope}
+            ORDER BY a.id DESC LIMIT ?
+            """,
+            tuple([since_arg] + list(scope_args) + [limit]),
+        )
+        alarm_rows = [dict(r) for r in cur.fetchall()]
+        cur.execute(
+            f"""
+            SELECT s.id, s.created_at, s.kind, s.device_id, s.zone,
+                   s.actor_username AS actor, s.target_count AS fanout_count,
+                   0 AS email_sent, '' AS email_detail, s.duration_ms,
+                   IFNULL(d.display_label, '') AS display_label, s.detail_json
+            FROM signal_triggers s
+            LEFT JOIN device_state d ON d.device_id = s.device_id
+            WHERE s.created_at >= datetime('now', ?) {st_scope}
+            ORDER BY s.id DESC LIMIT ?
+            """,
+            tuple([since_arg] + list(scope_args) + [limit]),
+        )
+        sig_rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+
+    merged: list[dict[str, Any]] = []
+    for r in alarm_rows:
+        merged.append(
+            {
+                "ts": r["created_at"],
+                "kind": "device_alarm",
+                "what": "alarm_fanout",
+                "device_id": r["device_id"],
+                "display_label": r["display_label"] or "",
+                "zone": r["zone"] or "",
+                "who": r["actor"],
+                "fanout_count": int(r["fanout_count"] or 0),
+                "email_sent": bool(r["email_sent"]),
+                "email_detail": r["email_detail"] or "",
+                "duration_ms": r["duration_ms"],
+                "_row": int(r["id"]),
+            }
+        )
+    for r in sig_rows:
+        merged.append(
+            {
+                "ts": r["created_at"],
+                "kind": r["kind"],
+                "what": r["kind"],
+                "device_id": r["device_id"],
+                "display_label": r["display_label"] or "",
+                "zone": r["zone"] or "",
+                "who": r["actor"],
+                "fanout_count": int(r["fanout_count"] or 0),
+                "email_sent": bool(r["email_sent"]),
+                "email_detail": r["email_detail"] or "",
+                "duration_ms": r["duration_ms"],
+                "detail_json": r.get("detail_json") or "",
+                "_row": int(r["id"]),
+            }
+        )
+    merged.sort(key=lambda x: (x["ts"] or "", x["_row"]), reverse=True)
+    out_items = merged[:limit]
+    for x in out_items:
+        x.pop("_row", None)
+    return {"items": out_items}
+
+
 # =====================================================================
 #  Email recipients (per-tenant) & SMTP test
 # =====================================================================
@@ -5025,6 +5359,34 @@ def smtp_test(req: SmtpTestRequest, principal: Principal = Depends(require_princ
         raise HTTPException(status_code=502, detail=f"SMTP error: {exc}")
     audit_event(principal.username, "smtp.test.ok", req.to, {})
     return {"ok": True, "status": notifier.status()}
+
+
+@app.get("/admin/telegram/status")
+def telegram_admin_status(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "admin")
+    from telegram_notify import telegram_status
+
+    return telegram_status()
+
+
+class TelegramTestRequest(BaseModel):
+    text: str = Field(default="Croc Sentinel Telegram test OK", max_length=3900)
+
+
+@app.post("/admin/telegram/test")
+def telegram_admin_test(
+    req: TelegramTestRequest,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    assert_min_role(principal, "admin")
+    from telegram_notify import send_telegram_text_now, telegram_status
+
+    ok, detail = send_telegram_text_now(req.text.strip())
+    if not ok:
+        audit_event(principal.username, "telegram.test.fail", "", {"error": detail})
+        raise HTTPException(status_code=502, detail=detail)
+    audit_event(principal.username, "telegram.test.ok", "", {"detail": detail})
+    return {"ok": True, "detail": detail, "telegram": telegram_status()}
 
 
 # =====================================================================
