@@ -237,8 +237,17 @@
 
   async function renderRoute() {
     const view = $("#view");
-    const hash = location.hash || "#/overview";
-    const [_, rawId, ...rest] = hash.split("/");
+    let hashFull = location.hash || "#/overview";
+    let routeQuery = new URLSearchParams("");
+    const qm = hashFull.indexOf("?");
+    if (qm >= 0) {
+      try {
+        routeQuery = new URLSearchParams(hashFull.slice(qm + 1));
+      } catch (_) {}
+      hashFull = hashFull.slice(0, qm);
+    }
+    window.__routeQuery = routeQuery;
+    const [_, rawId, ...rest] = hashFull.split("/");
     const id = rawId || "overview";
     const args = rest;
 
@@ -969,6 +978,15 @@
     });
 
     $("#reload").addEventListener("click", () => renderRoute());
+
+    try {
+      const rq = window.__routeQuery || new URLSearchParams("");
+      const pre = (rq.get("q") || rq.get("serial") || "").trim();
+      if (pre) {
+        const el = $("#idn_input");
+        if (el) el.value = pre;
+      }
+    } catch (_) {}
 
     const data = await api("/provision/pending").catch(() => ({ items: [] }));
     const items = data.items || [];

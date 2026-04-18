@@ -5817,6 +5817,13 @@ def factory_register_bulk(body: FactoryBulkRequest, request: Request) -> dict[st
     return {"ok": True, "written": written}
 
 
+@app.get("/factory/ping")
+def factory_ping(request: Request) -> dict[str, Any]:
+    """No-op auth probe for factory UIs / scripts (same auth as POST /factory/devices)."""
+    _require_factory_auth(request)
+    return {"ok": True, "factory_auth": True}
+
+
 @app.get("/factory/devices")
 def factory_list(
     request: Request,

@@ -56,6 +56,7 @@
 | 18 | GET  | `/provision/pending` | admin | 列出"已连线但未认领"的设备 |
 | 19 | POST | `/provision/claim` | admin | admin 认领 pending 设备，颁发永久 MQTT 凭据 |
 | 20 | POST | `/provision/identify` | admin | 根据序列号 / 二维码查询设备状态（未注册/可认领/已认领/出厂禁用） |
+| 20b | GET | `/factory/ping` | superadmin **或** `X-Factory-Token` | 工厂脚本连通性探测（不写库） |
 | 21 | POST | `/factory/devices` | superadmin **或** `X-Factory-Token` | 出厂批量录入 (serial, mac, qr) |
 | 22 | GET  | `/factory/devices` | superadmin | 列出 factory 清单 |
 | 23 | POST | `/factory/devices/{serial}/block` | superadmin | 封禁序列号（不可再被认领） |
