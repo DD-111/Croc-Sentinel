@@ -66,36 +66,37 @@
 #define MQTT_CLEAN_SESSION false
 // Required when MQTT_USE_TLS=1 and PROD_ENFORCE=1.
 // For CA rotation: keep primary old CA, secondary new CA during transition.
-#define MQTT_CA_CERT_PRIMARY_PEM "-----BEGIN CERTIFICATE-----
-MIIFFzCCAv+gAwIBAgIUfgl4PbZuAFWp6fYkHMGd3moUeBYwDQYJKoZIhvcNAQEL
-BQAwGzEZMBcGA1UEAwwQQ3JvYy1TZW50aW5lbC1DQTAeFw0yNjA0MTcwOTU1MDVa
-Fw0zNjA0MTQwOTU1MDVaMBsxGTAXBgNVBAMMEENyb2MtU2VudGluZWwtQ0EwggIi
-MA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQDKOowm7sNkNfmCDzeFoUKDHjHt
-dPQHQQXsRe/YfovYeP6T+tpYDlivyV3NFKynXPWTIia1OjoX4YIQoj+4U9rpUOUz
-gcdrhgL26Qa9QxXScPCqVChFnuVabmaMFI76zBKAxlXvZ8hrQtpc9RshpZISw+Dz
-mFyx+oY0U6OROFJx7Y5IlOl2aPe+HMPCJfMC5xNMmnghgWZQhsG149vOGrE3D2ni
-aWG8kcxne3+bppOCxHJUzZVgVxAhlxEQHBGkm1tvXCt8fAnYjO51HdM+ssRjLG3j
-XppcFQjKDkZBAomHFBdhvaDxRrdS4qrMyioTatHli400iTM2vWrlO7EyL6yh//aV
-ss0no2xram9EO7MWZmPEmZTkZIEf3RghWdrLtg7ynTR2VqGgJmfNCKo759wT72Cc
-b8BAm+6Rb4VkEiQzTxn/uMHF/yTGfKAzMgzpVPJr08aoMS5ODZtTwrAGc78E/Zdo
-XALG6UVT+jncu/60QlLdTscX7c7gybyHhfGPfZxV4DkAbhDa4/L+Fh14aDrL+wam
-4tCzpWXt0nyfGmPidPDXmM39l1fFQ333cbMGHi/rjDycdz+jj0nFFDyhrmhMW592
-yI++gghxJrLQgCPxai1l4PxeuVE0c5QWaBd9JgloQvS1ATYSiAQo+2VbOnwM+U1U
-GZw3IOwOtGV0/j6d3QIDAQABo1MwUTAdBgNVHQ4EFgQU1Zi6nJ4/QWgsc3aGnC9x
-91aFP68wHwYDVR0jBBgwFoAU1Zi6nJ4/QWgsc3aGnC9x91aFP68wDwYDVR0TAQH/
-BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAgEAI6SgQ+nXhW2dvUOc2FdJeTXGMg+p
-Zd+egJfvijgEipxovuKKunW2OsDQhojU7j2IYof8YcwVMZg44nmLf1lVSdLpDjsR
-vjvSzRzLUhihSxpi/656vMMmwD989lP24fO6/TDXePmVFt6Kju/cbJYPoEqM9Nbg
-4RQhxsZO29ID4uPy93i0DreuDOcgmIfGWls+P0jbSEAhnNLQF0nHDsHuO1m0fSps
-U11i45/4NzmIogPIFiKcoqj4n7cNyCIWa0PesPwL9hS/BZpGoP2Agv5NTzdJnGUk
-zhaz1a3KoQFiv2gSQ2Fe+CYbFP440Iwtazqg5fDbPa4d07TY1cnH5rZIzxwSuEsy
-sQYcdGF/iumIGrn7Y1xff5ZI3A269Dv6zEsqCN2VYy+ckV3rKJkxe309VmrHfewu
-aKOCI5LlwCGBsNA0/B+RjZpR2jz+lNYL3NDY8GBJ1epKGJNhycl9ej1/b1x9KJVT
-cM/qS/O6YijTOZcbmwllEQYKNkqoRnGPR8CLkuNZd2GBu7mtz4FlT2BYnnGvfnXS
-+vz4vbClvrF+D6cFZvUwTu3/3wg+Ip4NHgWYvd71elmRi5+5oPWA+c+Oa/+8fU6y
-wwuzYZ8giCmbf++VC+iOG7tVY6qW4j55EVmPfG4bufodjQbvKR7I7UgJ82pdXOmu
-wkFdjR+vR+oDBl8=
------END CERTIFICATE-----"
+#define MQTT_CA_CERT_PRIMARY_PEM \
+"-----BEGIN CERTIFICATE-----\n" \
+"MIIFFzCCAv+gAwIBAgIUfgl4PbZuAFWp6fYkHMGd3moUeBYwDQYJKoZIhvcNAQEL\n" \
+"BQAwGzEZMBcGA1UEAwwQQ3JvYy1TZW50aW5lbC1DQTAeFw0yNjA0MTcwOTU1MDVa\n" \
+"Fw0zNjA0MTQwOTU1MDVaMBsxGTAXBgNVBAMMEENyb2MtU2VudGluZWwtQ0EwggIi\n" \
+"MA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQDKOowm7sNkNfmCDzeFoUKDHjHt\n" \
+"dPQHQQXsRe/YfovYeP6T+tpYDlivyV3NFKynXPWTIia1OjoX4YIQoj+4U9rpUOUz\n" \
+"gcdrhgL26Qa9QxXScPCqVChFnuVabmaMFI76zBKAxlXvZ8hrQtpc9RshpZISw+Dz\n" \
+"mFyx+oY0U6OROFJx7Y5IlOl2aPe+HMPCJfMC5xNMmnghgWZQhsG149vOGrE3D2ni\n" \
+"aWG8kcxne3+bppOCxHJUzZVgVxAhlxEQHBGkm1tvXCt8fAnYjO51HdM+ssRjLG3j\n" \
+"XppcFQjKDkZBAomHFBdhvaDxRrdS4qrMyioTatHli400iTM2vWrlO7EyL6yh//aV\n" \
+"ss0no2xram9EO7MWZmPEmZTkZIEf3RghWdrLtg7ynTR2VqGgJmfNCKo759wT72Cc\n" \
+"b8BAm+6Rb4VkEiQzTxn/uMHF/yTGfKAzMgzpVPJr08aoMS5ODZtTwrAGc78E/Zdo\n" \
+"XALG6UVT+jncu/60QlLdTscX7c7gybyHhfGPfZxV4DkAbhDa4/L+Fh14aDrL+wam\n" \
+"4tCzpWXt0nyfGmPidPDXmM39l1fFQ333cbMGHi/rjDycdz+jj0nFFDyhrmhMW592\n" \
+"yI++gghxJrLQgCPxai1l4PxeuVE0c5QWaBd9JgloQvS1ATYSiAQo+2VbOnwM+U1U\n" \
+"GZw3IOwOtGV0/j6d3QIDAQABo1MwUTAdBgNVHQ4EFgQU1Zi6nJ4/QWgsc3aGnC9x\n" \
+"91aFP68wHwYDVR0jBBgwFoAU1Zi6nJ4/QWgsc3aGnC9x91aFP68wDwYDVR0TAQH/\n" \
+"BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAgEAI6SgQ+nXhW2dvUOc2FdJeTXGMg+p\n" \
+"Zd+egJfvijgEipxovuKKunW2OsDQhojU7j2IYof8YcwVMZg44nmLf1lVSdLpDjsR\n" \
+"vjvSzRzLUhihSxpi/656vMMmwD989lP24fO6/TDXePmVFt6Kju/cbJYPoEqM9Nbg\n" \
+"4RQhxsZO29ID4uPy93i0DreuDOcgmIfGWls+P0jbSEAhnNLQF0nHDsHuO1m0fSps\n" \
+"U11i45/4NzmIogPIFiKcoqj4n7cNyCIWa0PesPwL9hS/BZpGoP2Agv5NTzdJnGUk\n" \
+"zhaz1a3KoQFiv2gSQ2Fe+CYbFP440Iwtazqg5fDbPa4d07TY1cnH5rZIzxwSuEsy\n" \
+"sQYcdGF/iumIGrn7Y1xff5ZI3A269Dv6zEsqCN2VYy+ckV3rKJkxe309VmrHfewu\n" \
+"aKOCI5LlwCGBsNA0/B+RjZpR2jz+lNYL3NDY8GBJ1epKGJNhycl9ej1/b1x9KJVT\n" \
+"cM/qS/O6YijTOZcbmwllEQYKNkqoRnGPR8CLkuNZd2GBu7mtz4FlT2BYnnGvfnXS\n" \
+"+vz4vbClvrF+D6cFZvUwTu3/3wg+Ip4NHgWYvd71elmRi5+5oPWA+c+Oa/+8fU6y\n" \
+"wwuzYZ8giCmbf++VC+iOG7tVY6qW4j55EVmPfG4bufodjQbvKR7I7UgJ82pdXOmu\n" \
+"wkFdjR+vR+oDBl8=\n" \
+"-----END CERTIFICATE-----\n"
 #define MQTT_CA_CERT_SECONDARY_PEM ""
 // Bootstrap credential used before dashboard claim/bind.
 #define BOOTSTRAP_MQTT_USERNAME "sentinel_Boot"
@@ -155,11 +156,12 @@ wkFdjR+vR+oDBl8=
 // ── OTA firmware update ──
 #define OTA_ENABLED 1
 // Only accept OTA URLs starting with this prefix (your VPS).
-// Set to "" to disable domain lock (not recommended in production).
-#define OTA_ALLOWED_HOST "your.vps.domain"
+// Must match real host/IP (PROD_ENFORCE rejects "your.vps.domain").
+#define OTA_ALLOWED_HOST "76.13.187.100"
 // Token appended as query param: http://host/fw/v2.1.bin?token=XXX
-// VPS nginx checks this token before serving the .bin file.
-#define OTA_TOKEN "CHANGE_ME_OTA_SECRET"
+// VPS nginx checks this token — must match croc_sentinel_systems/.env OTA_TOKEN
+// and must not contain CHANGE_ME / YOUR_ when PROD_ENFORCE=1.
+#define OTA_TOKEN "a3f9c2e81b704d65f0a8629c1d4e7b08"
 // Mark OTA as healthy after continuous uptime.
 #define OTA_HEALTH_CONFIRM_MS 20000UL
 // Auto rollback after too many failed boots on new firmware.
@@ -254,7 +256,8 @@ wkFdjR+vR+oDBl8=
 #define ADC_OVERSAMPLE 16
 
 // ── Watchdog timeout (seconds) ──
-#define WDT_TIMEOUT_S 30
+// TLS + MQTT connect can exceed 30s on slow links; keep margin above worst-case loop stall.
+#define WDT_TIMEOUT_S 90
 
 // ── NVS ──
 #define NVS_NAMESPACE "sentinel"

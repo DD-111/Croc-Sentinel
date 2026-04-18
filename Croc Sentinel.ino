@@ -9,7 +9,9 @@
 #include <Preferences.h>
 #include <time.h>
 #include <esp_task_wdt.h>
+#include <esp_idf_version.h>
 #include <esp_system.h>
+#include <esp_mac.h>
 #include <esp_ota_ops.h>
 #include <mbedtls/md.h>
 
@@ -43,6 +45,8 @@ char cmdAuthKey[33];
 char bootstrapClaimNonce[17];
 bool isProvisioned = false;
 unsigned long lastBootstrapRegisterAt = 0;
+
+bool publishRaw(const char *topic, const char *payload, bool retain);
 
 void getMacString() {
   uint8_t mac[6];
@@ -131,6 +135,7 @@ static bool g_wifiMultiConnectBlocking(unsigned long timeoutMs) {
   g_wifiMultiRegisterAps();
   unsigned long t0 = millis();
   while (millis() - t0 < timeoutMs) {
+    twdtFeedMaybe();
     if (g_wifiMulti.run(500) == WL_CONNECTED) return true;
   }
   return WiFi.status() == WL_CONNECTED;
@@ -1473,10 +1478,12 @@ void ensureMqtt() {
   serializeJson(willDoc, willBuf, sizeof(willBuf));
 
   mqttClient.setSocketTimeout(10);
+  twdtFeedMaybe();
   bool ok = mqttClient.connect(
       deviceId, mqttUser, mqttPass,
       topicStatus, 1, true, willBuf,
       MQTT_CLEAN_SESSION);
+  twdtFeedMaybe();
 
   if (!ok) {
     strlcpy(lastError, "mqtt_conn_fail", sizeof(lastError));
@@ -1579,12 +1586,49 @@ void updateThroughput() {
 }
 
 // ═══════════════════════════════════════════════
+//  Task watchdog (TWDT): subscribe before any long WiFi/MQTT blocking work.
+//  Arduino-ESP32 often inits TWDT first — prefer reconfigure to avoid duplicate init logs.
+// ═══════════════════════════════════════════════
+
+static bool gTwdtLoopSubscribed = false;
+
+static void setupTaskWatchdogEarly() {
+#if ESP_IDF_VERSION_MAJOR >= 5
+  esp_task_wdt_config_t wdt_cfg = {
+      .timeout_ms = (uint32_t)WDT_TIMEOUT_S * 1000u,
+      .idle_core_mask = 0,
+      .trigger_panic = true,
+  };
+  esp_err_t e = ESP_FAIL;
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0)
+  e = esp_task_wdt_reconfigure(&wdt_cfg);
+#endif
+  if (e != ESP_OK) {
+    e = esp_task_wdt_init(&wdt_cfg);
+  }
+  (void)e;
+#else
+  (void)esp_task_wdt_init(WDT_TIMEOUT_S, true);
+#endif
+  esp_err_t a = esp_task_wdt_add(NULL);
+  // Core may have already subscribed the loop task.
+  gTwdtLoopSubscribed = (a == ESP_OK || a == ESP_ERR_INVALID_STATE);
+}
+
+static inline void twdtFeedMaybe() {
+  if (gTwdtLoopSubscribed) {
+    esp_task_wdt_reset();
+  }
+}
+
+// ═══════════════════════════════════════════════
 //  setup / loop
 // ═══════════════════════════════════════════════
 
 void setup() {
   Serial.begin(115200);
   delay(100);
+  setupTaskWatchdogEarly();
 
   resetReasonStr = decodeResetReason(esp_reset_reason());
   buildDeviceId();
@@ -1625,17 +1669,27 @@ void setup() {
   lastThroughputResetAt = bootAtMs;
 
   logLine("[boot] Croc-Sentinel " FW_VERSION);
-  logLine(String("[boot] id=") + deviceId + " mac=" + deviceMac
-          + " zone=" + deviceZone + " rst=" + resetReasonStr
-          + " boot#" + bootCount);
-  logLine(String("[boot] board_profile=") + BOARD_PROFILE_NAME);
-  logLine(String("[boot] provisioned=") + (isProvisioned ? "yes" : "no")
-          + " mqtt_user=" + mqttUser + " qr=" + deviceQrCode);
+  // Avoid chained String allocations right after WiFi init (can fragment heap and
+  // trigger intermittent SW_CPU_RESET on some boards).
+  {
+    char line[320];
+    snprintf(line, sizeof(line),
+             "[boot] id=%s mac=%s mac_nocolon=%s zone=%s rst=%s boot#%lu",
+             deviceId, deviceMac, deviceMacNoColon, deviceZone, resetReasonStr,
+             (unsigned long)bootCount);
+    logLine(line);
+    snprintf(line, sizeof(line), "[boot] board_profile=%s", BOARD_PROFILE_NAME);
+    logLine(line);
+    snprintf(line, sizeof(line), "[boot] provisioned=%s mqtt_user=%s qr=%s",
+             isProvisioned ? "yes" : "no", mqttUser, deviceQrCode);
+    logLine(line);
+  }
 
   securityConfigValid = validateProductionSecurityConfig();
   if (!securityConfigValid) {
     logLine("[secure] invalid production security configuration; startup blocked");
     while (true) {
+      twdtFeedMaybe();
       digitalWrite(STATUS_LED_GPIO, HIGH);
       delay(120);
       digitalWrite(STATUS_LED_GPIO, LOW);
@@ -1645,6 +1699,7 @@ void setup() {
 
   unsigned long waitStart = millis();
   while (!netIf->connected() && millis() - waitStart < WIFI_CONNECT_WAIT_MS) {
+    twdtFeedMaybe();
     delay(200);
     Serial.print('.');
   }
@@ -1655,13 +1710,10 @@ void setup() {
     configTime(NTP_GMT_OFFSET_S, NTP_DAYLIGHT_OFFSET_S, NTP_SERVER);
     ntpInitDone = true;
   }
-
-  esp_task_wdt_init(WDT_TIMEOUT_S, true);
-  esp_task_wdt_add(NULL);
 }
 
 void loop() {
-  esp_task_wdt_reset();
+  twdtFeedMaybe();
 
   unsigned long now = millis();
 

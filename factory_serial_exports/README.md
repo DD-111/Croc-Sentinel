@@ -54,6 +54,29 @@ python tools/factory_pack/generate_serial_qr.py --count 5 --batch TEST001 --push
 
 浏览器激活页支持深链预填：`#/activate?q=<序列号或整段CROC|...>`（需已登录）。
 
+## 服务器如何“认识”这台板子 / Register so the server accepts the device
+
+在 **`ENFORCE_FACTORY_REGISTRATION=1`** 时，设备进 `pending_claims` 前必须在表 **`factory_devices`** 里有一条记录，且 **`serial` 或 `mac_nocolon`** 能对上 bootstrap 上报。
+
+1. **生成批次时已 `--push`**：若 manifest 里该 SN 已在服务器，只需板子 NVS 写入同一 `SN-...` + MAC 与登记一致即可。  
+2. **补登一条**（示例，把 `API`、`TOKEN`、MAC、整段 `qr_code` 换成你的）：
+
+```bash
+curl -sS -X POST "https://YOUR_API:8088/factory/devices" \
+  -H "Content-Type: application/json" \
+  -H "X-Factory-Token: YOUR_FACTORY_API_TOKEN" \
+  -d "{\"items\":[{\"serial\":\"SN-653BSYV4WP6YAEJB\",\"mac_nocolon\":\"AABBCCDDEEFF\",\"qr_code\":\"CROC|SN-653BSYV4WP6YAEJB|1776514219|....\",\"batch\":\"manual1\"}]}"
+```
+
+`mac_nocolon` 为板子 Wi‑Fi MAC **无冒号大写** 12 位；`qr_code` 与 `generate_serial_qr.py` 生成的 **`CROC|...`** 一致（或你策略允许的值）。确保服务器 `.env` 里 **`FACTORY_API_TOKEN`**、**`QR_SIGN_SECRET`** 已配置并已 **`docker compose restart api`**。
+
+## 板子 NVS 烧 `serial`（与固件 `sentinel` 命名空间一致）
+
+Arduino IDE 打开：**`tools/factory_pack/BurnSentinelSerial/BurnSentinelSerial.ino`**
+
+- 在文件顶部把 **`SERIAL_DEFAULT`** 设为 `SN-...`，或留空、115200 串口下粘贴整行序列号后回车。  
+- 烧录 → 串口出现 **`OK NVS sentinel/serial = ...`** 后，再烧录根目录 **`Croc Sentinel.ino`**，且**不要**勾选 **Erase Flash**。
+
 ## 图形界面（简易 UI）
 
 仓库根目录执行（需已安装 `tools/factory_pack/requirements.txt`）：

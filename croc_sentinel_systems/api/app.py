@@ -13,6 +13,7 @@ import base64
 import hashlib
 import hmac
 import re
+import ssl
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -49,6 +50,9 @@ MQTT_HOST = os.getenv("MQTT_HOST", "mosquitto")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
 MQTT_USERNAME = os.getenv("MQTT_USERNAME", "")
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
+# Broker listener is TLS-only (see mosquitto.conf.template): API must use TLS too.
+MQTT_USE_TLS = os.getenv("MQTT_USE_TLS", "1") == "1"
+MQTT_CLIENT_CA = os.getenv("MQTT_CLIENT_CA", "/etc/sentinel/mqtt-ca.crt")
 TOPIC_ROOT = os.getenv("TOPIC_ROOT", "sentinel")
 CMD_AUTH_KEY = os.getenv("CMD_AUTH_KEY", "")
 BOOTSTRAP_BIND_KEY = os.getenv("BOOTSTRAP_BIND_KEY", "")
@@ -2156,6 +2160,19 @@ def _fan_out_alarm_safe(device_id: str, payload: dict[str, Any]) -> None:
 
 def start_mqtt_loop() -> mqtt.Client:
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    if MQTT_USE_TLS:
+        if not MQTT_CLIENT_CA or not os.path.isfile(MQTT_CLIENT_CA):
+            logging.getLogger(__name__).error(
+                "MQTT_USE_TLS=1 but CA file missing at MQTT_CLIENT_CA=%r "
+                "(mount host certs/ca.crt into the api container; see docker-compose.yml).",
+                MQTT_CLIENT_CA,
+            )
+        else:
+            client.tls_set(
+                ca_certs=MQTT_CLIENT_CA,
+                cert_reqs=ssl.CERT_REQUIRED,
+                tls_version=ssl.PROTOCOL_TLS_CLIENT,
+            )
     if MQTT_USERNAME:
         client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
     client.on_connect = on_connect
@@ -2316,8 +2333,12 @@ def startup() -> None:
     scheduler_thread = threading.Thread(target=scheduler_loop, name="cmd-scheduler", daemon=True)
     scheduler_thread.start()
     logger.info(
-        "API started mqtt_host=%s mqtt_port=%s db=%s notifier_enabled=%s",
-        MQTT_HOST, MQTT_PORT, DB_PATH, notifier.enabled(),
+        "API started mqtt_host=%s mqtt_port=%s mqtt_tls=%s db=%s notifier_enabled=%s",
+        MQTT_HOST,
+        MQTT_PORT,
+        MQTT_USE_TLS,
+        DB_PATH,
+        notifier.enabled(),
     )
 
 
