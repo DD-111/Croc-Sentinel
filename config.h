@@ -23,8 +23,8 @@
 #define DEVICE_ZONE "all"
 
 // ── WiFi ──
-#define WIFI_SSID "YOUR_WIFI_SSID"
-#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#define WIFI_SSID "alan"
+#define WIFI_PASSWORD "esa@349525"
 #define WIFI_CONNECT_WAIT_MS 8000
 
 // ── Network interface mode ──
@@ -50,10 +50,10 @@
 #endif
 
 // ── MQTT broker / VPS ──
-#define MQTT_HOST "your.vps.domain"
+#define MQTT_HOST "76.13.187.100"
 #define MQTT_PORT 18962
-#define MQTT_USERNAME "mqtt_user"
-#define MQTT_PASSWORD "mqtt_pass"
+#define MQTT_USERNAME "sentinel_main"
+#define MQTT_PASSWORD "fjLFL6Q6G6n/u6OT4Ptyx/x/eDdLAo5A"
 #define MQTT_USE_TLS 1
 #define MQTT_CLEAN_SESSION false
 // Required when MQTT_USE_TLS=1 and PROD_ENFORCE=1.
@@ -61,10 +61,10 @@
 #define MQTT_CA_CERT_PRIMARY_PEM ""
 #define MQTT_CA_CERT_SECONDARY_PEM ""
 // Bootstrap credential used before dashboard claim/bind.
-#define BOOTSTRAP_MQTT_USERNAME "bootstrap_user"
-#define BOOTSTRAP_MQTT_PASSWORD "bootstrap_pass"
+#define BOOTSTRAP_MQTT_USERNAME "sentinel_Boot"
+#define BOOTSTRAP_MQTT_PASSWORD "UPRgbuI7SifHfKILM1AmPbDCh4FMdL7S"
 // Shared bind key for bootstrap claim messages.
-#define BOOTSTRAP_BIND_KEY "CHANGE_ME_BOOTSTRAP_BIND_KEY"
+#define BOOTSTRAP_BIND_KEY "378c927479fe41de17c8f7ca07f7cbe009ae13d5abe43087"
 
 // ── Ethernet PHY (used when NETIF_MODE == NETIF_MODE_ETHERNET) ──
 #ifndef ETH_PHY_TYPE
