@@ -116,6 +116,20 @@ static bool g_wifiMultiApsRegistered = false;
 static void g_wifiMultiRegisterAps() {
   if (g_wifiMultiApsRegistered) return;
   g_wifiMultiApsRegistered = true;
+#if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
+    !defined(CONFIG_IDF_TARGET_ESP32P4)
+  {
+    Preferences pr;
+    if (pr.begin(NVS_NAMESPACE, true)) {
+      String rs = pr.getString("wifi_sta_ssid", "");
+      String rp = pr.getString("wifi_sta_pass", "");
+      pr.end();
+      if (rs.length() > 0) {
+        g_wifiMulti.addAP(rs.c_str(), rp.c_str());
+      }
+    }
+  }
+#endif
   if (strlen(WIFI_SSID) > 0) {
     g_wifiMulti.addAP(WIFI_SSID, WIFI_PASSWORD);
   }
@@ -932,6 +946,51 @@ void publishAck(const char *cmd, bool ok, const char *detail) {
   publishRaw(topicAck, buf, false);
 }
 
+#if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
+    !defined(CONFIG_IDF_TARGET_ESP32P4)
+// Publishes wifi_scan result on the ack topic (replaces small publishAck shape).
+static void publishWifiScanAckJson(int apCount) {
+  StaticJsonDocument<2048> doc;
+  doc["device_id"] = deviceId;
+  doc["cmd"] = "wifi_scan";
+  doc["ts"] = tsNow();
+  if (apCount < 0) {
+    doc["ok"] = false;
+    doc["detail"] = "scan failed";
+    doc["count"] = 0;
+  } else {
+    doc["ok"] = true;
+    doc["count"] = apCount;
+    JsonArray arr = doc.createNestedArray("networks");
+    int cap = apCount > 32 ? 32 : apCount;
+    for (int i = 0; i < cap; i++) {
+      JsonObject o = arr.createNestedObject();
+      String s = WiFi.SSID(i);
+      o["ssid"] = (s.length() == 0) ? "(hidden)" : s;
+      o["rssi"] = WiFi.RSSI(i);
+      o["ch"] = WiFi.channel(i);
+      o["auth"] = (int)WiFi.encryptionType(i);
+    }
+  }
+  char buf[2048];
+  size_t w = serializeJson(doc, buf, sizeof(buf));
+  if (w == 0 || w >= sizeof(buf)) {
+    StaticJsonDocument<192> err;
+    err["device_id"] = deviceId;
+    err["cmd"] = "wifi_scan";
+    err["ok"] = false;
+    err["detail"] = "payload too large";
+    err["ts"] = tsNow();
+    char ebuf[192];
+    serializeJson(err, ebuf, sizeof(ebuf));
+    publishRaw(topicAck, ebuf, false);
+  } else {
+    publishRaw(topicAck, buf, false);
+  }
+  WiFi.scanDelete();
+}
+#endif
+
 // Dedicated OTA result event. Carries campaign_id + target fw so the API can
 // drive the campaign state machine and know whether a rollback is needed.
 void publishOtaResult(const char *campaignId,
@@ -1021,6 +1080,17 @@ void publishStatus() {
   doc["boot_count"]         = bootCount;
   doc["reset_reason"]       = resetReasonStr;
   doc["net_type"]           = netIf->type();
+#if !defined(CONFIG_IDF_TARGET_ESP32P4)
+  if (strcmp(netIf->type(), "wifi") == 0) {
+    if (WiFi.status() == WL_CONNECTED) {
+      doc["wifi_ssid"] = WiFi.SSID();
+      doc["wifi_channel"] = WiFi.channel();
+    } else {
+      doc["wifi_ssid"] = "";
+      doc["wifi_channel"] = 0;
+    }
+  }
+#endif
   doc["ip"]                 = netIf->localIP();
   doc["rssi"]               = rssi;
   doc["vbat"]               = vbat;
@@ -1288,6 +1358,54 @@ void executeCommand(const char *cmd, JsonVariant params) {
   }
 #endif
 
+#if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
+    !defined(CONFIG_IDF_TARGET_ESP32P4)
+  if (strcmp(resolvedCmd, "wifi_scan") == 0) {
+    twdtFeedMaybe();
+    WiFi.mode(WIFI_STA);
+    WiFi.scanDelete();
+    twdtFeedMaybe();
+    int n = WiFi.scanNetworks(false, false, false, 130);
+    if (n == WIFI_SCAN_FAILED) {
+      publishWifiScanAckJson(-1);
+    } else {
+      publishWifiScanAckJson(n);
+    }
+    twdtFeedMaybe();
+    publishStatus();
+    return;
+  }
+
+  if (strcmp(resolvedCmd, "wifi_config") == 0) {
+    const char *ssid = params["ssid"] | "";
+    const char *pass = params["password"] | "";
+    size_t sl = strlen(ssid);
+    if (sl == 0 || sl > 32) {
+      publishAck(resolvedCmd, false, "invalid ssid");
+      return;
+    }
+    if (strlen(pass) > 64) {
+      publishAck(resolvedCmd, false, "password too long");
+      return;
+    }
+    prefs.begin(NVS_NAMESPACE, false);
+    prefs.putString("wifi_sta_ssid", ssid);
+    prefs.putString("wifi_sta_pass", pass);
+    prefs.end();
+    requestRestartWithAck(resolvedCmd, "wifi_config saved");
+    return;
+  }
+
+  if (strcmp(resolvedCmd, "wifi_clear") == 0) {
+    prefs.begin(NVS_NAMESPACE, false);
+    prefs.remove("wifi_sta_ssid");
+    prefs.remove("wifi_sta_pass");
+    prefs.end();
+    requestRestartWithAck(resolvedCmd, "wifi_cleared");
+    return;
+  }
+#endif
+
   if (strcmp(resolvedCmd, "get_info") == 0) {
     publishStatus();
     publishAck(resolvedCmd, true, "status published");
@@ -1357,6 +1475,12 @@ void publishCommandTable() {
   arr.add("get_info");
   arr.add("get_cmd_table");
   arr.add("ping");
+#if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
+    !defined(CONFIG_IDF_TARGET_ESP32P4)
+  arr.add("wifi_scan");
+  arr.add("wifi_config");
+  arr.add("wifi_clear");
+#endif
   doc["aliases"] = "set_params->set_param,info->get_info,reboot_now->reboot,ota_update->ota,red_alert->siren_on,cancel_alert->siren_off,self_check->self_test";
   doc["ts"] = tsNow();
 

@@ -62,6 +62,10 @@ class Notifier:
     def enabled(self) -> bool:
         return bool(self.host)
 
+    def worker_alive(self) -> bool:
+        """True if the background SMTP worker thread is running."""
+        return self._worker is not None and self._worker.is_alive()
+
     def status(self) -> dict:
         return {
             "enabled": self.enabled(),
@@ -74,6 +78,7 @@ class Notifier:
             "sent": self._sent_count,
             "failed": self._failed_count,
             "last_error": self._last_error,
+            "worker_running": self.worker_alive(),
         }
 
     # ----------------------------------------------------------------- api
@@ -140,7 +145,11 @@ class Notifier:
     def _build_message(self, job: MailJob) -> EmailMessage:
         msg = EmailMessage()
         msg["Subject"] = job.subject
-        msg["From"] = self.sender or self.username or "noreply@localhost"
+        # From must be a mailbox many providers accept (often equals SMTP auth user).
+        from_addr = (self.sender or self.username or "").strip()
+        if not from_addr or "@" not in from_addr:
+            from_addr = (self.username or "").strip() or "noreply@localhost"
+        msg["From"] = from_addr
         msg["To"] = ", ".join(job.to)
         if job.reply_to:
             msg["Reply-To"] = job.reply_to
@@ -182,11 +191,17 @@ def render_alarm_email(alarm: dict) -> tuple[str, str, str]:
     zone = alarm.get("zone") or "all"
     ts = alarm.get("created_at") or ""
     fanout = alarm.get("fanout_count")
-    subject = f"[Croc Sentinel] ALARM on {source} (zone {zone})"
+    grp = str(alarm.get("notification_group") or "").strip()
+    disp = str(alarm.get("display_label") or "").strip()
+    pfx = str(alarm.get("notify_prefix") or "").strip()
+    subject = f"[Croc Sentinel] {pfx}ALARM ({triggered_by})" if pfx else f"[Croc Sentinel] ALARM on {source} (zone {zone})"
     lines = [
         "A Croc Sentinel alarm was triggered.",
         "",
+        f"Notify as     : {pfx.strip() or '(device id only)'}",
         f"Source device : {source}",
+        f"Group         : {grp or '—'}",
+        f"Display name  : {disp or '—'}",
         f"Zone          : {zone}",
         f"Triggered via : {triggered_by}",
         f"Time (UTC)    : {ts}",
@@ -198,7 +213,10 @@ def render_alarm_email(alarm: dict) -> tuple[str, str, str]:
         f"<tr><td style='padding:4px 12px;color:#64748b'>{k}</td>"
         f"<td style='padding:4px 12px'><code>{v}</code></td></tr>"
         for k, v in (
+            ("Notify as", pfx.strip() or "—"),
             ("Source device", source),
+            ("Group", grp or "—"),
+            ("Display name", disp or "—"),
             ("Zone", zone),
             ("Triggered via", triggered_by),
             ("Time (UTC)", ts),
@@ -220,18 +238,26 @@ def render_remote_siren_email(
     action: str,
     device_id: str,
     display_label: str,
+    notification_group: str = "",
     zone: str,
     actor: str,
     duration_ms: Optional[int],
 ) -> tuple[str, str, str]:
     """Dashboard / API remote siren (not the device physical alarm fan-out)."""
     label = display_label.strip() or "—"
-    subject = f"[Croc Sentinel] Remote siren {action} on {device_id}"
+    grp = (notification_group or "").strip() or "—"
+    pfx_parts = [f"[{notification_group.strip()}]"] if (notification_group or "").strip() else []
+    if (display_label or "").strip():
+        pfx_parts.append(display_label.strip())
+    pfx = (" ".join(pfx_parts) + " · ") if pfx_parts else f"{device_id} · "
+    subject = f"[Croc Sentinel] {pfx}Remote siren {action}"
     lines = [
         "A user triggered a remote siren command from the dashboard or API.",
         "",
+        f"Notify as     : {pfx.strip()}",
         f"Action        : {action}",
         f"Device id     : {device_id}",
+        f"Group         : {grp}",
         f"Display name  : {label}",
         f"Zone          : {zone or 'all'}",
         f"Triggered by  : {actor}",
@@ -243,8 +269,10 @@ def render_remote_siren_email(
         f"<tr><td style='padding:4px 12px;color:#64748b'>{k}</td>"
         f"<td style='padding:4px 12px'><code>{v}</code></td></tr>"
         for k, v in (
+            ("Notify as", pfx.strip()),
             ("Action", action),
             ("Device id", device_id),
+            ("Group", grp),
             ("Display name", label),
             ("Zone", zone or "all"),
             ("Triggered by", actor),

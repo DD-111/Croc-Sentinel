@@ -721,6 +721,7 @@ def init_db() -> None:
         ensure_column(conn, "device_state", "net_type", "TEXT")
         ensure_column(conn, "device_state", "provisioned", "INTEGER")
         ensure_column(conn, "device_state", "display_label", "TEXT")
+        ensure_column(conn, "device_state", "notification_group", "TEXT")
         ensure_column(conn, "dashboard_users", "manager_admin", "TEXT")
         ensure_column(conn, "dashboard_users", "tenant", "TEXT")
         ensure_column(conn, "dashboard_users", "email", "TEXT")
@@ -978,6 +979,12 @@ def emit_event(
     now = datetime.now(timezone.utc)
     ts_iso = now.isoformat()
     ts_ms = int(now.timestamp() * 1000)
+    sum_line = summary or event_type
+    did = (device_id or "").strip()
+    if did:
+        pfx = _notify_subject_prefix(did)
+        if pfx and not str(sum_line).startswith(pfx):
+            sum_line = f"{pfx}{sum_line}"
     ev: dict[str, Any] = {
         "ts": ts_iso,
         "ts_epoch_ms": ts_ms,
@@ -988,7 +995,7 @@ def emit_event(
         "target": target or "",
         "owner_admin": owner_admin or "",
         "device_id": device_id or "",
-        "summary": summary or event_type,
+        "summary": sum_line,
         "detail": detail or {},
         "ref_table": ref_table,
         "ref_id": ref_id,
@@ -1595,6 +1602,36 @@ def _log_signal_trigger(
         conn.close()
 
 
+def _device_notify_labels(device_id: str) -> tuple[str, str]:
+    """Returns (notification_group, display_label) from device_state; may be empty."""
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT IFNULL(notification_group,''), IFNULL(display_label,'') "
+            "FROM device_state WHERE device_id = ?",
+            (device_id,),
+        )
+        row = cur.fetchone()
+        conn.close()
+    if not row:
+        return "", ""
+    return str(row[0] or "").strip(), str(row[1] or "").strip()
+
+
+def _notify_subject_prefix(device_id: str) -> str:
+    """Prefix for emails / Telegram: '[Group] DisplayName · ' or fallback to device_id."""
+    grp, name = _device_notify_labels(device_id)
+    parts: list[str] = []
+    if grp:
+        parts.append(f"[{grp}]")
+    if name:
+        parts.append(name)
+    if parts:
+        return " ".join(parts) + " · "
+    return f"{device_id} · "
+
+
 def _remote_siren_notify_email(
     *,
     action: str,
@@ -1605,21 +1642,14 @@ def _remote_siren_notify_email(
     duration_ms: Optional[int],
 ) -> None:
     recipients = _recipients_for_admin(owner_admin) if owner_admin else []
-    disp = ""
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT IFNULL(display_label,'') FROM device_state WHERE device_id = ?", (device_id,))
-        r = cur.fetchone()
-        conn.close()
-    if r:
-        disp = str(r[0] or "")
+    grp, disp = _device_notify_labels(device_id)
     if not recipients or not notifier.enabled():
         return
     subject, text, html = render_remote_siren_email(
         action=action,
         device_id=device_id,
         display_label=disp,
+        notification_group=grp,
         zone=zone,
         actor=actor,
         duration_ms=duration_ms,
@@ -2111,12 +2141,16 @@ def _fan_out_alarm(device_id: str, payload: dict[str, Any]) -> None:
     try:
         recipients = _recipients_for_admin(owner_admin)
         if recipients and notifier.enabled():
+            g, n = _device_notify_labels(device_id)
             subject, text, html = render_alarm_email({
                 "source_id": device_id,
                 "zone": source_zone,
                 "triggered_by": triggered_by,
                 "created_at": utc_now_iso(),
                 "fanout_count": sent,
+                "notification_group": g,
+                "display_label": n,
+                "notify_prefix": _notify_subject_prefix(device_id),
             })
             email_sent = notifier.enqueue(recipients, subject, text, html)
             email_detail = f"queued={email_sent} to={len(recipients)}"
@@ -2439,7 +2473,7 @@ def startup() -> None:
 
         start_telegram_worker()
     except Exception:
-        pass
+        logger.exception("Telegram worker failed to start (check TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_IDS)")
     mqtt_client = start_mqtt_loop()
     scheduler_stop.clear()
     scheduler_thread = threading.Thread(target=scheduler_loop, name="cmd-scheduler", daemon=True)
@@ -2609,22 +2643,27 @@ def _record_signup_attempt(ip: str, email: str) -> None:
 
 
 def _send_email_otp(to: str, code: str, purpose: str) -> None:
-    subject_prefix = os.getenv("SMTP_SUBJECT_PREFIX", "[Sentinel]")
-    purpose_zh = {
-        "signup": "账号注册",
-        "activate": "账号激活",
-        "reset": "重置密码",
-    }.get(purpose, purpose)
-    subject = f"{subject_prefix} {purpose_zh} 验证码: {code}"
+    """Queue a registration / activation / reset OTP (English-only for deliverability)."""
+    subject_prefix = (os.getenv("SMTP_SUBJECT_PREFIX", "[Sentinel]") or "[Sentinel]").strip()
+    purpose_en = {
+        "signup": "Admin signup verification",
+        "activate": "Account activation",
+        "reset": "Password recovery",
+    }.get(purpose, "Verification")
+    ttl_min = max(1, int(OTP_TTL_SECONDS // 60))
+    subject = f"{subject_prefix} {purpose_en} — code {code}"
     body = (
-        f"您的 Croc Sentinel {purpose_zh} 验证码是：\n\n"
+        f"Croc Sentinel — {purpose_en}\n\n"
+        f"Your one-time verification code is:\n\n"
         f"    {code}\n\n"
-        f"该验证码 {OTP_TTL_SECONDS // 60} 分钟内有效。若非本人操作，请忽略此邮件。\n"
-        "Your verification code for Croc Sentinel is above.\n"
+        f"This code expires in {ttl_min} minutes.\n"
+        f"If you did not request this email, you can ignore it.\n"
     )
     ok = notifier.enqueue(to=[to], subject=subject, body_text=body)
     if not ok:
-        raise RuntimeError("notifier queue full or SMTP not configured")
+        raise RuntimeError(
+            "SMTP is not configured (set SMTP_HOST and related env) or the mail queue rejected the job"
+        )
 
 
 def _send_sms_otp(phone: str, code: str, purpose: str) -> None:
@@ -2665,9 +2704,10 @@ def _issue_verification(username: str, channel: str, target: str, purpose: str) 
                 last_ts = 0
             if int(time.time()) - last_ts < OTP_RESEND_COOLDOWN_SECONDS:
                 conn.close()
+                wait = OTP_RESEND_COOLDOWN_SECONDS - (int(time.time()) - last_ts)
                 raise HTTPException(
                     status_code=429,
-                    detail=f"请稍候 {OTP_RESEND_COOLDOWN_SECONDS - (int(time.time()) - last_ts)} 秒再重试",
+                    detail=f"Resend cooldown: wait {max(1, wait)}s before requesting another code",
                 )
         # Invalidate previous pending codes for this (user, channel, purpose).
         cur.execute(
@@ -3490,14 +3530,14 @@ def auth_create_user(req: UserCreateRequest, principal: Principal = Depends(requ
     activation_msg = ""
     try:
         _issue_verification(req.username, "email", email_norm, purpose="activate")
-        activation_msg = "已向邮箱发送验证码"
+        activation_msg = "Email verification code sent."
     except Exception as exc:
         logger.warning("email OTP issue failed for %s: %s", req.username, exc)
-        activation_msg = f"邮件验证码未发送：{exc}"
+        activation_msg = f"Email code not sent: {exc}"
     if phone_norm:
         try:
             _issue_verification(req.username, "phone", phone_norm, purpose="activate")
-            activation_msg += "；短信验证码已发送"
+            activation_msg += " SMS code sent."
         except Exception as exc:
             logger.warning("phone OTP issue failed for %s: %s", req.username, exc)
     return {
@@ -3854,9 +3894,21 @@ def unrevoke_device(device_id: str, principal: Principal = Depends(require_princ
 def health() -> dict[str, Any]:
     """Liveness for load balancers / `curl` — intentionally **no** auth so Uptime
     Kuma, Docker healthchecks, and reverse proxies can probe without a token."""
+    tg: dict[str, Any] = {}
+    try:
+        from telegram_notify import telegram_status
+
+        tg = dict(telegram_status())
+    except Exception as exc:
+        tg = {"enabled": False, "worker_running": False, "error": str(exc)}
     return {
         "ok": True,
         "mqtt_connected": mqtt_connected,
+        "smtp": {
+            "configured": notifier.enabled(),
+            "worker_running": notifier.worker_alive(),
+        },
+        "telegram": tg,
         "ts": int(time.time()),
     }
 
@@ -3998,7 +4050,8 @@ def list_devices(principal: Principal = Depends(require_principal)) -> dict[str,
         cur.execute(
             f"""
             SELECT device_id, fw, chip_target, board_profile, net_type, zone, provisioned,
-                   IFNULL(display_label, '') AS display_label, updated_at
+                   IFNULL(display_label, '') AS display_label,
+                   IFNULL(notification_group, '') AS notification_group, updated_at
             FROM device_state
             WHERE 1=1 {zs} {osf}
             ORDER BY updated_at DESC
@@ -4037,14 +4090,34 @@ class DeviceDisplayLabelBody(BaseModel):
     display_label: str = Field(default="", max_length=80)
 
 
-@app.patch("/devices/{device_id}/display-label")
-def patch_device_display_label(
+class DeviceProfileBody(BaseModel):
+    display_label: Optional[str] = Field(default=None, max_length=80)
+    notification_group: Optional[str] = Field(default=None, max_length=80)
+
+
+def _apply_device_profile_update(
     device_id: str,
-    body: DeviceDisplayLabelBody,
-    principal: Principal = Depends(require_principal),
+    principal: Principal,
+    body: DeviceProfileBody,
 ) -> dict[str, Any]:
+    if body.display_label is None and body.notification_group is None:
+        raise HTTPException(
+            status_code=400,
+            detail="provide at least one of display_label, notification_group",
+        )
     assert_min_role(principal, "user")
     assert_device_owner(principal, device_id)
+    sets: list[str] = []
+    args: list[Any] = []
+    if body.display_label is not None:
+        sets.append("display_label = ?")
+        args.append(body.display_label.strip())
+    if body.notification_group is not None:
+        sets.append("notification_group = ?")
+        args.append(body.notification_group.strip())
+    sets.append("updated_at = ?")
+    args.append(utc_now_iso())
+    args.append(device_id)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -4055,8 +4128,8 @@ def patch_device_display_label(
             raise HTTPException(status_code=404, detail="device not found")
         assert_zone_for_device(principal, str(zr["zone"]) if zr["zone"] is not None else "")
         cur.execute(
-            "UPDATE device_state SET display_label = ?, updated_at = ? WHERE device_id = ?",
-            (body.display_label.strip(), utc_now_iso(), device_id),
+            f"UPDATE device_state SET {', '.join(sets)} WHERE device_id = ?",
+            tuple(args),
         )
         conn.commit()
         conn.close()
@@ -4065,14 +4138,45 @@ def patch_device_display_label(
     emit_event(
         level="info",
         category="device",
-        event_type="device.display_label",
-        summary=f"display label updated for {device_id}",
+        event_type="device.profile",
+        summary=f"device profile updated {device_id}",
         actor=principal.username,
         target=device_id,
         device_id=device_id,
-        detail={"label": body.display_label.strip()},
+        detail={
+            "display_label": body.display_label.strip() if body.display_label is not None else None,
+            "notification_group": body.notification_group.strip() if body.notification_group is not None else None,
+        },
     )
-    return {"ok": True, "device_id": device_id, "display_label": body.display_label.strip()}
+    out: dict[str, Any] = {"ok": True, "device_id": device_id}
+    if body.display_label is not None:
+        out["display_label"] = body.display_label.strip()
+    if body.notification_group is not None:
+        out["notification_group"] = body.notification_group.strip()
+    return out
+
+
+@app.patch("/devices/{device_id}/profile")
+def patch_device_profile(
+    device_id: str,
+    body: DeviceProfileBody,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    return _apply_device_profile_update(device_id, principal, body)
+
+
+@app.patch("/devices/{device_id}/display-label")
+def patch_device_display_label(
+    device_id: str,
+    body: DeviceDisplayLabelBody,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    """Legacy: only updates display_label."""
+    return _apply_device_profile_update(
+        device_id,
+        principal,
+        DeviceProfileBody(display_label=body.display_label, notification_group=None),
+    )
 
 
 @app.get("/devices/{device_id}/messages")
@@ -5110,7 +5214,8 @@ def list_activity_signals(
             f"""
             SELECT a.id, a.created_at, 'device_alarm' AS kind, a.source_id AS device_id, a.zone,
                    a.triggered_by AS actor, a.fanout_count, a.email_sent, a.email_detail,
-                   NULL AS duration_ms, IFNULL(d.display_label, '') AS display_label
+                   NULL AS duration_ms, IFNULL(d.display_label, '') AS display_label,
+                   IFNULL(d.notification_group, '') AS notification_group
             FROM alarms a
             LEFT JOIN device_state d ON d.device_id = a.source_id
             WHERE a.created_at >= datetime('now', ?) {al_scope}
@@ -5124,7 +5229,8 @@ def list_activity_signals(
             SELECT s.id, s.created_at, s.kind, s.device_id, s.zone,
                    s.actor_username AS actor, s.target_count AS fanout_count,
                    0 AS email_sent, '' AS email_detail, s.duration_ms,
-                   IFNULL(d.display_label, '') AS display_label, s.detail_json
+                   IFNULL(d.display_label, '') AS display_label,
+                   IFNULL(d.notification_group, '') AS notification_group, s.detail_json
             FROM signal_triggers s
             LEFT JOIN device_state d ON d.device_id = s.device_id
             WHERE s.created_at >= datetime('now', ?) {st_scope}
@@ -5144,6 +5250,7 @@ def list_activity_signals(
                 "what": "alarm_fanout",
                 "device_id": r["device_id"],
                 "display_label": r["display_label"] or "",
+                "notification_group": r.get("notification_group") or "",
                 "zone": r["zone"] or "",
                 "who": r["actor"],
                 "fanout_count": int(r["fanout_count"] or 0),
@@ -5161,6 +5268,7 @@ def list_activity_signals(
                 "what": r["kind"],
                 "device_id": r["device_id"],
                 "display_label": r["display_label"] or "",
+                "notification_group": r.get("notification_group") or "",
                 "zone": r["zone"] or "",
                 "who": r["actor"],
                 "fanout_count": int(r["fanout_count"] or 0),

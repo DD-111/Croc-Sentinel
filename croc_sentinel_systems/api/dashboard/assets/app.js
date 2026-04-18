@@ -12,15 +12,41 @@
   };
   const OFFLINE_MS = 90 * 1000;
 
-  const NAV = [
-    { id: "overview",  label: "Overview",  ico: "◎", path: "#/overview",   min: "user"  },
-    { id: "signals",   label: "Signals",   ico: "◉", path: "#/signals",    min: "user"  },
-    { id: "alerts",    label: "Siren",     ico: "!", path: "#/alerts",     min: "user"  },
-    { id: "activate",  label: "Activate",  ico: "+", path: "#/activate",   min: "admin" },
-    { id: "ota",       label: "OTA",       ico: "↑", path: "#/ota",        min: "admin" },
-    { id: "events",    label: "Events",    ico: "≈", path: "#/events",     min: "user"  },
-    { id: "audit",     label: "Audit",     ico: "≡", path: "#/audit",      min: "admin" },
-    { id: "admin",     label: "Admin",     ico: "☼", path: "#/admin",      min: "admin" },
+  /** Sidebar: grouped by function (paths unchanged). */
+  const NAV_GROUPS = [
+    {
+      title: "Dashboard",
+      items: [
+        { id: "overview", label: "Overview", ico: "◎", path: "#/overview", min: "user" },
+      ],
+    },
+    {
+      title: "Monitoring",
+      items: [
+        { id: "signals", label: "Signals", ico: "◉", path: "#/signals", min: "user" },
+        { id: "events", label: "Events", ico: "≈", path: "#/events", min: "user" },
+      ],
+    },
+    {
+      title: "Field ops",
+      items: [
+        { id: "alerts", label: "Siren", ico: "!", path: "#/alerts", min: "user" },
+        { id: "activate", label: "Activate device", ico: "+", path: "#/activate", min: "admin" },
+      ],
+    },
+    {
+      title: "Firmware",
+      items: [
+        { id: "ota", label: "OTA", ico: "↑", path: "#/ota", min: "admin" },
+      ],
+    },
+    {
+      title: "Governance",
+      items: [
+        { id: "audit", label: "Audit", ico: "≡", path: "#/audit", min: "admin" },
+        { id: "admin", label: "Admin & users", ico: "☼", path: "#/admin", min: "admin" },
+      ],
+    },
   ];
 
   const ROLE_WEIGHT = { user: 1, admin: 2, superadmin: 3 };
@@ -29,9 +55,10 @@
   const state = {
     me: null,
     mqttConnected: false,
+    health: null,
   };
 
-  /** 注册/激活页「几秒后跳转登录」的定时器，路由切换时必须清掉以免泄漏与误跳转 */
+  /** Route redirect timer (signup / activate → login); cleared on navigation. */
   let routeRedirectTimer = null;
   function clearRouteRedirectTimer() {
     if (routeRedirectTimer) {
@@ -47,11 +74,11 @@
     }, ms);
   }
 
-  /** 离开「事件中心」后应置空；仅在该页赋值，用于切回前台时重连 SSE */
+  /** Cleared when leaving Events; used to resume SSE when tab visible again. */
   window.__eventsStreamResume = null;
 
   let healthPollTimer = null;
-  /** 总览设备搜索防抖；离开页面时清掉，避免对已卸载 DOM 赋值 */
+  /** Overview device search debounce. */
   let overviewFilterDebounce = null;
   function clearHealthPollTimer() {
     if (healthPollTimer) {
@@ -173,10 +200,13 @@
     try {
       const h = await api("/health");
       state.mqttConnected = !!h.mqtt_connected;
+      state.health = h;
     } catch {
       state.mqttConnected = false;
+      state.health = null;
     }
     renderMqttDot();
+    renderHealthPills();
   }
 
   // ------------------------------------------------------------------ layout
@@ -191,6 +221,7 @@
       who.textContent = "Signed out";
     }
     renderNav();
+    renderHealthPills();
   }
 
   function renderNav() {
@@ -198,11 +229,42 @@
     if (!nav) return;
     if (!state.me) { nav.innerHTML = ""; return; }
     const hash = location.hash || "#/overview";
-    const items = NAV.filter((n) => hasRole(n.min)).map((n) => {
-      const active = hash.startsWith(n.path) ? ` aria-current="page"` : "";
-      return `<a href="${n.path}"${active}><span class="nav-ico">${n.ico}</span>${escapeHtml(n.label)}</a>`;
-    }).join("");
-    nav.innerHTML = `<div class="nav-section">Menu</div>${items}`;
+    const parts = [];
+    for (const g of NAV_GROUPS) {
+      const items = g.items.filter((n) => hasRole(n.min));
+      if (items.length === 0) continue;
+      parts.push(`<div class="nav-section">${escapeHtml(g.title)}</div>`);
+      for (const n of items) {
+        const active = hash.startsWith(n.path) ? ` aria-current="page"` : "";
+        parts.push(
+          `<a href="${n.path}"${active}><span class="nav-ico">${n.ico}</span>${escapeHtml(n.label)}</a>`,
+        );
+      }
+    }
+    nav.innerHTML = parts.join("");
+  }
+
+  function renderHealthPills() {
+    const el = $("#healthPills");
+    if (!el) return;
+    if (!state.me || !state.health) {
+      el.innerHTML = "";
+      return;
+    }
+    const sm = state.health.smtp || {};
+    const tg = state.health.telegram || {};
+    const smtpOk = !!sm.configured && !!sm.worker_running;
+    const tgOn = !!tg.enabled;
+    const tgOk = tgOn && !!tg.worker_running;
+    const smtpTitle = sm.configured
+      ? (smtpOk ? "SMTP worker running — OTP mail can be sent" : "SMTP configured but worker not running — check API logs")
+      : "SMTP not configured — set SMTP_HOST (and auth) for email OTP";
+    const tgTitle = tgOn
+      ? (tgOk ? "Telegram worker running" : "Telegram enabled but worker not running — check API logs")
+      : "Telegram disabled — set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS on server";
+    el.innerHTML = `
+      <span class="health-pill ${smtpOk ? "ok" : sm.configured ? "warn" : "off"}" title="${escapeHtml(smtpTitle)}">SMTP</span>
+      <span class="health-pill ${tgOk ? "ok" : tgOn ? "warn" : "off"}" title="${escapeHtml(tgTitle)}">TG</span>`;
   }
 
   function renderMqttDot() {
@@ -279,6 +341,7 @@
       view.innerHTML = '<div class="card"><span class="muted">Loading…</span></div>';
       await handler(view, args);
       renderNav();
+      renderHealthPills();
     } catch (e) {
       view.innerHTML = `<div class="card"><h2>Load failed</h2><p class="muted">${escapeHtml(e.message || e)}</p></div>`;
     }
@@ -334,7 +397,7 @@
 
   // Forgot password — offline RSA decrypt flow
   registerRoute("forgot-password", async (view) => {
-    setCrumb("忘记密码");
+    setCrumb("Forgot password");
     document.body.dataset.auth = "none";
     let enabled = true;
     try {
@@ -345,42 +408,36 @@
     view.innerHTML = `
       <div class="login-wrap">
         <div class="login-card" style="max-width:520px">
-          <h1>忘记密码</h1>
+          <h1>Forgot password</h1>
           <p class="muted">
-            本流程用于<strong>未配置邮箱自助重置</strong>或<strong>更高安全要求</strong>的部署。
-            点击「获取编码」后，会得到字段 <span class="mono">recovery_blob_hex</span>：
-            它是<strong>纯十六进制</strong>字符串，字符数 ≈ <strong>2 × blob_byte_len</strong>（与接口返回的
-            <span class="mono">blob_byte_len</span> 一致）。当前服务端为 RSA-2048 且
-            <span class="mono">PASSWORD_RECOVERY_PLAINTEXT_PAD=512</span> 时，长度约为 <strong>1602</strong> 个字符
-            ——不是「64 位短码」，请务必<strong>整段复制</strong>、勿换行截断、勿夹空格。
-            把整段发给运维；运维在<strong>离线机</strong>用
-            <span class="mono">password_recovery_offline/decrypt_recovery_blob.py</span>
-            + <span class="mono">private.pem</span> 解密后，将输出的一行 JSON 粘贴到下方「解密明文」，
-            再输入两次新密码即可写入数据库。
+            Offline RSA recovery: after <strong>Get blob</strong> you receive <span class="mono">recovery_blob_hex</span>
+            (long hex, length ≈ 2×<span class="mono">blob_byte_len</span>). Copy the <strong>entire</strong> string — no line breaks.
+            Decrypt offline with <span class="mono">password_recovery_offline/decrypt_recovery_blob.py</span> and <span class="mono">private.pem</span>,
+            paste the one-line JSON below, then set a new password.
           </p>
-          ${enabled ? "" : `<p class="badge revoked" style="margin:10px 0">当前服务器未配置公钥（<span class="mono">PASSWORD_RECOVERY_PUBLIC_KEY_*</span>），无法发起找回。</p>`}
+          ${enabled ? "" : `<p class="badge revoked" style="margin:10px 0">Server has no <span class="mono">PASSWORD_RECOVERY_PUBLIC_KEY_*</span> — recovery disabled.</p>`}
           <div id="fpStep1">
-            <label class="field"><span>用户名</span><input id="fp_user" autocomplete="username" /></label>
+            <label class="field"><span>Username</span><input id="fp_user" autocomplete="username" /></label>
             <div style="margin-top:14px;display:flex;flex-direction:column;gap:10px">
-              <button class="btn btn-tap btn-block" type="button" id="fp_go" ${enabled ? "" : "disabled"}>获取编码</button>
-              <a class="link-tile" href="#/login" style="text-align:center">返回登录</a>
+              <button class="btn btn-tap btn-block" type="button" id="fp_go" ${enabled ? "" : "disabled"}>Get recovery blob</button>
+              <a class="link-tile" href="#/login" style="text-align:center">Back to sign in</a>
             </div>
             <p class="muted" id="fp_msg1" style="margin-top:10px"></p>
           </div>
           <div id="fpStep2" style="display:none">
-            <label class="field"><span>recovery_blob_hex（整段复制）</span>
+            <label class="field"><span>recovery_blob_hex</span>
               <textarea id="fp_blob" readonly rows="6" class="mono" style="width:100%;font-size:11px"></textarea>
             </label>
             <p class="muted" id="fp_blob_hint" style="margin-top:6px;font-size:12px"></p>
             <p class="muted" id="fp_meta"></p>
-            <label class="field"><span>解密明文（一行 JSON）</span>
+            <label class="field"><span>Decrypted JSON (one line)</span>
               <textarea id="fp_plain" rows="3" placeholder='{"jti":"...","u":"...","s":"...","e":...}' style="width:100%"></textarea>
             </label>
-            <label class="field"><span>新密码（≥8 位）</span><input id="fp_p1" type="password" autocomplete="new-password" /></label>
-            <label class="field"><span>确认新密码</span><input id="fp_p2" type="password" autocomplete="new-password" /></label>
+            <label class="field"><span>New password (≥8)</span><input id="fp_p1" type="password" autocomplete="new-password" /></label>
+            <label class="field"><span>Confirm password</span><input id="fp_p2" type="password" autocomplete="new-password" /></label>
             <div style="margin-top:14px;display:flex;flex-direction:column;gap:10px">
-              <button class="btn btn-tap btn-block" type="button" id="fp_done">更新密码</button>
-              <button class="btn secondary btn-tap btn-block" type="button" id="fp_back">上一步</button>
+              <button class="btn btn-tap btn-block" type="button" id="fp_done">Update password</button>
+              <button class="btn secondary btn-tap btn-block" type="button" id="fp_back">Back</button>
             </div>
             <p class="muted" id="fp_msg2" style="margin-top:10px"></p>
           </div>
@@ -390,7 +447,7 @@
     $("#fp_go").addEventListener("click", async () => {
       m1.textContent = "";
       const username = $("#fp_user").value.trim();
-      if (!username) { m1.textContent = "请输入用户名"; return; }
+      if (!username) { m1.textContent = "Enter username"; return; }
       try {
         const r = await fetch(apiBase() + "/auth/forgot/start", {
           method: "POST",
@@ -409,9 +466,9 @@
         const hexLen = hex.length;
         $("#fp_blob_hint").textContent =
           bl != null
-            ? `当前编码：十六进制 ${hexLen} 个字符（应等于 2×${bl}=${2 * Number(bl)}）。请完整复制到解密脚本，不要只复制前几行。`
-            : `当前编码：十六进制 ${hexLen} 个字符。请完整复制，不要截断。`;
-        $("#fp_meta").textContent = `有效时间约 ${((d.ttl_seconds || 0) / 3600).toFixed(1)} 小时 · 二进制长度 ${bl != null ? bl + " 字节" : "—"}`;
+            ? `Hex length ${hexLen} (expected 2×${bl}=${2 * Number(bl)}). Copy all of it.`
+            : `Hex length ${hexLen}. Copy the full blob.`;
+        $("#fp_meta").textContent = `TTL ~ ${((d.ttl_seconds || 0) / 3600).toFixed(1)} h · raw bytes ${bl != null ? bl : "—"}`;
         $("#fpStep1").style.display = "none";
         $("#fpStep2").style.display = "block";
       } catch (e) { m1.textContent = String(e.message || e); }
@@ -427,8 +484,8 @@
       const recovery_plain = ($("#fp_plain").value || "").trim();
       const password = $("#fp_p1").value;
       const password_confirm = $("#fp_p2").value;
-      if (!recovery_plain || !password) { m2.textContent = "请填写解密明文与密码"; return; }
-      if (password !== password_confirm) { m2.textContent = "两次密码不一致"; return; }
+      if (!recovery_plain || !password) { m2.textContent = "Enter decrypted JSON and password"; return; }
+      if (password !== password_confirm) { m2.textContent = "Passwords do not match"; return; }
       try {
         const r = await fetch(apiBase() + "/auth/forgot/complete", {
           method: "POST",
@@ -441,43 +498,43 @@
           const msg = Array.isArray(det) ? det.map((x) => x.msg || JSON.stringify(x)).join("; ") : (det || r.statusText);
           throw new Error(msg);
         }
-        m2.textContent = "密码已更新，请返回登录。";
-        toast("密码已更新", "ok");
+        m2.textContent = "Password updated. You can sign in now.";
+        toast("Password updated", "ok");
       } catch (e) { m2.textContent = String(e.message || e); }
     });
   });
 
   // Public admin signup
   registerRoute("register", async (view) => {
-    setCrumb("注册管理员");
+    setCrumb("Register admin");
     document.body.dataset.auth = "none";
     view.innerHTML = `
       <div class="login-wrap">
         <div class="login-card login-card--wide">
-          <h1>注册管理员</h1>
-          <p class="muted">只创建 <strong>管理员</strong> 角色。用<strong>邮箱收验证码</strong>完成验证，不需要手机号。<br>
-            超级管理员由运维在服务器配置，不从此页注册。若开启审批，验证通过后还需超管批准才能登录。</p>
-          <ol class="login-steps" aria-label="注册步骤">
-            <li id="r_step_ind1" class="is-active">① 填写资料</li>
-            <li id="r_step_ind2">② 邮箱验证</li>
+          <h1>Admin signup</h1>
+          <p class="muted">Creates an <strong>admin</strong> account. Email OTP only (no phone). Superadmin is seeded on the server, not here.
+            If approval is enabled, a superadmin must approve before login.</p>
+          <ol class="login-steps" aria-label="Steps">
+            <li id="r_step_ind1" class="is-active">1 · Details</li>
+            <li id="r_step_ind2">2 · Email code</li>
           </ol>
           <div id="rStep1">
-            <label class="field"><span>用户名（2–64 位：字母数字以及 ._-）</span><input id="r_user" autocomplete="username"/></label>
-            <label class="field" style="margin-top:10px"><span>密码（至少 8 位）</span><input id="r_pass" type="password" autocomplete="new-password"/></label>
-            <label class="field" style="margin-top:10px"><span>邮箱（收验证码与通知）</span><input id="r_email" type="email" autocomplete="email"/></label>
+            <label class="field"><span>Username (2–64, letters/digits/._-)</span><input id="r_user" autocomplete="username"/></label>
+            <label class="field" style="margin-top:10px"><span>Password (min 8)</span><input id="r_pass" type="password" autocomplete="new-password"/></label>
+            <label class="field" style="margin-top:10px"><span>Email</span><input id="r_email" type="email" autocomplete="email"/></label>
             <div style="margin-top:16px;display:flex;flex-direction:column;gap:10px">
-              <button class="btn btn-tap btn-block" type="button" id="r_start">发送邮件验证码</button>
-              <a class="link-tile" href="#/login" style="text-align:center">已有账号，去登录</a>
+              <button class="btn btn-tap btn-block" type="button" id="r_start">Send email code</button>
+              <a class="link-tile" href="#/login" style="text-align:center">Already have an account</a>
             </div>
             <p class="muted" id="r_msg1" style="margin-top:10px"></p>
           </div>
           <div id="rStep2" style="display:none">
-            <p>我们已向 <strong class="mono" id="r_shown_email"></strong> 发送验证码。请打开邮箱（含垃圾邮件夹）查看。</p>
-            <label class="field" style="margin-top:10px"><span>邮箱里的验证码</span><input id="r_email_code" inputmode="numeric" maxlength="12" autocomplete="one-time-code"/></label>
+            <p>We sent a code to <strong class="mono" id="r_shown_email"></strong> (check spam).</p>
+            <label class="field" style="margin-top:10px"><span>Email code</span><input id="r_email_code" inputmode="numeric" maxlength="12" autocomplete="one-time-code"/></label>
             <div style="margin-top:16px;display:flex;flex-direction:column;gap:10px">
-              <button class="btn btn-tap btn-block" type="button" id="r_verify">完成注册</button>
-              <button class="btn secondary btn-tap btn-block" type="button" id="r_resend">重发邮件验证码</button>
-              <button class="btn ghost btn-tap btn-block" type="button" id="r_back_step">返回上一步</button>
+              <button class="btn btn-tap btn-block" type="button" id="r_verify">Finish signup</button>
+              <button class="btn secondary btn-tap btn-block" type="button" id="r_resend">Resend code</button>
+              <button class="btn ghost btn-tap btn-block" type="button" id="r_back_step">Back</button>
             </div>
             <p class="muted" id="r_msg2" style="margin-top:10px"></p>
           </div>
@@ -491,7 +548,7 @@
         password: $("#r_pass").value,
         email: $("#r_email").value.trim(),
       };
-      if (!body.username || !body.password || !body.email) { m1.textContent = "请填写用户名、密码和邮箱"; return; }
+      if (!body.username || !body.password || !body.email) { m1.textContent = "Username, password, and email required"; return; }
       try {
         const r = await fetch(apiBase() + "/auth/signup/start", {
           method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
@@ -519,9 +576,9 @@
         const j = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(j.detail || `${r.status}`);
         if (j.status === "awaiting_approval") {
-          m2.innerHTML = `<span class="badge online">验证成功</span> 账号已提交，正在等待超级管理员审批，审批通过后可登录。`;
+          m2.innerHTML = `<span class="badge online">OK</span> Awaiting superadmin approval before login.`;
         } else {
-          m2.innerHTML = `<span class="badge online">验证成功</span> 账号已激活，3 秒后跳转到登录…`;
+          m2.innerHTML = `<span class="badge online">OK</span> Redirecting to sign in…`;
           scheduleRouteRedirect(3000, "#/login");
         }
       } catch (e) { m2.textContent = String(e.message || e); }
@@ -535,7 +592,7 @@
     });
     $("#r_resend").addEventListener("click", async () => {
       const username = sessionStorage.getItem("croc.signup_user") || "";
-      if (!username) { m2.textContent = "请先在上一步提交"; return; }
+      if (!username) { m2.textContent = "Complete step 1 first"; return; }
       try {
         const r = await fetch(apiBase() + "/auth/code/resend", {
           method: "POST", headers: { "Content-Type": "application/json" },
@@ -543,26 +600,26 @@
         });
         const j = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(j.detail || `${r.status}`);
-        m2.textContent = "已重新发送";
+        m2.textContent = "Code resent";
       } catch (e) { m2.textContent = String(e.message || e); }
     });
   });
 
   // Account activation (admin-created users arrive here)
   registerRoute("account-activate", async (view) => {
-    setCrumb("激活账号");
+    setCrumb("Activate account");
     document.body.dataset.auth = "none";
     view.innerHTML = `
       <div class="login-wrap">
         <div class="login-card login-card--wide">
-          <h1>激活账号</h1>
-          <p class="muted">管理员已在后台为你开好账号，并往你的邮箱发了验证码。在下面输入<strong>用户名</strong>和<strong>邮件里的验证码</strong>即可激活（无需手机号）。</p>
-          <label class="field"><span>用户名</span><input id="a_user" autocomplete="username"/></label>
-          <label class="field" style="margin-top:10px"><span>邮箱验证码</span><input id="a_email_code" inputmode="numeric" maxlength="12" autocomplete="one-time-code"/></label>
+          <h1>Activate account</h1>
+          <p class="muted">An admin created your user and sent an email code. Enter <strong>username</strong> and the <strong>code</strong> below.</p>
+          <label class="field"><span>Username</span><input id="a_user" autocomplete="username"/></label>
+          <label class="field" style="margin-top:10px"><span>Email code</span><input id="a_email_code" inputmode="numeric" maxlength="12" autocomplete="one-time-code"/></label>
           <div style="margin-top:16px;display:flex;flex-direction:column;gap:10px">
-            <button class="btn btn-tap btn-block" type="button" id="a_submit">激活账号</button>
-            <button class="btn secondary btn-tap btn-block" type="button" id="a_resend">重发邮件验证码</button>
-            <a class="link-tile" href="#/login" style="text-align:center">返回登录</a>
+            <button class="btn btn-tap btn-block" type="button" id="a_submit">Activate</button>
+            <button class="btn secondary btn-tap btn-block" type="button" id="a_resend">Resend code</button>
+            <a class="link-tile" href="#/login" style="text-align:center">Back to sign in</a>
           </div>
           <p class="muted" id="a_msg" style="margin-top:10px"></p>
         </div>
@@ -580,14 +637,14 @@
         });
         const j = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(j.detail || `${r.status}`);
-        msg.innerHTML = `<span class="badge online">已激活</span> 3 秒后回到登录…`;
+        msg.innerHTML = `<span class="badge online">Activated</span> Redirecting to sign in…`;
         scheduleRouteRedirect(3000, "#/login");
       } catch (e) { msg.textContent = String(e.message || e); }
     });
     $("#a_resend").addEventListener("click", async () => {
       msg.textContent = "";
       const username = $("#a_user").value.trim();
-      if (!username) { msg.textContent = "请先填写用户名"; return; }
+      if (!username) { msg.textContent = "Enter username first"; return; }
       try {
         const r = await fetch(apiBase() + "/auth/code/resend", {
           method: "POST",
@@ -596,7 +653,7 @@
         });
         const j = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(j.detail || `${r.status}`);
-        msg.textContent = "已尝试重新发送，请查收邮箱（含垃圾邮件）。";
+        msg.textContent = "Resend requested — check inbox and spam.";
       } catch (e) { msg.textContent = String(e.message || e); }
     });
   });
@@ -644,7 +701,7 @@
         <div class="row" style="align-items:center">
           <h2 style="margin:0">Devices</h2>
           <span class="muted">${devices.length} total</span>
-          <input id="q" placeholder="Filter id / name / zone / fw" class="grow right" />
+          <input id="q" placeholder="Filter id / name / group / zone / fw" class="grow right" />
         </div>
         <div class="divider"></div>
         <div class="device-grid" id="devGrid"></div>
@@ -654,7 +711,7 @@
       const grid = document.getElementById("devGrid");
       if (!grid) return;
       const q = ($("#q").value || "").toLowerCase().trim();
-      const rows = devices.filter((d) => !q || [d.device_id, d.display_label, d.zone, d.fw, d.board_profile, d.chip_target].join(" ").toLowerCase().includes(q));
+      const rows = devices.filter((d) => !q || [d.device_id, d.display_label, d.notification_group, d.zone, d.fw, d.board_profile, d.chip_target].join(" ").toLowerCase().includes(q));
       grid.innerHTML = rows.length === 0
         ? `<p class="muted">No matching devices.</p>`
         : rows.map((d) => {
@@ -663,6 +720,7 @@
           return `<a class="device-card" href="#/devices/${encodeURIComponent(d.device_id)}" style="text-decoration:none;color:inherit">
             <h3>${title}</h3>
             <div><span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>
+              ${d.notification_group ? `<span class="chip">${escapeHtml(d.notification_group)}</span>` : ""}
               ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
               ${d.fw ? `<span class="chip">v${escapeHtml(d.fw)}</span>` : ""}
             </div>
@@ -712,6 +770,28 @@
     const reason = s.disconnect_reason || (on ? "none" : "network_lost");
     const vbat = (s.vbat == null || s.vbat < 0) ? "—" : `${Number(s.vbat).toFixed(2)} V`;
     const rssi = (s.rssi == null || s.rssi === -127) ? "—" : `${s.rssi} dBm`;
+    const netT = String(s.net_type || d.net_type || "");
+    const wifiSsidDd = netT === "wifi"
+      ? ((s.wifi_ssid != null && String(s.wifi_ssid).length > 0)
+        ? escapeHtml(String(s.wifi_ssid))
+        : `<span class="muted">Not associated</span>`)
+      : `<span class="muted">N/A (${escapeHtml(netT || "—")})</span>`;
+    const wifiChDd = (netT === "wifi" && s.wifi_channel != null && Number(s.wifi_channel) > 0)
+      ? escapeHtml(String(s.wifi_channel))
+      : "—";
+    const wifiScanTableHtml = (ack) => {
+      if (!ack || ack.cmd !== "wifi_scan") return "";
+      if (ack.ok && Array.isArray(ack.networks) && ack.networks.length > 0) {
+        return `<div class="table-wrap" style="margin-top:10px"><table class="t"><thead><tr><th>SSID</th><th>RSSI</th><th>Ch</th><th>Auth</th></tr></thead><tbody>${
+          ack.networks.map((n) => `<tr><td>${escapeHtml(n.ssid || "")}</td><td class="mono">${escapeHtml(String(n.rssi ?? ""))}</td><td class="mono">${escapeHtml(String(n.ch ?? ""))}</td><td class="mono">${escapeHtml(String(n.auth ?? ""))}</td></tr>`).join("")
+        }</tbody></table></div>`;
+      }
+      if (ack.ok && Array.isArray(ack.networks) && ack.networks.length === 0) {
+        return `<p class="muted" style="margin-top:10px">No APs found.</p>`;
+      }
+      return `<p class="badge revoked" style="margin-top:10px">${escapeHtml(ack.detail || "wifi_scan failed")}</p>`;
+    };
+    const wifiScanBlock = wifiScanTableHtml(d.last_ack_json || {});
 
     view.innerHTML = `
       <div class="card">
@@ -723,17 +803,26 @@
           <a href="#/overview" class="btn ghost right">← Overview</a>
         </div>
         <div class="divider"></div>
-        <div class="row" style="gap:10px;align-items:flex-end;flex-wrap:wrap;margin-bottom:10px">
-          <label class="field grow"><span>Display name</span>
-            <input id="dispLabel" value="${escapeHtml(d.display_label || "")}" maxlength="80" />
-          </label>
-          <button class="btn secondary" type="button" id="saveLabel">Save</button>
+        <div style="margin-bottom:12px;padding:12px 14px;border:1px dashed var(--border-strong);border-radius:var(--radius-sm);background:var(--bg-muted)">
+          <h3 style="margin:0 0 8px;font-size:13px;color:var(--text-muted)">Notifications</h3>
+          <p class="muted" style="margin:0 0 10px">Used as the prefix for emails, Telegram, and in-app summaries for this device.</p>
+          <div class="row" style="gap:10px;align-items:flex-end;flex-wrap:wrap">
+            <label class="field grow"><span>Display name</span>
+              <input id="dispLabel" value="${escapeHtml(d.display_label || "")}" maxlength="80" />
+            </label>
+            <label class="field grow"><span>Notification group</span>
+              <input id="notifGroup" value="${escapeHtml(d.notification_group || "")}" maxlength="80" placeholder="e.g. Warehouse A" />
+            </label>
+            <button class="btn secondary btn-tap" type="button" id="saveProfile">Save</button>
+          </div>
         </div>
         <dl class="kv">
           <dt>Firmware</dt><dd class="mono">${escapeHtml(d.fw || "—")}</dd>
           <dt>Chip</dt><dd class="mono">${escapeHtml(d.chip_target || "—")}</dd>
           <dt>Board</dt><dd class="mono">${escapeHtml(d.board_profile || "—")}</dd>
           <dt>Network</dt><dd class="mono">${escapeHtml(d.net_type || "—")} · ${escapeHtml(s.ip || "—")}</dd>
+          <dt>Wi‑Fi SSID</dt><dd>${wifiSsidDd}</dd>
+          <dt>Wi‑Fi channel</dt><dd>${wifiChDd}</dd>
           <dt>RSSI</dt><dd class="mono">${escapeHtml(rssi)}</dd>
           <dt>Battery</dt><dd class="mono">${escapeHtml(vbat)}</dd>
           <dt>Tx / Rx</dt><dd class="mono">${escapeHtml(bps(s.tx_bps))} / ${escapeHtml(bps(s.rx_bps))}</dd>
@@ -772,6 +861,23 @@
         </div>
       </div>
 
+      <div class="card" id="wifiCtlCard">
+        <h3>Wi‑Fi (device)</h3>
+        <p class="muted">SSID / channel come from the last <span class="mono">status</span> report (STA). Use scan to list APs (radio may drop MQTT briefly). Apply saves credentials in device NVS as the <strong>first</strong> preferred network, then reboots.</p>
+        ${can("can_send_command") ? `
+        <div class="inline-form" style="margin-top:10px">
+          <label class="field grow"><span>New SSID</span><input id="wifiNewSsid" maxlength="32" autocomplete="off" placeholder="2.4 GHz network name" /></label>
+          <label class="field grow"><span>Password</span><input id="wifiNewPass" type="password" maxlength="64" autocomplete="new-password" placeholder="empty if open network" /></label>
+          <div class="row wide" style="justify-content:flex-end;flex-wrap:wrap;gap:8px">
+            <button class="btn secondary btn-tap" type="button" id="wifiScanBtn">Scan networks</button>
+            <button class="btn btn-tap" type="button" id="wifiApplyBtn">Save & reboot</button>
+            <button class="btn danger btn-tap" type="button" id="wifiClearBtn">Clear saved Wi‑Fi & reboot</button>
+          </div>
+        </div>
+        <p class="muted" id="wifiScanStatus" style="margin-top:8px;min-height:1.3em"></p>
+        <div id="wifiScanTable">${wifiScanBlock}</div>` : `<p class="muted">Requires <span class="mono">can_send_command</span>.</p>`}
+      </div>
+
       <div class="card">
         <div class="row">
           <h3 style="margin:0">Recent messages</h3>
@@ -793,11 +899,14 @@
         </div>
       </div>`;
 
-    $("#saveLabel").addEventListener("click", async () => {
+    $("#saveProfile").addEventListener("click", async () => {
       try {
-        await api(`/devices/${encodeURIComponent(id)}/display-label`, {
+        await api(`/devices/${encodeURIComponent(id)}/profile`, {
           method: "PATCH",
-          body: { display_label: ($("#dispLabel").value || "").trim() },
+          body: {
+            display_label: ($("#dispLabel").value || "").trim(),
+            notification_group: ($("#notifGroup").value || "").trim(),
+          },
         });
         toast("Saved", "ok");
       } catch (e) { toast(e.message || e, "err"); }
@@ -842,6 +951,53 @@
         toast("Command sent", "ok");
       } catch (e) { toast(e.message || e, "err"); }
     });
+
+    const wifiScanBtn = $("#wifiScanBtn");
+    if (wifiScanBtn) {
+      wifiScanBtn.addEventListener("click", async () => {
+        const st = $("#wifiScanStatus");
+        if (st) st.textContent = "Sending scan command…";
+        try {
+          await api(`/devices/${encodeURIComponent(id)}/commands`, { method: "POST", body: { cmd: "wifi_scan", params: {} } });
+          if (st) st.textContent = "Waiting for result (radio scan may drop MQTT briefly)…";
+          for (let i = 0; i < 28; i++) {
+            await new Promise((r) => setTimeout(r, 700));
+            const d2 = await api(`/devices/${encodeURIComponent(id)}`);
+            const a = d2.last_ack_json || {};
+            if (a.cmd === "wifi_scan" && typeof a.ok === "boolean") {
+              const tbl = $("#wifiScanTable");
+              if (tbl) tbl.innerHTML = wifiScanTableHtml(a);
+              if (st) st.textContent = a.ok ? `Done — ${a.count ?? (a.networks || []).length} AP(s).` : "Scan failed.";
+              return;
+            }
+          }
+          if (st) st.textContent = "Timeout — try Refresh or check Events.";
+        } catch (e) { if (st) st.textContent = String(e.message || e); }
+      });
+    }
+    const wifiApplyBtn = $("#wifiApplyBtn");
+    if (wifiApplyBtn) {
+      wifiApplyBtn.addEventListener("click", async () => {
+        const ssid = ($("#wifiNewSsid").value || "").trim();
+        const password = $("#wifiNewPass").value || "";
+        if (!ssid) { toast("Enter SSID", "err"); return; }
+        if (!confirm("Save Wi‑Fi on device and reboot? You may lose contact until it joins the new network.")) return;
+        try {
+          await api(`/devices/${encodeURIComponent(id)}/commands`, { method: "POST", body: { cmd: "wifi_config", params: { ssid, password } } });
+          toast("wifi_config sent — device rebooting", "ok");
+        } catch (e) { toast(e.message || e, "err"); }
+      });
+    }
+    const wifiClearBtn = $("#wifiClearBtn");
+    if (wifiClearBtn) {
+      wifiClearBtn.addEventListener("click", async () => {
+        if (!confirm("Clear device-stored Wi‑Fi override and reboot? It will use compile-time AP list only.")) return;
+        try {
+          await api(`/devices/${encodeURIComponent(id)}/commands`, { method: "POST", body: { cmd: "wifi_clear", params: {} } });
+          toast("wifi_clear sent — device rebooting", "ok");
+        } catch (e) { toast(e.message || e, "err"); }
+      });
+    }
   });
 
   // Alerts
@@ -875,7 +1031,8 @@
     const sel = $("#targets");
     sel.innerHTML = devices.map((d) => {
       const lab = d.display_label ? `${escapeHtml(d.display_label)} · ` : "";
-      return `<option value="${escapeHtml(d.device_id)}">${lab}${escapeHtml(d.device_id)} · ${escapeHtml(d.zone || "")}</option>`;
+      const grp = d.notification_group ? `[${escapeHtml(d.notification_group)}] ` : "";
+      return `<option value="${escapeHtml(d.device_id)}">${grp}${lab}${escapeHtml(d.device_id)} · ${escapeHtml(d.zone || "")}</option>`;
     }).join("");
 
     $("#fire").addEventListener("click", async () => {
@@ -892,25 +1049,25 @@
 
   // Activate
   registerRoute("activate", async (view) => {
-    setCrumb("激活设备");
-    if (!hasRole("admin")) { view.innerHTML = `<div class="card"><p class="muted">仅管理员可访问。</p></div>`; return; }
+    setCrumb("Activate device");
+    if (!hasRole("admin")) { view.innerHTML = `<div class="card"><p class="muted">Admins only.</p></div>`; return; }
     const canClaim = can("can_claim_device");
 
     view.innerHTML = `
       <div class="card">
-        <h2 style="margin-top:0">激活新设备</h2>
+        <h2 style="margin-top:0">Claim a device</h2>
         <p class="muted">
-          1) 先把 ESP32 通电，连上 Wi-Fi 或网线，等状态灯稳定。<br>
-          2) 用手机扫一下设备背面二维码，或把序列号（以 <span class="mono">SN-</span> 开头）抄到下面的框里。<br>
-          3) 点击"识别"——系统会告诉你这台设备是：未注册 / 已注册 / 还没联网 / 不在出厂清单。
+          1) Power the board and wait until it is on the network.<br>
+          2) Scan the label QR or paste the serial (<span class="mono">SN-…</span>) or full <span class="mono">CROC|…</span> string.<br>
+          3) Tap <strong>Identify</strong> — you will see whether it is claimable, already claimed, offline, blocked, or unknown.
         </p>
-        ${canClaim ? "" : `<p class="badge revoked" style="margin-top:6px">当前账号无 can_claim_device 能力，联系管理员开启。</p>`}
+        ${canClaim ? "" : `<p class="badge revoked" style="margin-top:6px">Your role does not have <span class="mono">can_claim_device</span>. Ask an admin.</p>`}
         <div class="inline-form" style="margin-top:10px">
-          <label class="field wide"><span>扫描二维码 或 粘贴序列号</span>
-            <input id="idn_input" placeholder="SN-XXXXXXXXXXXXXXXX 或 CROC|SN-…|…|…" autocomplete="off"/>
+          <label class="field wide"><span>QR payload or serial</span>
+            <input id="idn_input" placeholder="SN-XXXXXXXXXXXXXXXX or CROC|SN-…|…|…" autocomplete="off"/>
           </label>
           <div class="row wide" style="justify-content:flex-end">
-            <button class="btn secondary" id="idn_go" ${canClaim ? "" : "disabled"}>识别</button>
+            <button class="btn secondary btn-tap" id="idn_go" ${canClaim ? "" : "disabled"}>Identify</button>
           </div>
         </div>
         <div id="idnResult" style="margin-top:14px"></div>
@@ -918,9 +1075,9 @@
 
       <div class="card">
         <div class="row">
-          <h3 style="margin:0">最近联网、等待被激活的设备</h3>
-          <span class="muted">来自 MQTT 的 bootstrap.register 事件</span>
-          <button class="btn secondary right" id="reload">刷新</button>
+          <h3 style="margin:0">Recently seen (pending claim)</h3>
+          <span class="muted">From MQTT <span class="mono">bootstrap.register</span></span>
+          <button class="btn secondary right" id="reload">Refresh</button>
         </div>
         <div class="divider"></div>
         <div id="pendList"></div>
@@ -933,14 +1090,14 @@
     const showClaimForm = (serial, mac, qr) => {
       resultBox.insertAdjacentHTML("beforeend", `
         <div class="card" style="margin-top:10px">
-          <h4 style="margin-top:0">确认认领为你名下</h4>
+          <h4 style="margin-top:0">Confirm claim</h4>
           <div class="inline-form">
-            <label class="field"><span>device_id (=序列号，不建议修改)</span><input id="c_id" value="${escapeHtml(serial)}"/></label>
+            <label class="field"><span>device_id (usually the serial)</span><input id="c_id" value="${escapeHtml(serial)}"/></label>
             <label class="field"><span>mac_nocolon</span><input id="c_mac" value="${escapeHtml(mac)}"/></label>
             <label class="field"><span>zone</span><input id="c_zone" value="all"/></label>
-            <label class="field wide"><span>qr_code (可选)</span><input id="c_qr" value="${escapeHtml(qr || "")}"/></label>
+            <label class="field wide"><span>qr_code (optional)</span><input id="c_qr" value="${escapeHtml(qr || "")}"/></label>
             <div class="row wide" style="justify-content:flex-end">
-              <button class="btn" id="c_submit">确认认领</button>
+              <button class="btn btn-tap" id="c_submit">Claim device</button>
             </div>
           </div>
         </div>`);
@@ -954,46 +1111,46 @@
         if (q) body.qr_code = q;
         try {
           await api("/provision/claim", { method: "POST", body });
-          toast("认领成功", "ok");
+          toast("Device claimed", "ok");
           renderRoute();
         } catch (e) { toast(e.message || e, "err"); }
       });
     };
 
     $("#idn_go").addEventListener("click", async () => {
-      resultBox.innerHTML = `<p class="muted">识别中…</p>`;
+      resultBox.innerHTML = `<p class="muted">Identifying…</p>`;
       const raw = ($("#idn_input").value || "").trim();
-      if (!raw) { resultBox.innerHTML = `<p class="muted">请输入序列号或扫码结果</p>`; return; }
+      if (!raw) { resultBox.innerHTML = `<p class="muted">Enter serial or QR payload</p>`; return; }
       const body = raw.startsWith("CROC|") ? { qr_code: raw } : { serial: raw.toUpperCase() };
       try {
         const r = await api("/provision/identify", { method: "POST", body });
         const kv = (k, v) => `<dt>${escapeHtml(k)}</dt><dd class="mono">${escapeHtml(v)}</dd>`;
         switch (r.status) {
           case "ready":
-            resultBox.innerHTML = `${drawBadge("ok", "✓ 可认领")}
-              <dl class="kv">${kv("序列号", r.serial)}${kv("MAC", r.mac_nocolon)}${kv("固件", r.fw || "—")}${kv("最近上报", r.last_seen_at || "—")}</dl>
+            resultBox.innerHTML = `${drawBadge("ok", "Ready to claim")}
+              <dl class="kv">${kv("Serial", r.serial)}${kv("MAC", r.mac_nocolon)}${kv("Firmware", r.fw || "—")}${kv("Last seen", r.last_seen_at || "—")}</dl>
               <p>${escapeHtml(r.message)}</p>`;
             showClaimForm(r.serial, r.mac_nocolon, raw.startsWith("CROC|") ? raw : "");
             break;
           case "already_registered":
-            resultBox.innerHTML = `${drawBadge("err", r.by_you ? "已注册 (属于你)" : "已注册 (非本管理员)")}
-              <dl class="kv">${kv("序列号", r.serial)}${kv("device_id", r.device_id)}${kv("归属 admin", r.owner_admin || "—")}${kv("登记时间", r.claimed_at)}</dl>
+            resultBox.innerHTML = `${drawBadge("err", r.by_you ? "Already yours" : "Owned by another admin")}
+              <dl class="kv">${kv("Serial", r.serial)}${kv("device_id", r.device_id)}${kv("Owner admin", r.owner_admin || "—")}${kv("Claimed at", r.claimed_at)}</dl>
               <p class="muted">${escapeHtml(r.message)}</p>
-              ${r.by_you ? `<a class="btn secondary" href="#/devices/${encodeURIComponent(r.device_id)}">查看该设备</a>` : ""}`;
+              ${r.by_you ? `<a class="btn secondary" href="#/devices/${encodeURIComponent(r.device_id)}">Open device</a>` : ""}`;
             break;
           case "offline":
-            resultBox.innerHTML = `${drawBadge("", "等待联网")}
-              <dl class="kv">${kv("序列号", r.serial)}${r.mac_hint ? kv("出厂 MAC", r.mac_hint) : ""}</dl>
+            resultBox.innerHTML = `${drawBadge("", "Waiting for device")}
+              <dl class="kv">${kv("Serial", r.serial)}${r.mac_hint ? kv("Factory MAC", r.mac_hint) : ""}</dl>
               <p>${escapeHtml(r.message)}</p>`;
             break;
           case "blocked":
-            resultBox.innerHTML = `${drawBadge("err", "出厂禁用")}<p>${escapeHtml(r.message)}</p>`;
+            resultBox.innerHTML = `${drawBadge("err", "Factory blocked")}<p>${escapeHtml(r.message)}</p>`;
             break;
           case "unknown_serial":
-            resultBox.innerHTML = `${drawBadge("err", "未在出厂清单")}<p>${escapeHtml(r.message)}</p>`;
+            resultBox.innerHTML = `${drawBadge("err", "Unknown serial")}<p>${escapeHtml(r.message)}</p>`;
             break;
           default:
-            resultBox.innerHTML = `<p class="muted">未知状态: ${escapeHtml(r.status)}</p>`;
+            resultBox.innerHTML = `<p class="muted">Unknown status: ${escapeHtml(r.status)}</p>`;
         }
       } catch (e) { resultBox.innerHTML = `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`; }
     });
@@ -1013,8 +1170,8 @@
     const items = data.items || [];
     $("#pendList").innerHTML = `
       <div class="table-wrap"><table class="t">
-        <thead><tr><th>MAC</th><th>序列号 / 建议ID</th><th>QR</th><th>固件</th><th>上报时间</th></tr></thead>
-        <tbody>${items.length === 0 ? `<tr><td colspan="5" class="muted">暂无</td></tr>` :
+        <thead><tr><th>MAC</th><th>Serial / proposed ID</th><th>QR</th><th>Firmware</th><th>Last seen</th></tr></thead>
+        <tbody>${items.length === 0 ? `<tr><td colspan="5" class="muted">None</td></tr>` :
           items.map((p) => `<tr>
             <td class="mono">${escapeHtml(p.mac_nocolon || p.mac || "")}</td>
             <td class="mono">${escapeHtml(p.proposed_device_id || "—")}</td>
@@ -1029,29 +1186,29 @@
   // NOTE: SSE isn't automatically torn down on route change, so we stash the
   // active EventSource on window so leaving the page closes it.
   registerRoute("events", async (view) => {
-    setCrumb("事件中心");
+    setCrumb("Events");
     const me = state.me || { username: "", role: "" };
     const isSuper = me.role === "superadmin";
-    const scopeLabel = isSuper ? "全局（superadmin）" : (me.role === "admin" ? `我的租户 · ${escapeHtml(me.username)}` : `我的上级租户`);
+    const scopeLabel = isSuper ? "Global (superadmin)" : (me.role === "admin" ? `My tenant · ${escapeHtml(me.username)}` : "Parent tenant");
 
     view.innerHTML = `
       <div class="card">
         <div class="row between" style="flex-wrap:wrap;gap:10px">
           <div>
-            <h2 style="margin:0">事件中心</h2>
-            <p class="muted" style="margin:4px 0 0">范围：${scopeLabel} · 超管可见全部；管理员默认仅本租户；用户仅与自己相关 + warn+</p>
+            <h2 style="margin:0">Event center</h2>
+            <p class="muted" style="margin:4px 0 0">Scope: ${scopeLabel} · Superadmin sees all; admin sees tenant; users see related + warn+.</p>
           </div>
           <div class="row" style="gap:8px;align-items:center">
-            <span id="evLive" class="badge offline" title="实时连接状态">离线</span>
-            <button class="btn sm secondary" id="evPause">暂停</button>
-            <button class="btn sm secondary" id="evClear">清空</button>
+            <span id="evLive" class="badge offline" title="Live stream">Offline</span>
+            <button class="btn sm secondary" id="evPause">Pause</button>
+            <button class="btn sm secondary" id="evClear">Clear</button>
           </div>
         </div>
         <div class="divider"></div>
         <div class="inline-form" style="margin-bottom:10px">
-          <label class="field"><span>最低级别</span>
+          <label class="field"><span>Min level</span>
             <select id="evLevel">
-              <option value="">全部</option>
+              <option value="">All</option>
               <option value="debug">debug+</option>
               <option value="info" selected>info+</option>
               <option value="warn">warn+</option>
@@ -1059,9 +1216,9 @@
               <option value="critical">critical</option>
             </select>
           </label>
-          <label class="field"><span>分类</span>
+          <label class="field"><span>Category</span>
             <select id="evCategory">
-              <option value="">全部</option>
+              <option value="">All</option>
               <option value="alarm">alarm</option>
               <option value="ota">ota</option>
               <option value="presence">presence</option>
@@ -1072,22 +1229,22 @@
               <option value="system">system</option>
             </select>
           </label>
-          <label class="field"><span>设备 ID</span><input id="evDevice" placeholder="SN-... 或 dev_id" /></label>
-          <label class="field wide"><span>关键词</span><input id="evQ" placeholder="搜索摘要 / actor / event_type" /></label>
+          <label class="field"><span>Device ID</span><input id="evDevice" placeholder="SN-… or id" /></label>
+          <label class="field wide"><span>Search</span><input id="evQ" placeholder="summary / actor / event_type" /></label>
           <div class="row wide" style="justify-content:flex-end;gap:8px;flex-wrap:wrap">
-            <button class="btn sm secondary" id="evApply">应用筛选</button>
-            <button class="btn sm" id="evReload">历史 200 条</button>
-            <button class="btn sm secondary" id="evStats">设备统计(7天)</button>
-            <button class="btn sm secondary" id="evCsv">导出 CSV</button>
+            <button class="btn sm secondary" id="evApply">Apply filters</button>
+            <button class="btn sm" id="evReload">Last 200</button>
+            <button class="btn sm secondary" id="evStats">By device (7d)</button>
+            <button class="btn sm secondary" id="evCsv">Export CSV</button>
           </div>
         </div>
       </div>
       <div id="evStatsBox" class="card" style="margin-top:12px;display:none">
-        <h3 style="margin:0 0 8px">按设备事件数（最近 7 天）</h3>
+        <h3 style="margin:0 0 8px">Events per device (7 days)</h3>
         <div id="evStatsInner" class="muted">—</div>
       </div>
       <div class="card" style="margin-top:12px">
-        <div id="evList" class="events-list muted">连接中…</div>
+        <div id="evList" class="events-list muted">Connecting…</div>
       </div>`;
 
     let paused = false;
@@ -1121,14 +1278,14 @@
         <span class="ev-actor">${escapeHtml(e.actor || "")}</span>
         <span class="ev-summary">${escapeHtml(summary)}</span>
         ${dev} ${owner}
-        ${detailTxt ? `<details class="ev-detail"><summary class="muted">详情</summary><pre class="code">${escapeHtml(detailTxt)}</pre></details>` : ""}
+        ${detailTxt ? `<details class="ev-detail"><summary class="muted">Details</summary><pre class="code">${escapeHtml(detailTxt)}</pre></details>` : ""}
       </div>`;
     }
     function flushEvRender() {
       const listEl = document.getElementById("evList");
       if (!listEl) return;
       if (buffer.length === 0) {
-        listEl.innerHTML = `<p class="muted">无事件。</p>`;
+        listEl.innerHTML = `<p class="muted">No events.</p>`;
         return;
       }
       listEl.innerHTML = buffer.map(rowHtml).join("");
@@ -1170,7 +1327,7 @@
 
     function closeStream() {
       if (window.__evSSE) { try { window.__evSSE.close(); } catch {} window.__evSSE = null; }
-      $("#evLive").textContent = "离线"; $("#evLive").className = "badge offline";
+      $("#evLive").textContent = "Offline"; $("#evLive").className = "badge offline";
     }
     function openStream() {
       closeStream();
@@ -1180,9 +1337,9 @@
       const url = apiBase() + "/events/stream?" + p.toString();
       const es = new EventSource(url);
       window.__evSSE = es;
-      es.onopen = () => { $("#evLive").textContent = "实时"; $("#evLive").className = "badge online"; };
+      es.onopen = () => { $("#evLive").textContent = "Live"; $("#evLive").className = "badge online"; };
       es.onerror = () => {
-        $("#evLive").textContent = "重连中…"; $("#evLive").className = "badge offline";
+        $("#evLive").textContent = "Reconnecting…"; $("#evLive").className = "badge offline";
       };
       es.onmessage = (m) => {
         try {
@@ -1195,7 +1352,7 @@
 
     $("#evPause").addEventListener("click", () => {
       paused = !paused;
-      $("#evPause").textContent = paused ? "恢复" : "暂停";
+      $("#evPause").textContent = paused ? "Resume" : "Pause";
     });
     $("#evClear").addEventListener("click", () => {
       buffer = [];
@@ -1213,10 +1370,10 @@
         const items = r.items || [];
         $("#evStatsBox").style.display = "block";
         if (items.length === 0) {
-          $("#evStatsInner").innerHTML = "<p class='muted'>无带 device_id 的事件。</p>";
+          $("#evStatsInner").innerHTML = "<p class='muted'>No rows with device_id.</p>";
           return;
         }
-        $("#evStatsInner").innerHTML = `<div class="table-wrap"><table class="t"><thead><tr><th>设备</th><th>条数</th></tr></thead><tbody>${
+        $("#evStatsInner").innerHTML = `<div class="table-wrap"><table class="t"><thead><tr><th>Device</th><th>Count</th></tr></thead><tbody>${
           items.map((x) => `<tr><td class="mono">${escapeHtml(x.device_id)}</td><td>${x.count}</td></tr>`).join("")
         }</tbody></table></div>`;
       } catch (e) { toast(e.message || e, "err"); }
@@ -1237,7 +1394,7 @@
         a.download = "croc_sentinel_events.csv";
         a.click();
         URL.revokeObjectURL(a.href);
-        toast("已下载 CSV", "ok");
+        toast("CSV downloaded", "ok");
       } catch (e) { toast(e.message || e, "err"); }
     });
 
@@ -1251,16 +1408,16 @@
 
   // Audit
   registerRoute("audit", async (view) => {
-    setCrumb("审计");
-    if (!hasRole("admin")) { view.innerHTML = `<div class="card"><p class="muted">仅管理员可访问。</p></div>`; return; }
+    setCrumb("Audit");
+    if (!hasRole("admin")) { view.innerHTML = `<div class="card"><p class="muted">Admins only.</p></div>`; return; }
     view.innerHTML = `
       <div class="card">
         <div class="row">
-          <h2 style="margin:0">审计事件</h2>
+          <h2 style="margin:0">Audit log</h2>
           <label class="field" style="max-width:180px"><span>actor</span><input id="f_actor" /></label>
-          <label class="field" style="max-width:180px"><span>action 前缀</span><input id="f_action" placeholder="device / user / command" /></label>
+          <label class="field" style="max-width:180px"><span>action prefix</span><input id="f_action" placeholder="device / user / command" /></label>
           <label class="field" style="max-width:180px"><span>target</span><input id="f_target" /></label>
-          <button class="btn secondary right" id="f_reload">查询</button>
+          <button class="btn secondary right" id="f_reload">Query</button>
         </div>
         <div class="divider"></div>
         <div id="auditList"></div>
@@ -1276,9 +1433,9 @@
         const d = await api("/audit?" + qs.toString());
         const items = d.items || [];
         $("#auditList").innerHTML = items.length === 0
-          ? `<p class="muted">无记录。</p>`
+          ? `<p class="muted">No rows.</p>`
           : `<div class="table-wrap"><table class="t">
-              <thead><tr><th>时间</th><th>actor</th><th>action</th><th>target</th><th>detail</th></tr></thead>
+              <thead><tr><th>Time</th><th>actor</th><th>action</th><th>target</th><th>detail</th></tr></thead>
               <tbody>${items.map((e) => `
                 <tr>
                   <td>${escapeHtml(fmtTs(e.created_at))}</td>
@@ -1295,8 +1452,8 @@
 
   // Admin
   registerRoute("admin", async (view) => {
-    setCrumb("系统管理");
-    if (!hasRole("admin")) { view.innerHTML = `<div class="card"><p class="muted">仅管理员可访问。</p></div>`; return; }
+    setCrumb("Admin");
+    if (!hasRole("admin")) { view.innerHTML = `<div class="card"><p class="muted">Admins only.</p></div>`; return; }
     const isSuper = state.me.role === "superadmin";
     let admins = [];
     if (isSuper) {
@@ -1305,62 +1462,63 @@
 
     view.innerHTML = `
       <div class="card">
-        <h2>用户管理</h2>
+        <h2>Users</h2>
         <p class="muted">${isSuper
-          ? "superadmin：可创建 admin/user，并为任意 user 设置 manager_admin 与策略。"
-          : "admin：仅能管理自己名下的 user，并可开/关其能力。"}</p>
+          ? "Superadmin: create admin/user, assign manager_admin and policies."
+          : "Admin: manage users under you and toggle their capabilities."}</p>
+        <p class="muted" style="margin-top:8px">Registration OTP email uses <span class="mono">SMTP_*</span> in server <span class="mono">.env</span>; set <span class="mono">SMTP_FROM</span> to a valid address (or leave blank to use <span class="mono">SMTP_USERNAME</span>). Telegram alerts need <span class="mono">TELEGRAM_BOT_TOKEN</span> and <span class="mono">TELEGRAM_CHAT_IDS</span>; restart the API after changing those. Status: top bar pills (from <span class="mono">/health</span>).</p>
         <div class="row right-end" style="justify-content:flex-end;flex-wrap:wrap;gap:10px">
-          <button class="btn btn-tap" id="showCreate" type="button">新增用户</button>
-          <button class="btn secondary btn-tap" id="reloadUsers" type="button">刷新</button>
+          <button class="btn btn-tap" id="showCreate" type="button">New user</button>
+          <button class="btn secondary btn-tap" id="reloadUsers" type="button">Refresh</button>
         </div>
         <div class="divider"></div>
         <div id="userTable"></div>
       </div>
 
       <div class="card" id="createPanel" style="display:none">
-        <h3>新增用户</h3>
+        <h3>New user</h3>
         <div class="inline-form">
-          <label class="field"><span>用户名</span><input id="u_name" autocomplete="off" /></label>
-          <label class="field"><span>密码（≥8位）</span><input id="u_pass" type="password" autocomplete="new-password" /></label>
-          <label class="field"><span>角色</span><select id="u_role">
+          <label class="field"><span>Username</span><input id="u_name" autocomplete="off" /></label>
+          <label class="field"><span>Password (min 8)</span><input id="u_pass" type="password" autocomplete="new-password" /></label>
+          <label class="field"><span>Role</span><select id="u_role">
             ${isSuper
               ? `<option value="user">user</option><option value="admin">admin</option>`
               : `<option value="user">user</option>`}
           </select></label>
           <label class="field" id="u_mgr_wrap" ${isSuper ? "" : 'style="display:none"'}>
-            <span>归属管理员 (manager_admin)</span>
+            <span>Manager admin</span>
             <select id="u_mgr">${admins.map((a) => `<option value="${escapeHtml(a)}">${escapeHtml(a)}</option>`).join("")}</select>
           </label>
-          <label class="field"><span>邮箱 (必填，收激活码)</span><input id="u_email" type="email" autocomplete="off"/></label>
-          <label class="field"><span>tenant（可选）</span><input id="u_tenant" /></label>
+          <label class="field"><span>Email (required)</span><input id="u_email" type="email" autocomplete="off"/></label>
+          <label class="field"><span>Tenant (optional)</span><input id="u_tenant" /></label>
           <div class="row wide" style="justify-content:flex-end;flex-wrap:wrap;gap:10px">
-            <button class="btn ghost btn-tap" id="u_cancel" type="button">取消</button>
-            <button class="btn btn-tap" id="u_submit" type="button">创建并发邮件激活码</button>
+            <button class="btn ghost btn-tap" id="u_cancel" type="button">Cancel</button>
+            <button class="btn btn-tap" id="u_submit" type="button">Create & send activation email</button>
           </div>
           <p class="muted" style="margin:8px 0 0">
-            新用户状态为 <span class="mono">pending</span>；必须让该用户在
-            <a href="#/account-activate">激活账号</a> 页输入邮箱收到的验证码后才能登录。
+            New users start as <span class="mono">pending</span>. They must finish
+            <a href="#/account-activate">Activate account</a> with the email code before sign-in.
           </p>
         </div>
       </div>
 
       ${isSuper ? `<div class="card">
-        <h3>待审批的管理员注册</h3>
-        <p class="muted">通过公开注册页提交、已完成邮箱验证、等待你批准的 admin 账号。</p>
+        <h3>Pending admin signups</h3>
+        <p class="muted">Public registration + email verified; awaiting your approval.</p>
         <div id="pendAdmins"></div>
       </div>` : ""}
 
       <div class="card">
-        <h3>告警邮件收件人</h3>
-        <p class="muted">这些邮箱会在你所管设备发生警报时收到通知（服务端 SMTP 需已配置）。</p>
+        <h3>Alert email recipients</h3>
+        <p class="muted">Inbox list for alarm emails when SMTP is configured on the server.</p>
         <div id="smtpStatus" class="row" style="gap:6px"></div>
         <div class="divider"></div>
         <div class="inline-form">
-          <label class="field wide"><span>邮箱</span><input id="r_email" type="email" autocomplete="off" placeholder="you@company.com"/></label>
-          <label class="field"><span>标签</span><input id="r_label" autocomplete="off" placeholder="值班 / 老板"/></label>
+          <label class="field wide"><span>Email</span><input id="r_email" type="email" autocomplete="off" placeholder="you@company.com"/></label>
+          <label class="field"><span>Label</span><input id="r_label" autocomplete="off" placeholder="on-call"/></label>
           <div class="row wide" style="justify-content:flex-end">
-            <button class="btn" id="r_add">添加</button>
-            <button class="btn ghost" id="r_test">发送测试邮件</button>
+            <button class="btn" id="r_add">Add</button>
+            <button class="btn ghost" id="r_test">Send test email</button>
           </div>
         </div>
         <div id="recipientList" style="margin-top:10px"></div>
@@ -1376,16 +1534,16 @@
       </div>
 
       ${isSuper ? `<div class="card">
-        <h3>数据库备份 / 恢复</h3>
-        <p class="muted">调用 <span class="mono">/admin/backup/export</span> 与 <span class="mono">/admin/backup/import</span>：整库 SQLite 按口令加密为 .enc。导入会写入 <span class="mono">*.restored</span>，需按提示停机替换。</p>
+        <h3>Database backup / restore</h3>
+        <p class="muted">Uses <span class="mono">/admin/backup/export</span> and <span class="mono">/admin/backup/import</span>: full SQLite encrypted to <span class="mono">.enc</span>. Import writes <span class="mono">*.restored</span> — follow ops runbook to swap files.</p>
         <label class="field" style="max-width:420px">
-          <span>加密口令 <span class="muted">X-Backup-Encryption-Key</span></span>
+          <span>Encryption key <span class="muted">X-Backup-Encryption-Key</span></span>
           <input id="bk_key" type="password" autocomplete="off" />
         </label>
         <div class="row" style="margin-top:10px">
-          <button class="btn" id="bk_export">导出 .enc</button>
+          <button class="btn" id="bk_export">Export .enc</button>
           <input type="file" id="bk_file" accept=".enc,application/octet-stream" />
-          <button class="btn secondary" id="bk_import">上传 + 解密</button>
+          <button class="btn secondary" id="bk_import">Upload & decrypt</button>
         </div>
       </div>` : ""}`;
 
@@ -1395,9 +1553,9 @@
         const d = await api("/auth/users");
         const users = d.items || [];
         $("#userTable").innerHTML = users.length === 0
-          ? `<p class="muted">暂无。</p>`
+          ? `<p class="muted">No users.</p>`
           : `<div class="table-wrap"><table class="t">
-              <thead><tr><th>用户</th><th>角色</th><th>manager</th><th>tenant</th><th>创建</th><th></th></tr></thead>
+              <thead><tr><th>User</th><th>Role</th><th>manager</th><th>tenant</th><th>Created</th><th></th></tr></thead>
               <tbody>${users.map((u) => {
                 const isUser = u.role === "user";
                 const self = u.username === (state.me && state.me.username);
@@ -1408,8 +1566,8 @@
                   <td class="mono">${escapeHtml(u.tenant || "—")}</td>
                   <td>${escapeHtml(fmtTs(u.created_at))}</td>
                   <td>
-                    ${isUser ? `<button class="btn sm secondary js-pol" data-u="${escapeHtml(u.username)}">策略</button>` : ""}
-                    ${self ? "" : `<button class="btn sm danger js-del" data-u="${escapeHtml(u.username)}">删除</button>`}
+                    ${isUser ? `<button class="btn sm secondary js-pol" data-u="${escapeHtml(u.username)}">Policy</button>` : ""}
+                    ${self ? "" : `<button class="btn sm danger js-del" data-u="${escapeHtml(u.username)}">Delete</button>`}
                   </td>
                 </tr><tr class="sub" style="display:none" data-pol-row="${escapeHtml(u.username)}"><td colspan="6"></td></tr>`;
               }).join("")}</tbody></table></div>`;
@@ -1430,15 +1588,15 @@
         password: $("#u_pass").value,
         role: $("#u_role").value,
       };
-      if (!body.username || !body.password) { toast("请填写用户名和密码", "err"); return; }
+      if (!body.username || !body.password) { toast("Username and password required", "err"); return; }
       const email = $("#u_email").value.trim();
-      if (!email) { toast("必须填写邮箱——新用户要用它激活账号", "err"); return; }
+      if (!email) { toast("Email required for activation", "err"); return; }
       body.email = email;
       const tenant = $("#u_tenant").value.trim(); if (tenant) body.tenant = tenant;
       if (isSuper && body.role === "user") body.manager_admin = $("#u_mgr").value;
       try {
         const resp = await api("/auth/users", { method: "POST", body });
-        toast(`创建成功：${resp.message || "已发送验证码"}`, "ok");
+        toast(`Created: ${resp.message || "activation email sent"}`, "ok");
         $("#createPanel").style.display = "none";
         $("#u_name").value = ""; $("#u_pass").value = ""; $("#u_tenant").value = "";
         $("#u_email").value = "";
@@ -1448,7 +1606,7 @@
 
     const openPolicy = async (username, trRow) => {
       const cell = trRow.querySelector("td");
-      cell.innerHTML = `<span class="muted">加载中…</span>`;
+      cell.innerHTML = `<span class="muted">Loading…</span>`;
       trRow.style.display = "";
       try {
         const p = await api(`/auth/users/${encodeURIComponent(username)}/policy`);
@@ -1458,7 +1616,7 @@
           cell.querySelectorAll("input[type=checkbox][data-k]").forEach((i) => body[i.dataset.k] = !!i.checked);
           try {
             const r = await api(`/auth/users/${encodeURIComponent(username)}/policy`, { method: "PUT", body });
-            toast(`${username} 策略已更新`, "ok");
+            toast(`Policy updated for ${username}`, "ok");
             cell.innerHTML = renderPolicyPanel(username, r.policy || r);
             cell.querySelector(".js-save").addEventListener("click", () => openPolicy(username, trRow));
           } catch (e) { toast(e.message || e, "err"); }
@@ -1471,8 +1629,8 @@
       if (!t) return;
       const u = t.dataset.u;
       if (t.classList.contains("js-del")) {
-        if (!confirm(`确定删除用户 ${u} ?`)) return;
-        try { await api(`/auth/users/${encodeURIComponent(u)}`, { method: "DELETE" }); toast("已删除", "ok"); loadUsers(); }
+        if (!confirm(`Delete user ${u}?`)) return;
+        try { await api(`/auth/users/${encodeURIComponent(u)}`, { method: "DELETE" }); toast("Deleted", "ok"); loadUsers(); }
         catch (e) { toast(e.message || e, "err"); }
       }
       if (t.classList.contains("js-pol")) {
@@ -1487,7 +1645,7 @@
     if (isSuper) {
       $("#bk_export").addEventListener("click", async () => {
         const key = ($("#bk_key").value || "").trim();
-        if (!key) { toast("请填写加密口令", "err"); return; }
+        if (!key) { toast("Enter backup encryption key", "err"); return; }
         try {
           const r = await fetch(apiBase() + "/admin/backup/export", {
             headers: { Authorization: "Bearer " + getToken(), "X-Backup-Encryption-Key": key },
@@ -1497,13 +1655,13 @@
           const a = document.createElement("a");
           a.href = URL.createObjectURL(blob); a.download = "sentinel-backup.enc"; a.click();
           URL.revokeObjectURL(a.href);
-          toast("已下载", "ok");
+          toast("Downloaded", "ok");
         } catch (e) { toast(e.message || e, "err"); }
       });
       $("#bk_import").addEventListener("click", async () => {
         const key = ($("#bk_key").value || "").trim();
         const f = $("#bk_file").files[0];
-        if (!key || !f) { toast("请选择文件并填写加密口令", "err"); return; }
+        if (!key || !f) { toast("Pick a file and enter the encryption key", "err"); return; }
         const fd = new FormData(); fd.append("file", f, f.name || "sentinel-backup.enc");
         try {
           const r = await fetch(apiBase() + "/admin/backup/import", {
@@ -1513,7 +1671,7 @@
           });
           const j = await r.json().catch(() => ({}));
           if (!r.ok) throw new Error(`${r.status} ${j.detail || ""}`);
-          toast("已写入: " + (j.written_path || "done"), "ok");
+          toast("Written: " + (j.written_path || "done"), "ok");
         } catch (e) { toast(e.message || e, "err"); }
       });
     }
@@ -1542,18 +1700,18 @@
         const d = await api("/admin/alert-recipients");
         const items = d.items || [];
         $("#recipientList").innerHTML = items.length === 0
-          ? `<p class="muted">尚未配置任何收件人。</p>`
+          ? `<p class="muted">No recipients yet.</p>`
           : `<div class="table-wrap"><table class="t">
-              <thead><tr><th>邮箱</th><th>标签</th><th>启用</th><th>租户</th><th></th></tr></thead>
+              <thead><tr><th>Email</th><th>Label</th><th>Enabled</th><th>Tenant</th><th></th></tr></thead>
               <tbody>${items.map((r) => `
                 <tr>
                   <td class="mono">${escapeHtml(r.email)}</td>
                   <td>${escapeHtml(r.label || "—")}</td>
-                  <td>${r.enabled ? `<span class="badge online">启用</span>` : `<span class="badge offline">关闭</span>`}</td>
+                  <td>${r.enabled ? `<span class="badge online">On</span>` : `<span class="badge offline">Off</span>`}</td>
                   <td class="mono">${escapeHtml(r.owner_admin || "")}</td>
                   <td>
-                    <button class="btn sm secondary js-rtoggle" data-id="${r.id}" data-en="${r.enabled ? 1 : 0}">${r.enabled ? "停用" : "启用"}</button>
-                    <button class="btn sm danger js-rdel" data-id="${r.id}">删除</button>
+                    <button class="btn sm secondary js-rtoggle" data-id="${r.id}" data-en="${r.enabled ? 1 : 0}">${r.enabled ? "Disable" : "Enable"}</button>
+                    <button class="btn sm danger js-rdel" data-id="${r.id}">Delete</button>
                   </td>
                 </tr>`).join("")}</tbody></table></div>`;
       } catch (e) {
@@ -1563,11 +1721,11 @@
     $("#r_add").addEventListener("click", async () => {
       const email = ($("#r_email").value || "").trim();
       const label = ($("#r_label").value || "").trim();
-      if (!email) { toast("请填写邮箱", "err"); return; }
+      if (!email) { toast("Enter email", "err"); return; }
       try {
         await api("/admin/alert-recipients", { method: "POST", body: { email, label } });
         $("#r_email").value = ""; $("#r_label").value = "";
-        toast("已添加", "ok");
+        toast("Added", "ok");
         loadRecipients();
       } catch (e) { toast(e.message || e, "err"); }
     });
@@ -1605,8 +1763,8 @@
       const b = ev.target.closest("button"); if (!b) return;
       const id = b.dataset.id;
       if (b.classList.contains("js-rdel")) {
-        if (!confirm("删除这个收件人？")) return;
-        try { await api(`/admin/alert-recipients/${id}`, { method: "DELETE" }); toast("已删除", "ok"); loadRecipients(); }
+        if (!confirm("Remove this recipient?")) return;
+        try { await api(`/admin/alert-recipients/${id}`, { method: "DELETE" }); toast("Removed", "ok"); loadRecipients(); }
         catch (e) { toast(e.message || e, "err"); }
       }
       if (b.classList.contains("js-rtoggle")) {
@@ -1626,17 +1784,17 @@
         const d = await api("/auth/signup/pending");
         const items = d.items || [];
         $("#pendAdmins").innerHTML = items.length === 0
-          ? `<p class="muted">没有待审批。</p>`
+          ? `<p class="muted">No pending signups.</p>`
           : `<div class="table-wrap"><table class="t">
-              <thead><tr><th>用户名</th><th>邮箱</th><th>提交时间</th><th>邮箱已验</th><th></th></tr></thead>
+              <thead><tr><th>Username</th><th>Email</th><th>Submitted</th><th>Email OK</th><th></th></tr></thead>
               <tbody>${items.map((u) => `<tr>
                 <td><strong>${escapeHtml(u.username)}</strong></td>
                 <td class="mono">${escapeHtml(u.email || "—")}</td>
                 <td>${escapeHtml(fmtTs(u.created_at))}</td>
                 <td>${u.email_verified_at ? "✓" : "—"}</td>
                 <td>
-                  <button class="btn sm js-ok" data-u="${escapeHtml(u.username)}">批准</button>
-                  <button class="btn sm danger js-reject" data-u="${escapeHtml(u.username)}">拒绝</button>
+                  <button class="btn sm js-ok" data-u="${escapeHtml(u.username)}">Approve</button>
+                  <button class="btn sm danger js-reject" data-u="${escapeHtml(u.username)}">Reject</button>
                 </td>
               </tr>`).join("")}</tbody></table></div>`;
       } catch (e) {
@@ -1648,11 +1806,11 @@
         const b = ev.target.closest("button"); if (!b) return;
         const u = b.dataset.u;
         if (b.classList.contains("js-ok")) {
-          try { await api(`/auth/signup/approve/${encodeURIComponent(u)}`, { method: "POST" }); toast("已批准", "ok"); loadPendAdmins(); loadUsers(); }
+          try { await api(`/auth/signup/approve/${encodeURIComponent(u)}`, { method: "POST" }); toast("Approved", "ok"); loadPendAdmins(); loadUsers(); }
           catch (e) { toast(e.message || e, "err"); }
         } else if (b.classList.contains("js-reject")) {
-          if (!confirm(`确定拒绝并删除管理员注册申请: ${u} ?`)) return;
-          try { await api(`/auth/signup/reject/${encodeURIComponent(u)}`, { method: "POST" }); toast("已拒绝", "ok"); loadPendAdmins(); }
+          if (!confirm(`Reject and delete signup for ${u}?`)) return;
+          try { await api(`/auth/signup/reject/${encodeURIComponent(u)}`, { method: "POST" }); toast("Rejected", "ok"); loadPendAdmins(); }
           catch (e) { toast(e.message || e, "err"); }
         }
       });
@@ -1667,11 +1825,13 @@
     setCrumb("Signals");
     view.innerHTML = `
       <div class="card">
-        <div class="row">
-          <h2 style="margin:0">Signal log</h2>
-          <span class="muted">Device alarms + remote siren from dashboard/API</span>
-          <label class="field" style="max-width:140px"><span>Hours</span><input id="sig_hours" type="number" value="168" min="1" max="720"/></label>
-          <button class="btn secondary right" id="sig_reload">Refresh</button>
+        <div class="row" style="flex-wrap:wrap;align-items:flex-end;gap:12px">
+          <div style="flex:1;min-width:200px">
+            <h2 style="margin:0">Signal log</h2>
+            <p class="muted" style="margin:6px 0 0">Device alarms and dashboard/API siren events. Group comes from device notification settings.</p>
+          </div>
+          <label class="field" style="max-width:140px;margin:0"><span>Hours</span><input id="sig_hours" type="number" value="168" min="1" max="720"/></label>
+          <button class="btn secondary btn-tap" id="sig_reload">Refresh</button>
         </div>
         <div class="divider"></div>
         <div class="stats" id="sigSummary"></div>
@@ -1700,7 +1860,7 @@
         $("#sigList").innerHTML = items.length === 0
           ? `<p class="muted">No rows in this window.</p>`
           : `<div class="table-wrap"><table class="t">
-              <thead><tr><th>When (UTC)</th><th>What</th><th>Where</th><th>Device</th><th>Name</th><th>Who</th><th>Fan-out / targets</th><th>Email</th></tr></thead>
+              <thead><tr><th>When (UTC)</th><th>What</th><th>Where</th><th>Device</th><th>Group</th><th>Name</th><th>Who</th><th>Fan-out</th><th>Email</th></tr></thead>
               <tbody>${items.map((a) => {
             const dev = a.device_id === "*" ? "(bulk)" : a.device_id;
             const link = a.device_id && a.device_id !== "*"
@@ -1713,6 +1873,7 @@
                   <td><span class="chip">${escapeHtml(a.what || a.kind || "")}</span></td>
                   <td><span class="chip">${escapeHtml(a.zone || "all")}</span></td>
                   <td class="mono">${link}</td>
+                  <td>${escapeHtml(a.notification_group || "—")}</td>
                   <td>${escapeHtml(a.display_label || "—")}</td>
                   <td>${escapeHtml(a.kind === "device_alarm" ? whoLbl(a.who) : a.who)}</td>
                   <td class="mono">${escapeHtml(fo)}</td>
@@ -1730,8 +1891,8 @@
   function renderOtaCampaignRow(c, me) {
     const myDec = (c.decisions || []).find((d) => d.admin_username === me.username);
     const decLabel = myDec ? (
-      { accepted: "已接受", declined: "已拒绝", rolled_back: "已回滚" }[myDec.action] || myDec.action
-    ) : (me.role === "superadmin" ? "—" : "待决策");
+      { accepted: "Accepted", declined: "Declined", rolled_back: "Rolled back" }[myDec.action] || myDec.action
+    ) : (me.role === "superadmin" ? "—" : "Pending");
     const co = c.counters || {};
     const counters = ["pending","dispatched","success","failed","rolled_back"]
       .filter((k) => co[k])
@@ -1748,53 +1909,53 @@
         <td>${escapeHtml(c.created_at)}</td>
         <td>
           ${(me.role === "admin" && (!myDec || myDec.action === "declined"))
-              ? `<button class="btn sm js-accept" data-id="${escapeHtml(c.id)}">升级</button>
-                 <button class="btn sm secondary js-decline" data-id="${escapeHtml(c.id)}">拒绝</button>`
+              ? `<button class="btn sm js-accept" data-id="${escapeHtml(c.id)}">Accept</button>
+                 <button class="btn sm secondary js-decline" data-id="${escapeHtml(c.id)}">Decline</button>`
               : ""}
           ${(myDec && myDec.action === "accepted")
-              ? `<button class="btn sm danger js-rollback" data-id="${escapeHtml(c.id)}">回滚</button>`
+              ? `<button class="btn sm danger js-rollback" data-id="${escapeHtml(c.id)}">Rollback</button>`
               : ""}
-          <button class="btn sm secondary js-detail" data-id="${escapeHtml(c.id)}">详情</button>
+          <button class="btn sm secondary js-detail" data-id="${escapeHtml(c.id)}">Detail</button>
         </td>
       </tr>`;
   }
 
   registerRoute("ota", async (view) => {
-    setCrumb("OTA 更新");
+    setCrumb("OTA");
     const me = state.me || { username: "", role: "" };
-    if (!hasRole("admin")) { view.innerHTML = `<div class="card"><p class="muted">OTA 更新仅对 admin 及以上开放。</p></div>`; return; }
+    if (!hasRole("admin")) { view.innerHTML = `<div class="card"><p class="muted">OTA is available to admin and above.</p></div>`; return; }
     const isSuper = me.role === "superadmin";
 
     view.innerHTML = `
       ${isSuper ? `
       <div class="card">
-        <h2>下发新 OTA 活动</h2>
+        <h2>New OTA campaign</h2>
         <p class="muted">
-          流程：超管在此填写固件版本 + 下载地址 → admin 在各自仪表盘看到
-          <strong>待决策</strong>，点击「升级」时服务器先 HEAD 校验 URL 再推送到该
-          admin 名下所有设备。任一设备失败会自动回滚到升级前的固件。
+          Superadmin sets firmware version + download URL. Each admin sees the campaign as
+          <strong>pending</strong>; on <strong>Accept</strong> the server HEAD-checks the URL then dispatches OTA to that admin’s devices.
+          Failed devices roll back automatically.
         </p>
-        <div id="fwList" class="muted">加载固件清单…</div>
+        <div id="fwList" class="muted">Loading firmware list…</div>
         <div class="divider"></div>
         <div class="inline-form" style="margin-top:10px">
-          <label class="field"><span>固件版本 *</span><input id="c_fw" placeholder="2.2.0" /></label>
-          <label class="field wide"><span>下载 URL *</span><input id="c_url" placeholder="https://你的.vps/fw/sentinel-v2.2.0.bin" /></label>
-          <label class="field"><span>SHA-256（可选）</span><input id="c_sha" placeholder="64 hex" /></label>
-          <label class="field wide"><span>目标 admin（留空 = 全部 admin）</span>
-            <input id="c_admins" placeholder="admin-a, admin-b  或留空" />
+          <label class="field"><span>Firmware version *</span><input id="c_fw" placeholder="2.2.0" /></label>
+          <label class="field wide"><span>Download URL *</span><input id="c_url" placeholder="https://cdn.example.com/sentinel-v2.2.0.bin" /></label>
+          <label class="field"><span>SHA-256 (optional)</span><input id="c_sha" placeholder="64 hex chars" /></label>
+          <label class="field wide"><span>Target admins (empty = all)</span>
+            <input id="c_admins" placeholder="admin-a, admin-b or leave blank" />
           </label>
-          <label class="field wide"><span>备注</span><input id="c_notes" maxlength="500" /></label>
+          <label class="field wide"><span>Notes</span><input id="c_notes" maxlength="500" /></label>
           <div class="row wide" style="justify-content:flex-end">
-            <button class="btn danger" id="c_send">发起活动</button>
+            <button class="btn danger btn-tap" id="c_send">Create campaign</button>
           </div>
         </div>
       </div>` : ""}
       <div class="card">
         <div class="row between">
-          <h2 style="margin:0">OTA 活动</h2>
-          <button class="btn sm secondary" id="camp_reload">刷新</button>
+          <h2 style="margin:0">Campaigns</h2>
+          <button class="btn sm secondary" id="camp_reload">Refresh</button>
         </div>
-        <div id="campList" class="muted" style="margin-top:8px">加载中…</div>
+        <div id="campList" class="muted" style="margin-top:8px">Loading…</div>
       </div>
       <div id="campDetail"></div>`;
 
@@ -1803,42 +1964,42 @@
         const r = await api("/ota/campaigns");
         const list = r.items || [];
         if (list.length === 0) {
-          $("#campList").innerHTML = `<p class="muted">暂无 OTA 活动。</p>`;
+          $("#campList").innerHTML = `<p class="muted">No OTA campaigns.</p>`;
           return;
         }
         $("#campList").innerHTML = `<div class="table-wrap"><table class="t">
-          <thead><tr><th>ID</th><th>版本</th><th>URL</th><th>状态</th><th>设备进度</th><th>我的决策</th><th>创建</th><th></th></tr></thead>
+          <thead><tr><th>ID</th><th>Version</th><th>URL</th><th>State</th><th>Progress</th><th>My decision</th><th>Created</th><th></th></tr></thead>
           <tbody>${list.map((c) => renderOtaCampaignRow(c, me)).join("")}</tbody>
         </table></div>`;
 
         view.querySelectorAll(".js-accept").forEach((b) => b.addEventListener("click", async () => {
-          if (!confirm("确认升级？服务器将先验证 URL 再推送到你名下所有设备。")) return;
+          if (!confirm("Accept upgrade? The server will verify the URL then push to all devices you own.")) return;
           try {
             const r2 = await api(`/ota/campaigns/${encodeURIComponent(b.dataset.id)}/accept`, { method: "POST", body: {} });
-            toast(`已下发 ${r2.dispatched}/${r2.target_count} 台，校验：${r2.verify}`, "ok");
+            toast(`Dispatched ${r2.dispatched}/${r2.target_count} · verify: ${r2.verify}`, "ok");
             loadCampaigns();
           } catch (e) { toast(e.message || e, "err"); }
         }));
         view.querySelectorAll(".js-decline").forEach((b) => b.addEventListener("click", async () => {
-          if (!confirm("拒绝这次升级？")) return;
+          if (!confirm("Decline this upgrade?")) return;
           try { await api(`/ota/campaigns/${encodeURIComponent(b.dataset.id)}/decline`, { method: "POST", body: {} }); loadCampaigns(); }
           catch (e) { toast(e.message || e, "err"); }
         }));
         view.querySelectorAll(".js-rollback").forEach((b) => b.addEventListener("click", async () => {
-          if (!confirm("确认回滚？已升级设备会被推回升级前的固件。")) return;
-          try { const r2 = await api(`/ota/campaigns/${encodeURIComponent(b.dataset.id)}/rollback`, { method: "POST", body: {} }); toast(`回滚 ${r2.rolled_back} 台`, "ok"); loadCampaigns(); }
+          if (!confirm("Rollback? Upgraded devices will be pushed back to the previous firmware.")) return;
+          try { const r2 = await api(`/ota/campaigns/${encodeURIComponent(b.dataset.id)}/rollback`, { method: "POST", body: {} }); toast(`Rolled back ${r2.rolled_back} device(s)`, "ok"); loadCampaigns(); }
           catch (e) { toast(e.message || e, "err"); }
         }));
         view.querySelectorAll(".js-detail").forEach((b) => b.addEventListener("click", async () => {
           try {
             const c = await api(`/ota/campaigns/${encodeURIComponent(b.dataset.id)}`);
             $("#campDetail").innerHTML = `<div class="card">
-              <h3>活动 ${escapeHtml(c.id)}</h3>
-              <p class="muted">FW ${escapeHtml(c.fw_version)} · ${escapeHtml(c.state)} · 创建于 ${escapeHtml(c.created_at)}</p>
+              <h3>Campaign ${escapeHtml(c.id)}</h3>
+              <p class="muted">FW ${escapeHtml(c.fw_version)} · ${escapeHtml(c.state)} · created ${escapeHtml(c.created_at)}</p>
               <p class="mono" style="word-break:break-all">${escapeHtml(c.url)}</p>
-              <h4 style="margin:12px 0 4px">设备执行</h4>
+              <h4 style="margin:12px 0 4px">Device runs</h4>
               <div class="table-wrap"><table class="t">
-                <thead><tr><th>admin</th><th>设备</th><th>之前 fw</th><th>目标 fw</th><th>状态</th><th>错误</th><th>完成</th></tr></thead>
+                <thead><tr><th>admin</th><th>Device</th><th>Prev fw</th><th>Target fw</th><th>State</th><th>Error</th><th>Finished</th></tr></thead>
                 <tbody>${(c.device_runs || []).map((r) => `
                   <tr>
                     <td>${escapeHtml(r.admin_username)}</td>
@@ -1860,16 +2021,16 @@
       try {
         const fw = await api("/ota/firmwares");
         $("#fwList").innerHTML = (fw.items || []).length === 0
-          ? `<p class="muted">${escapeHtml(fw.dir || "/opt/sentinel/firmware")} 下没有 .bin 文件。</p>`
+          ? `<p class="muted">No .bin files under ${escapeHtml(fw.dir || "/opt/sentinel/firmware")}.</p>`
           : `<div class="table-wrap"><table class="t">
-              <thead><tr><th>文件</th><th>大小</th><th>SHA-256</th><th>修改时间</th><th></th></tr></thead>
+              <thead><tr><th>File</th><th>Size</th><th>SHA-256</th><th>Modified</th><th></th></tr></thead>
               <tbody>${fw.items.map((it) => `
                 <tr>
                   <td class="mono">${escapeHtml(it.name)}</td>
                   <td>${(it.size / 1024).toFixed(1)} KB</td>
                   <td class="mono" style="max-width:280px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(it.sha256 || "—")}</td>
                   <td>${escapeHtml(fmtTs(it.mtime))}</td>
-                  <td>${it.download_url ? `<button class="btn sm secondary js-use" data-url="${escapeHtml(it.download_url)}" data-fw="${escapeHtml(it.name.replace(/\\.bin$/i, ""))}" data-sha="${escapeHtml(it.sha256 || "")}">填入活动</button>` : ""}</td>
+                  <td>${it.download_url ? `<button class="btn sm secondary js-use" data-url="${escapeHtml(it.download_url)}" data-fw="${escapeHtml(it.name.replace(/\\.bin$/i, ""))}" data-sha="${escapeHtml(it.sha256 || "")}">Use in form</button>` : ""}</td>
                 </tr>`).join("")}</tbody></table></div>`;
         view.querySelectorAll(".js-use").forEach((b) => {
           b.addEventListener("click", () => {
@@ -1887,11 +2048,11 @@
         const notes = ($("#c_notes").value || "").trim();
         const adminsRaw = ($("#c_admins").value || "").trim();
         const target_admins = adminsRaw ? adminsRaw.split(/[ ,;\n]+/).filter(Boolean) : ["*"];
-        if (!url || !fw) { toast("请填写固件版本和 URL", "err"); return; }
-        if (!confirm(`确认发起 OTA 活动？目标 admin: ${target_admins.join(", ") || "ALL"}`)) return;
+        if (!url || !fw) { toast("Firmware version and URL required", "err"); return; }
+        if (!confirm(`Create OTA campaign? Target admins: ${target_admins.join(", ") || "ALL"}`)) return;
         try {
           const r = await api("/ota/campaigns", { method: "POST", body: { fw_version: fw, url, sha256: sha || undefined, notes, target_admins } });
-          toast(`活动已创建：${r.campaign_id}，目标 admin ${r.target_admins.length} 个`, "ok");
+          toast(`Campaign ${r.campaign_id} · ${r.target_admins.length} admin(s)`, "ok");
           $("#c_url").value = ""; $("#c_fw").value = ""; $("#c_sha").value = ""; $("#c_notes").value = ""; $("#c_admins").value = "";
           loadCampaigns();
         } catch (e) { toast(e.message || e, "err"); }
@@ -1907,16 +2068,16 @@
       <label class="checkbox"><input type="checkbox" data-k="${k}" ${p[k] ? "checked" : ""} ${locked ? "disabled" : ""}/><span>${escapeHtml(label)}</span></label>`;
     return `
       <div class="stack">
-        <p class="muted" style="margin:0">调整 <strong>${escapeHtml(username)}</strong> 的能力（user 角色适用）。</p>
+        <p class="muted" style="margin:0">Capabilities for <strong>${escapeHtml(username)}</strong> (user role).</p>
         <div class="row">
-          ${row("can_alert", "允许警报 (触发/批量/取消)")}
-          ${row("can_send_command", "允许下发命令")}
-          ${row("can_claim_device", "允许认领设备")}
-          ${row("can_manage_users", "允许管理用户（user 级别不生效）", true)}
-          ${row("can_backup_restore", "允许备份/恢复（user 级别不生效）", true)}
+          ${row("can_alert", "Alarms (device + bulk + cancel)")}
+          ${row("can_send_command", "Send device commands")}
+          ${row("can_claim_device", "Claim / provision devices")}
+          ${row("can_manage_users", "Manage users (N/A for user role)", true)}
+          ${row("can_backup_restore", "Backup / restore (N/A for user role)", true)}
         </div>
         <div class="row" style="justify-content:flex-end">
-          <button class="btn js-save" type="button">保存</button>
+          <button class="btn js-save" type="button">Save</button>
         </div>
       </div>`;
   }
@@ -1936,6 +2097,15 @@
     });
     $("#refreshBtn").addEventListener("click", () => renderRoute());
 
+    document.addEventListener("click", (ev) => {
+      const b = ev.target.closest(".btn-tap");
+      if (!b || b.disabled) return;
+      try {
+        if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+        if (typeof navigator !== "undefined" && navigator.vibrate) navigator.vibrate(10);
+      } catch (_) {}
+    }, true);
+
     if (getToken()) await loadMe();
     await loadHealth();
     if (!location.hash) location.hash = state.me ? "#/overview" : "#/login";
@@ -1950,7 +2120,7 @@
           window.__evSSE = null;
           const live = document.getElementById("evLive");
           if (live) {
-            live.textContent = "已暂停";
+            live.textContent = "Paused";
             live.className = "badge offline";
           }
         }

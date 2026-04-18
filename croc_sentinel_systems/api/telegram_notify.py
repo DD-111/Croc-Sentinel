@@ -144,11 +144,13 @@ def maybe_notify_telegram(ev: dict[str, Any]) -> None:
 
 
 def telegram_status() -> dict[str, Any]:
+    wr = bool(_tg._worker is not None and _tg._worker.is_alive())
     return {
         "enabled": _tg.enabled(),
         "chats": len(_tg._chats),
         "min_level": _tg._min,
         "queue_size": _tg._q.qsize(),
+        "worker_running": wr,
     }
 
 

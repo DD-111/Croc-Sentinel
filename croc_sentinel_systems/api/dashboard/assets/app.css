@@ -118,7 +118,46 @@ body {
 .nav a:hover { background: var(--bg-muted); color: var(--text); }
 .nav a[aria-current="page"] { background: var(--accent-weak); color: var(--accent); font-weight: 600; }
 .nav a .nav-ico { width: 18px; text-align: center; opacity: 0.9; }
-.nav-section { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.6px; padding: 10px 10px 4px; }
+.nav-section {
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: 14px 10px 6px;
+  margin-top: 4px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+}
+.nav .nav-section:first-of-type {
+  margin-top: 0;
+  padding-top: 6px;
+  border-top: none;
+}
+
+.health-pills {
+  display: none;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+body[data-auth="ok"] .health-pills {
+  display: inline-flex;
+}
+.health-pill {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  background: var(--bg-muted);
+  cursor: default;
+}
+.health-pill.ok { border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); color: var(--ok); background: var(--ok-weak); }
+.health-pill.warn { border-color: color-mix(in srgb, var(--warn) 50%, var(--border)); color: var(--warn); background: var(--warn-weak); }
+.health-pill.off { opacity: 0.55; }
 
 .sidebar-foot { border-top: 1px solid var(--border); padding-top: 10px; display: flex; flex-direction: column; gap: 8px; }
 .who { font-size: 12.5px; color: var(--text-muted); padding: 0 8px; word-break: break-all; }
@@ -220,6 +259,15 @@ textarea { resize: vertical; min-height: 90px; font-family: var(--mono); }
 .btn.danger:hover { background: color-mix(in srgb, var(--danger) 80%, black); border-color: color-mix(in srgb, var(--danger) 80%, black); }
 .btn.sm { padding: 5px 10px; font-size: 12px; }
 .btn[disabled] { opacity: 0.55; cursor: not-allowed; }
+
+/* Larger tap targets + subtle press (paired with optional navigator.vibrate in app.js) */
+.btn.btn-tap {
+  min-height: 44px;
+  padding: 10px 16px;
+}
+.btn.btn-tap:active:not([disabled]) {
+  transform: translateY(1px) scale(0.99);
+}
 
 /* Tables */
 .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-elev); }
@@ -377,7 +425,7 @@ pre.code { background: var(--bg-muted); border: 1px solid var(--border); border-
 }
 
 /* -------------------------------------------------------------------------
-   Comfort UI — 大按钮、易读、少「科技感」装饰（桌面与手机共用）
+   Comfort UI — large controls, readable type (desktop + mobile)
    ------------------------------------------------------------------------- */
 body.comfort-ui {
   font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
@@ -536,7 +584,7 @@ body.comfort-ui a.link-tile:hover {
 }
 
 /* -------------------------------------------------------------------------
-   Motion + glass — 全站动效、毛玻璃、主内容区排版（尊重 prefers-reduced-motion）
+   Motion + glass — site-wide motion, blur, layout (honors prefers-reduced-motion)
    ------------------------------------------------------------------------- */
 @keyframes motion-fade-up {
   from {
@@ -663,6 +711,9 @@ body.motion-ui .btn:hover:not([disabled]) {
 body.motion-ui .btn:active:not([disabled]) {
   transform: translateY(0);
 }
+body.motion-ui .btn.btn-tap:active:not([disabled]) {
+  transform: translateY(1px) scale(0.99);
+}
 
 body.motion-ui .btn.secondary:hover:not([disabled]),
 body.motion-ui .btn.ghost:hover:not([disabled]) {
@@ -713,7 +764,7 @@ body.motion-ui .ev-row:hover {
   box-shadow: 0 4px 16px rgba(15, 23, 42, 0.06);
 }
 
-/* 路由主区域：直接子块依次入场 */
+/* Route view: staggered enter animation for direct children */
 body.motion-ui #view > * {
   animation: motion-fade-up 0.52s cubic-bezier(0.22, 1, 0.36, 1) backwards;
 }
@@ -731,23 +782,17 @@ body.motion-ui #view > *:nth-child(10) { animation-delay: 0.48s; }
 body.motion-ui #view > *:nth-child(11) { animation-delay: 0.53s; }
 body.motion-ui #view > *:nth-child(12) { animation-delay: 0.58s; }
 
-/* 侧栏导航项（首个为 nav-section，其后为链接） */
+/* Sidebar: nav-section label then links */
 body.motion-ui .nav > .nav-section {
   animation: motion-fade-in 0.4s ease backwards;
   animation-delay: 0.02s;
 }
 
-body.motion-ui .nav a:nth-child(2) { animation: motion-fade-up 0.42s cubic-bezier(0.22, 1, 0.36, 1) backwards; animation-delay: 0.05s; }
-body.motion-ui .nav a:nth-child(3) { animation: motion-fade-up 0.42s cubic-bezier(0.22, 1, 0.36, 1) backwards; animation-delay: 0.09s; }
-body.motion-ui .nav a:nth-child(4) { animation: motion-fade-up 0.42s cubic-bezier(0.22, 1, 0.36, 1) backwards; animation-delay: 0.13s; }
-body.motion-ui .nav a:nth-child(5) { animation: motion-fade-up 0.42s cubic-bezier(0.22, 1, 0.36, 1) backwards; animation-delay: 0.17s; }
-body.motion-ui .nav a:nth-child(6) { animation: motion-fade-up 0.42s cubic-bezier(0.22, 1, 0.36, 1) backwards; animation-delay: 0.21s; }
-body.motion-ui .nav a:nth-child(7) { animation: motion-fade-up 0.42s cubic-bezier(0.22, 1, 0.36, 1) backwards; animation-delay: 0.25s; }
-body.motion-ui .nav a:nth-child(8) { animation: motion-fade-up 0.42s cubic-bezier(0.22, 1, 0.36, 1) backwards; animation-delay: 0.29s; }
-body.motion-ui .nav a:nth-child(9) { animation: motion-fade-up 0.42s cubic-bezier(0.22, 1, 0.36, 1) backwards; animation-delay: 0.33s; }
-body.motion-ui .nav a:nth-child(10) { animation: motion-fade-up 0.42s cubic-bezier(0.22, 1, 0.36, 1) backwards; animation-delay: 0.37s; }
-body.motion-ui .nav a:nth-child(11) { animation: motion-fade-up 0.42s cubic-bezier(0.22, 1, 0.36, 1) backwards; animation-delay: 0.41s; }
-body.motion-ui .nav a:nth-child(12) { animation: motion-fade-up 0.42s cubic-bezier(0.22, 1, 0.36, 1) backwards; animation-delay: 0.45s; }
+/* Links sit after section headers — animate all anchors uniformly */
+body.motion-ui .nav > a {
+  animation: motion-fade-up 0.4s cubic-bezier(0.22, 1, 0.36, 1) backwards;
+  animation-delay: 0.06s;
+}
 
 body.motion-ui .toast {
   transition:
@@ -794,14 +839,14 @@ body.motion-ui table.t th {
   }
 }
 
-/* 浏览器标签在后台时暂停装饰性动画与入场动效，减轻 GPU / 省电 */
+/* When the tab is hidden, pause decorative animation to save GPU / battery */
 html.tab-hidden body.motion-ui .login-wrap {
   animation: none;
 }
 
 html.tab-hidden body.motion-ui #view > *,
 html.tab-hidden body.motion-ui .nav > .nav-section,
-html.tab-hidden body.motion-ui .nav a,
+html.tab-hidden body.motion-ui .nav > a,
 html.tab-hidden body.motion-ui .login-card,
 html.tab-hidden body.motion-ui .toast.show {
   animation: none !important;
@@ -822,6 +867,7 @@ html.tab-hidden body.motion-ui .toast.show {
   }
 
   body.motion-ui .btn:hover:not([disabled]),
+  body.motion-ui .btn.btn-tap:active:not([disabled]),
   body.motion-ui .nav a:hover,
   body.motion-ui .icon-btn:hover,
   body.motion-ui .device-card:hover,
