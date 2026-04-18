@@ -53,6 +53,9 @@ MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
 # Broker listener is TLS-only (see mosquitto.conf.template): API must use TLS too.
 MQTT_USE_TLS = os.getenv("MQTT_USE_TLS", "1") == "1"
 MQTT_CLIENT_CA = os.getenv("MQTT_CLIENT_CA", "/etc/sentinel/mqtt-ca.crt")
+# When 0 (default): skip TLS hostname check; broker cert CN/SAN usually matches public
+# hostname, not the Docker DNS name (e.g. mosquitto). Chain is still verified via CA.
+MQTT_TLS_VERIFY_HOSTNAME = os.getenv("MQTT_TLS_VERIFY_HOSTNAME", "0") == "1"
 TOPIC_ROOT = os.getenv("TOPIC_ROOT", "sentinel")
 CMD_AUTH_KEY = os.getenv("CMD_AUTH_KEY", "")
 BOOTSTRAP_BIND_KEY = os.getenv("BOOTSTRAP_BIND_KEY", "")
@@ -2168,11 +2171,12 @@ def start_mqtt_loop() -> mqtt.Client:
                 MQTT_CLIENT_CA,
             )
         else:
-            client.tls_set(
-                ca_certs=MQTT_CLIENT_CA,
-                cert_reqs=ssl.CERT_REQUIRED,
-                tls_version=ssl.PROTOCOL_TLS_CLIENT,
-            )
+            ctx = ssl.create_default_context(cafile=MQTT_CLIENT_CA)
+            ctx.verify_mode = ssl.CERT_REQUIRED
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            if not MQTT_TLS_VERIFY_HOSTNAME:
+                ctx.check_hostname = False
+            client.tls_set_context(ctx)
     if MQTT_USERNAME:
         client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
     client.on_connect = on_connect
@@ -2333,10 +2337,12 @@ def startup() -> None:
     scheduler_thread = threading.Thread(target=scheduler_loop, name="cmd-scheduler", daemon=True)
     scheduler_thread.start()
     logger.info(
-        "API started mqtt_host=%s mqtt_port=%s mqtt_tls=%s db=%s notifier_enabled=%s",
+        "API started mqtt_host=%s mqtt_port=%s mqtt_tls=%s "
+        "mqtt_tls_verify_hostname=%s db=%s notifier_enabled=%s",
         MQTT_HOST,
         MQTT_PORT,
         MQTT_USE_TLS,
+        MQTT_TLS_VERIFY_HOSTNAME,
         DB_PATH,
         notifier.enabled(),
     )
