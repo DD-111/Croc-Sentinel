@@ -5983,14 +5983,23 @@ def provision_identify(
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
+        pend = None
         if mac_for_lookup:
-            cur.execute("SELECT mac_nocolon, last_seen_at, fw FROM pending_claims WHERE mac_nocolon = ?", (mac_for_lookup,))
-        else:
             cur.execute(
-                "SELECT mac_nocolon, last_seen_at, fw FROM pending_claims WHERE proposed_device_id = ? ORDER BY last_seen_at DESC LIMIT 1",
+                "SELECT mac_nocolon, last_seen_at, fw FROM pending_claims WHERE mac_nocolon = ?",
+                (mac_for_lookup,),
+            )
+            pend = cur.fetchone()
+        # Factory CSV may still carry a placeholder MAC while bootstrap.register
+        # upserts pending_claims with the real MAC — list_pending shows the row
+        # but MAC-only identify would wrongly return offline without this fallback.
+        if pend is None:
+            cur.execute(
+                "SELECT mac_nocolon, last_seen_at, fw FROM pending_claims "
+                "WHERE UPPER(IFNULL(proposed_device_id,'')) = ? ORDER BY last_seen_at DESC LIMIT 1",
                 (serial,),
             )
-        pend = cur.fetchone()
+            pend = cur.fetchone()
         conn.close()
     if not pend:
         return {
