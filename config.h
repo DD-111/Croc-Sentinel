@@ -23,8 +23,16 @@
 #define DEVICE_ZONE "all"
 
 // ── WiFi ──
+// Primary + optional extra APs (ESP32 tries in order; first that is in range
+// and accepts credentials wins). Leave WIFI_SSID_2..4 as "" to disable slots.
 #define WIFI_SSID "alan"
 #define WIFI_PASSWORD "esa@349525"
+#define WIFI_SSID_2 "DanielHome2.4Ghz"
+#define WIFI_PASSWORD_2 "672737Dy"
+#define WIFI_SSID_3 "iPhone"
+#define WIFI_PASSWORD_3 "12345678"
+#define WIFI_SSID_4 ""
+#define WIFI_PASSWORD_4 ""
 #define WIFI_CONNECT_WAIT_MS 8000
 
 // ── Network interface mode ──

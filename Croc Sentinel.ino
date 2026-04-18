@@ -99,6 +99,45 @@ void buildDeviceId() {
 }
 
 // ═══════════════════════════════════════════════
+//  Wi-Fi multi-AP (WiFiMulti): primary + optional WIFI_SSID_2..4 from config.h
+// ═══════════════════════════════════════════════
+
+#if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
+    !defined(CONFIG_IDF_TARGET_ESP32P4)
+#include <WiFiMulti.h>
+
+static WiFiMulti g_wifiMulti;
+static bool g_wifiMultiApsRegistered = false;
+
+static void g_wifiMultiRegisterAps() {
+  if (g_wifiMultiApsRegistered) return;
+  g_wifiMultiApsRegistered = true;
+  if (strlen(WIFI_SSID) > 0) {
+    g_wifiMulti.addAP(WIFI_SSID, WIFI_PASSWORD);
+  }
+  if (strlen(WIFI_SSID_2) > 0) {
+    g_wifiMulti.addAP(WIFI_SSID_2, WIFI_PASSWORD_2);
+  }
+  if (strlen(WIFI_SSID_3) > 0) {
+    g_wifiMulti.addAP(WIFI_SSID_3, WIFI_PASSWORD_3);
+  }
+  if (strlen(WIFI_SSID_4) > 0) {
+    g_wifiMulti.addAP(WIFI_SSID_4, WIFI_PASSWORD_4);
+  }
+}
+
+// Blocks up to timeoutMs calling WiFiMulti::run (scan + join best available AP).
+static bool g_wifiMultiConnectBlocking(unsigned long timeoutMs) {
+  g_wifiMultiRegisterAps();
+  unsigned long t0 = millis();
+  while (millis() - t0 < timeoutMs) {
+    if (g_wifiMulti.run(500) == WL_CONNECTED) return true;
+  }
+  return WiFi.status() == WL_CONNECTED;
+}
+#endif
+
+// ═══════════════════════════════════════════════
 //  NetIf abstraction
 // ═══════════════════════════════════════════════
 
@@ -117,16 +156,25 @@ class NetIf {
 class WiFiNetIf : public NetIf {
  public:
   void begin() override {
+#if defined(CONFIG_IDF_TARGET_ESP32P4)
+    // P4 Arduino core has no Wi-Fi radio.
+#else
     WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(true);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    WiFi.setAutoReconnect(false);
+    g_wifiMultiConnectBlocking(WIFI_CONNECT_WAIT_MS);
+#endif
   }
   bool connected() override { return WiFi.status() == WL_CONNECTED; }
   bool reconnect() override {
-    if (connected()) return true;
-    WiFi.disconnect(false, true);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+#if defined(CONFIG_IDF_TARGET_ESP32P4)
     return false;
+#else
+    if (connected()) return true;
+    WiFi.disconnect(true, true);
+    delay(80);
+    g_wifiMultiConnectBlocking(WIFI_CONNECT_WAIT_MS);
+    return connected();
+#endif
   }
   String localIP() override {
     return connected() ? WiFi.localIP().toString() : "0.0.0.0";
@@ -146,8 +194,11 @@ class AutoNetIf : public NetIf {
   #endif
   #if !defined(CONFIG_IDF_TARGET_ESP32P4)
     WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(true);
-    if (strlen(WIFI_SSID) > 0) WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    WiFi.setAutoReconnect(false);
+    if (strlen(WIFI_SSID) > 0 || strlen(WIFI_SSID_2) > 0 ||
+        strlen(WIFI_SSID_3) > 0 || strlen(WIFI_SSID_4) > 0) {
+      g_wifiMultiConnectBlocking(WIFI_CONNECT_WAIT_MS);
+    }
   #endif
   }
   bool connected() override {
@@ -171,8 +222,12 @@ class AutoNetIf : public NetIf {
   #endif
   #if !defined(CONFIG_IDF_TARGET_ESP32P4)
     if (WiFi.status() != WL_CONNECTED) {
-      WiFi.disconnect(false, true);
-      if (strlen(WIFI_SSID) > 0) WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      WiFi.disconnect(true, true);
+      delay(80);
+      if (strlen(WIFI_SSID) > 0 || strlen(WIFI_SSID_2) > 0 ||
+          strlen(WIFI_SSID_3) > 0 || strlen(WIFI_SSID_4) > 0) {
+        g_wifiMultiConnectBlocking(WIFI_CONNECT_WAIT_MS);
+      }
     }
   #endif
     return false;
