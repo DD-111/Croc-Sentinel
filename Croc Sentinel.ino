@@ -1697,10 +1697,17 @@ void setup() {
     }
   }
 
+  // Give Wi-Fi extra time after begin(); must call WiFiMulti::run (not just
+  // delay) or association never progresses when the first blocking connect times out.
   unsigned long waitStart = millis();
   while (!netIf->connected() && millis() - waitStart < WIFI_CONNECT_WAIT_MS) {
     twdtFeedMaybe();
+#if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
+    !defined(CONFIG_IDF_TARGET_ESP32P4)
+    if (g_wifiMulti.run(200) == WL_CONNECTED) break;
+#else
     delay(200);
+#endif
     Serial.print('.');
   }
   Serial.println();
