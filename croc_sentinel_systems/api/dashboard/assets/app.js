@@ -31,6 +31,39 @@
     mqttConnected: false,
   };
 
+  /** 注册/激活页「几秒后跳转登录」的定时器，路由切换时必须清掉以免泄漏与误跳转 */
+  let routeRedirectTimer = null;
+  function clearRouteRedirectTimer() {
+    if (routeRedirectTimer) {
+      clearTimeout(routeRedirectTimer);
+      routeRedirectTimer = null;
+    }
+  }
+  function scheduleRouteRedirect(ms, hash) {
+    clearRouteRedirectTimer();
+    routeRedirectTimer = setTimeout(() => {
+      routeRedirectTimer = null;
+      location.hash = hash;
+    }, ms);
+  }
+
+  /** 离开「事件中心」后应置空；仅在该页赋值，用于切回前台时重连 SSE */
+  window.__eventsStreamResume = null;
+
+  let healthPollTimer = null;
+  /** 总览设备搜索防抖；离开页面时清掉，避免对已卸载 DOM 赋值 */
+  let overviewFilterDebounce = null;
+  function clearHealthPollTimer() {
+    if (healthPollTimer) {
+      clearInterval(healthPollTimer);
+      healthPollTimer = null;
+    }
+  }
+  function tickHealthIfVisible() {
+    if (document.visibilityState !== "visible") return;
+    loadHealth();
+  }
+
   // ------------------------------------------------------------------ utils
   const $ = (sel, root) => (root || document).querySelector(sel);
   const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
@@ -209,6 +242,16 @@
     const id = rawId || "overview";
     const args = rest;
 
+    clearRouteRedirectTimer();
+    if (overviewFilterDebounce) {
+      clearTimeout(overviewFilterDebounce);
+      overviewFilterDebounce = null;
+    }
+    if (window.__pendingEvListRaf) {
+      try { cancelAnimationFrame(window.__pendingEvListRaf); } catch (_) {}
+      window.__pendingEvListRaf = 0;
+    }
+    window.__eventsStreamResume = null;
     toggleNav(false);
     if (window.__evSSE) { try { window.__evSSE.close(); } catch {} window.__evSSE = null; }
 
@@ -242,7 +285,7 @@
       <div class="login-wrap">
         <form class="login-card" id="loginForm" autocomplete="on">
           <h1>Croc Sentinel</h1>
-          <p class="muted">登录控制台以管理您的设备。</p>
+          <p class="muted">用用户名和密码进入控制台，管理设备与告警。</p>
           <label class="field">
             <span>用户名</span>
             <input name="username" autocomplete="username" required />
@@ -251,17 +294,15 @@
             <span>密码</span>
             <input name="password" type="password" autocomplete="current-password" required />
           </label>
-          <div class="row between">
-            <span class="muted" id="loginMsg"></span>
-            <button class="btn" type="submit">登录</button>
+          <div style="margin-top:18px">
+            <button class="btn btn-tap btn-block" type="submit">登录</button>
           </div>
-          <div class="row between" style="margin-top:12px">
-            <a class="muted" href="#/register">没有账号？注册管理员</a>
-            <a class="muted" href="#/account-activate">有激活码？</a>
+          <p class="muted" id="loginMsg" style="margin-top:10px;min-height:1.4em"></p>
+          <div class="login-link-stack">
+            <a class="link-tile" href="#/register">注册管理员（只用邮箱验证）</a>
+            <a class="link-tile" href="#/account-activate">激活账号（收邮件里的验证码）</a>
+            <a class="link-tile" href="#/forgot-password" title="离线 RSA 解密；长十六进制编码">忘记密码</a>
           </div>
-          <p class="muted" style="margin-top:10px;text-align:center">
-            <a href="#/forgot-password" title="离线 RSA 解密；编码为长十六进制（约千位以上），非短验证码">忘记密码（离线解密找回）</a>
-          </p>
         </form>
       </div>`;
     const form = $("#loginForm", view);
@@ -310,9 +351,9 @@
           ${enabled ? "" : `<p class="badge revoked" style="margin:10px 0">当前服务器未配置公钥（<span class="mono">PASSWORD_RECOVERY_PUBLIC_KEY_*</span>），无法发起找回。</p>`}
           <div id="fpStep1">
             <label class="field"><span>用户名</span><input id="fp_user" autocomplete="username" /></label>
-            <div class="row between" style="margin-top:14px">
-              <a class="muted" href="#/login">返回登录</a>
-              <button class="btn" id="fp_go" ${enabled ? "" : "disabled"}>获取编码</button>
+            <div style="margin-top:14px;display:flex;flex-direction:column;gap:10px">
+              <button class="btn btn-tap btn-block" type="button" id="fp_go" ${enabled ? "" : "disabled"}>获取编码</button>
+              <a class="link-tile" href="#/login" style="text-align:center">返回登录</a>
             </div>
             <p class="muted" id="fp_msg1" style="margin-top:10px"></p>
           </div>
@@ -327,9 +368,9 @@
             </label>
             <label class="field"><span>新密码（≥8 位）</span><input id="fp_p1" type="password" autocomplete="new-password" /></label>
             <label class="field"><span>确认新密码</span><input id="fp_p2" type="password" autocomplete="new-password" /></label>
-            <div class="row between" style="margin-top:14px">
-              <button class="btn ghost" id="fp_back">上一步</button>
-              <button class="btn" id="fp_done">更新密码</button>
+            <div style="margin-top:14px;display:flex;flex-direction:column;gap:10px">
+              <button class="btn btn-tap btn-block" type="button" id="fp_done">更新密码</button>
+              <button class="btn secondary btn-tap btn-block" type="button" id="fp_back">上一步</button>
             </div>
             <p class="muted" id="fp_msg2" style="margin-top:10px"></p>
           </div>
@@ -402,29 +443,31 @@
     document.body.dataset.auth = "none";
     view.innerHTML = `
       <div class="login-wrap">
-        <div class="login-card" style="max-width:460px">
+        <div class="login-card login-card--wide">
           <h1>注册管理员</h1>
-          <p class="muted">仅支持创建 <strong>管理员(admin)</strong> 账号。<br>
-            超级管理员由运维在服务端 <span class="mono">.env</span> 种子，账号不对外开放。<br>
-            管理员注册后需验证邮箱，部分部署还需超管审批方可登录。</p>
+          <p class="muted">只创建 <strong>管理员</strong> 角色。用<strong>邮箱收验证码</strong>完成验证，不需要手机号。<br>
+            超级管理员由运维在服务器配置，不从此页注册。若开启审批，验证通过后还需超管批准才能登录。</p>
+          <ol class="login-steps" aria-label="注册步骤">
+            <li id="r_step_ind1" class="is-active">① 填写资料</li>
+            <li id="r_step_ind2">② 邮箱验证</li>
+          </ol>
           <div id="rStep1">
-            <label class="field"><span>用户名 (2–64 位，字母/数字/._-)</span><input id="r_user" autocomplete="username"/></label>
-            <label class="field" style="margin-top:10px"><span>密码 (≥8 位)</span><input id="r_pass" type="password" autocomplete="new-password"/></label>
-            <label class="field" style="margin-top:10px"><span>邮箱（用于收验证码 / 重要通知）</span><input id="r_email" type="email" autocomplete="email"/></label>
-            <label class="field" style="margin-top:10px"><span>手机号（可选，建议带区号如 +86…）</span><input id="r_phone" autocomplete="tel" placeholder="+8613800138000"/></label>
-            <div class="row between" style="margin-top:14px">
-              <a class="muted" href="#/login">返回登录</a>
-              <button class="btn" id="r_start">发送验证码</button>
+            <label class="field"><span>用户名（2–64 位：字母数字以及 ._-）</span><input id="r_user" autocomplete="username"/></label>
+            <label class="field" style="margin-top:10px"><span>密码（至少 8 位）</span><input id="r_pass" type="password" autocomplete="new-password"/></label>
+            <label class="field" style="margin-top:10px"><span>邮箱（收验证码与通知）</span><input id="r_email" type="email" autocomplete="email"/></label>
+            <div style="margin-top:16px;display:flex;flex-direction:column;gap:10px">
+              <button class="btn btn-tap btn-block" type="button" id="r_start">发送邮件验证码</button>
+              <a class="link-tile" href="#/login" style="text-align:center">已有账号，去登录</a>
             </div>
             <p class="muted" id="r_msg1" style="margin-top:10px"></p>
           </div>
           <div id="rStep2" style="display:none">
-            <p>验证码已发送到 <strong class="mono" id="r_shown_email"></strong>，请查收（请同时检查垃圾邮件）。</p>
-            <label class="field"><span>邮箱验证码</span><input id="r_email_code" inputmode="numeric" maxlength="8"/></label>
-            <label class="field" id="r_phone_code_wrap" style="margin-top:10px;display:none"><span>手机验证码</span><input id="r_phone_code" inputmode="numeric" maxlength="8"/></label>
-            <div class="row between" style="margin-top:14px">
-              <button class="btn ghost" id="r_resend">重新发送</button>
-              <button class="btn" id="r_verify">提交</button>
+            <p>我们已向 <strong class="mono" id="r_shown_email"></strong> 发送验证码。请打开邮箱（含垃圾邮件夹）查看。</p>
+            <label class="field" style="margin-top:10px"><span>邮箱里的验证码</span><input id="r_email_code" inputmode="numeric" maxlength="12" autocomplete="one-time-code"/></label>
+            <div style="margin-top:16px;display:flex;flex-direction:column;gap:10px">
+              <button class="btn btn-tap btn-block" type="button" id="r_verify">完成注册</button>
+              <button class="btn secondary btn-tap btn-block" type="button" id="r_resend">重发邮件验证码</button>
+              <button class="btn ghost btn-tap btn-block" type="button" id="r_back_step">返回上一步</button>
             </div>
             <p class="muted" id="r_msg2" style="margin-top:10px"></p>
           </div>
@@ -438,9 +481,7 @@
         password: $("#r_pass").value,
         email: $("#r_email").value.trim(),
       };
-      const ph = $("#r_phone").value.trim();
-      if (ph) body.phone = ph;
-      if (!body.username || !body.password || !body.email) { m1.textContent = "请填写所有必填项"; return; }
+      if (!body.username || !body.password || !body.email) { m1.textContent = "请填写用户名、密码和邮箱"; return; }
       try {
         const r = await fetch(apiBase() + "/auth/signup/start", {
           method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
@@ -449,7 +490,8 @@
         if (!r.ok) throw new Error(j.detail || `${r.status}`);
         sessionStorage.setItem("croc.signup_user", body.username);
         $("#r_shown_email").textContent = body.email;
-        if (j.phone_otp_sent) $("#r_phone_code_wrap").style.display = "";
+        $("#r_step_ind1").classList.remove("is-active");
+        $("#r_step_ind2").classList.add("is-active");
         $("#rStep1").style.display = "none";
         $("#rStep2").style.display = "";
       } catch (e) { m1.textContent = String(e.message || e); }
@@ -460,8 +502,6 @@
         username: sessionStorage.getItem("croc.signup_user") || "",
         email_code: $("#r_email_code").value.trim(),
       };
-      const pc = $("#r_phone_code").value.trim();
-      if (pc) body.phone_code = pc;
       try {
         const r = await fetch(apiBase() + "/auth/signup/verify", {
           method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
@@ -472,9 +512,16 @@
           m2.innerHTML = `<span class="badge online">验证成功</span> 账号已提交，正在等待超级管理员审批，审批通过后可登录。`;
         } else {
           m2.innerHTML = `<span class="badge online">验证成功</span> 账号已激活，3 秒后跳转到登录…`;
-          setTimeout(() => (location.hash = "#/login"), 3000);
+          scheduleRouteRedirect(3000, "#/login");
         }
       } catch (e) { m2.textContent = String(e.message || e); }
+    });
+    $("#r_back_step").addEventListener("click", () => {
+      m2.textContent = "";
+      $("#r_step_ind2").classList.remove("is-active");
+      $("#r_step_ind1").classList.add("is-active");
+      $("#rStep2").style.display = "none";
+      $("#rStep1").style.display = "";
     });
     $("#r_resend").addEventListener("click", async () => {
       const username = sessionStorage.getItem("croc.signup_user") || "";
@@ -497,27 +544,25 @@
     document.body.dataset.auth = "none";
     view.innerHTML = `
       <div class="login-wrap">
-        <div class="login-card">
+        <div class="login-card login-card--wide">
           <h1>激活账号</h1>
-          <p class="muted">管理员为你创建账号后，请用收到的邮件/短信验证码激活。</p>
-          <label class="field"><span>用户名</span><input id="a_user"/></label>
-          <label class="field" style="margin-top:10px"><span>邮箱验证码</span><input id="a_email_code" inputmode="numeric" maxlength="8"/></label>
-          <label class="field" style="margin-top:10px"><span>手机验证码 (可选)</span><input id="a_phone_code" inputmode="numeric" maxlength="8"/></label>
-          <div class="row between" style="margin-top:14px">
-            <a class="muted" href="#/login">返回登录</a>
-            <button class="btn" id="a_submit">激活</button>
+          <p class="muted">管理员已在后台为你开好账号，并往你的邮箱发了验证码。在下面输入<strong>用户名</strong>和<strong>邮件里的验证码</strong>即可激活（无需手机号）。</p>
+          <label class="field"><span>用户名</span><input id="a_user" autocomplete="username"/></label>
+          <label class="field" style="margin-top:10px"><span>邮箱验证码</span><input id="a_email_code" inputmode="numeric" maxlength="12" autocomplete="one-time-code"/></label>
+          <div style="margin-top:16px;display:flex;flex-direction:column;gap:10px">
+            <button class="btn btn-tap btn-block" type="button" id="a_submit">激活账号</button>
+            <button class="btn secondary btn-tap btn-block" type="button" id="a_resend">重发邮件验证码</button>
+            <a class="link-tile" href="#/login" style="text-align:center">返回登录</a>
           </div>
           <p class="muted" id="a_msg" style="margin-top:10px"></p>
         </div>
       </div>`;
+    const msg = $("#a_msg");
     $("#a_submit").addEventListener("click", async () => {
       const body = {
         username: $("#a_user").value.trim(),
         email_code: $("#a_email_code").value.trim(),
       };
-      const pc = $("#a_phone_code").value.trim();
-      if (pc) body.phone_code = pc;
-      const msg = $("#a_msg");
       msg.textContent = "";
       try {
         const r = await fetch(apiBase() + "/auth/activate", {
@@ -526,7 +571,22 @@
         const j = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(j.detail || `${r.status}`);
         msg.innerHTML = `<span class="badge online">已激活</span> 3 秒后回到登录…`;
-        setTimeout(() => (location.hash = "#/login"), 3000);
+        scheduleRouteRedirect(3000, "#/login");
+      } catch (e) { msg.textContent = String(e.message || e); }
+    });
+    $("#a_resend").addEventListener("click", async () => {
+      msg.textContent = "";
+      const username = $("#a_user").value.trim();
+      if (!username) { msg.textContent = "请先填写用户名"; return; }
+      try {
+        const r = await fetch(apiBase() + "/auth/code/resend", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username, channel: "email", purpose: "activate" }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(j.detail || `${r.status}`);
+        msg.textContent = "已尝试重新发送，请查收邮箱（含垃圾邮件）。";
       } catch (e) { msg.textContent = String(e.message || e); }
     });
   });
@@ -581,9 +641,11 @@
       </section>`;
 
     const renderList = () => {
+      const grid = document.getElementById("devGrid");
+      if (!grid) return;
       const q = ($("#q").value || "").toLowerCase().trim();
       const rows = devices.filter((d) => !q || [d.device_id, d.zone, d.fw, d.board_profile, d.chip_target].join(" ").toLowerCase().includes(q));
-      $("#devGrid").innerHTML = rows.length === 0
+      grid.innerHTML = rows.length === 0
         ? `<p class="muted">没有匹配的设备。</p>`
         : rows.map((d) => {
           const on = isOnline(d);
@@ -602,7 +664,13 @@
           </a>`;
         }).join("");
     };
-    $("#q").addEventListener("input", renderList);
+    $("#q").addEventListener("input", () => {
+      clearTimeout(overviewFilterDebounce);
+      overviewFilterDebounce = setTimeout(() => {
+        overviewFilterDebounce = null;
+        renderList();
+      }, 140);
+    });
     renderList();
   });
 
@@ -1017,18 +1085,27 @@
         ${detailTxt ? `<details class="ev-detail"><summary class="muted">详情</summary><pre class="code">${escapeHtml(detailTxt)}</pre></details>` : ""}
       </div>`;
     }
-    function render() {
+    function flushEvRender() {
+      const listEl = document.getElementById("evList");
+      if (!listEl) return;
       if (buffer.length === 0) {
-        $("#evList").innerHTML = `<p class="muted">无事件。</p>`;
+        listEl.innerHTML = `<p class="muted">无事件。</p>`;
         return;
       }
-      $("#evList").innerHTML = buffer.map(rowHtml).join("");
+      listEl.innerHTML = buffer.map(rowHtml).join("");
+    }
+    function scheduleEvRender() {
+      if (window.__pendingEvListRaf) return;
+      window.__pendingEvListRaf = requestAnimationFrame(() => {
+        window.__pendingEvListRaf = 0;
+        flushEvRender();
+      });
     }
     function pushEvent(ev) {
       if (paused) return;
       buffer.unshift(ev);
       if (buffer.length > BUFFER_MAX) buffer.length = BUFFER_MAX;
-      render();
+      scheduleEvRender();
     }
     function currentFilters() {
       const p = new URLSearchParams();
@@ -1044,7 +1121,11 @@
         const p = currentFilters(); p.set("limit", "200");
         const r = await api("/events?" + p.toString());
         buffer = (r.items || []).slice();
-        render();
+        if (window.__pendingEvListRaf) {
+          cancelAnimationFrame(window.__pendingEvListRaf);
+          window.__pendingEvListRaf = 0;
+        }
+        flushEvRender();
       } catch (e) { toast(e.message || e, "err"); }
     }
 
@@ -1077,7 +1158,14 @@
       paused = !paused;
       $("#evPause").textContent = paused ? "恢复" : "暂停";
     });
-    $("#evClear").addEventListener("click", () => { buffer = []; render(); });
+    $("#evClear").addEventListener("click", () => {
+      buffer = [];
+      if (window.__pendingEvListRaf) {
+        cancelAnimationFrame(window.__pendingEvListRaf);
+        window.__pendingEvListRaf = 0;
+      }
+      flushEvRender();
+    });
     $("#evApply").addEventListener("click", () => { loadHistory().then(openStream); });
     $("#evReload").addEventListener("click", loadHistory);
     $("#evStats").addEventListener("click", async () => {
@@ -1116,6 +1204,10 @@
 
     await loadHistory();
     openStream();
+    window.__eventsStreamResume = () => {
+      if (paused) return;
+      openStream();
+    };
   });
 
   // Audit
@@ -1178,9 +1270,9 @@
         <p class="muted">${isSuper
           ? "superadmin：可创建 admin/user，并为任意 user 设置 manager_admin 与策略。"
           : "admin：仅能管理自己名下的 user，并可开/关其能力。"}</p>
-        <div class="row right-end" style="justify-content:flex-end">
-          <button class="btn" id="showCreate">新增用户</button>
-          <button class="btn secondary" id="reloadUsers">刷新</button>
+        <div class="row right-end" style="justify-content:flex-end;flex-wrap:wrap;gap:10px">
+          <button class="btn btn-tap" id="showCreate" type="button">新增用户</button>
+          <button class="btn secondary btn-tap" id="reloadUsers" type="button">刷新</button>
         </div>
         <div class="divider"></div>
         <div id="userTable"></div>
@@ -1201,11 +1293,10 @@
             <select id="u_mgr">${admins.map((a) => `<option value="${escapeHtml(a)}">${escapeHtml(a)}</option>`).join("")}</select>
           </label>
           <label class="field"><span>邮箱 (必填，收激活码)</span><input id="u_email" type="email" autocomplete="off"/></label>
-          <label class="field"><span>手机号 (可选)</span><input id="u_phone" autocomplete="off" placeholder="+8613800138000"/></label>
           <label class="field"><span>tenant（可选）</span><input id="u_tenant" /></label>
-          <div class="row wide" style="justify-content:flex-end">
-            <button class="btn ghost" id="u_cancel" type="button">取消</button>
-            <button class="btn" id="u_submit" type="button">创建并发送激活码</button>
+          <div class="row wide" style="justify-content:flex-end;flex-wrap:wrap;gap:10px">
+            <button class="btn ghost btn-tap" id="u_cancel" type="button">取消</button>
+            <button class="btn btn-tap" id="u_submit" type="button">创建并发邮件激活码</button>
           </div>
           <p class="muted" style="margin:8px 0 0">
             新用户状态为 <span class="mono">pending</span>；必须让该用户在
@@ -1295,8 +1386,6 @@
       const email = $("#u_email").value.trim();
       if (!email) { toast("必须填写邮箱——新用户要用它激活账号", "err"); return; }
       body.email = email;
-      const phone = $("#u_phone").value.trim();
-      if (phone) body.phone = phone;
       const tenant = $("#u_tenant").value.trim(); if (tenant) body.tenant = tenant;
       if (isSuper && body.role === "user") body.manager_admin = $("#u_mgr").value;
       try {
@@ -1304,7 +1393,7 @@
         toast(`创建成功：${resp.message || "已发送验证码"}`, "ok");
         $("#createPanel").style.display = "none";
         $("#u_name").value = ""; $("#u_pass").value = ""; $("#u_tenant").value = "";
-        $("#u_email").value = ""; $("#u_phone").value = "";
+        $("#u_email").value = "";
         loadUsers();
       } catch (e) { toast(e.message || e, "err"); }
     });
@@ -1468,11 +1557,10 @@
         $("#pendAdmins").innerHTML = items.length === 0
           ? `<p class="muted">没有待审批。</p>`
           : `<div class="table-wrap"><table class="t">
-              <thead><tr><th>用户名</th><th>邮箱</th><th>手机</th><th>提交时间</th><th>邮箱已验</th><th></th></tr></thead>
+              <thead><tr><th>用户名</th><th>邮箱</th><th>提交时间</th><th>邮箱已验</th><th></th></tr></thead>
               <tbody>${items.map((u) => `<tr>
                 <td><strong>${escapeHtml(u.username)}</strong></td>
                 <td class="mono">${escapeHtml(u.email || "—")}</td>
-                <td class="mono">${escapeHtml(u.phone || "—")}</td>
                 <td>${escapeHtml(fmtTs(u.created_at))}</td>
                 <td>${u.email_verified_at ? "✓" : "—"}</td>
                 <td>
@@ -1771,7 +1859,28 @@
     await loadHealth();
     if (!location.hash) location.hash = state.me ? "#/overview" : "#/login";
     else renderRoute();
-    setInterval(loadHealth, 30000);
+    clearHealthPollTimer();
+    healthPollTimer = setInterval(tickHealthIfVisible, 30000);
+    document.addEventListener("visibilitychange", () => {
+      document.documentElement.classList.toggle("tab-hidden", document.visibilityState === "hidden");
+      if (document.visibilityState === "hidden") {
+        if (window.__evSSE) {
+          try { window.__evSSE.close(); } catch (_) {}
+          window.__evSSE = null;
+          const live = document.getElementById("evLive");
+          if (live) {
+            live.textContent = "已暂停";
+            live.className = "badge offline";
+          }
+        }
+        return;
+      }
+      tickHealthIfVisible();
+      if (typeof window.__eventsStreamResume === "function") {
+        try { window.__eventsStreamResume(); } catch (_) {}
+      }
+    });
+    document.documentElement.classList.toggle("tab-hidden", document.visibilityState === "hidden");
   }
 
   document.addEventListener("DOMContentLoaded", boot);

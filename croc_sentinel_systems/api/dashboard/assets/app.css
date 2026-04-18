@@ -376,3 +376,458 @@ pre.code { background: var(--bg-muted); border: 1px solid var(--border); border-
   .ev-ts { min-width: 0; flex-basis: 100%; }
   .ev-summary { flex-basis: 100%; }
 }
+
+/* -------------------------------------------------------------------------
+   Comfort UI — 大按钮、易读、少「科技感」装饰（桌面与手机共用）
+   ------------------------------------------------------------------------- */
+body.comfort-ui {
+  font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+  font-size: 15px;
+}
+
+body.comfort-ui .logo {
+  background: var(--accent);
+  box-shadow: none;
+}
+
+body.comfort-ui .brand-sub {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 12px;
+}
+
+body.comfort-ui .login-wrap {
+  min-height: 100vh;
+  padding: 16px;
+  background: var(--bg);
+}
+
+body.comfort-ui .login-card {
+  border-radius: 14px;
+  box-shadow: 0 4px 20px rgba(15, 23, 42, 0.07);
+  padding: 22px;
+}
+
+body.comfort-ui .login-card.login-card--wide {
+  width: min(520px, 100%);
+}
+
+body.comfort-ui .btn {
+  min-height: 46px;
+  padding: 12px 18px;
+  font-size: 16px;
+  border-radius: 10px;
+}
+
+body.comfort-ui .btn.btn-tap {
+  min-height: 52px;
+  padding: 14px 20px;
+  font-size: 17px;
+}
+
+body.comfort-ui .btn.btn-block {
+  width: 100%;
+  justify-content: center;
+}
+
+body.comfort-ui .btn.sm {
+  min-height: 40px;
+  padding: 8px 14px;
+  font-size: 14px;
+}
+
+body.comfort-ui .field input,
+body.comfort-ui .field select,
+body.comfort-ui .field textarea {
+  min-height: 48px;
+  font-size: 16px;
+  padding: 10px 12px;
+}
+
+body.comfort-ui .field textarea.mono {
+  min-height: 120px;
+  font-size: 13px;
+}
+
+body.comfort-ui .nav a {
+  min-height: 46px;
+  padding: 12px 12px;
+  font-size: 15px;
+}
+
+body.comfort-ui .sidebar-actions .btn {
+  min-height: 44px;
+  font-size: 14px;
+}
+
+body.comfort-ui .topbar {
+  min-height: 52px;
+}
+
+body.comfort-ui .menu-btn,
+body.comfort-ui .icon-btn {
+  min-width: 44px;
+  min-height: 44px;
+}
+
+body.comfort-ui .stat .k {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 13px;
+}
+
+body.comfort-ui .login-steps {
+  display: flex;
+  gap: 10px;
+  margin: 0 0 18px;
+  padding: 0;
+  list-style: none;
+}
+
+body.comfort-ui .login-steps li {
+  flex: 1;
+  text-align: center;
+  padding: 12px 8px;
+  border-radius: 10px;
+  background: var(--bg-muted);
+  color: var(--text-muted);
+  font-size: 14px;
+  font-weight: 600;
+  border: 1px solid var(--border);
+}
+
+body.comfort-ui .login-steps li.is-active {
+  background: var(--accent-weak);
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+}
+
+body.comfort-ui .login-link-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+body.comfort-ui a.link-tile {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 48px;
+  padding: 12px 16px;
+  border-radius: 10px;
+  background: var(--bg-muted);
+  color: var(--text);
+  text-decoration: none;
+  font-weight: 600;
+  font-size: 15px;
+  border: 1px solid var(--border);
+}
+
+body.comfort-ui a.link-tile:hover {
+  background: var(--bg-elev);
+  border-color: var(--border-strong);
+}
+
+@media (max-width: 520px) {
+  body.comfort-ui .device-card:hover {
+    transform: none;
+    box-shadow: var(--shadow);
+  }
+}
+
+/* -------------------------------------------------------------------------
+   Motion + glass — 全站动效、毛玻璃、主内容区排版（尊重 prefers-reduced-motion）
+   ------------------------------------------------------------------------- */
+@keyframes motion-fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes motion-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes motion-scale-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes motion-shimmer-bg {
+  0% { background-position: 0% 50%; }
+  100% { background-position: 100% 50%; }
+}
+
+body.motion-ui.app-shell {
+  background:
+    radial-gradient(ellipse 120% 80% at 0% -10%, color-mix(in srgb, var(--accent) 22%, transparent), transparent 55%),
+    radial-gradient(ellipse 90% 70% at 100% 0%, color-mix(in srgb, var(--accent) 12%, transparent), transparent 50%),
+    var(--bg);
+}
+
+body.motion-ui .main {
+  position: relative;
+  min-height: 100vh;
+}
+
+body.motion-ui .sidebar {
+  background: color-mix(in srgb, var(--bg-elev) 58%, transparent);
+  backdrop-filter: blur(18px) saturate(1.35);
+  -webkit-backdrop-filter: blur(18px) saturate(1.35);
+  border-right: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  box-shadow: 4px 0 32px rgba(15, 23, 42, 0.04);
+  transition: transform 0.38s cubic-bezier(0.32, 0.72, 0, 1), box-shadow 0.3s ease;
+}
+
+body.motion-ui .topbar {
+  background: color-mix(in srgb, var(--bg-elev) 55%, transparent);
+  backdrop-filter: blur(16px) saturate(1.25);
+  -webkit-backdrop-filter: blur(16px) saturate(1.25);
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 65%, transparent);
+  transition: box-shadow 0.25s ease;
+}
+
+body.motion-ui .view {
+  max-width: 1320px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+body.motion-ui .view .card + .card {
+  margin-top: 0;
+}
+
+body.motion-ui .card,
+body.motion-ui .stat,
+body.motion-ui .device-card,
+body.motion-ui .table-wrap,
+body.motion-ui .login-card,
+body.motion-ui .events-list {
+  background: color-mix(in srgb, var(--bg-elev) 62%, transparent);
+  backdrop-filter: blur(14px) saturate(1.2);
+  -webkit-backdrop-filter: blur(14px) saturate(1.2);
+  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  box-shadow:
+    0 4px 24px rgba(15, 23, 42, 0.06),
+    inset 0 1px 0 color-mix(in srgb, #fff 12%, transparent);
+  transition:
+    transform 0.28s cubic-bezier(0.22, 1, 0.36, 1),
+    box-shadow 0.28s ease,
+    border-color 0.2s ease;
+}
+
+html[data-theme="dark"] body.motion-ui .card,
+html[data-theme="dark"] body.motion-ui .stat,
+html[data-theme="dark"] body.motion-ui .device-card,
+html[data-theme="dark"] body.motion-ui .table-wrap,
+html[data-theme="dark"] body.motion-ui .login-card,
+html[data-theme="dark"] body.motion-ui .events-list {
+  box-shadow:
+    0 8px 40px rgba(0, 0, 0, 0.35),
+    inset 0 1px 0 color-mix(in srgb, #fff 4%, transparent);
+}
+
+body.motion-ui .device-card:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 12px 40px rgba(15, 23, 42, 0.12);
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--border));
+}
+
+body.motion-ui .btn {
+  transition:
+    transform 0.22s cubic-bezier(0.22, 1, 0.36, 1),
+    box-shadow 0.22s ease,
+    background 0.2s ease,
+    border-color 0.2s ease,
+    color 0.2s ease;
+}
+
+body.motion-ui .btn:hover:not([disabled]) {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 20px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+body.motion-ui .btn:active:not([disabled]) {
+  transform: translateY(0);
+}
+
+body.motion-ui .btn.secondary:hover:not([disabled]),
+body.motion-ui .btn.ghost:hover:not([disabled]) {
+  box-shadow: 0 4px 16px rgba(15, 23, 42, 0.06);
+}
+
+body.motion-ui .nav a {
+  transition:
+    transform 0.22s cubic-bezier(0.22, 1, 0.36, 1),
+    background 0.2s ease,
+    color 0.2s ease;
+}
+
+body.motion-ui .nav a:hover {
+  transform: translateX(4px);
+}
+
+body.motion-ui .icon-btn {
+  transition: transform 0.2s ease, background 0.2s ease, border-color 0.2s ease;
+}
+
+body.motion-ui .icon-btn:hover {
+  transform: scale(1.06);
+}
+
+body.motion-ui .login-wrap {
+  min-height: 100vh;
+  padding: 20px;
+  background:
+    linear-gradient(125deg, color-mix(in srgb, var(--accent) 16%, transparent) 0%, transparent 45%),
+    linear-gradient(-35deg, color-mix(in srgb, var(--accent) 10%, transparent) 0%, transparent 40%),
+    radial-gradient(ellipse 100% 80% at 50% 120%, color-mix(in srgb, var(--accent) 12%, transparent), transparent 55%),
+    var(--bg);
+  background-size: 200% 200%, 200% 200%, 100% 100%, 100% 100%;
+  animation: motion-shimmer-bg 18s ease-in-out infinite alternate;
+}
+
+body.motion-ui .login-card {
+  animation: motion-scale-in 0.55s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+body.motion-ui .ev-row {
+  transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+body.motion-ui .ev-row:hover {
+  transform: translateX(2px);
+  box-shadow: 0 4px 16px rgba(15, 23, 42, 0.06);
+}
+
+/* 路由主区域：直接子块依次入场 */
+body.motion-ui #view > * {
+  animation: motion-fade-up 0.52s cubic-bezier(0.22, 1, 0.36, 1) backwards;
+}
+
+body.motion-ui #view > *:nth-child(1) { animation-delay: 0.03s; }
+body.motion-ui #view > *:nth-child(2) { animation-delay: 0.08s; }
+body.motion-ui #view > *:nth-child(3) { animation-delay: 0.13s; }
+body.motion-ui #view > *:nth-child(4) { animation-delay: 0.18s; }
+body.motion-ui #view > *:nth-child(5) { animation-delay: 0.23s; }
+body.motion-ui #view > *:nth-child(6) { animation-delay: 0.28s; }
+body.motion-ui #view > *:nth-child(7) { animation-delay: 0.33s; }
+body.motion-ui #view > *:nth-child(8) { animation-delay: 0.38s; }
+body.motion-ui #view > *:nth-child(9) { animation-delay: 0.43s; }
+body.motion-ui #view > *:nth-child(10) { animation-delay: 0.48s; }
+body.motion-ui #view > *:nth-child(11) { animation-delay: 0.53s; }
+body.motion-ui #view > *:nth-child(12) { animation-delay: 0.58s; }
+
+/* 侧栏导航项（首个为 nav-section，其后为链接） */
+body.motion-ui .nav > .nav-section {
+  animation: motion-fade-in 0.4s ease backwards;
+  animation-delay: 0.02s;
+}
+
+body.motion-ui .nav a:nth-child(2) { animation: motion-fade-up 0.42s cubic-bezier(0.22, 1, 0.36, 1) backwards; animation-delay: 0.05s; }
+body.motion-ui .nav a:nth-child(3) { animation: motion-fade-up 0.42s cubic-bezier(0.22, 1, 0.36, 1) backwards; animation-delay: 0.09s; }
+body.motion-ui .nav a:nth-child(4) { animation: motion-fade-up 0.42s cubic-bezier(0.22, 1, 0.36, 1) backwards; animation-delay: 0.13s; }
+body.motion-ui .nav a:nth-child(5) { animation: motion-fade-up 0.42s cubic-bezier(0.22, 1, 0.36, 1) backwards; animation-delay: 0.17s; }
+body.motion-ui .nav a:nth-child(6) { animation: motion-fade-up 0.42s cubic-bezier(0.22, 1, 0.36, 1) backwards; animation-delay: 0.21s; }
+body.motion-ui .nav a:nth-child(7) { animation: motion-fade-up 0.42s cubic-bezier(0.22, 1, 0.36, 1) backwards; animation-delay: 0.25s; }
+body.motion-ui .nav a:nth-child(8) { animation: motion-fade-up 0.42s cubic-bezier(0.22, 1, 0.36, 1) backwards; animation-delay: 0.29s; }
+body.motion-ui .nav a:nth-child(9) { animation: motion-fade-up 0.42s cubic-bezier(0.22, 1, 0.36, 1) backwards; animation-delay: 0.33s; }
+body.motion-ui .nav a:nth-child(10) { animation: motion-fade-up 0.42s cubic-bezier(0.22, 1, 0.36, 1) backwards; animation-delay: 0.37s; }
+body.motion-ui .nav a:nth-child(11) { animation: motion-fade-up 0.42s cubic-bezier(0.22, 1, 0.36, 1) backwards; animation-delay: 0.41s; }
+body.motion-ui .nav a:nth-child(12) { animation: motion-fade-up 0.42s cubic-bezier(0.22, 1, 0.36, 1) backwards; animation-delay: 0.45s; }
+
+body.motion-ui .toast {
+  transition:
+    transform 0.45s cubic-bezier(0.34, 1.4, 0.64, 1),
+    opacity 0.35s ease;
+}
+
+body.motion-ui .toast.show {
+  animation: motion-scale-in 0.38s cubic-bezier(0.34, 1.4, 0.64, 1) both;
+}
+
+body.motion-ui .sidebar-backdrop {
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  transition: opacity 0.25s ease;
+}
+
+body.motion-ui a.link-tile {
+  background: color-mix(in srgb, var(--bg-muted) 68%, transparent);
+  backdrop-filter: blur(12px) saturate(1.15);
+  -webkit-backdrop-filter: blur(12px) saturate(1.15);
+  transition: transform 0.22s ease, border-color 0.2s ease, background 0.2s ease;
+}
+
+body.motion-ui a.link-tile:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+}
+
+body.motion-ui .login-steps li {
+  transition: border-color 0.2s ease, background 0.2s ease, color 0.2s ease;
+}
+
+body.motion-ui table.t th {
+  background: color-mix(in srgb, var(--bg-muted) 85%, transparent);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+@media (max-width: 520px) {
+  body.motion-ui .device-card:hover {
+    transform: none;
+    box-shadow: var(--shadow);
+  }
+}
+
+/* 浏览器标签在后台时暂停装饰性动画与入场动效，减轻 GPU / 省电 */
+html.tab-hidden body.motion-ui .login-wrap {
+  animation: none;
+}
+
+html.tab-hidden body.motion-ui #view > *,
+html.tab-hidden body.motion-ui .nav > .nav-section,
+html.tab-hidden body.motion-ui .nav a,
+html.tab-hidden body.motion-ui .login-card,
+html.tab-hidden body.motion-ui .toast.show {
+  animation: none !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body.motion-ui .login-wrap {
+    animation: none;
+    background: var(--bg);
+  }
+
+  body.motion-ui #view > *,
+  body.motion-ui .nav > .nav-section,
+  body.motion-ui .nav a,
+  body.motion-ui .login-card,
+  body.motion-ui .toast.show {
+    animation: none !important;
+  }
+
+  body.motion-ui .btn:hover:not([disabled]),
+  body.motion-ui .nav a:hover,
+  body.motion-ui .icon-btn:hover,
+  body.motion-ui .device-card:hover,
+  body.motion-ui .ev-row:hover,
+  body.motion-ui a.link-tile:hover {
+    transform: none;
+  }
+}
