@@ -46,13 +46,14 @@ services:
     expose:
       - "8088"
 
+    # Single process only: MQTT client, mqtt_ingest queue, event_bus, and
+    # api_ready_event are in-memory — multiple workers break routing and can
+    # duplicate broker connections. Do not add --loop uvloop unless uvloop is
+    # listed in api/requirements.txt.
     command: >
       uvicorn app:app
       --host 0.0.0.0
       --port 8088
-      --workers 2
-      --loop uvloop
-      --http httptools
 
     volumes:
       - ./data:/data
@@ -67,7 +68,8 @@ services:
       # ✅ FIXED: must match REAL network name
       - "traefik.docker.network=croc_net"
 
-      - "traefik.http.routers.api.rule=Host(`esasecure.com`)"
+      # Match apex + www (adjust hostnames to your real domain).
+      - "traefik.http.routers.api.rule=Host(`esasecure.com`) || Host(`www.esasecure.com`)"
       - "traefik.http.routers.api.entrypoints=web"
       - "traefik.http.services.api.loadbalancer.server.port=8088"
 
