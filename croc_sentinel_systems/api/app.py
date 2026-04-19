@@ -2562,16 +2562,31 @@ if os.path.isdir(_dash_dir):
     app.mount(DASHBOARD_PATH, StaticFiles(directory=_dash_dir, html=True), name="dashboard")
 
 
+def _readiness_public_paths(path: str) -> bool:
+    """Paths that must never be blocked by startup / bootstrap-failure guard (SPA shell + probes)."""
+    if path == "/health" or path == "/" or path.startswith("/docs") or path in (
+        "/openapi.json",
+        "/redoc",
+        "/favicon.ico",
+    ):
+        return True
+    # Mounted dashboard (StaticFiles at DASHBOARD_PATH) — was missing and caused 503 on entire UI.
+    base = DASHBOARD_PATH
+    if path == base or path.startswith(base + "/"):
+        return True
+    # Legacy redirects into the console
+    if path.startswith("/ui"):
+        return True
+    if path == "/dashboard" or path.startswith("/dashboard/"):
+        return True
+    return False
+
+
 @app.middleware("http")
 async def _readiness_guard(request: Request, call_next):
-    """503 API routes until deferred bootstrap finishes (Uvicorn binds immediately)."""
+    """503 JSON API routes until deferred bootstrap finishes; never block static dashboard."""
     path = request.url.path
-    if (
-        path == "/health"
-        or path == "/"
-        or path.startswith("/docs")
-        or path in ("/openapi.json", "/redoc", "/favicon.ico")
-    ):
+    if _readiness_public_paths(path):
         return await call_next(request)
     if not api_ready_event.is_set():
         return JSONResponse(
