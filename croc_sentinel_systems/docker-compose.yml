@@ -42,9 +42,12 @@ services:
     depends_on:
       - mosquitto
 
-    # ✅ IMPORTANT: ONLY internal, Traefik handles public access
     expose:
       - "8088"
+    # Publish API+console on host :8088 so URLs like http://HOST:8088/console/ work.
+    # Traefik still fronts http://HOST/console/ on :80 (entrypoints.web) — prefer that in prod.
+    ports:
+      - "8088:8088"
 
     # Single process only: MQTT client, mqtt_ingest queue, event_bus, and
     # api_ready_event are in-memory — multiple workers break routing and can

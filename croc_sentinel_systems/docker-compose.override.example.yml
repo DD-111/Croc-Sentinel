@@ -1,8 +1,9 @@
 # Copy to docker-compose.override.yml (same folder as docker-compose.yml).
 # Compose merges this automatically — no change to the default compose file.
 #
-# Use when host Nginx listens on 8088/443 and must proxy to the API:
-# avoid binding the API container to 0.0.0.0:8088 on the host (port clash).
+# Default docker-compose.yml already maps host 8088 -> api:8088 for direct access
+# (http://HOST:8088/console/). Use this override when that host port clashes
+# (e.g. host Nginx already binds :8088) — bind API only on loopback for a reverse proxy:
 
 services:
   api:
