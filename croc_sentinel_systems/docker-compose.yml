@@ -27,12 +27,6 @@ services:
     networks:
       - croc_net
 
-    deploy:
-      resources:
-        limits:
-          cpus: "0.5"
-          memory: 256M
-
 
   api:
     build:
@@ -48,6 +42,7 @@ services:
     depends_on:
       - mosquitto
 
+    # ✅ IMPORTANT: ONLY internal, Traefik handles public access
     expose:
       - "8088"
 
@@ -55,7 +50,9 @@ services:
       uvicorn app:app
       --host 0.0.0.0
       --port 8088
-      --workers 1
+      --workers 2
+      --loop uvloop
+      --http httptools
 
     volumes:
       - ./data:/data
@@ -66,18 +63,13 @@ services:
 
     labels:
       - "traefik.enable=true"
-      - "traefik.docker.network=croc_sentinel_systems_croc_net"
+
+      # ✅ FIXED: must match REAL network name
+      - "traefik.docker.network=croc_net"
 
       - "traefik.http.routers.api.rule=Host(`esasecure.com`)"
       - "traefik.http.routers.api.entrypoints=web"
-
       - "traefik.http.services.api.loadbalancer.server.port=8088"
-
-    deploy:
-      resources:
-        limits:
-          cpus: "1.0"
-          memory: 512M
 
 
   ota-nginx:
@@ -101,6 +93,31 @@ services:
     volumes:
       - ./nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro
       - ./firmware:/opt/sentinel/firmware:ro
+
+    networks:
+      - croc_net
+
+
+  traefik:
+    image: traefik:latest
+    container_name: traefik
+    restart: unless-stopped
+
+    command:
+      - "--api.dashboard=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--log.level=INFO"
+      - "--accesslog=false"
+      - "--ping=true"
+
+    ports:
+      - "80:80"
+      - "8080:8080"
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
 
     networks:
       - croc_net
