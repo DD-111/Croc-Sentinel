@@ -34,8 +34,13 @@ services:
       - "8088:8088"
     volumes:
       - ./data:/data
-      # Same CA as devices / mosquitto; path must match MQTT_CLIENT_CA in .env (default below).
       - ./certs/ca.crt:/etc/sentinel/mqtt-ca.crt:ro
+
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.api.rule=Host(`esasecure.com`)"
+      - "traefik.http.routers.api.entrypoints=web"
+      - "traefik.http.services.api.loadbalancer.server.port=8088"
 
   ota-nginx:
     image: nginx:1.27-alpine
