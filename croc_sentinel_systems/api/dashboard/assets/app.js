@@ -1606,12 +1606,16 @@
         </div>
       </div>` : ""}`;
 
+    const $v = (sel) => $(sel, view);
+
     // users
     const loadUsers = async () => {
       try {
         const d = await api("/auth/users");
         const users = d.items || [];
-        $("#userTable").innerHTML = users.length === 0
+        const userTableEl = $v("#userTable");
+        if (!userTableEl) return;
+        userTableEl.innerHTML = users.length === 0
           ? `<p class="muted">No users.</p>`
           : `<div class="table-wrap"><table class="t">
               <thead><tr><th>User</th><th>Role</th><th>manager</th><th>tenant</th><th>Created</th><th></th></tr></thead>
@@ -1631,34 +1635,35 @@
                 </tr><tr class="sub" style="display:none" data-pol-row="${escapeHtml(u.username)}"><td colspan="6"></td></tr>`;
               }).join("")}</tbody></table></div>`;
       } catch (e) {
-        $("#userTable").innerHTML = `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`;
+        const userTableEl = $v("#userTable");
+        if (userTableEl) userTableEl.innerHTML = `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`;
       }
     };
 
-    $("#reloadUsers").addEventListener("click", loadUsers);
-    $("#showCreate").addEventListener("click", () => {
-      $("#createPanel").style.display = "";
-      $("#createPanel").scrollIntoView({ behavior: "smooth", block: "start" });
+    $v("#reloadUsers").addEventListener("click", loadUsers);
+    $v("#showCreate").addEventListener("click", () => {
+      $v("#createPanel").style.display = "";
+      $v("#createPanel").scrollIntoView({ behavior: "smooth", block: "start" });
     });
-    $("#u_cancel").addEventListener("click", () => { $("#createPanel").style.display = "none"; });
-    $("#u_submit").addEventListener("click", async () => {
+    $v("#u_cancel").addEventListener("click", () => { $v("#createPanel").style.display = "none"; });
+    $v("#u_submit").addEventListener("click", async () => {
       const body = {
-        username: $("#u_name").value.trim(),
-        password: $("#u_pass").value,
-        role: $("#u_role").value,
+        username: $v("#u_name").value.trim(),
+        password: $v("#u_pass").value,
+        role: $v("#u_role").value,
       };
       if (!body.username || !body.password) { toast("Username and password required", "err"); return; }
-      const email = $("#u_email").value.trim();
+      const email = $v("#u_email").value.trim();
       if (!email) { toast("Email required for activation", "err"); return; }
       body.email = email;
-      const tenant = $("#u_tenant").value.trim(); if (tenant) body.tenant = tenant;
-      if (isSuper && body.role === "user") body.manager_admin = $("#u_mgr").value;
+      const tenant = $v("#u_tenant").value.trim(); if (tenant) body.tenant = tenant;
+      if (isSuper && body.role === "user") body.manager_admin = $v("#u_mgr").value;
       try {
         const resp = await api("/auth/users", { method: "POST", body });
         toast(`Created: ${resp.message || "activation email sent"}`, "ok");
-        $("#createPanel").style.display = "none";
-        $("#u_name").value = ""; $("#u_pass").value = ""; $("#u_tenant").value = "";
-        $("#u_email").value = "";
+        $v("#createPanel").style.display = "none";
+        $v("#u_name").value = ""; $v("#u_pass").value = ""; $v("#u_tenant").value = "";
+        $v("#u_email").value = "";
         loadUsers();
       } catch (e) { toast(e.message || e, "err"); }
     });
@@ -1683,7 +1688,7 @@
       } catch (e) { cell.innerHTML = `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`; }
     };
 
-    $("#userTable").addEventListener("click", async (ev) => {
+    $v("#userTable").addEventListener("click", async (ev) => {
       const t = ev.target.closest("button");
       if (!t) return;
       const u = t.dataset.u;
@@ -1702,8 +1707,8 @@
 
     // backup
     if (isSuper) {
-      $("#bk_export").addEventListener("click", async () => {
-        const key = ($("#bk_key").value || "").trim();
+      $v("#bk_export").addEventListener("click", async () => {
+        const key = ($v("#bk_key").value || "").trim();
         if (!key) { toast("Enter backup encryption key", "err"); return; }
         try {
           const r = await fetch(apiBase() + "/admin/backup/export", {
@@ -1717,9 +1722,9 @@
           toast("Downloaded", "ok");
         } catch (e) { toast(e.message || e, "err"); }
       });
-      $("#bk_import").addEventListener("click", async () => {
-        const key = ($("#bk_key").value || "").trim();
-        const f = $("#bk_file").files[0];
+      $v("#bk_import").addEventListener("click", async () => {
+        const key = ($v("#bk_key").value || "").trim();
+        const f = $v("#bk_file").files[0];
         if (!key || !f) { toast("Pick a file and enter the encryption key", "err"); return; }
         const fd = new FormData(); fd.append("file", f, f.name || "sentinel-backup.enc");
         try {
@@ -1739,11 +1744,13 @@
     const loadSmtpStatus = async () => {
       try {
         const s = await api("/admin/smtp/status");
+        const smtpEl = $v("#smtpStatus");
+        if (!smtpEl) return;
         const okBadge = s.enabled
           ? `<span class="badge online">SMTP on</span>`
           : `<span class="badge offline">SMTP off</span>`;
         const last = s.last_error ? `<span class="chip" title="last error">${escapeHtml(s.last_error)}</span>` : "";
-        $("#smtpStatus").innerHTML = `${okBadge}
+        smtpEl.innerHTML = `${okBadge}
           <span class="chip">host: ${escapeHtml(s.host || "—")}:${escapeHtml(String(s.port || "—"))}</span>
           <span class="chip">mode: ${escapeHtml(s.mode || "—")}</span>
           <span class="chip">from: ${escapeHtml(s.sender || "—")}</span>
@@ -1751,14 +1758,18 @@
           <span class="chip">failed: ${s.failed_count || 0}</span>
           <span class="chip">queue: ${s.queue_size ?? 0}/${s.queue_max ?? ""}</span>${last}`;
       } catch (e) {
-        $("#smtpStatus").innerHTML = `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`;
+        const smtpEl = $v("#smtpStatus");
+        if (!smtpEl) return;
+        smtpEl.innerHTML = `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`;
       }
     };
     const loadRecipients = async () => {
       try {
         const d = await api("/admin/alert-recipients");
         const items = d.items || [];
-        $("#recipientList").innerHTML = items.length === 0
+        const listEl = $v("#recipientList");
+        if (!listEl) return;
+        listEl.innerHTML = items.length === 0
           ? `<p class="muted">No recipients yet.</p>`
           : `<div class="table-wrap"><table class="t">
               <thead><tr><th>Email</th><th>Label</th><th>Enabled</th><th>Tenant</th><th></th></tr></thead>
@@ -1774,22 +1785,24 @@
                   </td>
                 </tr>`).join("")}</tbody></table></div>`;
       } catch (e) {
-        $("#recipientList").innerHTML = `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`;
+        const listEl = $v("#recipientList");
+        if (!listEl) return;
+        listEl.innerHTML = `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`;
       }
     };
-    $("#r_add").addEventListener("click", async () => {
-      const email = ($("#r_email").value || "").trim();
-      const label = ($("#r_label").value || "").trim();
+    $v("#r_add").addEventListener("click", async () => {
+      const email = ($v("#r_email").value || "").trim();
+      const label = ($v("#r_label").value || "").trim();
       if (!email) { toast("Enter email", "err"); return; }
       try {
         await api("/admin/alert-recipients", { method: "POST", body: { email, label } });
-        $("#r_email").value = ""; $("#r_label").value = "";
+        $v("#r_email").value = ""; $v("#r_label").value = "";
         toast("Added", "ok");
         loadRecipients();
       } catch (e) { toast(e.message || e, "err"); }
     });
-    $("#r_test").addEventListener("click", async () => {
-      const email = ($("#r_email").value || "").trim();
+    $v("#r_test").addEventListener("click", async () => {
+      const email = ($v("#r_email").value || "").trim();
       if (!email) { toast("Enter recipient email first", "err"); return; }
       try {
         await api("/admin/smtp/test", { method: "POST", body: { to: email } });
@@ -1800,6 +1813,8 @@
     const loadTgStatus = async () => {
       try {
         const t = await api("/admin/telegram/status");
+        const tgEl = $v("#tgStatus");
+        if (!tgEl) return;
         const badge = t.enabled
           ? `<span class="badge online">enabled</span>`
           : `<span class="badge offline">disabled</span>`;
@@ -1811,24 +1826,26 @@
         const le = (t.last_error || "").trim()
           ? `<p class="muted" style="margin-top:8px;word-break:break-word"><strong>Last error:</strong> ${escapeHtml(t.last_error)}</p>`
           : "";
-        $("#tgStatus").innerHTML = `${badge}
+        tgEl.innerHTML = `${badge}
           ${th}
           <span class="chip">worker: ${wk}</span>
           <span class="chip">chats: ${t.chats ?? 0}</span>
           <span class="chip">min_level: ${escapeHtml(t.min_level || "")}</span>
           <span class="chip">queue: ${t.queue_size ?? 0}</span>${modErr}${le}`;
       } catch (e) {
-        $("#tgStatus").innerHTML = `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`;
+        const tgEl = $v("#tgStatus");
+        if (!tgEl) return;
+        tgEl.innerHTML = `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`;
       }
     };
-    $("#tgTest").addEventListener("click", async () => {
+    $v("#tgTest").addEventListener("click", async () => {
       try {
         const r = await api("/admin/telegram/test", { method: "POST", body: { text: "Croc Sentinel UI test" } });
         toast(r.detail || "ok", "ok");
         loadTgStatus();
       } catch (e) { toast(e.message || e, "err"); }
     });
-    $("#recipientList").addEventListener("click", async (ev) => {
+    $v("#recipientList").addEventListener("click", async (ev) => {
       const b = ev.target.closest("button"); if (!b) return;
       const id = b.dataset.id;
       if (b.classList.contains("js-rdel")) {
@@ -1852,7 +1869,9 @@
       try {
         const d = await api("/auth/signup/pending");
         const items = d.items || [];
-        $("#pendAdmins").innerHTML = items.length === 0
+        const pendEl = $v("#pendAdmins");
+        if (!pendEl) return;
+        pendEl.innerHTML = items.length === 0
           ? `<p class="muted">No pending signups.</p>`
           : `<div class="table-wrap"><table class="t">
               <thead><tr><th>Username</th><th>Email</th><th>Submitted</th><th>Email OK</th><th></th></tr></thead>
@@ -1867,11 +1886,13 @@
                 </td>
               </tr>`).join("")}</tbody></table></div>`;
       } catch (e) {
-        $("#pendAdmins").innerHTML = `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`;
+        const pendEl = $v("#pendAdmins");
+        if (!pendEl) return;
+        pendEl.innerHTML = `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`;
       }
     };
     if (isSuper) {
-      $("#pendAdmins").addEventListener("click", async (ev) => {
+      $v("#pendAdmins").addEventListener("click", async (ev) => {
         const b = ev.target.closest("button"); if (!b) return;
         const u = b.dataset.u;
         if (b.classList.contains("js-ok")) {
