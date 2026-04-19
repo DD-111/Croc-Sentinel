@@ -1783,6 +1783,9 @@
           : `<span class="badge offline">disabled</span>`;
         const wk = t.worker_running ? "yes" : "no";
         const th = t.token_hint ? `<span class="chip mono" title="Token prefix/suffix only">${escapeHtml(t.token_hint)}</span>` : "";
+        const modErr = t.status_module_error
+          ? `<p class="badge revoked" style="margin-top:8px">Telegram module failed — see <span class="mono">last_error</span> and API logs.</p>`
+          : "";
         const le = (t.last_error || "").trim()
           ? `<p class="muted" style="margin-top:8px;word-break:break-word"><strong>Last error:</strong> ${escapeHtml(t.last_error)}</p>`
           : "";
@@ -1791,7 +1794,7 @@
           <span class="chip">worker: ${wk}</span>
           <span class="chip">chats: ${t.chats ?? 0}</span>
           <span class="chip">min_level: ${escapeHtml(t.min_level || "")}</span>
-          <span class="chip">queue: ${t.queue_size ?? 0}</span>${le}`;
+          <span class="chip">queue: ${t.queue_size ?? 0}</span>${modErr}${le}`;
       } catch (e) {
         $("#tgStatus").innerHTML = `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`;
       }

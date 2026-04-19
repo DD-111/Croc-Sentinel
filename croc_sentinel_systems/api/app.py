@@ -5472,9 +5472,23 @@ def smtp_test(req: SmtpTestRequest, principal: Principal = Depends(require_princ
 @app.get("/admin/telegram/status")
 def telegram_admin_status(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     assert_min_role(principal, "admin")
-    from telegram_notify import telegram_status
+    try:
+        from telegram_notify import telegram_status
 
-    return telegram_status()
+        return telegram_status()
+    except Exception as exc:
+        logging.getLogger(__name__).exception("telegram_admin_status import or call failed")
+        return {
+            "enabled": False,
+            "chats": 0,
+            "min_level": "info",
+            "queue_size": 0,
+            "worker_running": False,
+            "last_error": str(exc),
+            "last_send_ok": False,
+            "token_hint": "",
+            "status_module_error": True,
+        }
 
 
 class TelegramTestRequest(BaseModel):

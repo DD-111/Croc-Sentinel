@@ -53,8 +53,21 @@ class _TelegramQueue:
         self._worker: Optional[threading.Thread] = None
         self._last_error: str = ""
         self._last_send_ok: bool = False
-        self._ssl_ctx = ssl.create_default_context()
+        # Lazy SSL context: some minimal/container images throw or lack CA data at import time.
+        self._ssl_ctx: Optional[ssl.SSLContext] = None
+        self._ssl_ctx_init_done = False
         self.reload_from_env()
+
+    def _get_ssl_context(self) -> Optional[ssl.SSLContext]:
+        if self._ssl_ctx_init_done:
+            return self._ssl_ctx
+        self._ssl_ctx_init_done = True
+        try:
+            self._ssl_ctx = ssl.create_default_context()
+        except Exception as exc:
+            logger.warning("telegram SSL context init failed (will use platform default HTTPS): %s", exc)
+            self._ssl_ctx = None
+        return self._ssl_ctx
 
     def reload_from_env(self) -> None:
         """Re-read env (handles UTF-8 BOM / stray quotes from editors)."""
@@ -153,7 +166,11 @@ class _TelegramQueue:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=20, context=self._ssl_ctx) as resp:
+            ctx = self._get_ssl_context()
+            kw: dict[str, Any] = {"timeout": 20}
+            if ctx is not None:
+                kw["context"] = ctx
+            with urllib.request.urlopen(req, **kw) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
                 if resp.status != 200:
                     self._last_error = f"HTTP {resp.status}"
@@ -199,22 +216,41 @@ def maybe_notify_telegram(ev: dict[str, Any]) -> None:
 
 
 def telegram_status() -> dict[str, Any]:
-    _tg.reload_from_env()
-    wr = bool(_tg._worker is not None and _tg._worker.is_alive())
-    tok = _tg._token
-    hint = ""
-    if len(tok) >= 12:
-        hint = tok[:6] + "…" + tok[-4:]
-    return {
-        "enabled": bool(_tg._token and _tg._chats),
-        "chats": len(_tg._chats),
-        "min_level": _tg._min,
-        "queue_size": _tg._q.qsize(),
-        "worker_running": wr,
-        "last_error": getattr(_tg, "_last_error", "") or "",
-        "last_send_ok": bool(getattr(_tg, "_last_send_ok", False)),
-        "token_hint": hint,
-    }
+    """Safe for GET /admin/telegram/status — must not raise (avoid opaque 500s)."""
+    try:
+        _tg.reload_from_env()
+        wr = bool(_tg._worker is not None and _tg._worker.is_alive())
+        tok = _tg._token
+        hint = ""
+        if len(tok) >= 12:
+            hint = tok[:6] + "…" + tok[-4:]
+        try:
+            qsz = _tg._q.qsize()
+        except Exception:
+            qsz = -1
+        return {
+            "enabled": bool(_tg._token and _tg._chats),
+            "chats": len(_tg._chats),
+            "min_level": _tg._min,
+            "queue_size": qsz,
+            "worker_running": wr,
+            "last_error": getattr(_tg, "_last_error", "") or "",
+            "last_send_ok": bool(getattr(_tg, "_last_send_ok", False)),
+            "token_hint": hint,
+        }
+    except Exception as exc:
+        logger.exception("telegram_status failed")
+        return {
+            "enabled": False,
+            "chats": 0,
+            "min_level": "info",
+            "queue_size": 0,
+            "worker_running": False,
+            "last_error": str(exc),
+            "last_send_ok": False,
+            "token_hint": "",
+            "status_module_error": True,
+        }
 
 
 def send_telegram_text_now(text: str) -> tuple[bool, str]:
