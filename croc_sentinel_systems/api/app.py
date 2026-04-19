@@ -9,6 +9,7 @@ import secrets
 import sqlite3
 import threading
 import time
+from contextlib import asynccontextmanager
 import base64
 import hashlib
 import hmac
@@ -19,7 +20,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
-from fastapi.responses import RedirectResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import paho.mqtt.client as mqtt
@@ -196,6 +197,10 @@ mqtt_ingest_queue: _stdqueue.Queue[Optional[dict[str, Any]]] = _stdqueue.Queue(m
 mqtt_worker_stop = threading.Event()
 mqtt_worker_thread: Optional[threading.Thread] = None
 mqtt_ingest_dropped = 0
+# Deferred bootstrap: ASGI binds immediately; heavy IO runs on api-bootstrap thread.
+api_ready_event = threading.Event()
+api_bootstrap_error: Optional[str] = None
+_bootstrap_thread: Optional[threading.Thread] = None
 scheduler_stop = threading.Event()
 scheduler_thread: Optional[threading.Thread] = None
 cache_lock = threading.Lock()
@@ -2470,42 +2475,8 @@ class UserPolicyUpdateRequest(BaseModel):
     can_backup_restore: Optional[bool] = None
 
 
-app = FastAPI(title="Croc Sentinel API", version="1.1.0")
-
-_dash_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard")
-if os.path.isdir(_dash_dir):
-    app.mount(DASHBOARD_PATH, StaticFiles(directory=_dash_dir, html=True), name="dashboard")
-
-
-@app.get("/", include_in_schema=False)
-def _root_redirect() -> RedirectResponse:
-    return RedirectResponse(url=DASHBOARD_PATH + "/", status_code=302)
-
-
-@app.get("/ui", include_in_schema=False)
-@app.get("/ui/", include_in_schema=False)
-@app.get("/dashboard", include_in_schema=False)
-@app.get("/dashboard/", include_in_schema=False)
-def _legacy_ui_redirect() -> RedirectResponse:
-    return RedirectResponse(url=DASHBOARD_PATH + "/", status_code=301)
-
-
-@app.get("/ui/{path:path}", include_in_schema=False)
-def _legacy_ui_deep_redirect(path: str) -> RedirectResponse:
-    return RedirectResponse(url=f"{DASHBOARD_PATH}/{path}", status_code=301)
-
-
-def _telegram_enabled_safe() -> bool:
-    try:
-        from telegram_notify import telegram_status
-
-        return bool(telegram_status().get("enabled"))
-    except Exception:
-        return False
-
-
-@app.on_event("startup")
-def startup() -> None:
+def _blocking_api_bootstrap_inner() -> None:
+    """Runs on thread api-bootstrap: DB init, notifier, MQTT ingest, scheduler."""
     global mqtt_client, scheduler_thread, mqtt_worker_thread, mqtt_ingest_dropped
     validate_production_env()
     init_db()
@@ -2537,8 +2508,7 @@ def startup() -> None:
     )
 
 
-@app.on_event("shutdown")
-def shutdown() -> None:
+def _shutdown_api() -> None:
     global mqtt_client, scheduler_thread, mqtt_worker_thread
     scheduler_stop.set()
     if scheduler_thread is not None:
@@ -2558,6 +2528,89 @@ def shutdown() -> None:
     except Exception:
         pass
     notifier.stop()
+
+
+@asynccontextmanager
+async def _app_lifespan(app: FastAPI):
+    """Bind HTTP immediately; heavy sync startup runs on api-bootstrap thread."""
+    global _bootstrap_thread, api_bootstrap_error
+    api_ready_event.clear()
+    api_bootstrap_error = None
+
+    def _run_bootstrap() -> None:
+        global api_bootstrap_error
+        try:
+            _blocking_api_bootstrap_inner()
+        except BaseException as exc:
+            api_bootstrap_error = repr(exc)
+            logger.exception("API bootstrap failed")
+        finally:
+            api_ready_event.set()
+
+    _bootstrap_thread = threading.Thread(target=_run_bootstrap, name="api-bootstrap", daemon=True)
+    _bootstrap_thread.start()
+    yield
+    if _bootstrap_thread is not None and _bootstrap_thread.is_alive():
+        _bootstrap_thread.join(timeout=2.0)
+    _shutdown_api()
+
+
+app = FastAPI(title="Croc Sentinel API", version="1.1.0", lifespan=_app_lifespan)
+
+_dash_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard")
+if os.path.isdir(_dash_dir):
+    app.mount(DASHBOARD_PATH, StaticFiles(directory=_dash_dir, html=True), name="dashboard")
+
+
+@app.middleware("http")
+async def _readiness_guard(request: Request, call_next):
+    """503 API routes until deferred bootstrap finishes (Uvicorn binds immediately)."""
+    path = request.url.path
+    if (
+        path == "/health"
+        or path == "/"
+        or path.startswith("/docs")
+        or path in ("/openapi.json", "/redoc", "/favicon.ico")
+    ):
+        return await call_next(request)
+    if not api_ready_event.is_set():
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "service starting", "ready": False},
+        )
+    if api_bootstrap_error:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "bootstrap failed", "ready": False, "error": api_bootstrap_error},
+        )
+    return await call_next(request)
+
+
+@app.get("/", include_in_schema=False)
+def _root_redirect() -> RedirectResponse:
+    return RedirectResponse(url=DASHBOARD_PATH + "/", status_code=302)
+
+
+@app.get("/ui", include_in_schema=False)
+@app.get("/ui/", include_in_schema=False)
+@app.get("/dashboard", include_in_schema=False)
+@app.get("/dashboard/", include_in_schema=False)
+def _legacy_ui_redirect() -> RedirectResponse:
+    return RedirectResponse(url=DASHBOARD_PATH + "/", status_code=301)
+
+
+@app.get("/ui/{path:path}", include_in_schema=False)
+def _legacy_ui_deep_redirect(path: str) -> RedirectResponse:
+    return RedirectResponse(url=f"{DASHBOARD_PATH}/{path}", status_code=301)
+
+
+def _telegram_enabled_safe() -> bool:
+    try:
+        from telegram_notify import telegram_status
+
+        return bool(telegram_status().get("enabled"))
+    except Exception:
+        return False
 
 
 def _client_ip(request: Request) -> str:
@@ -3952,8 +4005,11 @@ def health() -> dict[str, Any]:
         tg = dict(telegram_status())
     except Exception as exc:
         tg = {"enabled": False, "worker_running": False, "error": str(exc)}
-    return {
-        "ok": True,
+    ready = api_ready_event.is_set() and not api_bootstrap_error
+    body: dict[str, Any] = {
+        "ok": bool(ready),
+        "ready": ready,
+        "starting": not api_ready_event.is_set(),
         "mqtt_connected": mqtt_connected,
         "mqtt_ingest_queue_depth": mqtt_ingest_queue.qsize(),
         "mqtt_ingest_dropped": mqtt_ingest_dropped,
@@ -3964,6 +4020,9 @@ def health() -> dict[str, Any]:
         "telegram": tg,
         "ts": int(time.time()),
     }
+    if api_bootstrap_error:
+        body["bootstrap_error"] = api_bootstrap_error
+    return body
 
 
 OFFLINE_THRESHOLD_SECONDS = int(os.getenv("OFFLINE_THRESHOLD_SECONDS", "90"))
@@ -5658,7 +5717,13 @@ def telegram_admin_test(
     principal: Principal = Depends(require_principal),
 ) -> dict[str, Any]:
     assert_min_role(principal, "admin")
-    from telegram_notify import send_telegram_text_now, telegram_status
+    try:
+        from telegram_notify import send_telegram_text_now, telegram_status
+    except ModuleNotFoundError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="telegram_notify module missing from deployment image (rebuild API with telegram_notify.py)",
+        ) from exc
 
     ok, detail = send_telegram_text_now(req.text.strip())
     if not ok:

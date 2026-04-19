@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py security.py notifier.py ./
+COPY app.py security.py notifier.py telegram_notify.py ./
 COPY dashboard ./dashboard
 
 EXPOSE 8088
