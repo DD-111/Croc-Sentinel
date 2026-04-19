@@ -145,10 +145,9 @@
   async function api(path, opts) {
     opts = opts || {};
     const token = getToken();
-    const headers = Object.assign(
-      { Authorization: token ? "Bearer " + token : "" },
-      opts.headers || {}
-    );
+    // Only send Authorization when non-empty — some stacks mis-handle "Authorization: ".
+    const headers = Object.assign({}, opts.headers || {});
+    if (token) headers.Authorization = "Bearer " + token;
     let body = opts.body;
     if (body && typeof body === "object" && !(body instanceof FormData)) {
       headers["Content-Type"] = "application/json";
@@ -198,7 +197,11 @@
 
   async function loadHealth() {
     try {
-      const h = await api("/health");
+      // Public endpoint — do not use api() (no Authorization) so bad/expired JWT
+      // never affects probes and we never trip the global 401 handler here.
+      const r = await fetch(apiBase() + "/health", { method: "GET" });
+      if (!r.ok) throw new Error(String(r.status));
+      const h = await r.json();
       state.mqttConnected = !!h.mqtt_connected;
       state.health = h;
     } catch {

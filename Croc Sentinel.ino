@@ -920,6 +920,12 @@ void activateSiren(uint32_t durationMs) {
   sirenActive = true;
   sirenStartAt = millis();
   sirenDurationMs = durationMs;
+  {
+    char line[96];
+    snprintf(line, sizeof(line), "[siren] on gpio=%d dur_ms=%lu",
+             SIREN_GPIO, (unsigned long)durationMs);
+    logLine(line);
+  }
   if (!wasActive) publishHeartbeatEvent("siren_on");
 }
 
@@ -1140,9 +1146,14 @@ void publishAlarmEvent(bool localTrigger) {
   doc["sig"]            = sig;
 
   char buf[320];
-  serializeJson(doc, buf, sizeof(buf));
-
-  publishRaw(topicEvent, buf, false);
+  size_t w = serializeJson(doc, buf, sizeof(buf));
+  if (w == 0 || w >= sizeof(buf)) {
+    logLine("[trigger] ERROR: alarm JSON serialize truncated; not sent");
+    return;
+  }
+  if (!publishRaw(topicEvent, buf, false)) {
+    logLine("[trigger] alarm.trigger queued (MQTT offline or publish failed)");
+  }
   lastAlarmAt = millis();
 }
 
@@ -1530,7 +1541,10 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
   }
 
   if (strcmp(topic, topicCmd) == 0) {
-    if (!isProvisioned) return;
+    if (!isProvisioned) {
+      logLine("[mqtt] cmd ignored: not provisioned");
+      return;
+    }
     int proto = doc["proto"] | 1;
     if (proto < CMD_PROTO_MIN || proto > CMD_PROTO_MAX) {
       strlcpy(lastError, "proto_unsupported", sizeof(lastError));
@@ -1553,7 +1567,14 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
     char macId[24];
     macToDeviceId(macId, sizeof(macId));
     bool forMac  = (strcmp(target, macId) == 0);
-    if (!forMe && !forAll && !isSelf && !forZone && !forMac) return;
+    if (!forMe && !forAll && !isSelf && !forZone && !forMac) {
+      char line[192];
+      snprintf(line, sizeof(line),
+               "[mqtt] cmd ignored: target_id mismatch (target=%s me=%s zone=%s macId=%s)",
+               target, deviceId, deviceZone, macId);
+      logLine(line);
+      return;
+    }
     executeCommand(doc["cmd"] | "", doc["params"]);
     return;
   }
@@ -1695,7 +1716,9 @@ void handleTriggerInput() {
   bool fallingEdge = (triggerPrevLevel && !level);
   triggerPrevLevel = level;
   if (!fallingEdge) return;
-  if (alarmInCooldown()) return;
+  if (alarmInCooldown()) {
+    return;
+  }
 
   logLine("[trigger] alarm");
   publishAlarmEvent(true);
@@ -1772,6 +1795,15 @@ void setup() {
   pinMode(TRIGGER_GPIO, INPUT_PULLUP);
   digitalWrite(SIREN_GPIO, LOW);
   digitalWrite(STATUS_LED_GPIO, LOW);
+  // Sync edge-detector baseline to actual pin (assumes NO switch to GND + pull-up: idle HIGH).
+  delay(10);
+  triggerPrevLevel = (digitalRead(TRIGGER_GPIO) == HIGH);
+  {
+    char tline[96];
+    snprintf(tline, sizeof(tline), "[boot] trigger_gpio=%d idle=%s",
+             TRIGGER_GPIO, triggerPrevLevel ? "HIGH" : "LOW");
+    logLine(tline);
+  }
 
 #if VBAT_SENSOR_ENABLED
   analogReadResolution(12);

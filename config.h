@@ -184,6 +184,12 @@
 #define TOPIC_BOOTSTRAP_ASSIGN_PREFIX "sentinel/bootstrap/assign"
 
 // ── GPIO (board profile defaults, override per project if needed) ──
+// Classic ESP32 profile defaults: SIREN_GPIO=25, TRIGGER_GPIO=33.
+// If your alarm **button** is wired to GPIO 25, you must move **SIREN_GPIO** to
+// another free pin (two outputs/inputs cannot share one GPIO for different roles).
+// Example (edit SIREN_GPIO to match where your buzzer actually is):
+//   #define SIREN_GPIO 26
+//   #define TRIGGER_GPIO 25
 #ifndef SIREN_GPIO
 #define SIREN_GPIO BOARD_DEFAULT_SIREN_GPIO
 #endif
@@ -200,6 +206,9 @@
 // (ALARM_FANOUT_SELF=0), so without local siren the physical button would silence.
 #define TRIGGER_SELF_SIREN 1
 #define SIREN_ON_MS 8000
+// Physical alarm input: firmware uses INPUT_PULLUP and fires on HIGH→LOW (falling edge).
+// Typical wiring: normally-open contact to GND (pressed = LOW). If your switch is NC or
+// active-high, this edge will never match — change hardware or adapt TRIGGER handling.
 #define DEBOUNCE_MS 80
 #define ALARM_COOLDOWN_MS 5000
 
