@@ -1,6 +1,7 @@
 # Croc Sentinel —— 白话总览（一页看懂）
 
-写给：运营 / 项目经理 / 非工程师。想看细节请看 `README.md` 与 `docs/MESH_AND_OTA.md`。
+写给：运营 / 项目经理 / 非工程师。想看细节请看 `README.md` 与 `docs/MESH_AND_OTA.md`。  
+**子路径控制台 + 宿主机 Nginx 整站部署**（运维照着做）：`docs/SERVER_DEPLOY_SUBPATH.md`。
 
 ---
 

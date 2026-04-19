@@ -13,3 +13,12 @@
 - **You lose everything** only on full-chip erase, partition-table changes, incompatible NVS schema migrations, or explicit erase code in firmware.
 
 If you need a field to **always** survive major upgrades, keep it in NVS with a versioned key schema and migration logic in `setup()`.
+
+## Wi‑Fi credentials (production)
+
+- Prefer **empty compile-time `WIFI_SSID` … `WIFI_SSID_4`** in `config.h` and rely on **NVS** written by the Dashboard `wifi_config` command (or factory tooling). That avoids ambiguity between baked-in APs and field-updated credentials.
+- After changing Wi‑Fi via MQTT, the device reboots and `WiFiMulti` tries the NVS SSID first, then any non-empty compile-time slots.
+
+## Wi‑Fi credentials (中文)
+
+- **生产环境**建议 `config.h` 里 WiFi 宏全部留空，只用控制台下发的 `wifi_config` 写入 NVS（或出厂烧录），避免与编译进固件的多 AP 列表混用、难以排查。

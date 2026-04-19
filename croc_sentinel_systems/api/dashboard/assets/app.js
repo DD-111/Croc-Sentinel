@@ -361,35 +361,51 @@
     setCrumb("Sign in");
     document.body.dataset.auth = "none";
     view.innerHTML = `
-      <div class="login-wrap">
-        <form class="login-card" id="loginForm" autocomplete="on">
-          <h1>Croc Sentinel</h1>
-          <p class="muted">Sign in with username and password.</p>
-          <label class="field">
-            <span>Username</span>
-            <input name="username" autocomplete="username" required />
-          </label>
-          <label class="field" style="margin-top:10px">
-            <span>Password</span>
-            <input name="password" type="password" autocomplete="current-password" required />
-          </label>
-          <div style="margin-top:18px">
-            <button class="btn btn-tap btn-block" type="submit">Sign in</button>
+      <div class="auth-split">
+        <div class="auth-split__hero" aria-hidden="true">
+          <div class="auth-split__brand">
+            <div class="auth-split__mark" role="presentation"></div>
+            <h2 class="auth-split__title">Croc Sentinel</h2>
+            <p class="auth-split__tagline">Fleet console — alarms, devices, and OTA in one calm workspace. Sign in to continue.</p>
           </div>
-          <p class="muted" id="loginMsg" style="margin-top:10px;min-height:1.4em"></p>
-          <div class="login-link-stack">
-            <a class="link-tile" href="#/register">Register admin (email OTP)</a>
-            <a class="link-tile" href="#/account-activate">Activate account (email code)</a>
-            <a class="link-tile" href="#/forgot-password" title="Offline RSA recovery">Forgot password</a>
-          </div>
-        </form>
+        </div>
+        <div class="auth-split__panel">
+          <form class="login-card" id="loginForm" autocomplete="on">
+            <h1 class="auth-form-title">Welcome back</h1>
+            <p class="muted auth-form-sub">Use your dashboard username and password.</p>
+            <label class="field">
+              <span>Username</span>
+              <input name="username" autocomplete="username" required />
+            </label>
+            <label class="field" style="margin-top:12px">
+              <span>Password</span>
+              <input name="password" type="password" autocomplete="current-password" required />
+            </label>
+            <div style="margin-top:20px">
+              <button class="btn btn-tap btn-block" type="submit" id="loginSubmit">Sign in</button>
+            </div>
+            <p class="muted" id="loginMsg" style="margin-top:12px;min-height:1.4em"></p>
+            <div class="login-link-stack">
+              <a class="link-tile" href="#/register">Create admin account</a>
+              <a class="link-tile" href="#/account-activate">Activate with email code</a>
+              <a class="link-tile" href="#/forgot-password" title="Offline RSA recovery">Forgot password</a>
+            </div>
+          </form>
+        </div>
       </div>`;
     const form = $("#loginForm", view);
+    const card = form;
     form.addEventListener("submit", async (ev) => {
       ev.preventDefault();
       const data = new FormData(form);
       const msg = $("#loginMsg", view);
+      const btn = $("#loginSubmit", view);
+      const label = btn ? btn.textContent : "Sign in";
       msg.textContent = "";
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = "Signing in…";
+      }
       try {
         await login(data.get("username"), data.get("password"));
         await loadMe();
@@ -397,6 +413,15 @@
         location.hash = "#/overview";
       } catch (e) {
         msg.textContent = String(e.message || e);
+        card.classList.remove("auth-shake");
+        void card.offsetWidth;
+        card.classList.add("auth-shake");
+        setTimeout(() => card.classList.remove("auth-shake"), 500);
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = label;
+        }
       }
     });
   });
@@ -412,9 +437,17 @@
       enabled = !!j.enabled;
     } catch { enabled = false; }
     view.innerHTML = `
-      <div class="login-wrap">
-        <div class="login-card" style="max-width:520px">
-          <h1>Forgot password</h1>
+      <div class="auth-split">
+        <div class="auth-split__hero" aria-hidden="true">
+          <div class="auth-split__brand">
+            <div class="auth-split__mark" role="presentation"></div>
+            <h2 class="auth-split__title">Account recovery</h2>
+            <p class="auth-split__tagline">Offline RSA path — your private key never touches the server.</p>
+          </div>
+        </div>
+        <div class="auth-split__panel">
+        <div class="login-card" style="max-width:520px;width:min(520px,100%)">
+          <h1 class="auth-form-title">Forgot password</h1>
           <p class="muted">
             Offline RSA recovery: after <strong>Get blob</strong> you receive <span class="mono">recovery_blob_hex</span>
             (long hex, length ≈ 2×<span class="mono">blob_byte_len</span>). Copy the <strong>entire</strong> string — no line breaks.
@@ -447,6 +480,7 @@
             </div>
             <p class="muted" id="fp_msg2" style="margin-top:10px"></p>
           </div>
+        </div>
         </div>
       </div>`;
     const m1 = $("#fp_msg1"), m2 = $("#fp_msg2");
@@ -515,10 +549,18 @@
     setCrumb("Register admin");
     document.body.dataset.auth = "none";
     view.innerHTML = `
-      <div class="login-wrap">
+      <div class="auth-split">
+        <div class="auth-split__hero" aria-hidden="true">
+          <div class="auth-split__brand">
+            <div class="auth-split__mark" role="presentation"></div>
+            <h2 class="auth-split__title">Join the console</h2>
+            <p class="auth-split__tagline">Create an admin account with email verification. Fresh layout, same secure signup flow.</p>
+          </div>
+        </div>
+        <div class="auth-split__panel">
         <div class="login-card login-card--wide">
-          <h1>Admin signup</h1>
-          <p class="muted">Creates an <strong>admin</strong> account. Email OTP only (no phone). Superadmin is seeded on the server, not here.
+          <h1 class="auth-form-title">Admin signup</h1>
+          <p class="muted auth-form-sub">Creates an <strong>admin</strong> account. Email OTP only (no phone). Superadmin is seeded on the server, not here.
             If approval is enabled, a superadmin must approve before login.</p>
           <ol class="login-steps" aria-label="Steps">
             <li id="r_step_ind1" class="is-active">1 · Details</li>
@@ -544,6 +586,7 @@
             </div>
             <p class="muted" id="r_msg2" style="margin-top:10px"></p>
           </div>
+        </div>
         </div>
       </div>`;
     const m1 = $("#r_msg1"), m2 = $("#r_msg2");
@@ -616,10 +659,18 @@
     setCrumb("Activate account");
     document.body.dataset.auth = "none";
     view.innerHTML = `
-      <div class="login-wrap">
+      <div class="auth-split">
+        <div class="auth-split__hero" aria-hidden="true">
+          <div class="auth-split__brand">
+            <div class="auth-split__mark" role="presentation"></div>
+            <h2 class="auth-split__title">Almost there</h2>
+            <p class="auth-split__tagline">Enter the code from your email to unlock your operator account.</p>
+          </div>
+        </div>
+        <div class="auth-split__panel">
         <div class="login-card login-card--wide">
-          <h1>Activate account</h1>
-          <p class="muted">An admin created your user and sent an email code. Enter <strong>username</strong> and the <strong>code</strong> below.</p>
+          <h1 class="auth-form-title">Activate account</h1>
+          <p class="muted auth-form-sub">An admin created your user and sent an email code. Enter <strong>username</strong> and the <strong>code</strong> below.</p>
           <label class="field"><span>Username</span><input id="a_user" autocomplete="username"/></label>
           <label class="field" style="margin-top:10px"><span>Email code</span><input id="a_email_code" inputmode="numeric" maxlength="12" autocomplete="one-time-code"/></label>
           <div style="margin-top:16px;display:flex;flex-direction:column;gap:10px">
@@ -628,6 +679,7 @@
             <a class="link-tile" href="#/login" style="text-align:center">Back to sign in</a>
           </div>
           <p class="muted" id="a_msg" style="margin-top:10px"></p>
+        </div>
         </div>
       </div>`;
     const msg = $("#a_msg");
@@ -788,20 +840,6 @@
     const wifiChDd = (netT === "wifi" && s.wifi_channel != null && Number(s.wifi_channel) > 0)
       ? escapeHtml(String(s.wifi_channel))
       : "—";
-    const wifiScanTableHtml = (ack) => {
-      if (!ack || ack.cmd !== "wifi_scan") return "";
-      if (ack.ok && Array.isArray(ack.networks) && ack.networks.length > 0) {
-        return `<div class="table-wrap" style="margin-top:10px"><table class="t"><thead><tr><th>SSID</th><th>RSSI</th><th>Ch</th><th>Auth</th></tr></thead><tbody>${
-          ack.networks.map((n) => `<tr><td>${escapeHtml(n.ssid || "")}</td><td class="mono">${escapeHtml(String(n.rssi ?? ""))}</td><td class="mono">${escapeHtml(String(n.ch ?? ""))}</td><td class="mono">${escapeHtml(String(n.auth ?? ""))}</td></tr>`).join("")
-        }</tbody></table></div>`;
-      }
-      if (ack.ok && Array.isArray(ack.networks) && ack.networks.length === 0) {
-        return `<p class="muted" style="margin-top:10px">No APs found.</p>`;
-      }
-      return `<p class="badge revoked" style="margin-top:10px">${escapeHtml(ack.detail || "wifi_scan failed")}</p>`;
-    };
-    const wifiScanBlock = wifiScanTableHtml(d.last_ack_json || {});
-
     view.innerHTML = `
       <div class="card">
         <div class="row" style="align-items:flex-start;flex-wrap:wrap;gap:10px">
@@ -875,19 +913,17 @@
 
       <div class="card" id="wifiCtlCard">
         <h3>Wi‑Fi (device)</h3>
-        <p class="muted">SSID / channel come from the last <span class="mono">status</span> report (STA). Scan uses <strong>async Wi‑Fi scan</strong> (firmware <strong>2.1.3+</strong>) so MQTT keeps getting <span class="mono">loop()</span> while results complete — not a blocking disconnect. Apply saves credentials in device NVS as the <strong>first</strong> preferred network, then reboots. Ethernet+Wi‑Fi (AUTO) boards need <strong>2.1.2+</strong> for NVS-only Wi‑Fi at boot.</p>
+        <p class="muted">SSID / channel come from the last <span class="mono">status</span> report (STA). Enter a <strong>2.4&nbsp;GHz</strong> SSID and password manually — credentials are stored in device NVS as the <strong>first</strong> preferred network, then the device reboots. Production builds often leave compile-time <span class="mono">WIFI_SSID</span> slots empty and rely on this field or factory burn.</p>
         ${can("can_send_command") ? `
         <div class="inline-form" style="margin-top:10px">
           <label class="field grow"><span>New SSID</span><input id="wifiNewSsid" maxlength="32" autocomplete="off" placeholder="2.4 GHz network name" /></label>
           <label class="field grow"><span>Password</span><input id="wifiNewPass" type="password" maxlength="64" autocomplete="new-password" placeholder="empty if open network" /></label>
           <div class="row wide" style="justify-content:flex-end;flex-wrap:wrap;gap:8px">
-            <button class="btn secondary btn-tap" type="button" id="wifiScanBtn">Scan networks</button>
             <button class="btn btn-tap" type="button" id="wifiApplyBtn">Save & reboot</button>
             <button class="btn danger btn-tap" type="button" id="wifiClearBtn">Clear saved Wi‑Fi & reboot</button>
           </div>
         </div>
-        <p class="muted" id="wifiScanStatus" style="margin-top:8px;min-height:1.3em"></p>
-        <div id="wifiScanTable">${wifiScanBlock}</div>` : `<p class="muted">Requires <span class="mono">can_send_command</span>.</p>`}
+        <p class="muted" id="wifiScanStatus" style="margin-top:8px;min-height:1.3em"></p>` : `<p class="muted">Requires <span class="mono">can_send_command</span>.</p>`}
       </div>
 
       <div class="card">
@@ -976,23 +1012,6 @@
       return null;
     };
 
-    const wifiScanBtn = $("#wifiScanBtn");
-    if (wifiScanBtn) {
-      wifiScanBtn.addEventListener("click", async () => {
-        const st = $("#wifiScanStatus");
-        if (st) st.textContent = "Sending scan command…";
-        try {
-          await api(`/devices/${encodeURIComponent(id)}/commands`, { method: "POST", body: { cmd: "wifi_scan", params: {} } });
-          if (st) st.textContent = "Waiting for result (radio scan may drop MQTT briefly)…";
-          const a = await waitForCmdAck("wifi_scan");
-          const tbl = $("#wifiScanTable");
-          if (a) {
-            if (tbl) tbl.innerHTML = wifiScanTableHtml(a);
-            if (st) st.textContent = a.ok ? `Done — ${a.count ?? (a.networks || []).length} AP(s).` : `Scan failed: ${a.detail || "unknown"}`;
-          } else if (st) st.textContent = "Timeout — try Refresh or check Events.";
-        } catch (e) { if (st) st.textContent = String(e.message || e); }
-      });
-    }
     const wifiApplyBtn = $("#wifiApplyBtn");
     if (wifiApplyBtn) {
       wifiApplyBtn.addEventListener("click", async () => {
@@ -1020,7 +1039,7 @@
     if (wifiClearBtn) {
       wifiClearBtn.addEventListener("click", async () => {
         const st = $("#wifiScanStatus");
-        if (!confirm("Clear device-stored Wi‑Fi override and reboot? It will use compile-time AP list only.")) return;
+        if (!confirm("Clear device-stored Wi‑Fi override and reboot? It will fall back to compile-time APs in firmware (if any) or remain offline until you apply new credentials.")) return;
         try {
           if (st) st.textContent = "Sending wifi_clear…";
           await api(`/devices/${encodeURIComponent(id)}/commands`, { method: "POST", body: { cmd: "wifi_clear", params: {} } });

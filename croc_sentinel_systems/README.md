@@ -6,6 +6,8 @@
 >
 > **固件 OTA 与 NVS 配置是否丢失**（设备侧）：见仓库根目录 [`../DEVICE_CONFIG_AND_OTA.md`](../DEVICE_CONFIG_AND_OTA.md)。
 
+ESP32 firmware in the repo root: copy [`../config.h.example`](../config.h.example) to `config.h` and edit (see [`../BUILD.md`](../BUILD.md)); `config.h` is gitignored so secrets are not committed.
+
 This folder contains a production-oriented server stack for your ESP32 fleet:
 
 - MQTT broker (Mosquitto)
@@ -147,6 +149,14 @@ docker compose ps
 - **Operations Console (SPA)**: `http://<your-vps>:8088${DASHBOARD_PATH}/`  
   Default is `http://<your-vps>:8088/console/` — total refresh: 侧边栏 + 移动端汉堡菜单 + 浅色/暗色主题 + 单页路由。  
   旧路径 `/ui`、`/dashboard` 会被 301 到 `DASHBOARD_PATH`；你可以改 `.env` 里的 `DASHBOARD_PATH`（建议自选一个不常见路径用于轻度混淆，例如 `/app`、`/c`、`/ops`、`/manage`）。
+
+**Subpath UI + root API (e.g. `https://esasecure.com:8088/Croc_Sentinel_systems/`)**  
+- **一步步生产部署（Docker、`docker-compose.override`、rsync 静态、Nginx、`/events/stream`、验收）**：[`docs/SERVER_DEPLOY_SUBPATH.md`](docs/SERVER_DEPLOY_SUBPATH.md)  
+- **设计说明与 API 前缀表（简版）**：[`docs/NGINX_SUBPATH_UI.md`](docs/NGINX_SUBPATH_UI.md)  
+- **API 仅绑定回环示例**：[`docker-compose.override.example.yml`](docker-compose.override.example.yml) → 复制为同目录 `docker-compose.override.yml`  
+
+The SPA uses `location.origin` for API calls, so no extra `apiBase` prefix is needed.  
+For the factory desktop tool (`tools/factory_pack`), set **`FACTORY_UI_API_BASE=https://esasecure.com:8088`** (no trailing slash, no UI subpath) so `POST /factory/devices` hits the API root.
 
 Auth: legacy `Authorization: Bearer <API_TOKEN>` (superadmin) **or** `POST /auth/login` JWT.  
 RBAC + backup details: `docs/DASHBOARD_RBAC_BACKUP_SPEC.md`.

@@ -324,6 +324,116 @@ table.t tr.sub td { background: var(--bg-muted); }
 .login-card .muted { margin-bottom: 16px; }
 .login-card .row.between { justify-content: space-between; margin-top: 14px; }
 
+/* Auth — split hero + glass form (login / register / activate / forgot) */
+.auth-split {
+  min-height: 100vh;
+  width: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1.02fr) minmax(300px, 0.98fr);
+  align-items: stretch;
+}
+.auth-split__hero {
+  position: relative;
+  padding: clamp(28px, 5vw, 56px);
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 14px;
+  color: #f8fafc;
+  background: linear-gradient(
+    155deg,
+    color-mix(in srgb, var(--accent) 72%, #0f172a 28%) 0%,
+    color-mix(in srgb, var(--accent) 28%, #042f2e 72%) 100%
+  );
+  overflow: hidden;
+}
+.auth-split__hero::after {
+  content: "";
+  position: absolute;
+  inset: -25%;
+  background:
+    radial-gradient(ellipse 55% 45% at 18% 22%, rgba(255, 255, 255, 0.2), transparent 55%),
+    radial-gradient(ellipse 50% 50% at 92% 88%, rgba(255, 255, 255, 0.08), transparent 50%);
+  pointer-events: none;
+}
+.auth-split__brand { position: relative; z-index: 1; }
+.auth-split__mark {
+  width: 52px;
+  height: 52px;
+  border-radius: 16px;
+  margin-bottom: 10px;
+  background: rgba(255, 255, 255, 0.18);
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.22);
+  background-image: radial-gradient(circle at 35% 35%, rgba(255, 255, 255, 0.55), transparent 42%);
+}
+.auth-split__title {
+  margin: 0;
+  font-size: clamp(1.45rem, 2.8vw, 2.05rem);
+  font-weight: 750;
+  letter-spacing: -0.03em;
+  line-height: 1.15;
+}
+.auth-split__tagline {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.55;
+  max-width: 38ch;
+  opacity: 0.92;
+}
+.auth-split__panel {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: clamp(20px, 4vw, 48px);
+  background: var(--bg);
+}
+.auth-split .login-card {
+  width: min(440px, 100%);
+  margin: 0;
+}
+.auth-form-title {
+  margin: 0 0 4px;
+  font-size: 1.32rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+.auth-form-sub {
+  margin: 0 0 18px;
+}
+.login-card .field input:focus,
+.login-card .field textarea:focus,
+.login-card .field select:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+.login-card.auth-shake {
+  animation: auth-shake 0.48s cubic-bezier(0.36, 0.07, 0.19, 0.97) both;
+}
+@keyframes auth-shake {
+  0%, 100% { transform: translateX(0); }
+  15% { transform: translateX(-8px); }
+  30% { transform: translateX(8px); }
+  45% { transform: translateX(-5px); }
+  60% { transform: translateX(5px); }
+  75% { transform: translateX(-2px); }
+}
+@media (max-width: 900px) {
+  .auth-split {
+    grid-template-columns: 1fr;
+    min-height: auto;
+  }
+  .auth-split__hero {
+    min-height: 200px;
+    padding: 24px 20px;
+  }
+  .auth-split__panel {
+    padding: 20px 16px 36px;
+  }
+}
+
 /* Toast */
 .toast {
   position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%) translateY(80px);
@@ -668,6 +778,7 @@ body.motion-ui .stat,
 body.motion-ui .device-card,
 body.motion-ui .table-wrap,
 body.motion-ui .login-card,
+body.motion-ui .auth-split .login-card,
 body.motion-ui .events-list {
   background: color-mix(in srgb, var(--bg-elev) 62%, transparent);
   backdrop-filter: blur(14px) saturate(1.2);
@@ -687,6 +798,7 @@ html[data-theme="dark"] body.motion-ui .stat,
 html[data-theme="dark"] body.motion-ui .device-card,
 html[data-theme="dark"] body.motion-ui .table-wrap,
 html[data-theme="dark"] body.motion-ui .login-card,
+html[data-theme="dark"] body.motion-ui .auth-split .login-card,
 html[data-theme="dark"] body.motion-ui .events-list {
   box-shadow:
     0 8px 40px rgba(0, 0, 0, 0.35),
@@ -758,6 +870,14 @@ body.motion-ui .login-wrap {
 
 body.motion-ui .login-card {
   animation: motion-scale-in 0.55s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+body.motion-ui .auth-split .login-card {
+  animation: motion-scale-in 0.58s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+body.motion-ui .auth-split__hero {
+  animation: motion-fade-in 0.7s ease both;
 }
 
 body.motion-ui .ev-row {
@@ -853,6 +973,8 @@ html.tab-hidden body.motion-ui #view > *,
 html.tab-hidden body.motion-ui .nav > .nav-section,
 html.tab-hidden body.motion-ui .nav > a,
 html.tab-hidden body.motion-ui .login-card,
+html.tab-hidden body.motion-ui .auth-split .login-card,
+html.tab-hidden body.motion-ui .auth-split__hero,
 html.tab-hidden body.motion-ui .toast.show {
   animation: none !important;
 }
@@ -867,6 +989,8 @@ html.tab-hidden body.motion-ui .toast.show {
   body.motion-ui .nav > .nav-section,
   body.motion-ui .nav a,
   body.motion-ui .login-card,
+  body.motion-ui .auth-split .login-card,
+  body.motion-ui .auth-split__hero,
   body.motion-ui .toast.show {
     animation: none !important;
   }

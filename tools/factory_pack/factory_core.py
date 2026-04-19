@@ -15,6 +15,9 @@ from pathlib import Path
 
 CROCKFORD = "ABCDEFGHJKLMNPQRSTUVWXYZ234567"
 
+# Default API root when .env does not set FACTORY_UI_API_BASE (no path suffix; /factory/* on this host).
+DEFAULT_FACTORY_UI_API_BASE = "https://esasecure.com:8088"
+
 DEFAULT_QR_POLICY = re.compile(
     r"^CROC\|SN-[A-Z2-7]{16}\|\d{10}\|[A-Za-z0-9_-]{20,120}$"
 )

@@ -153,44 +153,23 @@ static void g_wifiMultiRegisterAps() {
   }
 }
 
-// Blocks up to timeoutMs calling WiFiMulti::run (scan + join best available AP).
-static bool g_wifiMultiConnectBlocking(unsigned long timeoutMs) {
+// One non-blocking step: register APs, run WiFiMulti for a slice, return true if STA is up.
+static bool g_wifiMultiTrySliceJoin() {
   g_wifiMultiRegisterAps();
-  unsigned long t0 = millis();
-  while (millis() - t0 < timeoutMs) {
-    twdtFeedMaybe();
-    if (g_wifiMulti.run(500) == WL_CONNECTED) return true;
-  }
+  if (g_wifiMultiApCount == 0) return false;
+  twdtFeedMaybe();
+  if (g_wifiMulti.run(WIFI_MULTI_RUN_SLICE_MS) == WL_CONNECTED) return true;
   return WiFi.status() == WL_CONNECTED;
 }
 
-// Async Wi-Fi scan: start from MQTT cmd handler, finish in loop() so mqttClient.loop()
-// keeps running (avoids long blocking scan inside the MQTT callback / one stack).
-static void publishWifiScanAckJson(int apCount);  // defined below
-
-static volatile bool gWifiScanCompletionPending = false;
-static unsigned long gWifiScanStartedMs = 0;
-
-static void pollWifiScanCompletion() {
-  if (!gWifiScanCompletionPending) return;
-  int16_t n = WiFi.scanComplete();
-  if (n == WIFI_SCAN_RUNNING) {
-    if (millis() - gWifiScanStartedMs > 30000UL) {
-      gWifiScanCompletionPending = false;
-      WiFi.scanDelete();
-      logLine("[wifi] scan timeout");
-      publishWifiScanAckJson(-1);
-      publishStatus();
-    }
-    return;
+// Blocks up to timeoutMs calling WiFiMulti::run in slices (join best registered AP).
+static bool g_wifiMultiConnectBlocking(unsigned long timeoutMs) {
+  unsigned long t0 = millis();
+  while (millis() - t0 < timeoutMs) {
+    twdtFeedMaybe();
+    if (g_wifiMultiTrySliceJoin()) return true;
   }
-  gWifiScanCompletionPending = false;
-  if (n == WIFI_SCAN_FAILED) {
-    publishWifiScanAckJson(-1);
-  } else {
-    publishWifiScanAckJson(n);
-  }
-  publishStatus();
+  return WiFi.status() == WL_CONNECTED;
 }
 #endif
 
@@ -288,7 +267,7 @@ class AutoNetIf : public NetIf {
       }
     }
   #endif
-    return false;
+    return connected();
   }
   String localIP() override {
   #if BOARD_HAS_ETH
@@ -740,11 +719,25 @@ void loadScheduledRebootState() {
   unsigned long epoch = prefs.getUInt("rb_ep", 0);
   prefs.end();
 
+  // NVS may hold a "deadline" saved as millis() from an old pre-NTP delay_s — clear it.
+  if (armed && epoch > 0 && epoch < 1700000000UL) {
+    scheduledRebootArmed = false;
+    scheduledRebootEpoch = 0;
+    persistScheduledRebootIfNeeded();
+    logLine("[sched] cleared bogus reboot epoch (was pre-ntp millis; resched after NTP)");
+    return;
+  }
+
   unsigned long nowEpoch = epochNow();
   if (armed && epoch > 1700000000UL && nowEpoch > 1700000000UL && epoch > nowEpoch) {
     scheduledRebootArmed = true;
     scheduledRebootEpoch = epoch;
-    logLine(String("[sched] restored reboot at epoch=") + scheduledRebootEpoch);
+    {
+      char _sl[80];
+      snprintf(_sl, sizeof(_sl), "[sched] restored reboot at epoch=%lu",
+               (unsigned long)scheduledRebootEpoch);
+      logLine(_sl);
+    }
   } else {
     scheduledRebootArmed = false;
     scheduledRebootEpoch = 0;
@@ -790,7 +783,12 @@ void processOtaBootState() {
   String target = prefs.getString("ota_tgt", "");
   prefs.end();
 
-  logLine(String("[ota] pending validation fw=") + target + " boot_try=" + fails);
+  {
+    char _ol[160];
+    snprintf(_ol, sizeof(_ol), "[ota] pending validation fw=%s boot_try=%lu",
+             target.c_str(), (unsigned long)fails);
+    logLine(_ol);
+  }
 
   if (fails >= OTA_MAX_BOOT_FAILS) {
     logLine("[ota] rollback threshold reached");
@@ -809,7 +807,11 @@ void confirmOtaIfHealthy() {
   esp_err_t rc = esp_ota_mark_app_valid_cancel_rollback();
   if (rc != ESP_OK && rc != ESP_ERR_NOT_FOUND) {
     strlcpy(lastError, "ota_valid_fail", sizeof(lastError));
-    logLine(String("[ota] validate failed rc=") + (int)rc);
+    {
+      char _vl[64];
+      snprintf(_vl, sizeof(_vl), "[ota] validate failed rc=%d", (int)rc);
+      logLine(_vl);
+    }
     return;
   }
 
@@ -862,6 +864,7 @@ void enqueueOffline(const char *topic, const char *payload, bool retain) {
     return;
   }
   if (offlineCount >= OFFLINE_QUEUE_MAX) {
+    logLine("[offline] queue full; dropping oldest message");
     offlineHead = (offlineHead + 1) % OFFLINE_QUEUE_MAX;
     offlineCount--;
   }
@@ -990,51 +993,6 @@ void publishAck(const char *cmd, bool ok, const char *detail) {
   serializeJson(doc, buf, sizeof(buf));
   publishRaw(topicAck, buf, false);
 }
-
-#if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
-    !defined(CONFIG_IDF_TARGET_ESP32P4)
-// Publishes wifi_scan result on the ack topic (replaces small publishAck shape).
-static void publishWifiScanAckJson(int apCount) {
-  StaticJsonDocument<2048> doc;
-  doc["device_id"] = deviceId;
-  doc["cmd"] = "wifi_scan";
-  doc["ts"] = tsNow();
-  if (apCount < 0) {
-    doc["ok"] = false;
-    doc["detail"] = "scan failed";
-    doc["count"] = 0;
-  } else {
-    doc["ok"] = true;
-    doc["count"] = apCount;
-    JsonArray arr = doc.createNestedArray("networks");
-    int cap = apCount > 32 ? 32 : apCount;
-    for (int i = 0; i < cap; i++) {
-      JsonObject o = arr.createNestedObject();
-      String s = WiFi.SSID(i);
-      o["ssid"] = (s.length() == 0) ? "(hidden)" : s;
-      o["rssi"] = WiFi.RSSI(i);
-      o["ch"] = WiFi.channel(i);
-      o["auth"] = (int)WiFi.encryptionType(i);
-    }
-  }
-  char buf[2048];
-  size_t w = serializeJson(doc, buf, sizeof(buf));
-  if (w == 0 || w >= sizeof(buf)) {
-    StaticJsonDocument<192> err;
-    err["device_id"] = deviceId;
-    err["cmd"] = "wifi_scan";
-    err["ok"] = false;
-    err["detail"] = "payload too large";
-    err["ts"] = tsNow();
-    char ebuf[192];
-    serializeJson(err, ebuf, sizeof(ebuf));
-    publishRaw(topicAck, ebuf, false);
-  } else {
-    publishRaw(topicAck, buf, false);
-  }
-  WiFi.scanDelete();
-}
-#endif
 
 // Dedicated OTA result event. Carries campaign_id + target fw so the API can
 // drive the campaign state machine and know whether a rollback is needed.
@@ -1192,7 +1150,12 @@ void publishAlarmEvent(bool localTrigger) {
 
 #if OTA_ENABLED
 void performOTA(const char *url, const char *targetFw, const char *campaignId) {
-  logLine(String("[ota] from: ") + stripQuery(url));
+  {
+    String uq = stripQuery(url);
+    char _of[192];
+    snprintf(_of, sizeof(_of), "[ota] from: %s", uq.c_str());
+    logLine(_of);
+  }
   publishAck("ota", true, "ota starting");
   publishHeartbeatEvent("ota_start");
 
@@ -1208,7 +1171,11 @@ void performOTA(const char *url, const char *targetFw, const char *campaignId) {
   switch (ret) {
     case HTTP_UPDATE_FAILED: {
       String err = httpUpdate.getLastErrorString();
-      logLine(String("[ota] FAILED: ") + err);
+      {
+        char _fe[256];
+        snprintf(_fe, sizeof(_fe), "[ota] FAILED: %s", err.c_str());
+        logLine(_fe);
+      }
       publishAck("ota", false, err.c_str());
       publishOtaResult(campaignId, targetFw, false, err.c_str());
       clearOtaPendingState();
@@ -1325,7 +1292,13 @@ void executeCommand(const char *cmd, JsonVariant params) {
     uint32_t delayS = params["delay_s"] | 0;
     unsigned long atTs = params["at_ts"] | 0;
     unsigned long nowTs = tsNow();
+    // delay_s must use real Unix time; before NTP, tsNow() is millis() and would
+    // store a bogus "epoch" that fires immediately after NTP sync (SW_CPU_RESET loop).
     if (delayS > 0) {
+      if (epochNow() <= 1700000000UL) {
+        publishAck(resolvedCmd, false, "ntp not synced; wait for NTP then use delay_s or use at_ts");
+        return;
+      }
       scheduledRebootEpoch = nowTs + delayS;
       scheduledRebootArmed = true;
       persistScheduledRebootIfNeeded();
@@ -1360,7 +1333,11 @@ void executeCommand(const char *cmd, JsonVariant params) {
     prefs.begin(NVS_NAMESPACE, false);
     prefs.putString("dev_id", newId);
     prefs.end();
-    logLine(String("[id] assigned: ") + newId);
+    {
+      char _il[96];
+      snprintf(_il, sizeof(_il), "[id] assigned: %s", newId);
+      logLine(_il);
+    }
     requestRestartWithAck(resolvedCmd, newId);
     return;
   }
@@ -1410,38 +1387,6 @@ void executeCommand(const char *cmd, JsonVariant params) {
 
 #if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
     !defined(CONFIG_IDF_TARGET_ESP32P4)
-  if (strcmp(resolvedCmd, "wifi_scan") == 0) {
-    twdtFeedMaybe();
-    if (gWifiScanCompletionPending) {
-      publishAck(resolvedCmd, false, "scan already in progress");
-      return;
-    }
-    // Calling WiFi.mode(WIFI_STA) when already associated can bounce the link and
-    // drop MQTT — only set STA if we are not already in STA.
-    if (WiFi.getMode() != WIFI_STA) {
-      WiFi.mode(WIFI_STA);
-    }
-    WiFi.scanDelete();
-    twdtFeedMaybe();
-    // Async scan: returns WIFI_SCAN_RUNNING; completion polled in loop() while
-    // ensureMqtt()/mqttClient.loop() continue each iteration ("realtime" broker I/O).
-    int16_t r = WiFi.scanNetworks(true);
-    if (r == WIFI_SCAN_FAILED) {
-      publishWifiScanAckJson(-1);
-      publishStatus();
-      return;
-    }
-    if (r >= 0) {
-      publishWifiScanAckJson(r);
-      publishStatus();
-      return;
-    }
-    gWifiScanStartedMs = millis();
-    gWifiScanCompletionPending = true;
-    logLine("[wifi] scan async started");
-    return;
-  }
-
   if (strcmp(resolvedCmd, "wifi_config") == 0) {
     const char *ssid = params["ssid"] | "";
     const char *pass = params["password"] | "";
@@ -1458,6 +1403,10 @@ void executeCommand(const char *cmd, JsonVariant params) {
     prefs.putString("wifi_sta_ssid", ssid);
     prefs.putString("wifi_sta_pass", pass);
     prefs.end();
+    if (mqttClient.connected()) {
+      mqttClient.disconnect();
+      delay(50);
+    }
     requestRestartWithAck(resolvedCmd, "wifi_config saved");
     return;
   }
@@ -1467,6 +1416,10 @@ void executeCommand(const char *cmd, JsonVariant params) {
     prefs.remove("wifi_sta_ssid");
     prefs.remove("wifi_sta_pass");
     prefs.end();
+    if (mqttClient.connected()) {
+      mqttClient.disconnect();
+      delay(50);
+    }
     requestRestartWithAck(resolvedCmd, "wifi_cleared");
     return;
   }
@@ -1543,7 +1496,6 @@ void publishCommandTable() {
   arr.add("ping");
 #if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
     !defined(CONFIG_IDF_TARGET_ESP32P4)
-  arr.add("wifi_scan");
   arr.add("wifi_config");
   arr.add("wifi_clear");
 #endif
@@ -1649,12 +1601,39 @@ void ensureWiFi() {
     wifiBackoffMs = WIFI_RECONNECT_BASE_MS;
     return;
   }
+
+  // Light path: drive WiFiMulti association between heavy reconnect() attempts so
+  // STA can come back without waiting for the full exponential backoff window.
+  static unsigned long s_lastWifiSliceAt = 0;
   unsigned long now = millis();
+#if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
+    !defined(CONFIG_IDF_TARGET_ESP32P4)
+  if (now - s_lastWifiSliceAt >= (unsigned long)WIFI_MULTI_RUN_SLICE_MS) {
+    s_lastWifiSliceAt = now;
+    if (g_wifiMultiTrySliceJoin()) {
+      String lip = netIf->localIP();
+      char _nl[80];
+      snprintf(_nl, sizeof(_nl), "[net] ip=%s", lip.c_str());
+      logLine(_nl);
+      wifiBackoffMs = WIFI_RECONNECT_BASE_MS;
+      return;
+    }
+  }
+#endif
+
   if (now - lastWiFiAttemptAt < wifiBackoffMs) return;
   lastWiFiAttemptAt = now;
-  netIf->reconnect();
   logLine("[net] reconnecting...");
-  wifiBackoffMs = min(wifiBackoffMs * 2UL, (unsigned long)RECONNECT_MAX_MS);
+  netIf->reconnect();
+  if (netIf->connected()) {
+    wifiBackoffMs = WIFI_RECONNECT_BASE_MS;
+    String lip2 = netIf->localIP();
+    char _n2[80];
+    snprintf(_n2, sizeof(_n2), "[net] ip=%s", lip2.c_str());
+    logLine(_n2);
+  } else {
+    wifiBackoffMs = min(wifiBackoffMs * 2UL, (unsigned long)RECONNECT_MAX_MS);
+  }
 }
 
 void ensureMqtt() {
@@ -1687,7 +1666,11 @@ void ensureMqtt() {
 
   if (!ok) {
     strlcpy(lastError, "mqtt_conn_fail", sizeof(lastError));
-    logLine(String("[mqtt] fail rc=") + mqttClient.state());
+    {
+      char _mf[48];
+      snprintf(_mf, sizeof(_mf), "[mqtt] fail rc=%d", mqttClient.state());
+      logLine(_mf);
+    }
 #if MQTT_USE_TLS
     if (tlsCaSlot == 0 && hasSecondaryCa()) {
       if (applyTlsCaSlot(1)) {
@@ -1738,7 +1721,11 @@ void checkNTPSync() {
 
   unsigned long e = epochNow();
   if (e > 0) {
-    if (!ntpSynced) logLine(String("[ntp] synced epoch=") + e);
+    if (!ntpSynced) {
+      char _nt[56];
+      snprintf(_nt, sizeof(_nt), "[ntp] synced epoch=%lu", (unsigned long)e);
+      logLine(_nt);
+    }
     ntpSynced = true;
   } else {
     if (ntpSynced) {
@@ -1915,16 +1902,19 @@ void setup() {
     twdtFeedMaybe();
 #if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
     !defined(CONFIG_IDF_TARGET_ESP32P4)
-    if (g_wifiMulti.run(200) == WL_CONNECTED) break;
+    if (g_wifiMultiTrySliceJoin()) break;
 #else
-    delay(200);
+    delay(WIFI_MULTI_RUN_SLICE_MS);
 #endif
     Serial.print('.');
   }
   Serial.println();
 
   if (netIf->connected()) {
-    logLine(String("[net] ip=") + netIf->localIP());
+    String lipb = netIf->localIP();
+    char _nb[80];
+    snprintf(_nb, sizeof(_nb), "[net] ip=%s", lipb.c_str());
+    logLine(_nb);
     configTime(NTP_GMT_OFFSET_S, NTP_DAYLIGHT_OFFSET_S, NTP_SERVER);
     ntpInitDone = true;
   }
@@ -1946,11 +1936,6 @@ void loop() {
       publishBootstrapRegister();
     }
   }
-
-#if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
-    !defined(CONFIG_IDF_TARGET_ESP32P4)
-  pollWifiScanCompletion();
-#endif
 
 #if ENABLE_WS_LOG
   wsClient.loop();
@@ -1984,11 +1969,18 @@ void loop() {
   flushNvsIfNeeded();
   confirmOtaIfHealthy();
 
-  if (scheduledRebootArmed && tsNow() >= scheduledRebootEpoch) {
+  // Only fire on a real Unix deadline; sub-1.7e9 values are legacy millis mistakes.
+  if (scheduledRebootArmed && scheduledRebootEpoch >= 1700000000UL && tsNow() >= scheduledRebootEpoch) {
     scheduledRebootArmed = false;
     scheduledRebootEpoch = 0;
     persistScheduledRebootIfNeeded();
     requestRestartWithAck("schedule_reboot", "reboot due");
+  } else if (scheduledRebootArmed && scheduledRebootEpoch > 0 && scheduledRebootEpoch < 1700000000UL &&
+             epochNow() > 1700000000UL) {
+    scheduledRebootArmed = false;
+    scheduledRebootEpoch = 0;
+    persistScheduledRebootIfNeeded();
+    logLine("[sched] cleared bogus reboot epoch at runtime");
   }
 
   if (sirenExpired()) deactivateSiren();

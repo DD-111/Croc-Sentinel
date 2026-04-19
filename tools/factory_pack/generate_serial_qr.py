@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 from factory_core import (
+    DEFAULT_FACTORY_UI_API_BASE,
     DEFAULT_QR_POLICY,
     default_dotenv_path,
     generate_items,
@@ -69,10 +70,10 @@ def main() -> None:
         ("QR_SIGN_SECRET", "FACTORY_API_TOKEN", "FACTORY_UI_API_BASE", "FACTORY_AUTO_PUSH"),
     )
     if args.ping:
-        api_base = (args.api_base or env["FACTORY_UI_API_BASE"] or "").strip().rstrip("/")
+        api_base = (args.api_base or env["FACTORY_UI_API_BASE"] or DEFAULT_FACTORY_UI_API_BASE).strip().rstrip("/")
         token = (env["FACTORY_API_TOKEN"] or "").strip()
         if not api_base or not token:
-            print("Error: --ping needs --api-base + token or FACTORY_UI_API_BASE + FACTORY_API_TOKEN in .env", file=sys.stderr)
+            print("Error: --ping needs FACTORY_API_TOKEN in .env and API base (--api-base, FACTORY_UI_API_BASE, or default host)", file=sys.stderr)
             sys.exit(4)
         code, body = get_factory_ping(api_base, token, insecure_ssl=args.insecure_ssl)
         print(f"GET /factory/ping -> HTTP {code}\n{body}")
@@ -104,10 +105,10 @@ def main() -> None:
 
     do_push = bool(args.push) or (env.get("FACTORY_AUTO_PUSH") or "").strip() == "1"
     if do_push:
-        api_base = (args.api_base or env["FACTORY_UI_API_BASE"] or "").strip().rstrip("/")
+        api_base = (args.api_base or env["FACTORY_UI_API_BASE"] or DEFAULT_FACTORY_UI_API_BASE).strip().rstrip("/")
         token = (env["FACTORY_API_TOKEN"] or "").strip()
         if not api_base:
-            print("Error: push needs --api-base or FACTORY_UI_API_BASE in .env", file=sys.stderr)
+            print("Error: push needs API base (--api-base, FACTORY_UI_API_BASE, or built-in default)", file=sys.stderr)
             sys.exit(4)
         if not token:
             print("Error: push needs FACTORY_API_TOKEN in .env", file=sys.stderr)

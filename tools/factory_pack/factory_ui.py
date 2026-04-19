@@ -16,6 +16,7 @@ if str(_PACK) not in sys.path:
     sys.path.insert(0, str(_PACK))
 
 from factory_core import (  # noqa: E402
+    DEFAULT_FACTORY_UI_API_BASE,
     default_dotenv_path,
     generate_items,
     get_factory_ping,
@@ -36,7 +37,7 @@ class FactoryApp(tk.Tk):
 
         root = repo_root()
         self._dotenv_path = tk.StringVar(value=str(default_dotenv_path()))
-        self._api_base = tk.StringVar()
+        self._api_base = tk.StringVar(value=DEFAULT_FACTORY_UI_API_BASE)
         self._factory_token = tk.StringVar()
         self._batch = tk.StringVar(value=f"GUI_{int(time.time())}")
         self._count = tk.IntVar(value=3)
@@ -59,7 +60,7 @@ class FactoryApp(tk.Tk):
         ttk.Entry(r1, textvariable=self._api_base, width=60).pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Label(
             f,
-            text="示例：https://你的VPS:8088  （与浏览器打开 Dashboard 的 host:port 一致，不要带 /factory）",
+            text="默认 https://esasecure.com:8088（仅 API 根，不要带 /Croc_Sentinel_systems 或 /factory）；可被 .env 的 FACTORY_UI_API_BASE 覆盖",
             foreground="#555",
         ).pack(anchor=tk.W, padx=8)
 
@@ -120,7 +121,7 @@ class FactoryApp(tk.Tk):
     def _load_env(self) -> None:
         dot = Path(self._dotenv_path.get())
         env = read_dotenv_keys(dot, ("QR_SIGN_SECRET", "FACTORY_API_TOKEN", "FACTORY_UI_API_BASE"))
-        if env.get("FACTORY_UI_API_BASE") and not self._api_base.get().strip():
+        if env.get("FACTORY_UI_API_BASE", "").strip():
             self._api_base.set(env["FACTORY_UI_API_BASE"].strip())
         if env.get("FACTORY_API_TOKEN") and not self._factory_token.get().strip():
             self._factory_token.set(env["FACTORY_API_TOKEN"].strip())

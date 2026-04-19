@@ -1,3 +1,6 @@
+# Local firmware secrets (tracked template: config.h.example)
+config.h
+
 # Generated factory bundles (serials + QR PNGs) — copy out of repo for production use
 factory_serial_exports/output_*/
 
