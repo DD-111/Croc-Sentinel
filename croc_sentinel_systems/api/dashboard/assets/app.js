@@ -377,6 +377,7 @@
       return;
     }
     const routeId = id === "alarm-log" ? "signals" : id;
+    document.body.dataset.layout = publicRoutes.has(routeId) ? "auth" : "app";
     const handler = routes[routeId] || routes["overview"];
     try {
       view.innerHTML = `<div class="route-loading card" aria-busy="true" role="status">
@@ -413,40 +414,36 @@
     setCrumb("Sign in");
     document.body.dataset.auth = "none";
     view.innerHTML = `
-      <div class="auth-split">
-        <div class="auth-split__hero" aria-hidden="true">
-          <div class="auth-split__brand">
-            <div class="auth-split__mark" role="presentation"></div>
-            <h2 class="auth-split__title">Croc Sentinel</h2>
-            <p class="auth-split__tagline">Fleet console — alarms, devices, and OTA in one calm workspace. Sign in to continue.</p>
-          </div>
-        </div>
-        <div class="auth-split__panel">
-          <form class="login-card" id="loginForm" autocomplete="on">
-            <h1 class="auth-form-title">Welcome back</h1>
-            <p class="muted auth-form-sub">Use your dashboard username and password.</p>
+      <div class="auth-page" role="main">
+        <div class="auth-card" data-auth-card>
+          <header class="auth-card__head">
+            <div class="auth-card__logo" aria-hidden="true"></div>
+            <h1 class="auth-card__title">Sign in</h1>
+            <p class="auth-card__lead">Croc Sentinel — fleet alarms, devices &amp; OTA</p>
+          </header>
+          <form class="auth-card__body" id="loginForm" autocomplete="on">
             <label class="field">
               <span>Username</span>
-              <input name="username" autocomplete="username" required />
+              <input name="username" autocomplete="username" required placeholder="e.g. admin" />
             </label>
-            <label class="field" style="margin-top:12px">
+            <label class="field field--spaced">
               <span>Password</span>
-              <input name="password" type="password" autocomplete="current-password" required />
+              <input name="password" type="password" autocomplete="current-password" required placeholder="••••••••" />
             </label>
-            <div style="margin-top:20px">
+            <div class="auth-card__submit">
               <button class="btn btn-tap btn-block" type="submit" id="loginSubmit">Sign in</button>
             </div>
-            <p class="muted" id="loginMsg" style="margin-top:12px;min-height:1.4em"></p>
-            <div class="login-link-stack">
-              <a class="link-tile" href="#/register">Create admin account</a>
-              <a class="link-tile" href="#/account-activate">Activate with email code</a>
-              <a class="link-tile" href="#/forgot-password" title="Offline RSA recovery">Forgot password</a>
-            </div>
+            <p class="auth-card__msg muted" id="loginMsg" aria-live="polite"></p>
+            <nav class="auth-card__links" aria-label="Other sign-in options">
+              <a class="auth-link" href="#/register">Create admin account</a>
+              <a class="auth-link" href="#/account-activate">Activate with email code</a>
+              <a class="auth-link" href="#/forgot-password">Forgot password <span class="auth-link__hint">(offline RSA)</span></a>
+            </nav>
           </form>
         </div>
       </div>`;
     const form = $("#loginForm", view);
-    const card = form;
+    const card = view.querySelector("[data-auth-card]");
     form.addEventListener("submit", async (ev) => {
       ev.preventDefault();
       const data = new FormData(form);
@@ -465,10 +462,12 @@
         location.hash = "#/overview";
       } catch (e) {
         msg.textContent = String(e.message || e);
-        card.classList.remove("auth-shake");
-        void card.offsetWidth;
-        card.classList.add("auth-shake");
-        setTimeout(() => card.classList.remove("auth-shake"), 500);
+        if (card) {
+          card.classList.remove("auth-shake");
+          void card.offsetWidth;
+          card.classList.add("auth-shake");
+          setTimeout(() => card.classList.remove("auth-shake"), 500);
+        }
       } finally {
         if (btn) {
           btn.disabled = false;
@@ -489,18 +488,15 @@
       enabled = !!j.enabled;
     } catch { enabled = false; }
     view.innerHTML = `
-      <div class="auth-split">
-        <div class="auth-split__hero" aria-hidden="true">
-          <div class="auth-split__brand">
-            <div class="auth-split__mark" role="presentation"></div>
-            <h2 class="auth-split__title">Account recovery</h2>
-            <p class="auth-split__tagline">Offline RSA path — your private key never touches the server.</p>
-          </div>
-        </div>
-        <div class="auth-split__panel">
-        <div class="login-card" style="max-width:520px;width:min(520px,100%)">
-          <h1 class="auth-form-title">Forgot password</h1>
-          <p class="muted">
+      <div class="auth-page" role="main">
+        <div class="auth-card auth-card--wide auth-card--prose" data-auth-card>
+          <header class="auth-card__head">
+            <div class="auth-card__logo" aria-hidden="true"></div>
+            <h1 class="auth-card__title">Account recovery</h1>
+            <p class="auth-card__lead">Offline RSA — private key never sent to the server</p>
+          </header>
+          <div class="auth-card__body">
+          <p class="muted auth-card__prose">
             Offline RSA recovery: after <strong>Get blob</strong> you receive <span class="mono">recovery_blob_hex</span>
             (long hex, length ≈ 2×<span class="mono">blob_byte_len</span>). Copy the <strong>entire</strong> string — no line breaks.
             Decrypt offline with <span class="mono">password_recovery_offline/decrypt_recovery_blob.py</span> and <span class="mono">private.pem</span>,
@@ -509,11 +505,11 @@
           ${enabled ? "" : `<p class="badge revoked" style="margin:10px 0">Server has no <span class="mono">PASSWORD_RECOVERY_PUBLIC_KEY_*</span> — recovery disabled.</p>`}
           <div id="fpStep1">
             <label class="field"><span>Username</span><input id="fp_user" autocomplete="username" /></label>
-            <div style="margin-top:14px;display:flex;flex-direction:column;gap:10px">
+            <div class="auth-card__submit">
               <button class="btn btn-tap btn-block" type="button" id="fp_go" ${enabled ? "" : "disabled"}>Get recovery blob</button>
-              <a class="link-tile" href="#/login" style="text-align:center">Back to sign in</a>
+              <a class="auth-link auth-link--center" href="#/login">Back to sign in</a>
             </div>
-            <p class="muted" id="fp_msg1" style="margin-top:10px"></p>
+            <p class="auth-card__msg muted" id="fp_msg1" aria-live="polite"></p>
           </div>
           <div id="fpStep2" style="display:none">
             <label class="field"><span>recovery_blob_hex</span>
@@ -521,18 +517,18 @@
             </label>
             <p class="muted" id="fp_blob_hint" style="margin-top:6px;font-size:12px"></p>
             <p class="muted" id="fp_meta"></p>
-            <label class="field"><span>Decrypted JSON (one line)</span>
+            <label class="field field--spaced"><span>Decrypted JSON (one line)</span>
               <textarea id="fp_plain" rows="3" placeholder='{"jti":"...","u":"...","s":"...","e":...}' style="width:100%"></textarea>
             </label>
-            <label class="field"><span>New password (≥8)</span><input id="fp_p1" type="password" autocomplete="new-password" /></label>
-            <label class="field"><span>Confirm password</span><input id="fp_p2" type="password" autocomplete="new-password" /></label>
-            <div style="margin-top:14px;display:flex;flex-direction:column;gap:10px">
+            <label class="field field--spaced"><span>New password (≥8)</span><input id="fp_p1" type="password" autocomplete="new-password" /></label>
+            <label class="field field--spaced"><span>Confirm password</span><input id="fp_p2" type="password" autocomplete="new-password" /></label>
+            <div class="auth-card__submit">
               <button class="btn btn-tap btn-block" type="button" id="fp_done">Update password</button>
               <button class="btn secondary btn-tap btn-block" type="button" id="fp_back">Back</button>
             </div>
-            <p class="muted" id="fp_msg2" style="margin-top:10px"></p>
+            <p class="auth-card__msg muted" id="fp_msg2" aria-live="polite"></p>
           </div>
-        </div>
+          </div>
         </div>
       </div>`;
     const m1 = $("#fp_msg1"), m2 = $("#fp_msg2");
@@ -601,44 +597,40 @@
     setCrumb("Register admin");
     document.body.dataset.auth = "none";
     view.innerHTML = `
-      <div class="auth-split">
-        <div class="auth-split__hero" aria-hidden="true">
-          <div class="auth-split__brand">
-            <div class="auth-split__mark" role="presentation"></div>
-            <h2 class="auth-split__title">Join the console</h2>
-            <p class="auth-split__tagline">Create an admin account with email verification. Fresh layout, same secure signup flow.</p>
-          </div>
-        </div>
-        <div class="auth-split__panel">
-        <div class="login-card login-card--wide">
-          <h1 class="auth-form-title">Admin signup</h1>
-          <p class="muted auth-form-sub">Creates an <strong>admin</strong> account. Email OTP only (no phone). Superadmin is seeded on the server, not here.
-            If approval is enabled, a superadmin must approve before login.</p>
-          <ol class="login-steps" aria-label="Steps">
-            <li id="r_step_ind1" class="is-active">1 · Details</li>
-            <li id="r_step_ind2">2 · Email code</li>
-          </ol>
-          <div id="rStep1">
-            <label class="field"><span>Username (2–64, letters/digits/._-)</span><input id="r_user" autocomplete="username"/></label>
-            <label class="field" style="margin-top:10px"><span>Password (min 8)</span><input id="r_pass" type="password" autocomplete="new-password"/></label>
-            <label class="field" style="margin-top:10px"><span>Email</span><input id="r_email" type="email" autocomplete="email"/></label>
-            <div style="margin-top:16px;display:flex;flex-direction:column;gap:10px">
-              <button class="btn btn-tap btn-block" type="button" id="r_start">Send email code</button>
-              <a class="link-tile" href="#/login" style="text-align:center">Already have an account</a>
+      <div class="auth-page" role="main">
+        <div class="auth-card auth-card--wide" data-auth-card>
+          <header class="auth-card__head">
+            <div class="auth-card__logo" aria-hidden="true"></div>
+            <h1 class="auth-card__title">Create admin</h1>
+            <p class="auth-card__lead">Email verification · creates an <strong>admin</strong> account</p>
+          </header>
+          <div class="auth-card__body">
+            <p class="auth-card__note muted">Superadmin is created on the server. If signup approval is on, a superadmin must activate you before login.</p>
+            <ol class="auth-steps" aria-label="Steps">
+              <li id="r_step_ind1" class="is-active"><span class="auth-steps__n">1</span><span class="auth-steps__t">Your details</span></li>
+              <li id="r_step_ind2"><span class="auth-steps__n">2</span><span class="auth-steps__t">Email code</span></li>
+            </ol>
+            <div id="rStep1">
+              <label class="field"><span>Username</span><input id="r_user" autocomplete="username" placeholder="2–64 chars, letters · digits · ._-"/></label>
+              <label class="field field--spaced"><span>Password</span><input id="r_pass" type="password" autocomplete="new-password" placeholder="At least 8 characters"/></label>
+              <label class="field field--spaced"><span>Email</span><input id="r_email" type="email" autocomplete="email" placeholder="you@company.com"/></label>
+              <div class="auth-card__submit">
+                <button class="btn btn-tap btn-block" type="button" id="r_start">Send verification code</button>
+                <a class="auth-link auth-link--center" href="#/login">Already have an account</a>
+              </div>
+              <p class="auth-card__msg muted" id="r_msg1" aria-live="polite"></p>
             </div>
-            <p class="muted" id="r_msg1" style="margin-top:10px"></p>
-          </div>
-          <div id="rStep2" style="display:none">
-            <p>We sent a code to <strong class="mono" id="r_shown_email"></strong> (check spam).</p>
-            <label class="field" style="margin-top:10px"><span>Email code</span><input id="r_email_code" inputmode="numeric" maxlength="12" autocomplete="one-time-code"/></label>
-            <div style="margin-top:16px;display:flex;flex-direction:column;gap:10px">
-              <button class="btn btn-tap btn-block" type="button" id="r_verify">Finish signup</button>
-              <button class="btn secondary btn-tap btn-block" type="button" id="r_resend">Resend code</button>
-              <button class="btn ghost btn-tap btn-block" type="button" id="r_back_step">Back</button>
+            <div id="rStep2" style="display:none">
+              <p class="auth-card__note">We sent a code to <strong class="mono" id="r_shown_email"></strong>. Check inbox and spam.</p>
+              <label class="field field--spaced"><span>Verification code</span><input id="r_email_code" inputmode="numeric" maxlength="12" autocomplete="one-time-code" placeholder="6–12 digits"/></label>
+              <div class="auth-card__submit">
+                <button class="btn btn-tap btn-block" type="button" id="r_verify">Complete signup</button>
+                <button class="btn secondary btn-tap btn-block" type="button" id="r_resend">Resend code</button>
+                <button class="btn ghost btn-tap btn-block" type="button" id="r_back_step">Edit details</button>
+              </div>
+              <p class="auth-card__msg muted" id="r_msg2" aria-live="polite"></p>
             </div>
-            <p class="muted" id="r_msg2" style="margin-top:10px"></p>
           </div>
-        </div>
         </div>
       </div>`;
     const m1 = $("#r_msg1"), m2 = $("#r_msg2");
@@ -711,27 +703,24 @@
     setCrumb("Activate account");
     document.body.dataset.auth = "none";
     view.innerHTML = `
-      <div class="auth-split">
-        <div class="auth-split__hero" aria-hidden="true">
-          <div class="auth-split__brand">
-            <div class="auth-split__mark" role="presentation"></div>
-            <h2 class="auth-split__title">Almost there</h2>
-            <p class="auth-split__tagline">Enter the code from your email to unlock your operator account.</p>
+      <div class="auth-page" role="main">
+        <div class="auth-card auth-card--wide" data-auth-card>
+          <header class="auth-card__head">
+            <div class="auth-card__logo" aria-hidden="true"></div>
+            <h1 class="auth-card__title">Activate account</h1>
+            <p class="auth-card__lead">Use the code from your invitation email</p>
+          </header>
+          <div class="auth-card__body">
+            <p class="auth-card__note muted">An administrator created your user. Enter your <strong>username</strong> and the <strong>email code</strong> below.</p>
+            <label class="field"><span>Username</span><input id="a_user" autocomplete="username" placeholder="Your username"/></label>
+            <label class="field field--spaced"><span>Email code</span><input id="a_email_code" inputmode="numeric" maxlength="12" autocomplete="one-time-code" placeholder="From email"/></label>
+            <div class="auth-card__submit">
+              <button class="btn btn-tap btn-block" type="button" id="a_submit">Activate</button>
+              <button class="btn secondary btn-tap btn-block" type="button" id="a_resend">Resend code</button>
+              <a class="auth-link auth-link--center" href="#/login">Back to sign in</a>
+            </div>
+            <p class="auth-card__msg muted" id="a_msg" aria-live="polite"></p>
           </div>
-        </div>
-        <div class="auth-split__panel">
-        <div class="login-card login-card--wide">
-          <h1 class="auth-form-title">Activate account</h1>
-          <p class="muted auth-form-sub">An admin created your user and sent an email code. Enter <strong>username</strong> and the <strong>code</strong> below.</p>
-          <label class="field"><span>Username</span><input id="a_user" autocomplete="username"/></label>
-          <label class="field" style="margin-top:10px"><span>Email code</span><input id="a_email_code" inputmode="numeric" maxlength="12" autocomplete="one-time-code"/></label>
-          <div style="margin-top:16px;display:flex;flex-direction:column;gap:10px">
-            <button class="btn btn-tap btn-block" type="button" id="a_submit">Activate</button>
-            <button class="btn secondary btn-tap btn-block" type="button" id="a_resend">Resend code</button>
-            <a class="link-tile" href="#/login" style="text-align:center">Back to sign in</a>
-          </div>
-          <p class="muted" id="a_msg" style="margin-top:10px"></p>
-        </div>
         </div>
       </div>`;
     const msg = $("#a_msg");
