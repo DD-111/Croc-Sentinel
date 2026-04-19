@@ -12,6 +12,8 @@ import json
 import logging
 import os
 import queue
+import re
+import ssl
 import threading
 import urllib.error
 import urllib.request
@@ -22,21 +24,50 @@ logger = logging.getLogger("croc-telegram")
 _LEVEL_RANK = {"debug": 0, "info": 1, "warn": 2, "error": 3, "critical": 4}
 
 
+def _strip_bom(s: str) -> str:
+    s = (s or "").strip()
+    if s.startswith("\ufeff"):
+        s = s[1:].strip()
+    return s.strip().strip('"').strip("'")
+
+
+def _parse_chat_ids(raw: str) -> list[str]:
+    raw = _strip_bom(raw.replace("\u3001", ",").replace("\uff1b", ";"))
+    out: list[str] = []
+    for part in re.split(r"[\s,;]+", raw):
+        p = part.strip().strip('"').strip("'")
+        if not p:
+            continue
+        out.append(p)
+    return out
+
+
 class _TelegramQueue:
     def __init__(self) -> None:
-        self._token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-        raw = os.getenv("TELEGRAM_CHAT_IDS", "").strip()
-        self._chats = [c.strip() for c in raw.split(",") if c.strip()]
-        self._min = (os.getenv("TELEGRAM_MIN_LEVEL", "info").strip().lower() or "info")
-        self._min_rank = _LEVEL_RANK.get(self._min, 1)
+        self._token = ""
+        self._chats: list[str] = []
+        self._min = "info"
+        self._min_rank = 1
         self._q: "queue.Queue[str]" = queue.Queue(maxsize=800)
         self._stop = threading.Event()
         self._worker: Optional[threading.Thread] = None
+        self._last_error: str = ""
+        self._last_send_ok: bool = False
+        self._ssl_ctx = ssl.create_default_context()
+        self.reload_from_env()
+
+    def reload_from_env(self) -> None:
+        """Re-read env (handles UTF-8 BOM / stray quotes from editors)."""
+        self._token = _strip_bom(os.getenv("TELEGRAM_BOT_TOKEN", "") or "")
+        self._chats = _parse_chat_ids(os.getenv("TELEGRAM_CHAT_IDS", "") or "")
+        self._min = (os.getenv("TELEGRAM_MIN_LEVEL", "info").strip().lower() or "info")
+        self._min_rank = _LEVEL_RANK.get(self._min, 1)
 
     def enabled(self) -> bool:
         return bool(self._token and self._chats)
 
     def start(self) -> None:
+        self.reload_from_env()
         if not self.enabled() or self._worker is not None:
             return
         self._stop.clear()
@@ -51,6 +82,7 @@ class _TelegramQueue:
             self._worker = None
 
     def maybe_enqueue(self, ev: dict[str, Any]) -> None:
+        self.reload_from_env()
         if not self.enabled():
             return
         lvl = str(ev.get("level") or "info").lower()
@@ -88,8 +120,20 @@ class _TelegramQueue:
                 text = self._q.get(timeout=1.0)
             except queue.Empty:
                 continue
-            for chat in self._chats:
-                self._send_one(chat, text)
+            try:
+                self.reload_from_env()
+                if not self._token:
+                    self._last_error = "TELEGRAM_BOT_TOKEN empty after reload"
+                    continue
+                any_ok = False
+                for chat in list(self._chats):
+                    if self._send_one(chat, text):
+                        any_ok = True
+                self._last_send_ok = any_ok
+                if not any_ok and self._chats:
+                    logger.warning("telegram: message not delivered to any chat (see prior warnings)")
+            except Exception:
+                logger.exception("telegram worker iteration failed")
 
     def _send_one(self, chat_id: str, text: str) -> bool:
         url = f"https://api.telegram.org/bot{self._token}/sendMessage"
@@ -102,28 +146,39 @@ class _TelegramQueue:
         req = urllib.request.Request(
             url,
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "CrocSentinel-TelegramNotify/1.0",
+            },
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=12) as resp:
+            with urllib.request.urlopen(req, timeout=20, context=self._ssl_ctx) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
                 if resp.status != 200:
+                    self._last_error = f"HTTP {resp.status}"
                     logger.warning("telegram send HTTP %s", resp.status)
                     return False
                 try:
                     j = json.loads(raw)
                 except json.JSONDecodeError:
+                    self._last_error = "non-json response"
                     logger.warning("telegram non-json: %s", raw[:200])
                     return False
                 if not j.get("ok"):
-                    logger.warning("telegram api ok=false: %s", raw[:400])
+                    desc = raw[:500]
+                    self._last_error = desc
+                    logger.warning("telegram api ok=false: %s", desc)
                     return False
+                self._last_error = ""
                 return True
         except urllib.error.HTTPError as exc:
-            logger.warning("telegram HTTPError %s: %s", exc.code, exc.read()[:200])
+            err_body = exc.read().decode("utf-8", errors="replace")[:400]
+            self._last_error = f"HTTPError {exc.code}: {err_body}"
+            logger.warning("telegram HTTPError %s: %s", exc.code, err_body)
             return False
         except Exception as exc:
+            self._last_error = str(exc)
             logger.warning("telegram send failed: %s", exc)
             return False
 
@@ -144,18 +199,27 @@ def maybe_notify_telegram(ev: dict[str, Any]) -> None:
 
 
 def telegram_status() -> dict[str, Any]:
+    _tg.reload_from_env()
     wr = bool(_tg._worker is not None and _tg._worker.is_alive())
+    tok = _tg._token
+    hint = ""
+    if len(tok) >= 12:
+        hint = tok[:6] + "…" + tok[-4:]
     return {
-        "enabled": _tg.enabled(),
+        "enabled": bool(_tg._token and _tg._chats),
         "chats": len(_tg._chats),
         "min_level": _tg._min,
         "queue_size": _tg._q.qsize(),
         "worker_running": wr,
+        "last_error": getattr(_tg, "_last_error", "") or "",
+        "last_send_ok": bool(getattr(_tg, "_last_send_ok", False)),
+        "token_hint": hint,
     }
 
 
 def send_telegram_text_now(text: str) -> tuple[bool, str]:
     """Blocking send to all configured chats (for /admin/telegram/test)."""
+    _tg.reload_from_env()
     text = (text or "").strip() or "Croc Sentinel: test"
     if not _tg.enabled():
         return False, "Telegram disabled: set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS on the server only (not in git)."

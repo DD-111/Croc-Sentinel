@@ -256,12 +256,15 @@
     const smtpOk = !!sm.configured && !!sm.worker_running;
     const tgOn = !!tg.enabled;
     const tgOk = tgOn && !!tg.worker_running;
+    const tgErr = String(tg.last_error || "").trim();
     const smtpTitle = sm.configured
       ? (smtpOk ? "SMTP worker running — OTP mail can be sent" : "SMTP configured but worker not running — check API logs")
       : "SMTP not configured — set SMTP_HOST (and auth) for email OTP";
     const tgTitle = tgOn
-      ? (tgOk ? "Telegram worker running" : "Telegram enabled but worker not running — check API logs")
-      : "Telegram disabled — set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS on server";
+      ? (tgOk
+        ? (tgErr ? `Telegram worker up — last API error: ${tgErr}` : "Telegram worker running — events at min_level+ are queued")
+        : "Telegram enabled but worker not running — check API logs")
+      : "Telegram disabled — set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS (numeric chat id; start a chat with the bot first)";
     el.innerHTML = `
       <span class="health-pill ${smtpOk ? "ok" : sm.configured ? "warn" : "off"}" title="${escapeHtml(smtpTitle)}">SMTP</span>
       <span class="health-pill ${tgOk ? "ok" : tgOn ? "warn" : "off"}" title="${escapeHtml(tgTitle)}">TG</span>`;
@@ -716,9 +719,12 @@
         ? `<p class="muted">No matching devices.</p>`
         : rows.map((d) => {
           const on = isOnline(d);
-          const title = d.display_label ? `${escapeHtml(d.display_label)} · ${escapeHtml(d.device_id)}` : escapeHtml(d.device_id || "unknown");
+          const primary = escapeHtml(d.display_label || d.device_id || "unknown");
+          const subId = d.display_label
+            ? `<div class="device-id-sub mono">${escapeHtml(d.device_id || "")}</div>`
+            : "";
           return `<a class="device-card" href="#/devices/${encodeURIComponent(d.device_id)}" style="text-decoration:none;color:inherit">
-            <h3>${title}</h3>
+            <h3><div class="device-primary-name">${primary}</div>${subId}</h3>
             <div><span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>
               ${d.notification_group ? `<span class="chip">${escapeHtml(d.notification_group)}</span>` : ""}
               ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
@@ -747,12 +753,12 @@
   registerRoute("devices", async (view, args) => {
     const id = decodeURIComponent(args[0] || "");
     if (!id) { location.hash = "#/overview"; return; }
-    setCrumb(`Device · ${id}`);
 
     const [d, msgs] = await Promise.all([
       api(`/devices/${encodeURIComponent(id)}`),
       api(`/devices/${encodeURIComponent(id)}/messages?limit=25`).catch(() => ({ items: [] })),
     ]);
+    setCrumb(d.display_label ? `Device · ${d.display_label}` : `Device · ${id}`);
     const on = isOnline(d);
     const s = d.last_status_json || {};
     const bps = (v) => {
@@ -795,8 +801,11 @@
 
     view.innerHTML = `
       <div class="card">
-        <div class="row">
-          <h2 style="margin:0">${escapeHtml(id)}</h2>
+        <div class="row" style="align-items:flex-start;flex-wrap:wrap;gap:10px">
+          <div class="device-page-head" style="flex:1;min-width:0">
+            <div class="device-primary-name">${escapeHtml(d.display_label || id)}</div>
+            ${d.display_label ? `<div class="device-id-sub mono">${escapeHtml(id)}</div>` : ""}
+          </div>
           <span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>
           <span class="chip">${escapeHtml(reasonEn[reason] || reason)}</span>
           ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
@@ -863,7 +872,7 @@
 
       <div class="card" id="wifiCtlCard">
         <h3>Wi‑Fi (device)</h3>
-        <p class="muted">SSID / channel come from the last <span class="mono">status</span> report (STA). Use scan to list APs (radio may drop MQTT briefly). Apply saves credentials in device NVS as the <strong>first</strong> preferred network, then reboots.</p>
+        <p class="muted">SSID / channel come from the last <span class="mono">status</span> report (STA). Use scan to list APs (radio may drop MQTT briefly). Apply saves credentials in device NVS as the <strong>first</strong> preferred network, then reboots. Ethernet+Wi‑Fi (AUTO) boards need firmware <strong>2.1.2+</strong> so NVS-only credentials still connect at boot.</p>
         ${can("can_send_command") ? `
         <div class="inline-form" style="margin-top:10px">
           <label class="field grow"><span>New SSID</span><input id="wifiNewSsid" maxlength="32" autocomplete="off" placeholder="2.4 GHz network name" /></label>
@@ -952,6 +961,18 @@
       } catch (e) { toast(e.message || e, "err"); }
     });
 
+    const waitForCmdAck = async (expectedCmd) => {
+      for (let i = 0; i < 36; i++) {
+        await new Promise((r) => setTimeout(r, 500));
+        const d2 = await api(`/devices/${encodeURIComponent(id)}`);
+        const a = d2.last_ack_json || {};
+        if (a.cmd === expectedCmd && typeof a.ok === "boolean") {
+          return a;
+        }
+      }
+      return null;
+    };
+
     const wifiScanBtn = $("#wifiScanBtn");
     if (wifiScanBtn) {
       wifiScanBtn.addEventListener("click", async () => {
@@ -960,18 +981,12 @@
         try {
           await api(`/devices/${encodeURIComponent(id)}/commands`, { method: "POST", body: { cmd: "wifi_scan", params: {} } });
           if (st) st.textContent = "Waiting for result (radio scan may drop MQTT briefly)…";
-          for (let i = 0; i < 28; i++) {
-            await new Promise((r) => setTimeout(r, 700));
-            const d2 = await api(`/devices/${encodeURIComponent(id)}`);
-            const a = d2.last_ack_json || {};
-            if (a.cmd === "wifi_scan" && typeof a.ok === "boolean") {
-              const tbl = $("#wifiScanTable");
-              if (tbl) tbl.innerHTML = wifiScanTableHtml(a);
-              if (st) st.textContent = a.ok ? `Done — ${a.count ?? (a.networks || []).length} AP(s).` : "Scan failed.";
-              return;
-            }
-          }
-          if (st) st.textContent = "Timeout — try Refresh or check Events.";
+          const a = await waitForCmdAck("wifi_scan");
+          const tbl = $("#wifiScanTable");
+          if (a) {
+            if (tbl) tbl.innerHTML = wifiScanTableHtml(a);
+            if (st) st.textContent = a.ok ? `Done — ${a.count ?? (a.networks || []).length} AP(s).` : `Scan failed: ${a.detail || "unknown"}`;
+          } else if (st) st.textContent = "Timeout — try Refresh or check Events.";
         } catch (e) { if (st) st.textContent = String(e.message || e); }
       });
     }
@@ -980,22 +995,42 @@
       wifiApplyBtn.addEventListener("click", async () => {
         const ssid = ($("#wifiNewSsid").value || "").trim();
         const password = $("#wifiNewPass").value || "";
+        const st = $("#wifiScanStatus");
         if (!ssid) { toast("Enter SSID", "err"); return; }
         if (!confirm("Save Wi‑Fi on device and reboot? You may lose contact until it joins the new network.")) return;
         try {
+          if (st) st.textContent = "Sending wifi_config…";
           await api(`/devices/${encodeURIComponent(id)}/commands`, { method: "POST", body: { cmd: "wifi_config", params: { ssid, password } } });
-          toast("wifi_config sent — device rebooting", "ok");
-        } catch (e) { toast(e.message || e, "err"); }
+          if (st) st.textContent = "Waiting for device ack (then reboot)…";
+          const a = await waitForCmdAck("wifi_config");
+          if (a) {
+            if (st) st.textContent = a.ok ? String(a.detail || "Saved.") : String(a.detail || "wifi_config rejected");
+            toast(a.ok ? "Wi‑Fi saved on device; rebooting." : (a.detail || "wifi_config rejected"), a.ok ? "ok" : "err");
+          } else {
+            if (st) st.textContent = "No ack yet — device may still reboot; check Events.";
+            toast("Command sent; no ack seen yet.", "");
+          }
+        } catch (e) { toast(e.message || e, "err"); if (st) st.textContent = String(e.message || e); }
       });
     }
     const wifiClearBtn = $("#wifiClearBtn");
     if (wifiClearBtn) {
       wifiClearBtn.addEventListener("click", async () => {
+        const st = $("#wifiScanStatus");
         if (!confirm("Clear device-stored Wi‑Fi override and reboot? It will use compile-time AP list only.")) return;
         try {
+          if (st) st.textContent = "Sending wifi_clear…";
           await api(`/devices/${encodeURIComponent(id)}/commands`, { method: "POST", body: { cmd: "wifi_clear", params: {} } });
-          toast("wifi_clear sent — device rebooting", "ok");
-        } catch (e) { toast(e.message || e, "err"); }
+          if (st) st.textContent = "Waiting for device ack…";
+          const a = await waitForCmdAck("wifi_clear");
+          if (a) {
+            if (st) st.textContent = String(a.detail || (a.ok ? "Cleared." : "wifi_clear failed"));
+            toast(a.ok ? "Wi‑Fi override cleared; rebooting." : (a.detail || "wifi_clear failed"), a.ok ? "ok" : "err");
+          } else {
+            if (st) st.textContent = "No ack yet — device may still reboot.";
+            toast("wifi_clear sent; no ack seen yet.", "");
+          }
+        } catch (e) { toast(e.message || e, "err"); if (st) st.textContent = String(e.message || e); }
       });
     }
   });
@@ -1030,9 +1065,11 @@
 
     const sel = $("#targets");
     sel.innerHTML = devices.map((d) => {
-      const lab = d.display_label ? `${escapeHtml(d.display_label)} · ` : "";
+      const lab = d.display_label ? `${escapeHtml(d.display_label)}` : escapeHtml(d.device_id);
+      const serial = d.display_label ? ` · ${escapeHtml(d.device_id)}` : "";
       const grp = d.notification_group ? `[${escapeHtml(d.notification_group)}] ` : "";
-      return `<option value="${escapeHtml(d.device_id)}">${grp}${lab}${escapeHtml(d.device_id)} · ${escapeHtml(d.zone || "")}</option>`;
+      const z = d.zone ? ` · ${escapeHtml(d.zone)}` : "";
+      return `<option value="${escapeHtml(d.device_id)}">${grp}${lab}${serial}${z}</option>`;
     }).join("");
 
     $("#fire").addEventListener("click", async () => {
@@ -1744,10 +1781,17 @@
         const badge = t.enabled
           ? `<span class="badge online">enabled</span>`
           : `<span class="badge offline">disabled</span>`;
+        const wk = t.worker_running ? "yes" : "no";
+        const th = t.token_hint ? `<span class="chip mono" title="Token prefix/suffix only">${escapeHtml(t.token_hint)}</span>` : "";
+        const le = (t.last_error || "").trim()
+          ? `<p class="muted" style="margin-top:8px;word-break:break-word"><strong>Last error:</strong> ${escapeHtml(t.last_error)}</p>`
+          : "";
         $("#tgStatus").innerHTML = `${badge}
+          ${th}
+          <span class="chip">worker: ${wk}</span>
           <span class="chip">chats: ${t.chats ?? 0}</span>
           <span class="chip">min_level: ${escapeHtml(t.min_level || "")}</span>
-          <span class="chip">queue: ${t.queue_size ?? 0}</span>`;
+          <span class="chip">queue: ${t.queue_size ?? 0}</span>${le}`;
       } catch (e) {
         $("#tgStatus").innerHTML = `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`;
       }

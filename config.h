@@ -8,7 +8,7 @@
 #include "board_select.h"
 
 // ── Firmware version (bump before each OTA release) ──
-#define FW_VERSION "2.1.1"
+#define FW_VERSION "2.1.2"
 // Production guardrails: set to 1 for strict startup validation.
 #define PROD_ENFORCE 1
 // Keep command compatibility with previous 2 protocol versions.
@@ -195,7 +195,10 @@
 #endif
 
 // ── Behaviour ──
-#define TRIGGER_SELF_SIREN 0
+// When 1: local alarm input sounds this unit immediately. Recommended for
+// single-device sites: server fan-out excludes the source by default
+// (ALARM_FANOUT_SELF=0), so without local siren the physical button would silence.
+#define TRIGGER_SELF_SIREN 1
 #define SIREN_ON_MS 8000
 #define DEBOUNCE_MS 80
 #define ALARM_COOLDOWN_MS 5000

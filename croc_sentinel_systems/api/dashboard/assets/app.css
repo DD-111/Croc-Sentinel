@@ -289,8 +289,13 @@ table.t tr.sub td { background: var(--bg-muted); }
 .device-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); }
 .device-card { background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px; display: flex; flex-direction: column; gap: 8px; transition: transform var(--transition), box-shadow var(--transition); cursor: pointer; }
 .device-card:hover { transform: translateY(-1px); box-shadow: var(--shadow-lg); border-color: var(--border-strong); }
-.device-card h3 { margin: 0; font-size: 14.5px; }
+.device-card h3 { margin: 0; font-size: 14.5px; font-weight: 600; line-height: 1.25; }
+.device-card .device-primary-name { font-size: 1.05rem; font-weight: 650; letter-spacing: -0.01em; }
+.device-card .device-id-sub { margin-top: 3px; font-size: 11px; color: var(--text-dim); font-family: var(--mono); letter-spacing: 0.02em; word-break: break-all; }
 .device-card .meta { color: var(--text-muted); font-size: 12px; line-height: 1.6; }
+
+.device-page-head .device-primary-name { font-size: 1.35rem; font-weight: 700; letter-spacing: -0.02em; line-height: 1.2; }
+.device-page-head .device-id-sub { margin-top: 4px; font-size: 12px; color: var(--text-dim); font-family: var(--mono); word-break: break-all; }
 
 /* Badges / pills */
 .badge { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 999px; border: 1px solid transparent; }

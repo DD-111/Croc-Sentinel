@@ -112,10 +112,14 @@ void buildDeviceId() {
 
 static WiFiMulti g_wifiMulti;
 static bool g_wifiMultiApsRegistered = false;
+// Count of APs registered into WiFiMulti (NVS remote Wi‑Fi + compile-time slots).
+// Used by NETIF_MODE_AUTO so we still call WiFiMulti when only NVS credentials exist.
+static uint8_t g_wifiMultiApCount = 0;
 
 static void g_wifiMultiRegisterAps() {
   if (g_wifiMultiApsRegistered) return;
   g_wifiMultiApsRegistered = true;
+  g_wifiMultiApCount = 0;
 #if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
     !defined(CONFIG_IDF_TARGET_ESP32P4)
   {
@@ -126,21 +130,26 @@ static void g_wifiMultiRegisterAps() {
       pr.end();
       if (rs.length() > 0) {
         g_wifiMulti.addAP(rs.c_str(), rp.c_str());
+        g_wifiMultiApCount++;
       }
     }
   }
 #endif
   if (strlen(WIFI_SSID) > 0) {
     g_wifiMulti.addAP(WIFI_SSID, WIFI_PASSWORD);
+    g_wifiMultiApCount++;
   }
   if (strlen(WIFI_SSID_2) > 0) {
     g_wifiMulti.addAP(WIFI_SSID_2, WIFI_PASSWORD_2);
+    g_wifiMultiApCount++;
   }
   if (strlen(WIFI_SSID_3) > 0) {
     g_wifiMulti.addAP(WIFI_SSID_3, WIFI_PASSWORD_3);
+    g_wifiMultiApCount++;
   }
   if (strlen(WIFI_SSID_4) > 0) {
     g_wifiMulti.addAP(WIFI_SSID_4, WIFI_PASSWORD_4);
+    g_wifiMultiApCount++;
   }
 }
 
@@ -214,8 +223,9 @@ class AutoNetIf : public NetIf {
   #if !defined(CONFIG_IDF_TARGET_ESP32P4)
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(false);
-    if (strlen(WIFI_SSID) > 0 || strlen(WIFI_SSID_2) > 0 ||
-        strlen(WIFI_SSID_3) > 0 || strlen(WIFI_SSID_4) > 0) {
+    g_wifiMultiRegisterAps();
+    // Join STA when there is any credential: compile-time and/or remote wifi_config (NVS).
+    if (g_wifiMultiApCount > 0) {
       g_wifiMultiConnectBlocking(WIFI_CONNECT_WAIT_MS);
     }
   #endif
@@ -243,8 +253,8 @@ class AutoNetIf : public NetIf {
     if (WiFi.status() != WL_CONNECTED) {
       WiFi.disconnect(true, true);
       delay(80);
-      if (strlen(WIFI_SSID) > 0 || strlen(WIFI_SSID_2) > 0 ||
-          strlen(WIFI_SSID_3) > 0 || strlen(WIFI_SSID_4) > 0) {
+      g_wifiMultiRegisterAps();
+      if (g_wifiMultiApCount > 0) {
         g_wifiMultiConnectBlocking(WIFI_CONNECT_WAIT_MS);
       }
     }
