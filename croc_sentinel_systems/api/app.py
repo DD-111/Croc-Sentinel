@@ -1007,8 +1007,9 @@ def emit_event(
         from telegram_notify import maybe_notify_telegram
 
         maybe_notify_telegram(ev)
-    except Exception:
-        pass
+    except Exception as exc:
+        # Avoid silent failures when Telegram module/env is misconfigured (default log level INFO).
+        logger.warning("telegram_notify skipped: %s", exc)
 
 
 def audit_event(actor: str, action: str, target: str = "", detail: Optional[dict[str, Any]] = None) -> None:
@@ -3923,6 +3924,41 @@ def _parse_iso(ts: str) -> float:
         return 0.0
 
 
+def _payload_ts(d: dict[str, Any]) -> int:
+    """Device JSON `ts` field (epoch seconds or millis fallback before NTP)."""
+    t = d.get("ts")
+    if isinstance(t, int):
+        return t
+    if isinstance(t, float):
+        return int(t)
+    return 0
+
+
+def _effective_online_for_presence(
+    last_status: dict[str, Any],
+    last_heartbeat: dict[str, Any],
+    last_ack: dict[str, Any],
+    last_event: dict[str, Any],
+) -> bool:
+    """
+    True when the device is up on MQTT, even if last /status snapshot is stale.
+
+    Retained LWT (online=false) can remain in last_status_json while newer
+    heartbeat, ack, or event traffic (same row `updated_at`) proves the device is back.
+    """
+    ts_s = _payload_ts(last_status)
+    ts_hb = _payload_ts(last_heartbeat)
+    ts_a = _payload_ts(last_ack)
+    ts_e = _payload_ts(last_event)
+    if ts_a > ts_s or ts_e > ts_s:
+        return True
+    if ts_hb > ts_s:
+        return bool(last_heartbeat.get("online"))
+    if ts_s == 0 and ts_hb == 0 and ts_a == 0 and ts_e == 0:
+        return False
+    return bool(last_status.get("online"))
+
+
 @app.get("/dashboard/overview")
 def dashboard_overview(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     assert_min_role(principal, "user")
@@ -3959,7 +3995,7 @@ def dashboard_overview(principal: Principal = Depends(require_principal)) -> dic
         grouped = [dict(r) for r in cur.fetchall()]
         cur.execute(
             f"""
-            SELECT device_id, updated_at, last_status_json
+            SELECT device_id, updated_at, last_status_json, last_heartbeat_json, last_ack_json, last_event_json
             FROM device_state
             WHERE 1=1 {zs} {osf}
             """,
@@ -3997,8 +4033,24 @@ def dashboard_overview(principal: Principal = Depends(require_principal)) -> dic
             s = json.loads(raw) if raw else {}
         except Exception:
             s = {}
+        raw_hb = r["last_heartbeat_json"] or ""
+        try:
+            hb = json.loads(raw_hb) if raw_hb else {}
+        except Exception:
+            hb = {}
+        raw_ack = r["last_ack_json"] or ""
+        try:
+            ack = json.loads(raw_ack) if raw_ack else {}
+        except Exception:
+            ack = {}
+        raw_ev = r["last_event_json"] or ""
+        try:
+            ev = json.loads(raw_ev) if raw_ev else {}
+        except Exception:
+            ev = {}
         updated = _parse_iso(str(r["updated_at"] or ""))
-        is_online = bool(s.get("online")) and (now_s - updated) < OFFLINE_THRESHOLD_SECONDS
+        fresh = (now_s - updated) < OFFLINE_THRESHOLD_SECONDS
+        is_online = _effective_online_for_presence(s, hb, ack, ev) and fresh
         if is_online:
             presence["online"] += 1
             try:
@@ -4115,8 +4167,8 @@ def _apply_device_profile_update(
     if body.notification_group is not None:
         sets.append("notification_group = ?")
         args.append(body.notification_group.strip())
-    sets.append("updated_at = ?")
-    args.append(utc_now_iso())
+    # Do not touch device_state.updated_at here: it is used for MQTT freshness
+    # (overview presence, dashboard isOnline). Profile edits are not device traffic.
     args.append(device_id)
     with db_lock:
         conn = get_conn()

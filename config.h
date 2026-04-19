@@ -8,7 +8,7 @@
 #include "board_select.h"
 
 // ── Firmware version (bump before each OTA release) ──
-#define FW_VERSION "2.1.2"
+#define FW_VERSION "2.1.3"
 // Production guardrails: set to 1 for strict startup validation.
 #define PROD_ENFORCE 1
 // Keep command compatibility with previous 2 protocol versions.

@@ -163,6 +163,35 @@ static bool g_wifiMultiConnectBlocking(unsigned long timeoutMs) {
   }
   return WiFi.status() == WL_CONNECTED;
 }
+
+// Async Wi-Fi scan: start from MQTT cmd handler, finish in loop() so mqttClient.loop()
+// keeps running (avoids long blocking scan inside the MQTT callback / one stack).
+static void publishWifiScanAckJson(int apCount);  // defined below
+
+static volatile bool gWifiScanCompletionPending = false;
+static unsigned long gWifiScanStartedMs = 0;
+
+static void pollWifiScanCompletion() {
+  if (!gWifiScanCompletionPending) return;
+  int16_t n = WiFi.scanComplete();
+  if (n == WIFI_SCAN_RUNNING) {
+    if (millis() - gWifiScanStartedMs > 30000UL) {
+      gWifiScanCompletionPending = false;
+      WiFi.scanDelete();
+      logLine("[wifi] scan timeout");
+      publishWifiScanAckJson(-1);
+      publishStatus();
+    }
+    return;
+  }
+  gWifiScanCompletionPending = false;
+  if (n == WIFI_SCAN_FAILED) {
+    publishWifiScanAckJson(-1);
+  } else {
+    publishWifiScanAckJson(n);
+  }
+  publishStatus();
+}
 #endif
 
 // ═══════════════════════════════════════════════
@@ -1383,17 +1412,33 @@ void executeCommand(const char *cmd, JsonVariant params) {
     !defined(CONFIG_IDF_TARGET_ESP32P4)
   if (strcmp(resolvedCmd, "wifi_scan") == 0) {
     twdtFeedMaybe();
-    WiFi.mode(WIFI_STA);
+    if (gWifiScanCompletionPending) {
+      publishAck(resolvedCmd, false, "scan already in progress");
+      return;
+    }
+    // Calling WiFi.mode(WIFI_STA) when already associated can bounce the link and
+    // drop MQTT — only set STA if we are not already in STA.
+    if (WiFi.getMode() != WIFI_STA) {
+      WiFi.mode(WIFI_STA);
+    }
     WiFi.scanDelete();
     twdtFeedMaybe();
-    int n = WiFi.scanNetworks(false, false, false, 130);
-    if (n == WIFI_SCAN_FAILED) {
+    // Async scan: returns WIFI_SCAN_RUNNING; completion polled in loop() while
+    // ensureMqtt()/mqttClient.loop() continue each iteration ("realtime" broker I/O).
+    int16_t r = WiFi.scanNetworks(true);
+    if (r == WIFI_SCAN_FAILED) {
       publishWifiScanAckJson(-1);
-    } else {
-      publishWifiScanAckJson(n);
+      publishStatus();
+      return;
     }
-    twdtFeedMaybe();
-    publishStatus();
+    if (r >= 0) {
+      publishWifiScanAckJson(r);
+      publishStatus();
+      return;
+    }
+    gWifiScanStartedMs = millis();
+    gWifiScanCompletionPending = true;
+    logLine("[wifi] scan async started");
     return;
   }
 
@@ -1901,6 +1946,11 @@ void loop() {
       publishBootstrapRegister();
     }
   }
+
+#if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
+    !defined(CONFIG_IDF_TARGET_ESP32P4)
+  pollWifiScanCompletion();
+#endif
 
 #if ENABLE_WS_LOG
   wsClient.loop();

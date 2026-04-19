@@ -681,8 +681,8 @@
     };
     const stats = [
       ["Devices", ov.total_devices ?? devices.length, "in your scope"],
-      ["Online", online, "recent status online=true"],
-      ["Offline", offline, ">90s stale / online=false"],
+      ["Online", online, "recent MQTT + online (status / heartbeat / ack / event ts)"],
+      ["Offline", offline, ">90s no traffic or last status says offline"],
       ["Alarms 24h", ov.alarms_24h ?? 0, "device alarm count"],
       ["MQTT", ov.mqtt_connected ? "up" : "down", "broker"],
       ["Throughput", `${bps(tp.tx_bps_total)} / ${bps(tp.rx_bps_total)}`, "Tx / Rx sum"],
@@ -875,7 +875,7 @@
 
       <div class="card" id="wifiCtlCard">
         <h3>Wi‑Fi (device)</h3>
-        <p class="muted">SSID / channel come from the last <span class="mono">status</span> report (STA). Use scan to list APs (radio may drop MQTT briefly). Apply saves credentials in device NVS as the <strong>first</strong> preferred network, then reboots. Ethernet+Wi‑Fi (AUTO) boards need firmware <strong>2.1.2+</strong> so NVS-only credentials still connect at boot.</p>
+        <p class="muted">SSID / channel come from the last <span class="mono">status</span> report (STA). Scan uses <strong>async Wi‑Fi scan</strong> (firmware <strong>2.1.3+</strong>) so MQTT keeps getting <span class="mono">loop()</span> while results complete — not a blocking disconnect. Apply saves credentials in device NVS as the <strong>first</strong> preferred network, then reboots. Ethernet+Wi‑Fi (AUTO) boards need <strong>2.1.2+</strong> for NVS-only Wi‑Fi at boot.</p>
         ${can("can_send_command") ? `
         <div class="inline-form" style="margin-top:10px">
           <label class="field grow"><span>New SSID</span><input id="wifiNewSsid" maxlength="32" autocomplete="off" placeholder="2.4 GHz network name" /></label>
