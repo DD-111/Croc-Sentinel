@@ -69,6 +69,9 @@
 // ── MQTT broker / VPS ──
 #define MQTT_HOST "mqtt.example.com"
 #define MQTT_PORT 18962
+#ifndef MQTT_KEEPALIVE_SECONDS
+#define MQTT_KEEPALIVE_SECONDS 60
+#endif
 #define MQTT_USERNAME "sentinel_main"
 #define MQTT_PASSWORD "replace_with_strong_mqtt_password_min12"
 #define MQTT_USE_TLS 1

@@ -130,7 +130,10 @@
   function roleWeight(r) { return ROLE_WEIGHT[r] || 0; }
   function hasRole(min) { return state.me && roleWeight(state.me.role) >= roleWeight(min); }
   function can(cap) { return !!(state.me && state.me.policy && state.me.policy[cap]); }
-  function isOnline(d) { return Date.now() - Date.parse(d.updated_at || 0) < OFFLINE_MS; }
+  function isOnline(d) {
+    if (typeof d.is_online === "boolean") return d.is_online;
+    return Date.now() - Date.parse(d.updated_at || 0) < OFFLINE_MS;
+  }
 
   function toast(msg, kind) {
     const el = $("#toast");

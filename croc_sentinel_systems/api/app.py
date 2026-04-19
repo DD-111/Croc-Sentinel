@@ -3959,6 +3959,40 @@ def _effective_online_for_presence(
     return bool(last_status.get("online"))
 
 
+def _device_is_online_parsed(
+    last_status: dict[str, Any],
+    last_heartbeat: dict[str, Any],
+    last_ack: dict[str, Any],
+    last_event: dict[str, Any],
+    updated_at_iso: str,
+    now_s: int,
+) -> bool:
+    """Same rule as dashboard overview presence: payload truth + row freshness."""
+    updated = _parse_iso(str(updated_at_iso or ""))
+    fresh = (now_s - updated) < OFFLINE_THRESHOLD_SECONDS
+    return _effective_online_for_presence(last_status, last_heartbeat, last_ack, last_event) and fresh
+
+
+def _device_is_online_sql_row(row: dict[str, Any], now_s: int) -> bool:
+    def _pj(col: str) -> dict[str, Any]:
+        raw = row.get(col)
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw) if isinstance(raw, str) else dict(raw)
+        except Exception:
+            return {}
+
+    return _device_is_online_parsed(
+        _pj("last_status_json"),
+        _pj("last_heartbeat_json"),
+        _pj("last_ack_json"),
+        _pj("last_event_json"),
+        str(row.get("updated_at") or ""),
+        now_s,
+    )
+
+
 @app.get("/dashboard/overview")
 def dashboard_overview(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     assert_min_role(principal, "user")
@@ -4103,16 +4137,26 @@ def list_devices(principal: Principal = Depends(require_principal)) -> dict[str,
             f"""
             SELECT device_id, fw, chip_target, board_profile, net_type, zone, provisioned,
                    IFNULL(display_label, '') AS display_label,
-                   IFNULL(notification_group, '') AS notification_group, updated_at
+                   IFNULL(notification_group, '') AS notification_group, updated_at,
+                   last_status_json, last_heartbeat_json, last_ack_json, last_event_json
             FROM device_state
             WHERE 1=1 {zs} {osf}
             ORDER BY updated_at DESC
             """,
             tuple(za + osa),
         )
-        rows = [dict(r) for r in cur.fetchall()]
+        now_s = int(time.time())
+        rows_out: list[dict[str, Any]] = []
+        for r in cur.fetchall():
+            d = dict(r)
+            d["is_online"] = _device_is_online_sql_row(d, now_s)
+            d.pop("last_status_json", None)
+            d.pop("last_heartbeat_json", None)
+            d.pop("last_ack_json", None)
+            d.pop("last_event_json", None)
+            rows_out.append(d)
         conn.close()
-    out = {"items": rows}
+    out = {"items": rows_out}
     cache_put(cache_key, out)
     return out
 
@@ -4135,6 +4179,15 @@ def get_device(device_id: str, principal: Principal = Depends(require_principal)
     for key in ("last_status_json", "last_heartbeat_json", "last_ack_json", "last_event_json"):
         if out.get(key):
             out[key] = json.loads(out[key])
+    now_s = int(time.time())
+    out["is_online"] = _device_is_online_parsed(
+        out.get("last_status_json") or {},
+        out.get("last_heartbeat_json") or {},
+        out.get("last_ack_json") or {},
+        out.get("last_event_json") or {},
+        str(out.get("updated_at") or ""),
+        now_s,
+    )
     return out
 
 

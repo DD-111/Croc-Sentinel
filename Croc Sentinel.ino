@@ -171,6 +171,22 @@ static bool g_wifiMultiConnectBlocking(unsigned long timeoutMs) {
   }
   return WiFi.status() == WL_CONNECTED;
 }
+
+// Try ESP32 STA reconnect + WiFiMulti slices before wiping credentials with
+// disconnect(true). Reduces disconnect storms on marginal RF / DHCP renew.
+static bool g_wifiSoftReconnect(unsigned long dwellMs) {
+  g_wifiMultiRegisterAps();
+  if (g_wifiMultiApCount == 0) return false;
+  WiFi.reconnect();
+  unsigned long t0 = millis();
+  while (millis() - t0 < dwellMs) {
+    twdtFeedMaybe();
+    if (WiFi.status() == WL_CONNECTED) return true;
+    if (g_wifiMultiTrySliceJoin()) return true;
+    delay(50);
+  }
+  return WiFi.status() == WL_CONNECTED;
+}
 #endif
 
 // ═══════════════════════════════════════════════
@@ -206,6 +222,7 @@ class WiFiNetIf : public NetIf {
     return false;
 #else
     if (connected()) return true;
+    if (g_wifiSoftReconnect(3500)) return true;
     WiFi.disconnect(true, true);
     delay(80);
     g_wifiMultiConnectBlocking(WIFI_CONNECT_WAIT_MS);
@@ -259,11 +276,13 @@ class AutoNetIf : public NetIf {
   #endif
   #if !defined(CONFIG_IDF_TARGET_ESP32P4)
     if (WiFi.status() != WL_CONNECTED) {
-      WiFi.disconnect(true, true);
-      delay(80);
-      g_wifiMultiRegisterAps();
-      if (g_wifiMultiApCount > 0) {
-        g_wifiMultiConnectBlocking(WIFI_CONNECT_WAIT_MS);
+      if (!g_wifiSoftReconnect(3500)) {
+        WiFi.disconnect(true, true);
+        delay(80);
+        g_wifiMultiRegisterAps();
+        if (g_wifiMultiApCount > 0) {
+          g_wifiMultiConnectBlocking(WIFI_CONNECT_WAIT_MS);
+        }
       }
     }
   #endif
@@ -1637,7 +1656,10 @@ void ensureWiFi() {
 }
 
 void ensureMqtt() {
-  if (!netIf->connected()) return;
+  if (!netIf->connected()) {
+    if (mqttClient.connected()) mqttClient.disconnect();
+    return;
+  }
   if (mqttClient.connected()) {
     mqttBackoffMs = MQTT_RECONNECT_BASE_MS;
     return;
@@ -1855,7 +1877,7 @@ void setup() {
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
   mqttClient.setCallback(onMqttMessage);
   mqttClient.setBufferSize(MQTT_RX_BUFFER_BYTES);
-  mqttClient.setKeepAlive(20);
+  mqttClient.setKeepAlive(MQTT_KEEPALIVE_SECONDS);
 
 #if ENABLE_WS_LOG
   wsClient.begin(MQTT_HOST, 8080, "/ws");
@@ -1924,6 +1946,12 @@ void loop() {
   twdtFeedMaybe();
 
   unsigned long now = millis();
+
+  // Run MQTT before Wi-Fi may block for seconds; avoids broker keepalive
+  // timeouts while STA is re-associating.
+  if (netIf->connected() && mqttClient.connected()) {
+    mqttClient.loop();
+  }
 
   ensureWiFi();
   ensureMqtt();
