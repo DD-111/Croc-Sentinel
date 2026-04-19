@@ -164,10 +164,13 @@ static bool g_wifiMultiTrySliceJoin() {
 
 // Blocks up to timeoutMs calling WiFiMulti::run in slices (join best registered AP).
 static bool g_wifiMultiConnectBlocking(unsigned long timeoutMs) {
+  g_wifiMultiRegisterAps();
+  if (g_wifiMultiApCount == 0) return false;
   unsigned long t0 = millis();
   while (millis() - t0 < timeoutMs) {
     twdtFeedMaybe();
     if (g_wifiMultiTrySliceJoin()) return true;
+    delay(20);
   }
   return WiFi.status() == WL_CONNECTED;
 }
@@ -427,6 +430,13 @@ bool securityConfigValid = true;
 #if MQTT_USE_TLS
 uint8_t tlsCaSlot = 0;  // 0 primary, 1 secondary
 #endif
+
+// /cmd: copy in MQTT callback, parse + executeCommand() on main loop only.
+static char sPendingCmdBody[MQTT_RX_BUFFER_BYTES];
+static size_t sPendingCmdLen = 0;
+static volatile bool sPendingCmdArm = false;
+static unsigned long s_mqttCmdGraceUntilMs = 0;
+static volatile bool s_mqttPostConnectPublish = false;
 
 // ═══════════════════════════════════════════════
 //  Utility
@@ -765,6 +775,11 @@ void loadScheduledRebootState() {
 }
 
 void requestRestartWithAck(const char *cmd, const char *detail) {
+  {
+    char line[128];
+    snprintf(line, sizeof(line), "[rst] cmd=%s %s", cmd, detail ? detail : "");
+    logLine(line);
+  }
   publishAck(cmd, true, detail);
   flushNvsIfNeeded();
   delay(150);
@@ -1490,6 +1505,69 @@ bool verifyKey(const char *provided) {
   return secureEquals(expected, provided);
 }
 
+// Runs on loop() stack — never call from onMqttMessage (retained /cmd + nested publish).
+static void handleCmdFromBody(const char *body) {
+  StaticJsonDocument<MQTT_JSON_DOC_BYTES> doc;
+  if (deserializeJson(doc, body)) {
+    strlcpy(lastError, "json_fail", sizeof(lastError));
+    return;
+  }
+  if (!isProvisioned) {
+    return;
+  }
+  int proto = doc["proto"] | 1;
+  if (proto < CMD_PROTO_MIN || proto > CMD_PROTO_MAX) {
+    strlcpy(lastError, "proto_unsupported", sizeof(lastError));
+    publishAck("proto", false, "unsupported protocol");
+    return;
+  }
+
+  const char *key = doc["key"] | "";
+  if (!verifyKey(key)) {
+    strlcpy(lastError, "auth_fail", sizeof(lastError));
+    logLine("[auth] bad key rejected");
+    return;
+  }
+
+  const char *target = doc["target_id"] | "self";
+  bool forMe   = (strcmp(target, deviceId) == 0);
+  bool forAll  = (strcmp(target, "all") == 0);
+  bool isSelf  = (strcmp(target, "self") == 0);
+  bool forZone = (strcmp(target, deviceZone) == 0) && (strcmp(deviceZone, "all") != 0);
+  char macId[24];
+  macToDeviceId(macId, sizeof(macId));
+  bool forMac  = (strcmp(target, macId) == 0);
+  if (!forMe && !forAll && !isSelf && !forZone && !forMac) {
+    char line[192];
+    snprintf(line, sizeof(line),
+             "[mqtt] cmd ignored: target_id mismatch (target=%s me=%s zone=%s macId=%s)",
+             target, deviceId, deviceZone, macId);
+    logLine(line);
+    return;
+  }
+  executeCommand(doc["cmd"] | "", doc["params"]);
+}
+
+static void processPendingMqttCommand() {
+  if (!sPendingCmdArm) return;
+  sPendingCmdArm = false;
+
+  if (millis() < s_mqttCmdGraceUntilMs) {
+    static unsigned long s_lastGraceLogMs = 0;
+    unsigned long m = millis();
+    if (m - s_lastGraceLogMs > 3000UL) {
+      s_lastGraceLogMs = m;
+      logLine("[mqtt] cmd dropped (post-connect grace)");
+    }
+    return;
+  }
+
+  char local[MQTT_RX_BUFFER_BYTES];
+  memcpy(local, sPendingCmdBody, sPendingCmdLen + 1u);
+  local[sPendingCmdLen] = '\0';
+  handleCmdFromBody(local);
+}
+
 void publishCommandTable() {
   StaticJsonDocument<768> doc;
   doc["device_id"] = deviceId;
@@ -1538,6 +1616,22 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
   memcpy(body, payload, copyLen);
   body[copyLen] = '\0';
 
+  if (strcmp(topic, topicCmd) == 0) {
+    if (!isProvisioned) {
+      return;
+    }
+    if (ESP.getFreeHeap() < (uint32_t)MIN_FREE_HEAP_ACCEPT_CMD_BYTES) {
+      return;
+    }
+    if (sPendingCmdArm) {
+      return;
+    }
+    memcpy(sPendingCmdBody, body, copyLen + 1u);
+    sPendingCmdLen = copyLen;
+    sPendingCmdArm = true;
+    return;
+  }
+
   StaticJsonDocument<MQTT_JSON_DOC_BYTES> doc;
   if (deserializeJson(doc, body)) {
     strlcpy(lastError, "json_fail", sizeof(lastError));
@@ -1555,46 +1649,6 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
     requestRestartWithAck("claim", "claim accepted");
     return;
   }
-
-  if (strcmp(topic, topicCmd) == 0) {
-    if (!isProvisioned) {
-      logLine("[mqtt] cmd ignored: not provisioned");
-      return;
-    }
-    int proto = doc["proto"] | 1;
-    if (proto < CMD_PROTO_MIN || proto > CMD_PROTO_MAX) {
-      strlcpy(lastError, "proto_unsupported", sizeof(lastError));
-      publishAck("proto", false, "unsupported protocol");
-      return;
-    }
-
-    const char *key = doc["key"] | "";
-    if (!verifyKey(key)) {
-      strlcpy(lastError, "auth_fail", sizeof(lastError));
-      logLine("[auth] bad key rejected");
-      return;
-    }
-
-    const char *target = doc["target_id"] | "self";
-    bool forMe   = (strcmp(target, deviceId) == 0);
-    bool forAll  = (strcmp(target, "all") == 0);
-    bool isSelf  = (strcmp(target, "self") == 0);
-    bool forZone = (strcmp(target, deviceZone) == 0) && (strcmp(deviceZone, "all") != 0);
-    char macId[24];
-    macToDeviceId(macId, sizeof(macId));
-    bool forMac  = (strcmp(target, macId) == 0);
-    if (!forMe && !forAll && !isSelf && !forZone && !forMac) {
-      char line[192];
-      snprintf(line, sizeof(line),
-               "[mqtt] cmd ignored: target_id mismatch (target=%s me=%s zone=%s macId=%s)",
-               target, deviceId, deviceZone, macId);
-      logLine(line);
-      return;
-    }
-    executeCommand(doc["cmd"] | "", doc["params"]);
-    return;
-  }
-
 }
 
 // ═══════════════════════════════════════════════
@@ -1615,16 +1669,48 @@ void buildTopics() {
 //  Connection management
 // ═══════════════════════════════════════════════
 
+// Set true after we have ever seen a linked STA (or Ethernet in AUTO). Used so
+// the first join attempt is not debounced, while brief post-link dropouts are.
+static bool s_netHadLink = false;
+// Monotonic millis when we first observed link down after s_netHadLink became true.
+static unsigned long s_linkDownSinceMs = 0;
+
 void ensureWiFi() {
+  unsigned long now = millis();
+
   if (netIf->connected()) {
+    s_netHadLink = true;
+    s_linkDownSinceMs = 0;
     wifiBackoffMs = WIFI_RECONNECT_BASE_MS;
     return;
   }
 
+  if (s_netHadLink && s_linkDownSinceMs == 0) {
+    s_linkDownSinceMs = now;
+  }
+
+  const bool linkDownStable =
+      !s_netHadLink ||
+      (s_linkDownSinceMs != 0 &&
+       (now - s_linkDownSinceMs) >= (unsigned long)WIFI_LINK_DOWN_DEBOUNCE_MS);
+
+#if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
+    !defined(CONFIG_IDF_TARGET_ESP32P4)
+  g_wifiMultiRegisterAps();
+  if (g_wifiMultiApCount == 0) {
+    static unsigned long s_lastNoCredLogMs = 0;
+    if (now - s_lastNoCredLogMs > 60000UL) {
+      s_lastNoCredLogMs = now;
+      logLine("[net] no STA credentials (empty WIFI_* in config.h and no NVS wifi_sta_ssid). "
+              "Use Dashboard wifi_config or set compile-time SSID.");
+    }
+    return;
+  }
+#endif
+
   // Light path: drive WiFiMulti association between heavy reconnect() attempts so
   // STA can come back without waiting for the full exponential backoff window.
   static unsigned long s_lastWifiSliceAt = 0;
-  unsigned long now = millis();
 #if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
     !defined(CONFIG_IDF_TARGET_ESP32P4)
   if (now - s_lastWifiSliceAt >= (unsigned long)WIFI_MULTI_RUN_SLICE_MS) {
@@ -1639,6 +1725,12 @@ void ensureWiFi() {
     }
   }
 #endif
+
+  if (!linkDownStable) {
+    // Keep driving WiFiMulti slices only; do not call reconnect() (disconnect+join)
+    // until the link has been absent long enough — avoids aborting an in-flight join.
+    return;
+  }
 
   if (now - lastWiFiAttemptAt < wifiBackoffMs) return;
   lastWiFiAttemptAt = now;
@@ -1657,6 +1749,13 @@ void ensureWiFi() {
 
 void ensureMqtt() {
   if (!netIf->connected()) {
+    // Do not drop an active MQTT session on brief STA flicker; wait for the same
+    // debounce window used by ensureWiFi() so a momentary !WL_CONNECTED does not
+    // force a full TLS reconnect storm.
+    if (s_netHadLink && s_linkDownSinceMs != 0 &&
+        (millis() - s_linkDownSinceMs) < (unsigned long)WIFI_LINK_DOWN_DEBOUNCE_MS) {
+      return;
+    }
     if (mqttClient.connected()) mqttClient.disconnect();
     return;
   }
@@ -1713,9 +1812,9 @@ void ensureMqtt() {
   }
 
   logLine("[mqtt] connected");
+  s_mqttCmdGraceUntilMs = millis() + (unsigned long)MQTT_POST_CONNECT_CMD_GRACE_MS;
   if (isProvisioned) {
     mqttClient.subscribe(topicCmd, 1);
-    // NOTE: no global alarm topic; server fans out siren_on via our /cmd topic.
   } else {
     mqttClient.subscribe(topicBootstrapAssign, 1);
     publishBootstrapRegister();
@@ -1726,10 +1825,9 @@ void ensureMqtt() {
     ntpInitDone = true;
   }
 
-  publishStatus();
-  // Announce presence on (re)connect so the server flips us back to online
-  // without having to wait for the next event or 12h probe.
-  publishHeartbeatEvent("mqtt_connected");
+  // Defer large JSON publishes to loop() — avoids stack/DMA pressure in the
+  // connect/subscribe path and lets post-connect grace drop stale retained /cmd.
+  s_mqttPostConnectPublish = true;
 }
 
 // ═══════════════════════════════════════════════
@@ -1888,20 +1986,14 @@ void setup() {
   bootAtMs = millis();
   lastThroughputResetAt = bootAtMs;
 
-  logLine("[boot] Croc-Sentinel " FW_VERSION);
-  // Avoid chained String allocations right after WiFi init (can fragment heap and
-  // trigger intermittent SW_CPU_RESET on some boards).
   {
-    char line[320];
+    char line[384];
     snprintf(line, sizeof(line),
-             "[boot] id=%s mac=%s mac_nocolon=%s zone=%s rst=%s boot#%lu",
-             deviceId, deviceMac, deviceMacNoColon, deviceZone, resetReasonStr,
-             (unsigned long)bootCount);
+             "[boot] fw=%s id=%s mac=%s zone=%s rst=%s boot#%lu prov=%s brd=%s",
+             FW_VERSION, deviceId, deviceMac, deviceZone, resetReasonStr,
+             (unsigned long)bootCount, isProvisioned ? "y" : "n", BOARD_PROFILE_NAME);
     logLine(line);
-    snprintf(line, sizeof(line), "[boot] board_profile=%s", BOARD_PROFILE_NAME);
-    logLine(line);
-    snprintf(line, sizeof(line), "[boot] provisioned=%s mqtt_user=%s qr=%s",
-             isProvisioned ? "yes" : "no", mqttUser, deviceQrCode);
+    snprintf(line, sizeof(line), "[boot] mqtt_user=%s qr=%s", mqttUser, deviceQrCode);
     logLine(line);
   }
 
@@ -1919,18 +2011,36 @@ void setup() {
 
   // Give Wi-Fi extra time after begin(); must call WiFiMulti::run (not just
   // delay) or association never progresses when the first blocking connect times out.
-  unsigned long waitStart = millis();
-  while (!netIf->connected() && millis() - waitStart < WIFI_CONNECT_WAIT_MS) {
-    twdtFeedMaybe();
 #if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
     !defined(CONFIG_IDF_TARGET_ESP32P4)
-    if (g_wifiMultiTrySliceJoin()) break;
-#else
-    delay(WIFI_MULTI_RUN_SLICE_MS);
-#endif
-    Serial.print('.');
+  g_wifiMultiRegisterAps();
+  if (g_wifiMultiApCount == 0) {
+    logLine("[net] no STA credentials: compile-time WIFI_* empty and NVS wifi_sta_ssid empty.");
+    logLine("[net] use Dashboard wifi_config (device online once) or set WIFI_SSID in config.h");
+  } else {
+    unsigned long waitStart = millis();
+    while (!netIf->connected() && millis() - waitStart < WIFI_CONNECT_WAIT_MS) {
+      twdtFeedMaybe();
+      if (g_wifiMultiTrySliceJoin()) break;
+      Serial.print('.');
+      delay(20);
+    }
+    Serial.println();
+    if (!netIf->connected()) {
+      logLine("[net] STA join failed this boot (wrong password, AP missing, or RF); will retry in loop");
+    }
   }
-  Serial.println();
+#else
+  {
+    unsigned long waitStart = millis();
+    while (!netIf->connected() && millis() - waitStart < WIFI_CONNECT_WAIT_MS) {
+      twdtFeedMaybe();
+      delay(WIFI_MULTI_RUN_SLICE_MS);
+      Serial.print('.');
+    }
+    Serial.println();
+  }
+#endif
 
   if (netIf->connected()) {
     String lipb = netIf->localIP();
@@ -1958,7 +2068,13 @@ void loop() {
 
   if (mqttClient.connected()) {
     mqttClient.loop();
+    processPendingMqttCommand();
     flushOfflineQueue();
+    if (s_mqttPostConnectPublish) {
+      s_mqttPostConnectPublish = false;
+      publishStatus();
+      publishHeartbeatEvent("mqtt_connected");
+    }
     if (!isProvisioned && now - lastBootstrapRegisterAt >= BOOTSTRAP_REGISTER_INTERVAL_MS) {
       lastBootstrapRegisterAt = now;
       publishBootstrapRegister();
@@ -1998,7 +2114,10 @@ void loop() {
   confirmOtaIfHealthy();
 
   // Only fire on a real Unix deadline; sub-1.7e9 values are legacy millis mistakes.
-  if (scheduledRebootArmed && scheduledRebootEpoch >= 1700000000UL && tsNow() >= scheduledRebootEpoch) {
+  // Never compare a Unix deadline to tsNow()'s millis() fallback (pre-NTP).
+  if (scheduledRebootArmed && scheduledRebootEpoch >= 1700000000UL && ntpSynced &&
+      epochNow() >= scheduledRebootEpoch) {
+    logLine("[sched] reboot deadline reached");
     scheduledRebootArmed = false;
     scheduledRebootEpoch = 0;
     persistScheduledRebootIfNeeded();

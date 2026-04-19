@@ -17,8 +17,10 @@
 static const char *kNvsKey = "serial";
 static const unsigned long kPasteTimeoutMs = 90000UL;
 
+// Must match API / factory_core: exactly SN- + 16 chars from [A-Z2-7] minus I,O,0,1
+// (same alphabet as tools/factory_pack/factory_core.py CROCKFORD).
 static bool validSerial(const String &s) {
-  if (s.length() < 19 || s.length() >= 24)
+  if (s.length() != 19)
     return false;
   if (!s.startsWith("SN-"))
     return false;
@@ -33,20 +35,23 @@ static bool validSerial(const String &s) {
   return true;
 }
 
-static bool writeSerialToNvs(const String &sn) {
+// 0 = success, 1 = bad format (retry paste), 2 = NVS / verify failure
+static int writeSerialToNvs(String sn) {
+  sn.trim();
+  sn.toUpperCase();
   if (!validSerial(sn)) {
     Serial.println("[BurnSentinelSerial] ERROR: invalid serial format.");
-    return false;
+    return 1;
   }
   Preferences p;
   if (!p.begin(NVS_NAMESPACE, false)) {
     Serial.println("[BurnSentinelSerial] ERROR: NVS begin failed.");
-    return false;
+    return 2;
   }
   if (!p.putString(kNvsKey, sn)) {
     p.end();
     Serial.println("[BurnSentinelSerial] ERROR: putString failed.");
-    return false;
+    return 2;
   }
   p.end();
 
@@ -62,10 +67,10 @@ static bool writeSerialToNvs(const String &sn) {
   p.end();
   if (verify != sn) {
     Serial.println("[BurnSentinelSerial] ERROR: read-back mismatch.");
-    return false;
+    return 2;
   }
   Serial.println("[BurnSentinelSerial] Read-back OK. Flash main firmware.");
-  return true;
+  return 0;
 }
 
 // 0=done success, 1=waiting paste, 2=failed
@@ -80,10 +85,8 @@ void setup() {
   sn.trim();
 
   if (sn.length() > 0) {
-    if (writeSerialToNvs(sn))
-      gState = 0;
-    else
-      gState = 2;
+    int w = writeSerialToNvs(sn);
+    gState = (w == 0) ? 0 : 2;
     return;
   }
 
@@ -91,7 +94,11 @@ void setup() {
   Serial.println("[BurnSentinelSerial] Paste full serial (e.g. SN-653BSYV4WP6YAEJB) + Enter.");
   Serial.println("[BurnSentinelSerial] Waiting in loop() (not setup) — avoids watchdog reset. 90s timeout.");
   Serial.println("[BurnSentinelSerial] Or set #define SERIAL_DEFAULT \"SN-...\" and re-upload.");
-  Serial.setTimeout(200);
+  // readStringUntil() returns on timeout — 200ms is too short for a pasted SN-* line over USB.
+  Serial.setTimeout(8000);
+  while (Serial.available()) {
+    (void)Serial.read();
+  }
   gWaitStartedMs = millis();
   gState = 1;
 }
@@ -110,8 +117,19 @@ void loop() {
   if (Serial.available()) {
     String sn = Serial.readStringUntil('\n');
     sn.trim();
-    if (writeSerialToNvs(sn)) {
+    if (sn.length() == 0) {
+      return;
+    }
+    int w = writeSerialToNvs(sn);
+    if (w == 0) {
       gState = 0;
+    } else if (w == 1) {
+      Serial.print("[BurnSentinelSerial] Hint: need exactly 19 chars (got len=");
+      Serial.print(sn.length());
+      Serial.println("). Paste again + Enter.");
+      while (Serial.available()) {
+        (void)Serial.read();
+      }
     } else {
       gState = 2;
     }

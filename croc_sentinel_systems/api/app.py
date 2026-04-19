@@ -67,7 +67,8 @@ PROVISION_USE_SHARED_MQTT_CREDS = os.getenv("PROVISION_USE_SHARED_MQTT_CREDS", "
 SCHEDULER_POLL_SECONDS = float(os.getenv("SCHEDULER_POLL_SECONDS", "1.0"))
 CLAIM_RESPONSE_INCLUDE_SECRETS = os.getenv("CLAIM_RESPONSE_INCLUDE_SECRETS", "0") == "1"
 MAX_BULK_TARGETS = int(os.getenv("MAX_BULK_TARGETS", "500"))
-CACHE_TTL_SECONDS = float(os.getenv("CACHE_TTL_SECONDS", "2.0"))
+# Short TTL for dashboard list/overview JSON; higher = snappier repeat-nav, slightly staler counts.
+CACHE_TTL_SECONDS = float(os.getenv("CACHE_TTL_SECONDS", "4.0"))
 MESSAGE_RETENTION_DAYS = int(os.getenv("MESSAGE_RETENTION_DAYS", "14"))
 JWT_SECRET = os.getenv("JWT_SECRET", "")
 BOOTSTRAP_DASHBOARD_SUPERADMIN_USERNAME = os.getenv("BOOTSTRAP_DASHBOARD_SUPERADMIN_USERNAME", "superadmin").strip()

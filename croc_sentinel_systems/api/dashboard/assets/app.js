@@ -99,6 +99,29 @@
     return location.origin;
   }
 
+  /** Default ceiling so a stuck reverse-proxy / API cannot leave the SPA on “Loading…” forever. */
+  const DEFAULT_API_TIMEOUT_MS = 30000;
+
+  /**
+   * fetch() with AbortController timeout. opts.timeoutMs: number ms, false = no limit.
+   */
+  async function fetchWithDeadline(url, init, timeoutMs) {
+    const limit = timeoutMs === false ? 0 : (timeoutMs != null ? timeoutMs : DEFAULT_API_TIMEOUT_MS);
+    if (limit <= 0) return fetch(url, init || {});
+    const ac = new AbortController();
+    const tid = setTimeout(() => ac.abort(), limit);
+    try {
+      return await fetch(url, Object.assign({}, init || {}, { signal: ac.signal }));
+    } catch (e) {
+      if (e && e.name === "AbortError") {
+        throw new Error("Request timed out — check API reachability, Nginx proxy, and browser Network tab.");
+      }
+      throw e;
+    } finally {
+      clearTimeout(tid);
+    }
+  }
+
   function getToken() { return localStorage.getItem(LS.token) || ""; }
   function setToken(t) { t ? localStorage.setItem(LS.token, t) : localStorage.removeItem(LS.token); }
 
@@ -156,7 +179,11 @@
       headers["Content-Type"] = "application/json";
       body = JSON.stringify(body);
     }
-    const r = await fetch(apiBase() + path, { method: opts.method || "GET", headers, body });
+    const r = await fetchWithDeadline(
+      apiBase() + path,
+      { method: opts.method || "GET", headers, body },
+      opts.timeoutMs,
+    );
     if (r.status === 401) {
       setToken("");
       state.me = null;
@@ -176,10 +203,15 @@
   }
 
   async function login(username, password) {
-    const r = await fetch(apiBase() + "/auth/login", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username, password }),
-    });
+    const r = await fetchWithDeadline(
+      apiBase() + "/auth/login",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password }),
+      },
+      25000,
+    );
     if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
     const j = await r.json();
     setToken(j.access_token || "");
@@ -202,7 +234,7 @@
     try {
       // Public endpoint — do not use api() (no Authorization) so bad/expired JWT
       // never affects probes and we never trip the global 401 handler here.
-      const r = await fetch(apiBase() + "/health", { method: "GET" });
+      const r = await fetchWithDeadline(apiBase() + "/health", { method: "GET" }, 20000);
       if (!r.ok) throw new Error(String(r.status));
       const h = await r.json();
       state.mqttConnected = !!h.mqtt_connected;
@@ -347,8 +379,25 @@
     const routeId = id === "alarm-log" ? "signals" : id;
     const handler = routes[routeId] || routes["overview"];
     try {
-      view.innerHTML = '<div class="card"><span class="muted">Loading…</span></div>';
-      await handler(view, args);
+      view.innerHTML = `<div class="route-loading card" aria-busy="true" role="status">
+        <span class="sr-only">Loading page</span>
+        <div class="route-loading__head"></div>
+        <div class="route-loading__lines">
+          <span class="route-loading__bar route-loading__bar--90"></span>
+          <span class="route-loading__bar route-loading__bar--72"></span>
+          <span class="route-loading__bar route-loading__bar--84"></span>
+        </div>
+      </div>`;
+      const swap = async () => {
+        await handler(view, args);
+      };
+      const reduceMotion =
+        window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      if (!reduceMotion && typeof document.startViewTransition === "function") {
+        await document.startViewTransition(swap).finished;
+      } else {
+        await swap();
+      }
       renderNav();
       renderHealthPills();
     } catch (e) {
@@ -2199,8 +2248,10 @@
       } catch (_) {}
     }, true);
 
-    if (getToken()) await loadMe();
-    await loadHealth();
+    await Promise.all([
+      getToken() ? loadMe() : Promise.resolve(),
+      loadHealth(),
+    ]);
     if (!location.hash) location.hash = state.me ? "#/overview" : "#/login";
     else renderRoute();
     clearHealthPollTimer();

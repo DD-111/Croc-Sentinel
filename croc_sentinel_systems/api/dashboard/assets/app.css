@@ -733,6 +733,78 @@ body.comfort-ui a.link-tile:hover {
   100% { background-position: 100% 50%; }
 }
 
+/* Route transition (Chrome 111+ / Edge 111+); no-op elsewhere */
+@media (prefers-reduced-motion: no-preference) {
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation-duration: 220ms;
+    animation-timing-function: cubic-bezier(0.32, 0.72, 0, 1);
+  }
+}
+
+/* Skeleton while SPA route handler awaits API */
+.route-loading {
+  padding: 22px 20px;
+  min-height: 140px;
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+}
+.route-loading__head {
+  height: 22px;
+  max-width: 200px;
+  border-radius: 8px;
+  margin-bottom: 18px;
+  background: linear-gradient(
+    90deg,
+    var(--bg-muted) 0%,
+    color-mix(in srgb, var(--bg-elev) 88%, var(--accent) 6%) 45%,
+    var(--bg-muted) 90%
+  );
+  background-size: 200% 100%;
+  animation: motion-shimmer-bg 1.1s ease-in-out infinite;
+}
+.route-loading__lines {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.route-loading__bar {
+  display: block;
+  height: 12px;
+  border-radius: 6px;
+  background: linear-gradient(
+    90deg,
+    var(--bg-muted) 0%,
+    color-mix(in srgb, var(--bg-elev) 90%, var(--text-muted) 8%) 50%,
+    var(--bg-muted) 100%
+  );
+  background-size: 200% 100%;
+  animation: motion-shimmer-bg 1.25s ease-in-out infinite;
+}
+.route-loading__bar--90 { width: 90%; animation-delay: 0.05s; }
+.route-loading__bar--72 { width: 72%; animation-delay: 0.12s; }
+.route-loading__bar--84 { width: 84%; animation-delay: 0.2s; }
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .route-loading__head,
+  .route-loading__bar {
+    animation: none;
+    background: var(--bg-muted);
+  }
+}
+
 body.motion-ui.app-shell {
   background:
     radial-gradient(ellipse 120% 80% at 0% -10%, color-mix(in srgb, var(--accent) 22%, transparent), transparent 55%),
