@@ -1,18 +1,22 @@
 services:
+
   mosquitto:
     image: eclipse-mosquitto:2
     container_name: croc_mosquitto
     restart: unless-stopped
     env_file:
       - .env
+
     command: >
       /bin/sh -c
       "apk add --no-cache gettext >/dev/null
       && envsubst '$$MQTT_PORT $$MQTT_TLS_CA_FILE $$MQTT_TLS_CERT_FILE $$MQTT_TLS_KEY_FILE $$MQTT_TLS_REQUIRE_CLIENT_CERT'
       < /mosquitto/config/mosquitto.conf.template > /mosquitto/config/mosquitto.conf
       && mosquitto -c /mosquitto/config/mosquitto.conf"
+
     ports:
       - "${MQTT_PORT:-8883}:${MQTT_PORT:-8883}"
+
     volumes:
       - ./mosquitto/mosquitto.conf.template:/mosquitto/config/mosquitto.conf.template:ro
       - ./mosquitto/passwd:/mosquitto/config/passwd:ro
@@ -20,18 +24,41 @@ services:
       - ./mosquitto/data:/mosquitto/data
       - ./mosquitto/log:/mosquitto/log
 
+    networks:
+      - croc_net
+
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+
   api:
     build:
       context: ./api
       dockerfile: Dockerfile
+
     container_name: croc_api
     restart: unless-stopped
+
     env_file:
       - .env
+
     depends_on:
       - mosquitto
-    ports:
-      - "8088:8088"
+
+    expose:
+      - "8088"
+
+    command: >
+      uvicorn app:app
+      --host 0.0.0.0
+      --port 8088
+      --workers 2
+      --loop uvloop
+      --http httptools
+
     volumes:
       - ./data:/data
       - ./certs/ca.crt:/etc/sentinel/mqtt-ca.crt:ro
@@ -42,21 +69,43 @@ services:
       - "traefik.http.routers.api.entrypoints=web"
       - "traefik.http.services.api.loadbalancer.server.port=8088"
 
+    networks:
+      - croc_net
+
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+
   ota-nginx:
     image: nginx:1.27-alpine
     container_name: croc_ota_nginx
     restart: unless-stopped
-    depends_on:
-      - api
     env_file:
       - .env
+
     command: >
       /bin/sh -c
       "apk add --no-cache gettext >/dev/null
-      && envsubst '$$OTA_TOKEN' < /etc/nginx/templates/default.conf.template > /etc/nginx/conf.d/default.conf
+      && envsubst '$$OTA_TOKEN'
+      < /etc/nginx/templates/default.conf.template
+      > /etc/nginx/conf.d/default.conf
       && nginx -g 'daemon off;'"
-    ports:
-      - "8070:8070"
+
+    # ❌ IMPORTANT FIX: REMOVE PUBLIC PORT
+    expose:
+      - "8070"
+
     volumes:
       - ./nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro
       - ./firmware:/opt/sentinel/firmware:ro
+
+    networks:
+      - croc_net
+
+
+networks:
+  croc_net:
+    driver: bridge
