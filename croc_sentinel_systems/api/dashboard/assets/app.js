@@ -340,6 +340,7 @@
 
   async function renderRoute() {
     const view = $("#view");
+    if (!view) return;
     let hashFull = location.hash || "#/overview";
     let routeQuery = new URLSearchParams("");
     const qm = hashFull.indexOf("?");
@@ -392,13 +393,11 @@
       const swap = async () => {
         await handler(view, args);
       };
-      const reduceMotion =
-        window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-      if (!reduceMotion && typeof document.startViewTransition === "function") {
-        await document.startViewTransition(swap).finished;
-      } else {
-        await swap();
-      }
+      // Do not wrap `swap()` in `document.startViewTransition`: handlers often await
+      // network I/O before finishing; the View Transition API then hits a DOM-update
+      // timeout and rejects. (Also avoids races where a later route replaces #view while
+      // an older handler is still awaiting.)
+      await swap();
       renderNav();
       renderHealthPills();
     } catch (e) {
@@ -1268,7 +1267,9 @@
 
     const data = await api("/provision/pending").catch(() => ({ items: [] }));
     const items = data.items || [];
-    $("#pendList").innerHTML = `
+    const pendListEl = view.querySelector("#pendList");
+    if (!pendListEl) return;
+    pendListEl.innerHTML = `
       <div class="table-wrap"><table class="t">
         <thead><tr><th>MAC</th><th>Serial / proposed ID</th><th>QR</th><th>Firmware</th><th>Last seen</th></tr></thead>
         <tbody>${items.length === 0 ? `<tr><td colspan="5" class="muted">None</td></tr>` :
