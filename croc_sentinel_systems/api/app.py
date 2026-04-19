@@ -155,6 +155,9 @@ EVENT_RETAIN_DAYS_CRITICAL = int(os.getenv("EVENT_RETAIN_DAYS_CRITICAL", "365"))
 EVENT_RETAIN_DAYS_MAX = int(os.getenv("EVENT_RETAIN_DAYS_MAX", "400"))
 # How often the retention worker runs.
 EVENT_RETENTION_SCAN_SECONDS = int(os.getenv("EVENT_RETENTION_SCAN_SECONDS", "3600"))
+# MQTT → bounded RAM queue → single ingest worker (DB + emit_event + fan-out threads).
+# Callback must stay O(1): only decode + put_nowait; never parse business JSON there.
+MQTT_INGEST_QUEUE_MAX = int(os.getenv("MQTT_INGEST_QUEUE_MAX", "1000"))
 
 # --- Offline password recovery (RSA public on server, private key only in
 #     password_recovery_offline/ on the operator's air-gapped machine) ---
@@ -189,6 +192,10 @@ TOPIC_BOOTSTRAP_REGISTER = f"{TOPIC_ROOT}/bootstrap/register"
 db_lock = threading.Lock()
 mqtt_client: Optional[mqtt.Client] = None
 mqtt_connected = False
+mqtt_ingest_queue: _stdqueue.Queue[Optional[dict[str, Any]]] = _stdqueue.Queue(maxsize=MQTT_INGEST_QUEUE_MAX)
+mqtt_worker_stop = threading.Event()
+mqtt_worker_thread: Optional[threading.Thread] = None
+mqtt_ingest_dropped = 0
 scheduler_stop = threading.Event()
 scheduler_thread: Optional[threading.Thread] = None
 cache_lock = threading.Lock()
@@ -2183,16 +2190,8 @@ def _fan_out_alarm(device_id: str, payload: dict[str, Any]) -> None:
         pass
 
 
-def on_message(_client: mqtt.Client, _userdata: Any, msg: mqtt.MQTTMessage) -> None:
-    topic = msg.topic
-
-    try:
-        payload = json.loads(msg.payload.decode("utf-8", errors="ignore"))
-        if not isinstance(payload, dict):
-            return
-    except Exception:
-        return
-
+def _dispatch_mqtt_payload(topic: str, payload: dict[str, Any]) -> None:
+    """All MQTT business logic: runs on the mqtt-ingest worker thread only."""
     if topic == TOPIC_BOOTSTRAP_REGISTER:
         upsert_pending_claim(payload)
         insert_message(topic, "bootstrap_register", str(payload.get("device_id", "")), payload)
@@ -2252,9 +2251,7 @@ def on_message(_client: mqtt.Client, _userdata: Any, msg: mqtt.MQTTMessage) -> N
         )
 
     if channel == "event" and device_id and str(payload.get("type") or "") == "alarm.trigger":
-        # Dispatch fan-out to a worker thread so the MQTT loop keeps draining.
-        # With 200 siblings at ~100 ms each, publish_command could otherwise
-        # block the on_message callback for tens of seconds.
+        # Dispatch fan-out to a worker thread so the MQTT ingest queue keeps draining.
         t = threading.Thread(
             target=_fan_out_alarm_safe,
             name=f"alarm-fanout-{device_id}",
@@ -2264,8 +2261,6 @@ def on_message(_client: mqtt.Client, _userdata: Any, msg: mqtt.MQTTMessage) -> N
         t.start()
 
     if channel == "ack" and device_id and str(payload.get("type") or "") == "ota.result":
-        # Feed into the OTA campaign state machine on a worker thread to
-        # avoid blocking on_message if a rollback has to fan out.
         t = threading.Thread(
             target=_handle_ota_result_safe,
             name=f"ota-result-{device_id}",
@@ -2275,12 +2270,57 @@ def on_message(_client: mqtt.Client, _userdata: Any, msg: mqtt.MQTTMessage) -> N
         t.start()
 
     if channel in ("heartbeat", "status", "ack", "event") and device_id:
-        # Any freshly-received message from the device resolves an outstanding
-        # presence probe, so the dashboard can flip it back to "online" fast.
         try:
             _mark_presence_probe_acked(device_id)
         except Exception:
             logger.debug("presence probe ack update failed for %s", device_id, exc_info=True)
+
+
+def _mqtt_ingest_worker() -> None:
+    """Drain mqtt_ingest_queue: JSON parse + _dispatch_mqtt_payload (DB, emit_event, side threads)."""
+    while True:
+        try:
+            item = mqtt_ingest_queue.get(timeout=0.3)
+        except _stdqueue.Empty:
+            if mqtt_worker_stop.is_set():
+                break
+            continue
+        if not item:
+            continue
+        topic = str(item.get("topic") or "")
+        raw = item.get("payload")
+        if not isinstance(raw, str):
+            continue
+        try:
+            payload = json.loads(raw)
+            if not isinstance(payload, dict):
+                continue
+        except Exception:
+            continue
+        try:
+            _dispatch_mqtt_payload(topic, payload)
+        except Exception as exc:
+            logger.exception("mqtt ingest worker failed topic=%s: %s", topic, exc)
+
+
+def on_message(_client: mqtt.Client, _userdata: Any, msg: mqtt.MQTTMessage) -> None:
+    """Paho callback: enqueue only — never DB, JSON business logic, or emit_event here."""
+    global mqtt_ingest_dropped
+    try:
+        raw = msg.payload.decode("utf-8", errors="replace")
+    except Exception:
+        return
+    try:
+        mqtt_ingest_queue.put_nowait({"topic": msg.topic, "payload": raw, "ts": time.time()})
+    except _stdqueue.Full:
+        mqtt_ingest_dropped += 1
+        if mqtt_ingest_dropped == 1 or mqtt_ingest_dropped % 250 == 0:
+            logger.warning(
+                "mqtt ingest queue full (max=%s); dropped=%s last_topic=%r",
+                MQTT_INGEST_QUEUE_MAX,
+                mqtt_ingest_dropped,
+                getattr(msg, "topic", ""),
+            )
 
 
 def _fan_out_alarm_safe(device_id: str, payload: dict[str, Any]) -> None:
@@ -2466,7 +2506,7 @@ def _telegram_enabled_safe() -> bool:
 
 @app.on_event("startup")
 def startup() -> None:
-    global mqtt_client, scheduler_thread
+    global mqtt_client, scheduler_thread, mqtt_worker_thread, mqtt_ingest_dropped
     validate_production_env()
     init_db()
     notifier.start()
@@ -2476,6 +2516,10 @@ def startup() -> None:
         start_telegram_worker()
     except Exception:
         logger.exception("Telegram worker failed to start (check TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_IDS)")
+    mqtt_worker_stop.clear()
+    mqtt_ingest_dropped = 0
+    mqtt_worker_thread = threading.Thread(target=_mqtt_ingest_worker, name="mqtt-ingest", daemon=True)
+    mqtt_worker_thread.start()
     mqtt_client = start_mqtt_loop()
     scheduler_stop.clear()
     scheduler_thread = threading.Thread(target=scheduler_loop, name="cmd-scheduler", daemon=True)
@@ -2495,13 +2539,18 @@ def startup() -> None:
 
 @app.on_event("shutdown")
 def shutdown() -> None:
-    global mqtt_client, scheduler_thread
+    global mqtt_client, scheduler_thread, mqtt_worker_thread
     scheduler_stop.set()
     if scheduler_thread is not None:
         scheduler_thread.join(timeout=2.0)
         scheduler_thread = None
     if mqtt_client is not None:
         stop_mqtt_loop(mqtt_client)
+        mqtt_client = None
+    mqtt_worker_stop.set()
+    if mqtt_worker_thread is not None:
+        mqtt_worker_thread.join(timeout=10.0)
+        mqtt_worker_thread = None
     try:
         from telegram_notify import stop_telegram_worker
 
@@ -3906,6 +3955,8 @@ def health() -> dict[str, Any]:
     return {
         "ok": True,
         "mqtt_connected": mqtt_connected,
+        "mqtt_ingest_queue_depth": mqtt_ingest_queue.qsize(),
+        "mqtt_ingest_dropped": mqtt_ingest_dropped,
         "smtp": {
             "configured": notifier.enabled(),
             "worker_running": notifier.worker_alive(),
