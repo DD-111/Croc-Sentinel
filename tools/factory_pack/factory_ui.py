@@ -16,14 +16,18 @@ if str(_PACK) not in sys.path:
     sys.path.insert(0, str(_PACK))
 
 from factory_core import (  # noqa: E402
+    append_pending_push_queue,
     DEFAULT_FACTORY_UI_API_BASE,
     default_dotenv_path,
+    drain_pending_push_queue,
     generate_items,
     get_factory_ping,
+    load_pending_push_queue,
     post_factory_devices,
     read_dotenv_keys,
     repo_root,
     verify_qr_local,
+    write_push_status_file,
     write_batch_files,
 )
 
@@ -185,12 +189,28 @@ class FactoryApp(tk.Tk):
                 if not tok:
                     ui(messagebox.showerror, "错误", "需要 FACTORY_API_TOKEN（界面或 .env）才能登记。")
                     return
+                queue_path = repo_root() / "factory_serial_exports" / "pending_push_queue.json"
+                queued_before = len(load_pending_push_queue(queue_path))
+                if queued_before:
+                    drained, attempts = drain_pending_push_queue(
+                        queue_path,
+                        api,
+                        tok,
+                        insecure_ssl=self._insecure.get(),
+                        max_batches=20,
+                    )
+                    ui(self._append, f"[retry] queue_before={queued_before} drained={drained} remain={len(load_pending_push_queue(queue_path))}")
+                    for a in attempts:
+                        ui(self._append, f"[retry] batch={a.get('batch')} code={a.get('code')} ok={a.get('ok')}")
                 ui(self._append, f"[push] POST {api}/factory/devices  token_len={len(tok)}")
                 code, body = post_factory_devices(
                     api, tok, items, insecure_ssl=self._insecure.get()
                 )
                 ui(self._append, f"[push] HTTP {code}\n{body}")
-                if code in (200, 201):
+                ok = code in (200, 201)
+                status_file = write_push_status_file(out, batch, items, code, body, pushed_ok=ok, retry_attempt=0)
+                ui(self._append, f"[push] status file: {status_file}")
+                if ok:
                     first = str(items[0].get("serial") or "")
                     qr0 = str(items[0].get("qr_code") or "")
                     base = api.rstrip("/")
@@ -203,6 +223,8 @@ class FactoryApp(tk.Tk):
                         f"已登记 {len(items)} 条。\n\n下一步：浏览器登录控制台后打开「激活设备」，或复制日志里的 link 整行。\n\n{out}",
                     )
                 else:
+                    qlen = append_pending_push_queue(queue_path, batch, items, reason=f"HTTP {code}: {body[:500]}")
+                    ui(self._append, f"[queue] pushed to retry queue: {queue_path} (size={qlen})")
                     hint = ""
                     if code == 403:
                         hint = (

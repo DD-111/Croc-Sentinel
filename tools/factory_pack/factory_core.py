@@ -11,6 +11,7 @@ import ssl
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 CROCKFORD = "ABCDEFGHJKLMNPQRSTUVWXYZ234567"
@@ -178,6 +179,123 @@ def post_factory_devices(
         except Exception as e:
             return -1, str(e)
     return last_code, "\n---\n".join(bodies)
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def load_pending_push_queue(path: Path) -> list[dict]:
+    if not path.is_file():
+        return []
+    try:
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return data
+    except Exception:
+        pass
+    return []
+
+
+def save_pending_push_queue(path: Path, queue: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(queue, ensure_ascii=True, indent=2), encoding="utf-8")
+
+
+def append_pending_push_queue(
+    path: Path,
+    batch: str,
+    items: list[dict[str, str | None]],
+    reason: str,
+) -> int:
+    queue = load_pending_push_queue(path)
+    queue.append(
+        {
+            "batch": batch,
+            "items": items,
+            "reason": reason,
+            "queued_at": utc_now_iso(),
+            "retry_count": 0,
+        }
+    )
+    save_pending_push_queue(path, queue)
+    return len(queue)
+
+
+def drain_pending_push_queue(
+    path: Path,
+    api_base: str,
+    factory_token: str,
+    insecure_ssl: bool = False,
+    max_batches: int = 20,
+) -> tuple[int, list[dict]]:
+    queue = load_pending_push_queue(path)
+    if not queue:
+        return 0, []
+    attempted: list[dict] = []
+    keep: list[dict] = []
+    drained = 0
+    for item in queue:
+        if drained >= max_batches:
+            keep.append(item)
+            continue
+        batch = str(item.get("batch") or "")
+        items = item.get("items") or []
+        if not isinstance(items, list) or not items:
+            continue
+        code, body = post_factory_devices(
+            api_base,
+            factory_token,
+            items,
+            insecure_ssl=insecure_ssl,
+        )
+        ok = code in (200, 201)
+        attempted.append({"batch": batch, "code": code, "ok": ok, "body": body[:500]})
+        if ok:
+            drained += 1
+            continue
+        item["retry_count"] = int(item.get("retry_count") or 0) + 1
+        item["reason"] = f"HTTP {code}: {body[:500]}"
+        keep.append(item)
+    save_pending_push_queue(path, keep)
+    return drained, attempted
+
+
+def write_push_status_file(
+    out: Path,
+    batch: str,
+    items: list[dict[str, str | None]],
+    http_code: int,
+    response_body: str,
+    pushed_ok: bool,
+    retry_attempt: int,
+) -> Path:
+    rows = []
+    for i, it in enumerate(items, 1):
+        rows.append(
+            {
+                "index": i,
+                "serial": it.get("serial"),
+                "batch": batch,
+                "push_status": "success" if pushed_ok else "failed",
+                "retry_count": retry_attempt,
+                "http_code": http_code,
+            }
+        )
+    obj = {
+        "batch": batch,
+        "created_at": utc_now_iso(),
+        "item_count": len(items),
+        "push_ok": pushed_ok,
+        "http_code": http_code,
+        "retry_attempt": retry_attempt,
+        "response_snippet": (response_body or "")[:2000],
+        "items": rows,
+    }
+    p = out / "push_status.json"
+    p.write_text(json.dumps(obj, ensure_ascii=True, indent=2), encoding="utf-8")
+    return p
 
 
 def get_factory_ping(

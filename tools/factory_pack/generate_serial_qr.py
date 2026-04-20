@@ -12,15 +12,19 @@ import time
 from pathlib import Path
 
 from factory_core import (
+    append_pending_push_queue,
     DEFAULT_FACTORY_UI_API_BASE,
     DEFAULT_QR_POLICY,
     default_dotenv_path,
+    drain_pending_push_queue,
     generate_items,
     get_factory_ping,
+    load_pending_push_queue,
     post_factory_devices,
     read_dotenv_keys,
     repo_root,
     verify_qr_local,
+    write_push_status_file,
     write_batch_files,
 )
 
@@ -60,6 +64,12 @@ def main() -> None:
         "--insecure-ssl",
         action="store_true",
         help="Skip TLS certificate verification (dev only)",
+    )
+    ap.add_argument(
+        "--retry-queue-max",
+        type=int,
+        default=20,
+        help="Max queued failed batches to retry before current push (default: 20)",
     )
     args = ap.parse_args()
 
@@ -102,6 +112,8 @@ def main() -> None:
     out = Path(args.out) if args.out else default_out
     write_batch_files(out, items, batch)
     print(f"Wrote {len(items)} devices to:\n  {out}")
+    queue_path = root / "factory_serial_exports" / "pending_push_queue.json"
+    (out / "BATCH_ID.txt").write_text(batch + "\n", encoding="utf-8")
 
     do_push = bool(args.push) or (env.get("FACTORY_AUTO_PUSH") or "").strip() == "1"
     if do_push:
@@ -113,9 +125,26 @@ def main() -> None:
         if not token:
             print("Error: push needs FACTORY_API_TOKEN in .env", file=sys.stderr)
             sys.exit(5)
+        queued_before = len(load_pending_push_queue(queue_path))
+        if queued_before:
+            drained, attempts = drain_pending_push_queue(
+                queue_path,
+                api_base,
+                token,
+                insecure_ssl=args.insecure_ssl,
+                max_batches=max(1, args.retry_queue_max),
+            )
+            print(f"[retry] queue_before={queued_before} drained={drained} remain={len(load_pending_push_queue(queue_path))}")
+            for a in attempts:
+                print(f"[retry] batch={a.get('batch')} code={a.get('code')} ok={a.get('ok')}")
         code, body = post_factory_devices(api_base, token, items, insecure_ssl=args.insecure_ssl)
         print(f"POST /factory/devices -> HTTP {code}\n{body}")
-        if code not in (200, 201):
+        ok = code in (200, 201)
+        status_file = write_push_status_file(out, batch, items, code, body, pushed_ok=ok, retry_attempt=0)
+        print(f"Push status file:\n  {status_file}")
+        if not ok:
+            qlen = append_pending_push_queue(queue_path, batch, items, reason=f"HTTP {code}: {body[:500]}")
+            print(f"[queue] push failed; queued for auto-retry: {queue_path} (size={qlen})")
             sys.exit(6)
 
 

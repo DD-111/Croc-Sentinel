@@ -266,3 +266,17 @@ def send_telegram_text_now(text: str) -> tuple[bool, str]:
     if bad:
         return False, f"failed for chat_id(s): {','.join(bad)} — check token, chat id, and bot started chat with you"
     return True, f"sent to {len(_tg._chats)} chat(s)"
+
+
+def send_telegram_chat_text(chat_id: str, text: str) -> tuple[bool, str]:
+    """Blocking send to one chat_id (for webhook command replies)."""
+    _tg.reload_from_env()
+    chat = (chat_id or "").strip()
+    if not chat:
+        return False, "empty chat_id"
+    if not _tg._token:
+        return False, "Telegram disabled: TELEGRAM_BOT_TOKEN empty"
+    ok = _tg._send_one(chat, (text or "").strip()[:4090] or "ok")
+    if not ok:
+        return False, getattr(_tg, "_last_error", "") or "send failed"
+    return True, "sent"

@@ -223,7 +223,8 @@
 
   async function loadMe() {
     try {
-      state.me = await api("/auth/me");
+      // Keep bootstrap snappy when API is degraded; fail fast and render login.
+      state.me = await api("/auth/me", { timeoutMs: 8000 });
     } catch (e) {
       state.me = null;
     }
@@ -234,7 +235,7 @@
     try {
       // Public endpoint — do not use api() (no Authorization) so bad/expired JWT
       // never affects probes and we never trip the global 401 handler here.
-      const r = await fetchWithDeadline(apiBase() + "/health", { method: "GET" }, 20000);
+      const r = await fetchWithDeadline(apiBase() + "/health", { method: "GET" }, 5000);
       if (!r.ok) throw new Error(String(r.status));
       const h = await r.json();
       state.mqttConnected = !!h.mqtt_connected;
@@ -2238,12 +2239,11 @@
       } catch (_) {}
     }, true);
 
-    await Promise.all([
-      getToken() ? loadMe() : Promise.resolve(),
-      loadHealth(),
-    ]);
+    await (getToken() ? loadMe() : Promise.resolve());
     if (!location.hash) location.hash = state.me ? "#/overview" : "#/login";
     else renderRoute();
+    // Do not block first render on health probes.
+    loadHealth().catch(() => {});
     clearHealthPollTimer();
     healthPollTimer = setInterval(tickHealthIfVisible, 30000);
     document.addEventListener("visibilitychange", () => {

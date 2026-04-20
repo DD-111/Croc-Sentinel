@@ -69,8 +69,9 @@ SCHEDULER_POLL_SECONDS = float(os.getenv("SCHEDULER_POLL_SECONDS", "1.0"))
 CLAIM_RESPONSE_INCLUDE_SECRETS = os.getenv("CLAIM_RESPONSE_INCLUDE_SECRETS", "0") == "1"
 MAX_BULK_TARGETS = int(os.getenv("MAX_BULK_TARGETS", "500"))
 # Short TTL for dashboard list/overview JSON; higher = snappier repeat-nav, slightly staler counts.
-CACHE_TTL_SECONDS = float(os.getenv("CACHE_TTL_SECONDS", "4.0"))
+CACHE_TTL_SECONDS = float(os.getenv("CACHE_TTL_SECONDS", "10.0"))
 MESSAGE_RETENTION_DAYS = int(os.getenv("MESSAGE_RETENTION_DAYS", "14"))
+STRICT_STARTUP_ENV_CHECK = os.getenv("STRICT_STARTUP_ENV_CHECK", "0") == "1"
 JWT_SECRET = os.getenv("JWT_SECRET", "")
 BOOTSTRAP_DASHBOARD_SUPERADMIN_USERNAME = os.getenv("BOOTSTRAP_DASHBOARD_SUPERADMIN_USERNAME", "superadmin").strip()
 BOOTSTRAP_DASHBOARD_SUPERADMIN_PASSWORD = os.getenv("BOOTSTRAP_DASHBOARD_SUPERADMIN_PASSWORD", "")
@@ -114,6 +115,10 @@ SMS_PROVIDER = os.getenv("SMS_PROVIDER", "none").strip().lower()
 # unguessable in production.
 ENFORCE_FACTORY_REGISTRATION = os.getenv("ENFORCE_FACTORY_REGISTRATION", "0") == "1"
 FACTORY_API_TOKEN = os.getenv("FACTORY_API_TOKEN", "")
+TELEGRAM_COMMAND_SECRET = os.getenv("TELEGRAM_COMMAND_SECRET", "").strip()
+TELEGRAM_COMMAND_CHAT_IDS_RAW = os.getenv("TELEGRAM_COMMAND_CHAT_IDS", "").strip()
+TELEGRAM_COMMAND_MAX_LOG = int(os.getenv("TELEGRAM_COMMAND_MAX_LOG", "20"))
+TELEGRAM_COMMAND_MAX_DEVICES = int(os.getenv("TELEGRAM_COMMAND_MAX_DEVICES", "30"))
 
 # --- Presence probe (replaces firmware-side periodic heartbeat) ---
 # Devices in EVENT mode only publish heartbeats on state change. If we haven't
@@ -221,6 +226,18 @@ logging.basicConfig(
 logger = logging.getLogger("croc-api")
 
 
+def _parse_chat_ids(raw: str) -> set[str]:
+    out: set[str] = set()
+    for part in re.split(r"[\s,;]+", (raw or "").strip()):
+        p = part.strip().strip('"').strip("'")
+        if p:
+            out.add(p)
+    return out
+
+
+TELEGRAM_COMMAND_CHAT_IDS = _parse_chat_ids(TELEGRAM_COMMAND_CHAT_IDS_RAW)
+
+
 def contains_insecure_marker(value: str) -> bool:
     markers = ["CHANGE_ME", "YOUR_", "your.vps.domain", "bootstrap_user", "bootstrap_pass", "mqtt_pass", "mqtt_user"]
     return any(m in value for m in markers)
@@ -258,7 +275,10 @@ def validate_production_env() -> None:
         if not JWT_SECRET or len(JWT_SECRET) < 32:
             errors.append("JWT_SECRET must be set (>=32 chars) when BOOTSTRAP_DASHBOARD_SUPERADMIN_PASSWORD is used")
     if errors:
-        raise RuntimeError("Invalid production environment: " + "; ".join(errors))
+        msg = "Invalid production environment: " + "; ".join(errors)
+        if STRICT_STARTUP_ENV_CHECK:
+            raise RuntimeError(msg)
+        logger.warning("%s (startup allowed because STRICT_STARTUP_ENV_CHECK=0)", msg)
 
 
 def cache_get(key: str) -> Optional[Any]:
@@ -479,10 +499,28 @@ def init_db() -> None:
                 can_claim_device INTEGER NOT NULL DEFAULT 0,
                 can_manage_users INTEGER NOT NULL DEFAULT 0,
                 can_backup_restore INTEGER NOT NULL DEFAULT 0,
+                tg_view_logs INTEGER NOT NULL DEFAULT 0,
+                tg_view_devices INTEGER NOT NULL DEFAULT 0,
+                tg_siren_on INTEGER NOT NULL DEFAULT 0,
+                tg_siren_off INTEGER NOT NULL DEFAULT 0,
+                tg_test_single INTEGER NOT NULL DEFAULT 0,
+                tg_test_bulk INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS telegram_chat_bindings (
+                chat_id TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_tg_bindings_user ON telegram_chat_bindings(username)")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS device_ownership (
@@ -743,6 +781,12 @@ def init_db() -> None:
         ensure_column(conn, "dashboard_users", "phone_verified_at", "TEXT")
         # status ∈ pending | active | disabled | awaiting_approval
         ensure_column(conn, "dashboard_users", "status", "TEXT")
+        ensure_column(conn, "role_policies", "tg_view_logs", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "role_policies", "tg_view_devices", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "role_policies", "tg_siren_on", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "role_policies", "tg_siren_off", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "role_policies", "tg_test_single", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "role_policies", "tg_test_bulk", "INTEGER NOT NULL DEFAULT 0")
         cur.execute("UPDATE dashboard_users SET status='active' WHERE status IS NULL OR status = ''")
         cur.execute("SELECT mac_nocolon, COUNT(*) AS c FROM provisioned_credentials GROUP BY mac_nocolon HAVING c > 1")
         dup = cur.fetchone()
@@ -1144,6 +1188,30 @@ def get_manager_admin(username: str) -> str:
     return str(row["manager_admin"] or "")
 
 
+def principal_for_username(username: str) -> Principal:
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT username, role, allowed_zones_json, status
+            FROM dashboard_users
+            WHERE username = ?
+            """,
+            (username,),
+        )
+        row = cur.fetchone()
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="telegram binding user not found")
+    status = str(row["status"] or "active")
+    if status not in ("active", ""):
+        raise HTTPException(status_code=403, detail=f"user not active: {status}")
+    role = str(row["role"] or "user")
+    zones = zones_from_json(str(row["allowed_zones_json"] or "[]"))
+    return Principal(username=str(row["username"]), role=role, zones=zones)
+
+
 def default_policy_for_role(role: str) -> dict[str, int]:
     if role == "superadmin":
         return {
@@ -1152,6 +1220,12 @@ def default_policy_for_role(role: str) -> dict[str, int]:
             "can_claim_device": 1,
             "can_manage_users": 1,
             "can_backup_restore": 1,
+            "tg_view_logs": 1,
+            "tg_view_devices": 1,
+            "tg_siren_on": 1,
+            "tg_siren_off": 1,
+            "tg_test_single": 1,
+            "tg_test_bulk": 1,
         }
     if role == "admin":
         return {
@@ -1160,6 +1234,12 @@ def default_policy_for_role(role: str) -> dict[str, int]:
             "can_claim_device": 1,
             "can_manage_users": 1,
             "can_backup_restore": 0,
+            "tg_view_logs": 1,
+            "tg_view_devices": 1,
+            "tg_siren_on": 1,
+            "tg_siren_off": 1,
+            "tg_test_single": 1,
+            "tg_test_bulk": 1,
         }
     return {
         "can_alert": 0,
@@ -1167,6 +1247,12 @@ def default_policy_for_role(role: str) -> dict[str, int]:
         "can_claim_device": 0,
         "can_manage_users": 0,
         "can_backup_restore": 0,
+        "tg_view_logs": 0,
+        "tg_view_devices": 0,
+        "tg_siren_on": 0,
+        "tg_siren_off": 0,
+        "tg_test_single": 0,
+        "tg_test_bulk": 0,
     }
 
 
@@ -1177,7 +1263,8 @@ def get_effective_policy(principal: Principal) -> dict[str, int]:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT can_alert, can_send_command, can_claim_device, can_manage_users, can_backup_restore
+            SELECT can_alert, can_send_command, can_claim_device, can_manage_users, can_backup_restore,
+                   tg_view_logs, tg_view_devices, tg_siren_on, tg_siren_off, tg_test_single, tg_test_bulk
             FROM role_policies WHERE username = ?
             """,
             (principal.username,),
@@ -2473,6 +2560,12 @@ class UserPolicyUpdateRequest(BaseModel):
     can_claim_device: Optional[bool] = None
     can_manage_users: Optional[bool] = None
     can_backup_restore: Optional[bool] = None
+    tg_view_logs: Optional[bool] = None
+    tg_view_devices: Optional[bool] = None
+    tg_siren_on: Optional[bool] = None
+    tg_siren_off: Optional[bool] = None
+    tg_test_single: Optional[bool] = None
+    tg_test_bulk: Optional[bool] = None
 
 
 def _blocking_api_bootstrap_inner() -> None:
@@ -3715,7 +3808,9 @@ def auth_get_user_policy(username: str, principal: Principal = Depends(require_p
             raise HTTPException(status_code=403, detail="not your managed user")
         cur.execute(
             """
-            SELECT can_alert, can_send_command, can_claim_device, can_manage_users, can_backup_restore, updated_at
+            SELECT can_alert, can_send_command, can_claim_device, can_manage_users, can_backup_restore,
+                   tg_view_logs, tg_view_devices, tg_siren_on, tg_siren_off, tg_test_single, tg_test_bulk,
+                   updated_at
             FROM role_policies WHERE username = ?
             """,
             (username,),
@@ -3755,7 +3850,8 @@ def auth_set_user_policy(
         base = default_policy_for_role("user")
         cur.execute(
             """
-            SELECT can_alert, can_send_command, can_claim_device, can_manage_users, can_backup_restore
+            SELECT can_alert, can_send_command, can_claim_device, can_manage_users, can_backup_restore,
+                   tg_view_logs, tg_view_devices, tg_siren_on, tg_siren_off, tg_test_single, tg_test_bulk
             FROM role_policies WHERE username = ?
             """,
             (username,),
@@ -3770,6 +3866,12 @@ def auth_set_user_policy(
             "can_claim_device": req.can_claim_device,
             "can_manage_users": req.can_manage_users,
             "can_backup_restore": req.can_backup_restore,
+            "tg_view_logs": req.tg_view_logs,
+            "tg_view_devices": req.tg_view_devices,
+            "tg_siren_on": req.tg_siren_on,
+            "tg_siren_off": req.tg_siren_off,
+            "tg_test_single": req.tg_test_single,
+            "tg_test_bulk": req.tg_test_bulk,
         }
         for k, v in updates.items():
             if v is not None:
@@ -3779,14 +3881,23 @@ def auth_set_user_policy(
         base["can_manage_users"] = 0
         cur.execute(
             """
-            INSERT INTO role_policies (username, can_alert, can_send_command, can_claim_device, can_manage_users, can_backup_restore, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO role_policies (
+                username, can_alert, can_send_command, can_claim_device, can_manage_users, can_backup_restore,
+                tg_view_logs, tg_view_devices, tg_siren_on, tg_siren_off, tg_test_single, tg_test_bulk, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(username) DO UPDATE SET
                 can_alert=excluded.can_alert,
                 can_send_command=excluded.can_send_command,
                 can_claim_device=excluded.can_claim_device,
                 can_manage_users=excluded.can_manage_users,
                 can_backup_restore=excluded.can_backup_restore,
+                tg_view_logs=excluded.tg_view_logs,
+                tg_view_devices=excluded.tg_view_devices,
+                tg_siren_on=excluded.tg_siren_on,
+                tg_siren_off=excluded.tg_siren_off,
+                tg_test_single=excluded.tg_test_single,
+                tg_test_bulk=excluded.tg_test_bulk,
                 updated_at=excluded.updated_at
             """,
             (
@@ -3796,6 +3907,12 @@ def auth_set_user_policy(
                 base["can_claim_device"],
                 base["can_manage_users"],
                 base["can_backup_restore"],
+                base["tg_view_logs"],
+                base["tg_view_devices"],
+                base["tg_siren_on"],
+                base["tg_siren_off"],
+                base["tg_test_single"],
+                base["tg_test_bulk"],
                 utc_now_iso(),
             ),
         )
@@ -5746,6 +5863,359 @@ def telegram_admin_test(
         raise HTTPException(status_code=502, detail=detail)
     audit_event(principal.username, "telegram.test.ok", "", {"detail": detail})
     return {"ok": True, "detail": detail, "telegram": telegram_status()}
+
+
+class TelegramBindRequest(BaseModel):
+    chat_id: str = Field(min_length=1, max_length=64)
+    enabled: bool = True
+
+
+def _telegram_cmd_send_reply(chat_id: str, text: str) -> tuple[bool, str]:
+    try:
+        from telegram_notify import send_telegram_chat_text
+    except Exception as exc:
+        return False, f"telegram module unavailable: {exc}"
+    return send_telegram_chat_text(chat_id, text)
+
+
+def _telegram_policy_allow(principal: Principal, capability: str) -> bool:
+    if principal.role == "superadmin":
+        return True
+    pol = get_effective_policy(principal)
+    return int(pol.get(capability, 0)) == 1
+
+
+def _telegram_require(principal: Principal, capability: str) -> None:
+    if not _telegram_policy_allow(principal, capability):
+        raise HTTPException(status_code=403, detail=f"telegram capability denied: {capability}")
+
+
+def _telegram_bound_principal(chat_id: str) -> Principal:
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT username, enabled FROM telegram_chat_bindings WHERE chat_id = ?", (chat_id,))
+        row = cur.fetchone()
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=403, detail="chat is not bound")
+    if int(row["enabled"] or 0) != 1:
+        raise HTTPException(status_code=403, detail="chat binding disabled")
+    return principal_for_username(str(row["username"]))
+
+
+def _telegram_parse_targets(token: str) -> list[str]:
+    raw = (token or "").strip()
+    if not raw:
+        return []
+    if raw.lower() == "all":
+        return []
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def _telegram_cmd_recent_devices(principal: Principal, limit: int) -> str:
+    _telegram_require(principal, "tg_view_devices")
+    n = max(1, min(limit, TELEGRAM_COMMAND_MAX_DEVICES))
+    zs, za = zone_sql_suffix(principal)
+    osf, osa = owner_scope_clause_for_device_state(principal)
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT device_id, IFNULL(display_label, '') AS display_label, IFNULL(zone,'') AS zone,
+                   IFNULL(fw,'') AS fw, updated_at, last_status_json, last_heartbeat_json, last_ack_json, last_event_json
+            FROM device_state
+            WHERE 1=1 {zs} {osf}
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            tuple(za + osa + [n]),
+        )
+        rows = cur.fetchall()
+        conn.close()
+    now_s = int(time.time())
+    lines = [f"Devices (latest {len(rows)}):"]
+    for r in rows:
+        d = dict(r)
+        online = _device_is_online_sql_row(d, now_s)
+        did = str(d.get("device_id") or "")
+        label = str(d.get("display_label") or "")
+        fw = str(d.get("fw") or "-")
+        zone = str(d.get("zone") or "all")
+        tag = "online" if online else "offline"
+        lines.append(f"- {did} [{tag}] fw={fw} zone={zone}" + (f" label={label}" if label else ""))
+    return "\n".join(lines)[:3900]
+
+
+def _telegram_cmd_recent_logs(principal: Principal, limit: int) -> str:
+    _telegram_require(principal, "tg_view_logs")
+    n = max(1, min(limit, TELEGRAM_COMMAND_MAX_LOG))
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        if principal.role == "superadmin":
+            cur.execute(
+                """
+                SELECT ts, level, category, event_type, IFNULL(device_id,'') AS device_id, IFNULL(summary,'') AS summary
+                FROM events
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (n,),
+            )
+        elif principal.role == "admin":
+            cur.execute(
+                """
+                SELECT ts, level, category, event_type, IFNULL(device_id,'') AS device_id, IFNULL(summary,'') AS summary
+                FROM events
+                WHERE owner_admin = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (principal.username, n),
+            )
+        else:
+            mgr = get_manager_admin(principal.username)
+            cur.execute(
+                """
+                SELECT ts, level, category, event_type, IFNULL(device_id,'') AS device_id, IFNULL(summary,'') AS summary
+                FROM events
+                WHERE owner_admin = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (mgr or "__none__", n),
+            )
+        rows = cur.fetchall()
+        conn.close()
+    lines = [f"Logs (latest {len(rows)}):"]
+    for r in rows:
+        ts = str(r["ts"] or "")
+        lvl = str(r["level"] or "info").upper()
+        cat = str(r["category"] or "-")
+        et = str(r["event_type"] or "-")
+        did = str(r["device_id"] or "-")
+        summary = str(r["summary"] or "")[:90]
+        lines.append(f"- {ts} [{lvl}] {cat}/{et} dev={did} {summary}")
+    return "\n".join(lines)[:3900]
+
+
+def _telegram_cmd_publish(principal: Principal, cmd: str, params: dict[str, Any], ids: list[str], bulk_cap: str) -> tuple[int, int]:
+    if cmd in ("siren_on", "siren_off"):
+        require_capability(principal, "can_alert")
+    else:
+        require_capability(principal, "can_send_command")
+    if ids:
+        _telegram_require(principal, "tg_test_single" if cmd == "self_test" else ("tg_siren_on" if cmd == "siren_on" else "tg_siren_off"))
+    else:
+        _telegram_require(principal, bulk_cap)
+    targets = resolve_target_devices(ids, principal=principal)
+    sent = 0
+    for did in targets:
+        try:
+            publish_command(
+                topic=f"{TOPIC_ROOT}/{did}/cmd",
+                cmd=cmd,
+                params=params,
+                target_id=did,
+                proto=CMD_PROTO,
+                cmd_key=get_cmd_key_for_device(did),
+            )
+            sent += 1
+        except Exception as exc:
+            logger.warning("telegram cmd publish %s -> %s failed: %s", cmd, did, exc)
+    return sent, len(targets)
+
+
+def _telegram_cmd_handle_text(principal: Principal, text: str) -> str:
+    raw = (text or "").strip()
+    if not raw:
+        return "Empty command. Try: help"
+    if raw.startswith("/"):
+        raw = raw[1:]
+    raw = raw.split("@", 1)[0].strip()
+    lower = raw.lower()
+
+    if lower in ("start", "help", "h", "?"):
+        return (
+            "Commands:\n"
+            "- devices [N]\n"
+            "- log [N]\n"
+            "- siren on <all|device|id1,id2> [duration_ms]\n"
+            "- siren off <all|device|id1,id2>\n"
+            "- test <device_id>\n"
+            "- test all\n"
+            "- test many <id1,id2,...>\n"
+        )
+
+    if lower.startswith("devices"):
+        parts = lower.split()
+        n = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 10
+        return _telegram_cmd_recent_devices(principal, n)
+
+    if lower.startswith("log"):
+        parts = lower.split()
+        n = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 10
+        return _telegram_cmd_recent_logs(principal, n)
+
+    if lower.startswith("siren on"):
+        parts = raw.split()
+        target_token = "all" if len(parts) < 3 else parts[2]
+        duration_ms = 10000
+        if len(parts) >= 4 and parts[3].isdigit():
+            duration_ms = int(parts[3])
+        duration_ms = max(500, min(duration_ms, 120000))
+        ids = _telegram_parse_targets(target_token)
+        cap = "tg_siren_on"
+        sent, total = _telegram_cmd_publish(principal, "siren_on", {"duration_ms": duration_ms}, ids, cap)
+        emit_event(
+            level="warn",
+            category="alarm",
+            event_type="telegram.siren_on",
+            summary=f"telegram siren_on sent={sent}/{total}",
+            actor=f"telegram:{principal.username}",
+            owner_admin=None if principal.role == "superadmin" else (principal.username if principal.role == "admin" else get_manager_admin(principal.username)),
+            detail={"target": target_token, "duration_ms": duration_ms},
+        )
+        return f"siren_on done: sent={sent}/{total}, duration_ms={duration_ms}, target={target_token}"
+
+    if lower.startswith("siren off"):
+        parts = raw.split()
+        target_token = "all" if len(parts) < 3 else parts[2]
+        ids = _telegram_parse_targets(target_token)
+        cap = "tg_siren_off"
+        sent, total = _telegram_cmd_publish(principal, "siren_off", {}, ids, cap)
+        emit_event(
+            level="warn",
+            category="alarm",
+            event_type="telegram.siren_off",
+            summary=f"telegram siren_off sent={sent}/{total}",
+            actor=f"telegram:{principal.username}",
+            owner_admin=None if principal.role == "superadmin" else (principal.username if principal.role == "admin" else get_manager_admin(principal.username)),
+            detail={"target": target_token},
+        )
+        return f"siren_off done: sent={sent}/{total}, target={target_token}"
+
+    if lower in ("test all", "device all test", "devices all test"):
+        sent, total = _telegram_cmd_publish(principal, "self_test", {}, [], "tg_test_bulk")
+        return f"self_test(all) done: sent={sent}/{total}"
+
+    if lower.startswith("test many "):
+        ids = _telegram_parse_targets(raw[10:])
+        if not ids:
+            return "No device ids provided."
+        sent, total = _telegram_cmd_publish(principal, "self_test", {}, ids, "tg_test_bulk")
+        return f"self_test(many) done: sent={sent}/{total}"
+
+    if lower.startswith("test "):
+        did = raw.split(maxsplit=1)[1].strip() if len(raw.split(maxsplit=1)) > 1 else ""
+        if not did:
+            return "Usage: test <device_id>"
+        sent, total = _telegram_cmd_publish(principal, "self_test", {}, [did], "tg_test_single")
+        return f"self_test(single) done: sent={sent}/{total}"
+
+    return "Unknown command. Try: help"
+
+
+@app.post("/admin/telegram/bind-self")
+def telegram_bind_self(req: TelegramBindRequest, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "admin")
+    chat_id = req.chat_id.strip()
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO telegram_chat_bindings (chat_id, username, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                username=excluded.username,
+                enabled=excluded.enabled,
+                updated_at=excluded.updated_at
+            """,
+            (chat_id, principal.username, 1 if req.enabled else 0, utc_now_iso(), utc_now_iso()),
+        )
+        conn.commit()
+        conn.close()
+    audit_event(principal.username, "telegram.bind.self", chat_id, {"enabled": req.enabled})
+    return {"ok": True, "chat_id": chat_id, "username": principal.username, "enabled": bool(req.enabled)}
+
+
+@app.get("/admin/telegram/bindings")
+def telegram_bindings(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "admin")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        if principal.role == "superadmin":
+            cur.execute("SELECT chat_id, username, enabled, created_at, updated_at FROM telegram_chat_bindings ORDER BY updated_at DESC")
+        else:
+            cur.execute(
+                "SELECT chat_id, username, enabled, created_at, updated_at FROM telegram_chat_bindings WHERE username = ? ORDER BY updated_at DESC",
+                (principal.username,),
+            )
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+    return {"items": rows}
+
+
+@app.delete("/admin/telegram/bindings/{chat_id}")
+def telegram_unbind(chat_id: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "admin")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        if principal.role == "superadmin":
+            cur.execute("DELETE FROM telegram_chat_bindings WHERE chat_id = ?", (chat_id,))
+        else:
+            cur.execute("DELETE FROM telegram_chat_bindings WHERE chat_id = ? AND username = ?", (chat_id, principal.username))
+        deleted = cur.rowcount
+        conn.commit()
+        conn.close()
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail="binding not found")
+    audit_event(principal.username, "telegram.unbind", chat_id, {})
+    return {"ok": True}
+
+
+@app.post("/integrations/telegram/webhook")
+def telegram_webhook(
+    payload: dict[str, Any],
+    x_telegram_bot_api_secret_token: Optional[str] = Header(default=None, alias="X-Telegram-Bot-Api-Secret-Token"),
+) -> dict[str, Any]:
+    if TELEGRAM_COMMAND_SECRET and (x_telegram_bot_api_secret_token or "").strip() != TELEGRAM_COMMAND_SECRET:
+        return {"ok": True, "ignored": "bad_secret"}
+    msg = payload.get("message") or payload.get("channel_post") or {}
+    if not isinstance(msg, dict):
+        return {"ok": True, "ignored": "no_message"}
+    chat = msg.get("chat") or {}
+    chat_id = str(chat.get("id") or "").strip()
+    if not chat_id:
+        return {"ok": True, "ignored": "no_chat_id"}
+    if TELEGRAM_COMMAND_CHAT_IDS and chat_id not in TELEGRAM_COMMAND_CHAT_IDS:
+        return {"ok": True, "ignored": "chat_not_allowed"}
+    text = str(msg.get("text") or "").strip()
+    if not text:
+        return {"ok": True, "ignored": "no_text"}
+
+    # Allow unbound users to discover chat id for binding.
+    if text.strip().lower() in ("/start", "start", "/whoami", "whoami"):
+        _telegram_cmd_send_reply(chat_id, f"chat_id={chat_id}\nAsk admin to bind this chat.")
+        return {"ok": True, "processed": True, "bound": False}
+
+    try:
+        principal = _telegram_bound_principal(chat_id)
+        reply = _telegram_cmd_handle_text(principal, text)
+    except HTTPException as exc:
+        reply = f"Denied: {exc.detail}"
+    except Exception as exc:
+        logger.exception("telegram command failed")
+        reply = f"Error: {exc}"
+    ok, detail = _telegram_cmd_send_reply(chat_id, reply)
+    if not ok:
+        logger.warning("telegram webhook reply failed chat=%s: %s", chat_id, detail)
+    return {"ok": True, "processed": True}
 
 
 # =====================================================================

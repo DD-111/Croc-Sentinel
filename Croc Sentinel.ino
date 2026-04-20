@@ -2,6 +2,8 @@
 #include <NetworkClient.h>
 #if !defined(CONFIG_IDF_TARGET_ESP32P4)
 #include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
 #endif
 #include <ETH.h>
 #include <PubSubClient.h>
@@ -42,6 +44,7 @@ char topicBootstrapAssign[96];
 char mqttUser[48];
 char mqttPass[64];
 char cmdAuthKey[33];
+char accessorySn[40];
 char bootstrapClaimNonce[17];
 bool isProvisioned = false;
 unsigned long lastBootstrapRegisterAt = 0;
@@ -189,6 +192,162 @@ static bool g_wifiSoftReconnect(unsigned long dwellMs) {
     delay(50);
   }
   return WiFi.status() == WL_CONNECTED;
+}
+#endif
+
+#if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
+    !defined(CONFIG_IDF_TARGET_ESP32P4)
+static DNSServer g_provDns;
+static WebServer g_provHttp(80);
+static bool g_provActive = false;
+static bool g_provUnlocked = false;
+static char g_provAccessorySn[40] = {0};
+
+static bool isAccessorySnAllowedLocal(const String &snInput) {
+  String sn = snInput;
+  sn.trim();
+  if ((int)sn.length() < ACCESSORY_SN_MIN_LEN) return false;
+  const char *allow = ACCESSORY_SN_ALLOWLIST;
+  bool allowlistOk = false;
+  if (allow && strlen(allow) > 0) {
+    String list = String(allow);
+    int start = 0;
+    while (start <= list.length()) {
+      int comma = list.indexOf(',', start);
+      String token = (comma >= 0) ? list.substring(start, comma) : list.substring(start);
+      token.trim();
+      if (token.length() > 0 && token.equalsIgnoreCase(sn)) {
+        allowlistOk = true;
+        break;
+      }
+      if (comma < 0) break;
+      start = comma + 1;
+    }
+  } else {
+    allowlistOk = true;
+  }
+#if ACCESSORY_SN_REQUIRE_MATCH_DEVICE_SERIAL
+  Preferences p;
+  if (!p.begin(NVS_NAMESPACE, true)) return false;
+  String serial = p.getString("serial", "");
+  p.end();
+  if (!serial.length()) return false;
+  if (!serial.equalsIgnoreCase(sn)) return false;
+#endif
+  return allowlistOk;
+}
+
+static String provEsc(const String &s) {
+  String o;
+  o.reserve(s.length() + 16);
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '&') o += F("&amp;");
+    else if (c == '<') o += F("&lt;");
+    else if (c == '>') o += F("&gt;");
+    else if (c == '"') o += F("&quot;");
+    else o += c;
+  }
+  return o;
+}
+
+static String provPageGate(const String &msg) {
+  String html = F("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+                  "<title>Croc Setup</title></head><body style='font-family:Arial;padding:20px;max-width:560px;margin:auto'>"
+                  "<h2>Accessory SN verification</h2><p>Enter accessory SN to unlock Wi-Fi setup.</p>");
+  if (msg.length()) {
+    html += F("<p style='color:#b00020'>");
+    html += provEsc(msg);
+    html += F("</p>");
+  }
+  html += F("<form method='post' action='/unlock'>"
+            "<label>Accessory SN<br><input name='acc_sn' required maxlength='39' style='width:100%;padding:10px;margin-top:6px'></label>"
+            "<button style='margin-top:12px;padding:10px 14px'>Verify</button></form>"
+            "</body></html>");
+  return html;
+}
+
+static String provPageWifi(const String &msg) {
+  String html = F("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+                  "<title>Croc Wi-Fi Setup</title></head><body style='font-family:Arial;padding:20px;max-width:560px;margin:auto'>"
+                  "<h2>Wi-Fi setup</h2><p>Accessory verified. Enter target Wi-Fi credentials.</p>");
+  if (msg.length()) {
+    html += F("<p style='color:#0b7a58'>");
+    html += provEsc(msg);
+    html += F("</p>");
+  }
+  html += F("<form method='post' action='/save'>"
+            "<label>SSID<br><input name='ssid' required maxlength='32' style='width:100%;padding:10px;margin-top:6px'></label><br><br>"
+            "<label>Password<br><input name='password' maxlength='64' style='width:100%;padding:10px;margin-top:6px'></label><br>"
+            "<button style='margin-top:12px;padding:10px 14px'>Save and reboot</button></form>"
+            "</body></html>");
+  return html;
+}
+
+static void provisioningPortalStop() {
+  if (!g_provActive) return;
+  g_provHttp.stop();
+  g_provDns.stop();
+  WiFi.softAPdisconnect(true);
+  g_provActive = false;
+  g_provUnlocked = false;
+  memset(g_provAccessorySn, 0, sizeof(g_provAccessorySn));
+}
+
+static void provisioningPortalStart() {
+  if (!WIFI_PROVISION_PORTAL_ENABLED || g_provActive) return;
+  char apName[40];
+  snprintf(apName, sizeof(apName), "%s-%c%c%c%c",
+           WIFI_PROVISION_AP_PREFIX,
+           deviceMacNoColon[8], deviceMacNoColon[9], deviceMacNoColon[10], deviceMacNoColon[11]);
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(apName);
+  g_provDns.start(53, "*", WiFi.softAPIP());
+  g_provHttp.on("/", HTTP_GET, []() {
+    if (!g_provUnlocked) g_provHttp.send(200, "text/html", provPageGate(""));
+    else g_provHttp.send(200, "text/html", provPageWifi(""));
+  });
+  g_provHttp.on("/unlock", HTTP_POST, []() {
+    String sn = g_provHttp.arg("acc_sn");
+    if (!isAccessorySnAllowedLocal(sn)) {
+      g_provHttp.send(403, "text/html", provPageGate("Accessory SN verification failed."));
+      return;
+    }
+    g_provUnlocked = true;
+    strlcpy(g_provAccessorySn, sn.c_str(), sizeof(g_provAccessorySn));
+    g_provHttp.send(200, "text/html", provPageWifi("Verified."));
+  });
+  g_provHttp.on("/save", HTTP_POST, []() {
+    if (!g_provUnlocked) {
+      g_provHttp.send(403, "text/html", provPageGate("Accessory SN verification required."));
+      return;
+    }
+    String ssid = g_provHttp.arg("ssid");
+    String pass = g_provHttp.arg("password");
+    ssid.trim();
+    if (ssid.length() == 0 || ssid.length() > 32 || pass.length() > 64) {
+      g_provHttp.send(400, "text/html", provPageWifi("Invalid SSID or password length."));
+      return;
+    }
+    Preferences p;
+    p.begin(NVS_NAMESPACE, false);
+    p.putString("wifi_sta_ssid", ssid);
+    p.putString("wifi_sta_pass", pass);
+    if (strlen(g_provAccessorySn) > 0) p.putString("acc_sn", g_provAccessorySn);
+    p.end();
+    g_provHttp.send(200, "text/html", "<html><body style='font-family:Arial;padding:20px'><h3>Saved</h3><p>Device will reboot and connect to Wi-Fi.</p></body></html>");
+    delay(500);
+    ESP.restart();
+  });
+  g_provHttp.begin();
+  g_provActive = true;
+  logLine(String("[wifi] provisioning portal started ap=") + apName);
+}
+
+static void provisioningPortalLoop() {
+  if (!g_provActive) return;
+  g_provDns.processNextRequest();
+  g_provHttp.handleClient();
 }
 #endif
 
@@ -611,6 +770,7 @@ void loadProvisioningRuntime() {
   String user = prefs.getString("mqtt_u", "");
   String pass = prefs.getString("mqtt_p", "");
   String key = prefs.getString("cmd_key", "");
+  String acc = prefs.getString("acc_sn", "");
   prefs.end();
 
   if (isProvisioned && user.length() > 0 && pass.length() > 0) {
@@ -625,6 +785,11 @@ void loadProvisioningRuntime() {
     strlcpy(cmdAuthKey, key.c_str(), sizeof(cmdAuthKey));
   } else {
     strlcpy(cmdAuthKey, CMD_AUTH_KEY, sizeof(cmdAuthKey));
+  }
+  if (acc.length() > 0 && acc.length() < sizeof(accessorySn)) {
+    strlcpy(accessorySn, acc.c_str(), sizeof(accessorySn));
+  } else {
+    accessorySn[0] = '\0';
   }
 }
 
@@ -675,6 +840,8 @@ void publishBootstrapRegister() {
   doc["chip_target"] = chipTargetName();
   doc["board_profile"] = BOARD_PROFILE_NAME;
   doc["claim_nonce"] = bootstrapClaimNonce;
+  if (strlen(accessorySn) > 0) doc["accessory_sn"] = accessorySn;
+  doc["accessory_sn_local_verified"] = (strlen(accessorySn) > 0);
   doc["ts"] = tsNow();
 
   char buf[384];
@@ -1744,6 +1911,13 @@ void ensureWiFi() {
     logLine(_n2);
   } else {
     wifiBackoffMs = min(wifiBackoffMs * 2UL, (unsigned long)RECONNECT_MAX_MS);
+#if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
+    !defined(CONFIG_IDF_TARGET_ESP32P4)
+    // Fallback: if STA reconnect keeps failing for ~60s, open captive setup.
+    if (!g_provActive && (millis() - bootAtMs) > 60000UL) {
+      provisioningPortalStart();
+    }
+#endif
   }
 }
 
@@ -1995,6 +2169,10 @@ void setup() {
     logLine(line);
     snprintf(line, sizeof(line), "[boot] mqtt_user=%s qr=%s", mqttUser, deviceQrCode);
     logLine(line);
+    if (strlen(accessorySn) > 0) {
+      snprintf(line, sizeof(line), "[boot] accessory_sn=%s", accessorySn);
+      logLine(line);
+    }
   }
 
   securityConfigValid = validateProductionSecurityConfig();
@@ -2016,7 +2194,7 @@ void setup() {
   g_wifiMultiRegisterAps();
   if (g_wifiMultiApCount == 0) {
     logLine("[net] no STA credentials: compile-time WIFI_* empty and NVS wifi_sta_ssid empty.");
-    logLine("[net] use Dashboard wifi_config (device online once) or set WIFI_SSID in config.h");
+    provisioningPortalStart();
   } else {
     unsigned long waitStart = millis();
     while (!netIf->connected() && millis() - waitStart < WIFI_CONNECT_WAIT_MS) {
@@ -2056,6 +2234,16 @@ void loop() {
   twdtFeedMaybe();
 
   unsigned long now = millis();
+
+#if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
+    !defined(CONFIG_IDF_TARGET_ESP32P4)
+  if (g_provActive) {
+    provisioningPortalLoop();
+    digitalWrite(STATUS_LED_GPIO, ((now / 400) & 1) ? HIGH : LOW);
+    delay(5);
+    return;
+  }
+#endif
 
   // Run MQTT before Wi-Fi may block for seconds; avoids broker keepalive
   // timeouts while STA is re-associating.
