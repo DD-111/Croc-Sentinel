@@ -119,6 +119,8 @@ TELEGRAM_COMMAND_SECRET = os.getenv("TELEGRAM_COMMAND_SECRET", "").strip()
 TELEGRAM_COMMAND_CHAT_IDS_RAW = os.getenv("TELEGRAM_COMMAND_CHAT_IDS", "").strip()
 TELEGRAM_COMMAND_MAX_LOG = int(os.getenv("TELEGRAM_COMMAND_MAX_LOG", "20"))
 TELEGRAM_COMMAND_MAX_DEVICES = int(os.getenv("TELEGRAM_COMMAND_MAX_DEVICES", "30"))
+TELEGRAM_BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "").strip().lstrip("@")
+TELEGRAM_LINK_TOKEN_TTL_SECONDS = int(os.getenv("TELEGRAM_LINK_TOKEN_TTL_SECONDS", "900"))
 
 # --- Presence probe (replaces firmware-side periodic heartbeat) ---
 # Devices in EVENT mode only publish heartbeats on state change. If we haven't
@@ -521,6 +523,18 @@ def init_db() -> None:
             """
         )
         cur.execute("CREATE INDEX IF NOT EXISTS ix_tg_bindings_user ON telegram_chat_bindings(username)")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS telegram_link_tokens (
+                token TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                expires_at_ts INTEGER NOT NULL,
+                used_at TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_tg_link_tokens_user ON telegram_link_tokens(username)")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS device_ownership (
@@ -4629,6 +4643,48 @@ def list_device_shares(device_id: str, principal: Principal = Depends(require_pr
     return {"items": rows}
 
 
+@app.get("/admin/shares")
+def list_all_shares(
+    principal: Principal = Depends(require_principal),
+    device_id: Optional[str] = Query(default=None, min_length=2, max_length=128),
+    grantee_username: Optional[str] = Query(default=None, min_length=2, max_length=64),
+    include_revoked: bool = Query(default=False),
+    limit: int = Query(default=500, ge=1, le=2000),
+) -> dict[str, Any]:
+    assert_min_role(principal, "superadmin")
+    clauses = ["1=1"]
+    args: list[Any] = []
+    if device_id:
+        clauses.append("a.device_id = ?")
+        args.append(device_id.strip())
+    if grantee_username:
+        clauses.append("a.grantee_username = ?")
+        args.append(grantee_username.strip())
+    if not include_revoked:
+        clauses.append("a.revoked_at IS NULL")
+    where = " AND ".join(clauses)
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT a.device_id, a.grantee_username, u.role AS grantee_role,
+                   a.can_view, a.can_operate, a.granted_by, a.granted_at, a.revoked_at,
+                   o.owner_admin
+            FROM device_acl a
+            LEFT JOIN dashboard_users u ON u.username = a.grantee_username
+            LEFT JOIN device_ownership o ON o.device_id = a.device_id
+            WHERE {where}
+            ORDER BY a.revoked_at IS NOT NULL ASC, a.granted_at DESC
+            LIMIT ?
+            """,
+            tuple(args + [limit]),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+    return {"items": rows, "count": len(rows)}
+
+
 @app.post("/admin/devices/{device_id}/share")
 def share_device(
     device_id: str,
@@ -6092,12 +6148,36 @@ class TelegramBindRequest(BaseModel):
     enabled: bool = True
 
 
+class TelegramLinkTokenRequest(BaseModel):
+    enabled_on_bind: bool = True
+
+
 def _telegram_cmd_send_reply(chat_id: str, text: str) -> tuple[bool, str]:
     try:
         from telegram_notify import send_telegram_chat_text
     except Exception as exc:
         return False, f"telegram module unavailable: {exc}"
     return send_telegram_chat_text(chat_id, text)
+
+
+def _telegram_bind_chat(chat_id: str, username: str, enabled: bool) -> None:
+    now = utc_now_iso()
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO telegram_chat_bindings (chat_id, username, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                username=excluded.username,
+                enabled=excluded.enabled,
+                updated_at=excluded.updated_at
+            """,
+            (chat_id, username, 1 if enabled else 0, now, now),
+        )
+        conn.commit()
+        conn.close()
 
 
 def _telegram_policy_allow(principal: Principal, capability: str) -> bool:
@@ -6340,33 +6420,53 @@ def _telegram_cmd_handle_text(principal: Principal, text: str) -> str:
     return "Unknown command. Try: help"
 
 
-@app.post("/admin/telegram/bind-self")
-def telegram_bind_self(req: TelegramBindRequest, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_min_role(principal, "admin")
-    chat_id = req.chat_id.strip()
+@app.post("/telegram/link-token")
+def telegram_link_token(
+    req: TelegramLinkTokenRequest,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    assert_min_role(principal, "user")
+    token = secrets.token_urlsafe(24)
+    expires_at_ts = int(time.time()) + max(60, TELEGRAM_LINK_TOKEN_TTL_SECONDS)
+    now = utc_now_iso()
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
         cur.execute(
             """
-            INSERT INTO telegram_chat_bindings (chat_id, username, enabled, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(chat_id) DO UPDATE SET
-                username=excluded.username,
-                enabled=excluded.enabled,
-                updated_at=excluded.updated_at
+            INSERT INTO telegram_link_tokens (token, username, expires_at_ts, used_at, created_at)
+            VALUES (?, ?, ?, NULL, ?)
             """,
-            (chat_id, principal.username, 1 if req.enabled else 0, utc_now_iso(), utc_now_iso()),
+            (token, principal.username, expires_at_ts, now),
         )
         conn.commit()
         conn.close()
+    payload = f"bind_{token}"
+    deep_link = ""
+    if TELEGRAM_BOT_USERNAME:
+        deep_link = f"https://t.me/{TELEGRAM_BOT_USERNAME}?start={payload}"
+    return {
+        "ok": True,
+        "token": token,
+        "start_payload": payload,
+        "deep_link": deep_link,
+        "expires_at_ts": expires_at_ts,
+        "enabled_on_bind": bool(req.enabled_on_bind),
+    }
+
+
+@app.post("/admin/telegram/bind-self")
+def telegram_bind_self(req: TelegramBindRequest, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "user")
+    chat_id = req.chat_id.strip()
+    _telegram_bind_chat(chat_id, principal.username, bool(req.enabled))
     audit_event(principal.username, "telegram.bind.self", chat_id, {"enabled": req.enabled})
     return {"ok": True, "chat_id": chat_id, "username": principal.username, "enabled": bool(req.enabled)}
 
 
 @app.get("/admin/telegram/bindings")
 def telegram_bindings(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_min_role(principal, "admin")
+    assert_min_role(principal, "user")
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -6384,7 +6484,7 @@ def telegram_bindings(principal: Principal = Depends(require_principal)) -> dict
 
 @app.delete("/admin/telegram/bindings/{chat_id}")
 def telegram_unbind(chat_id: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_min_role(principal, "admin")
+    assert_min_role(principal, "user")
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -6401,6 +6501,35 @@ def telegram_unbind(chat_id: str, principal: Principal = Depends(require_princip
     return {"ok": True}
 
 
+@app.patch("/admin/telegram/bindings/{chat_id}/enabled")
+def telegram_binding_set_enabled(
+    chat_id: str,
+    enabled: bool = Query(...),
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    assert_min_role(principal, "user")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        if principal.role == "superadmin":
+            cur.execute(
+                "UPDATE telegram_chat_bindings SET enabled=?, updated_at=? WHERE chat_id=?",
+                (1 if enabled else 0, utc_now_iso(), chat_id),
+            )
+        else:
+            cur.execute(
+                "UPDATE telegram_chat_bindings SET enabled=?, updated_at=? WHERE chat_id=? AND username=?",
+                (1 if enabled else 0, utc_now_iso(), chat_id, principal.username),
+            )
+        n = cur.rowcount
+        conn.commit()
+        conn.close()
+    if n == 0:
+        raise HTTPException(status_code=404, detail="binding not found")
+    audit_event(principal.username, "telegram.bind.enabled", chat_id, {"enabled": bool(enabled)})
+    return {"ok": True, "chat_id": chat_id, "enabled": bool(enabled)}
+
+
 @app.post("/integrations/telegram/webhook")
 def telegram_webhook(
     payload: dict[str, Any],
@@ -6415,16 +6544,53 @@ def telegram_webhook(
     chat_id = str(chat.get("id") or "").strip()
     if not chat_id:
         return {"ok": True, "ignored": "no_chat_id"}
-    if TELEGRAM_COMMAND_CHAT_IDS and chat_id not in TELEGRAM_COMMAND_CHAT_IDS:
-        return {"ok": True, "ignored": "chat_not_allowed"}
     text = str(msg.get("text") or "").strip()
     if not text:
         return {"ok": True, "ignored": "no_text"}
 
-    # Allow unbound users to discover chat id for binding.
-    if text.strip().lower() in ("/start", "start", "/whoami", "whoami"):
-        _telegram_cmd_send_reply(chat_id, f"chat_id={chat_id}\nAsk admin to bind this chat.")
+    # Allow everyone to discover chat_id and perform one-time deep-link bind.
+    if text.strip().lower().startswith("/start") or text.strip().lower() in ("start", "/whoami", "whoami"):
+        parts = text.strip().split(maxsplit=1)
+        payload = parts[1].strip() if len(parts) > 1 else ""
+        if payload.startswith("bind_"):
+            token = payload[len("bind_"):].strip()
+            with db_lock:
+                conn = get_conn()
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT token, username, expires_at_ts, used_at
+                    FROM telegram_link_tokens
+                    WHERE token = ?
+                    """,
+                    (token,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    conn.close()
+                    _telegram_cmd_send_reply(chat_id, "Invalid link token. Generate a new one from dashboard.")
+                    return {"ok": True, "processed": True, "bound": False, "reason": "bad_token"}
+                if row["used_at"]:
+                    conn.close()
+                    _telegram_cmd_send_reply(chat_id, "This link token is already used.")
+                    return {"ok": True, "processed": True, "bound": False, "reason": "used_token"}
+                if int(row["expires_at_ts"]) < int(time.time()):
+                    conn.close()
+                    _telegram_cmd_send_reply(chat_id, "Link token expired. Generate a new one from dashboard.")
+                    return {"ok": True, "processed": True, "bound": False, "reason": "expired_token"}
+                username = str(row["username"])
+                cur.execute("UPDATE telegram_link_tokens SET used_at = ? WHERE token = ?", (utc_now_iso(), token))
+                conn.commit()
+                conn.close()
+            _telegram_bind_chat(chat_id, username, True)
+            _telegram_cmd_send_reply(chat_id, f"Bound OK: {username}\nYou can now use bot commands.")
+            return {"ok": True, "processed": True, "bound": True, "username": username}
+        _telegram_cmd_send_reply(chat_id, f"chat_id={chat_id}\nBind this in dashboard Telegram settings.")
         return {"ok": True, "processed": True, "bound": False}
+
+    # Command allowlist applies to command execution (not /start binding flow).
+    if TELEGRAM_COMMAND_CHAT_IDS and chat_id not in TELEGRAM_COMMAND_CHAT_IDS:
+        return {"ok": True, "ignored": "chat_not_allowed"}
 
     try:
         principal = _telegram_bound_principal(chat_id)

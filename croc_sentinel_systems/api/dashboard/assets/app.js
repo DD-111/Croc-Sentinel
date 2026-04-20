@@ -43,6 +43,7 @@
     {
       title: "Governance",
       items: [
+        { id: "telegram", label: "Telegram", ico: "✆", path: "#/telegram", min: "user" },
         { id: "audit", label: "Audit", ico: "≡", path: "#/audit", min: "admin" },
         { id: "admin", label: "Admin & users", ico: "☼", path: "#/admin", min: "admin" },
       ],
@@ -57,6 +58,7 @@
     mqttConnected: false,
     health: null,
     overviewCache: null,
+    routeSeq: 0,
   };
 
   /** Route redirect timer (signup / activate → login); cleared on navigation. */
@@ -349,6 +351,7 @@
   const routes = {};
 
   function registerRoute(id, handler) { routes[id] = handler; }
+  function isRouteCurrent(seq) { return seq === state.routeSeq; }
 
   async function renderRoute() {
     const view = $("#view");
@@ -366,6 +369,7 @@
     const [_, rawId, ...rest] = hashFull.split("/");
     const id = rawId || "overview";
     const args = rest;
+    const routeSeq = ++state.routeSeq;
 
     clearRouteRedirectTimer();
     if (overviewFilterDebounce) {
@@ -403,7 +407,7 @@
         </div>
       </div>`;
       const swap = async () => {
-        await handler(view, args);
+        await handler(view, args, routeSeq);
       };
       // Do not wrap `swap()` in `document.startViewTransition`: handlers often await
       // network I/O before finishing; the View Transition API then hits a DOM-update
@@ -1429,7 +1433,7 @@
   // Event Center — global live + historical log stream
   // NOTE: SSE isn't automatically torn down on route change, so we stash the
   // active EventSource on window so leaving the page closes it.
-  registerRoute("events", async (view) => {
+  registerRoute("events", async (view, _args, routeSeq) => {
     setCrumb("Events");
     const me = state.me || { username: "", role: "" };
     const isSuper = me.role === "superadmin";
@@ -1558,8 +1562,10 @@
 
     async function loadHistory() {
       try {
+        if (!isRouteCurrent(routeSeq)) return;
         const p = currentFilters(); p.set("limit", "200");
         const r = await api("/events?" + p.toString(), { timeoutMs: 8000 });
+        if (!isRouteCurrent(routeSeq)) return;
         buffer = (r.items || []).slice();
         if (window.__pendingEvListRaf) {
           cancelAnimationFrame(window.__pendingEvListRaf);
@@ -1567,6 +1573,7 @@
         }
         flushEvRender();
       } catch (e) {
+        if (!isRouteCurrent(routeSeq)) return;
         const listEl = document.getElementById("evList");
         if (listEl) listEl.innerHTML = `<p class="badge offline">${escapeHtml(e.message || e)}</p>`;
         toast(e.message || e, "err");
@@ -1575,9 +1582,11 @@
 
     function closeStream() {
       if (window.__evSSE) { try { window.__evSSE.close(); } catch {} window.__evSSE = null; }
-      $("#evLive").textContent = "Offline"; $("#evLive").className = "badge offline";
+      const live = $("#evLive");
+      if (live) { live.textContent = "Offline"; live.className = "badge offline"; }
     }
     function openStream() {
+      if (!isRouteCurrent(routeSeq)) return;
       closeStream();
       const p = currentFilters();
       p.set("token", getToken());
@@ -1585,11 +1594,20 @@
       const url = apiBase() + "/events/stream?" + p.toString();
       const es = new EventSource(url);
       window.__evSSE = es;
-      es.onopen = () => { $("#evLive").textContent = "Live"; $("#evLive").className = "badge online"; };
+      es.onopen = () => {
+        if (!isRouteCurrent(routeSeq)) return;
+        const live = $("#evLive");
+        if (live) { live.textContent = "Live"; live.className = "badge online"; }
+      };
       es.onerror = () => {
-        $("#evLive").textContent = "Reconnecting…"; $("#evLive").className = "badge offline";
+        if (!isRouteCurrent(routeSeq)) return;
+        const live = $("#evLive");
+        if (!live) return;
+        live.textContent = es.readyState === EventSource.CONNECTING ? "Reconnecting…" : "Offline";
+        live.className = "badge offline";
       };
       es.onmessage = (m) => {
+        if (!isRouteCurrent(routeSeq)) return;
         try {
           const ev = JSON.parse(m.data);
           if (ev.event_type === "stream.hello") return;
@@ -1614,14 +1632,18 @@
     $("#evReload").addEventListener("click", loadHistory);
     $("#evStats").addEventListener("click", async () => {
       try {
+        if (!isRouteCurrent(routeSeq)) return;
         const r = await api("/events/stats/by-device?hours=168&limit=200", { timeoutMs: 8000 });
         const items = r.items || [];
-        $("#evStatsBox").style.display = "block";
+        const evStatsBoxEl = $("#evStatsBox", view);
+        const evStatsInnerEl = $("#evStatsInner", view);
+        if (!evStatsBoxEl || !evStatsInnerEl || !isRouteCurrent(routeSeq)) return;
+        evStatsBoxEl.style.display = "block";
         if (items.length === 0) {
-          $("#evStatsInner").innerHTML = "<p class='muted'>No rows with device_id.</p>";
+          evStatsInnerEl.innerHTML = "<p class='muted'>No rows with device_id.</p>";
           return;
         }
-        $("#evStatsInner").innerHTML = `<div class="table-wrap"><table class="t"><thead><tr><th>Device</th><th>Count</th></tr></thead><tbody>${
+        evStatsInnerEl.innerHTML = `<div class="table-wrap"><table class="t"><thead><tr><th>Device</th><th>Count</th></tr></thead><tbody>${
           items.map((x) => `<tr><td class="mono">${escapeHtml(x.device_id)}</td><td>${x.count}</td></tr>`).join("")
         }</tbody></table></div>`;
       } catch (e) { toast(e.message || e, "err"); }
@@ -1650,8 +1672,112 @@
     openStream();
     window.__eventsStreamResume = () => {
       if (paused) return;
+      if (!isRouteCurrent(routeSeq)) return;
       openStream();
     };
+  });
+
+  // Telegram self-service (user/admin/superadmin)
+  registerRoute("telegram", async (view) => {
+    setCrumb("Telegram");
+    if (!hasRole("user")) { view.innerHTML = `<div class="card"><p class="muted">Sign in required.</p></div>`; return; }
+    view.innerHTML = `
+      <div class="card">
+        <h2>Telegram connect</h2>
+        <p class="muted">No password in Telegram. Click <strong>Generate connect link</strong>, open it, then send <span class="mono">/start</span> in Telegram to bind instantly.</p>
+        <div class="row" style="gap:8px;flex-wrap:wrap">
+          <button class="btn" id="tgGenLink">Generate connect link</button>
+          <button class="btn secondary" id="tgReloadMine">Refresh my bindings</button>
+        </div>
+        <div id="tgLinkBox" style="margin-top:10px"></div>
+      </div>
+      <div class="card">
+        <h3 style="margin-top:0">My chat bindings</h3>
+        <div id="tgMineList"></div>
+      </div>
+      <div class="card">
+        <h3 style="margin-top:0">Manual bind (fallback)</h3>
+        <p class="muted">If deep link fails: send <span class="mono">/start</span> to bot, copy <span class="mono">chat_id</span>, then bind manually.</p>
+        <div class="inline-form">
+          <label class="field"><span>chat_id</span><input id="tgManualChatId" placeholder="e.g. 2082431201 or -100xxxx" /></label>
+          <label class="field"><span>Enabled</span><input id="tgManualEnabled" type="checkbox" checked /></label>
+          <div class="row wide" style="justify-content:flex-end"><button class="btn" id="tgManualBind">Bind manually</button></div>
+        </div>
+      </div>
+    `;
+    const mineEl = $("#tgMineList", view);
+    const linkEl = $("#tgLinkBox", view);
+    const loadMine = async () => {
+      if (!mineEl) return;
+      mineEl.innerHTML = `<p class="muted">Loading…</p>`;
+      try {
+        const d = await api("/admin/telegram/bindings", { timeoutMs: 8000 });
+        const items = d.items || [];
+        mineEl.innerHTML = items.length === 0
+          ? `<p class="muted">No bindings yet.</p>`
+          : `<div class="table-wrap"><table class="t">
+              <thead><tr><th>chat_id</th><th>enabled</th><th>updated</th><th></th><th></th></tr></thead>
+              <tbody>${items.map((it) => `
+                <tr>
+                  <td class="mono">${escapeHtml(it.chat_id || "")}</td>
+                  <td>${it.enabled ? `<span class="badge online">on</span>` : `<span class="badge offline">off</span>`}</td>
+                  <td>${escapeHtml(fmtTs(it.updated_at || it.created_at))}</td>
+                  <td><button class="btn sm secondary js-tg-toggle" data-chat="${escapeHtml(String(it.chat_id || ""))}" data-en="${it.enabled ? "1" : "0"}">${it.enabled ? "Disable" : "Enable"}</button></td>
+                  <td><button class="btn sm danger js-tg-unbind" data-chat="${escapeHtml(String(it.chat_id || ""))}">Unbind</button></td>
+                </tr>`).join("")}</tbody>
+            </table></div>`;
+      } catch (e) {
+        mineEl.innerHTML = `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`;
+      }
+    };
+    $("#tgGenLink", view).addEventListener("click", async () => {
+      if (!linkEl) return;
+      try {
+        const r = await api("/telegram/link-token", { method: "POST", body: { enabled_on_bind: true } });
+        const deep = r.deep_link || "";
+        linkEl.innerHTML = deep
+          ? `<p><a class="btn" href="${escapeHtml(deep)}" target="_blank" rel="noopener">Open Telegram connect link</a></p><p class="muted mono">${escapeHtml(deep)}</p>`
+          : `<p class="muted">Set <span class="mono">TELEGRAM_BOT_USERNAME</span> on server, then retry. Payload: <span class="mono">${escapeHtml(r.start_payload || "")}</span></p>`;
+      } catch (e) {
+        linkEl.innerHTML = `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`;
+      }
+    });
+    $("#tgManualBind", view).addEventListener("click", async () => {
+      const chatId = ($("#tgManualChatId", view).value || "").trim();
+      const enabled = !!$("#tgManualEnabled", view).checked;
+      if (!chatId) { toast("Enter chat_id", "err"); return; }
+      try {
+        await api("/admin/telegram/bind-self", { method: "POST", body: { chat_id: chatId, enabled } });
+        toast("Bound", "ok");
+        loadMine();
+      } catch (e) { toast(e.message || e, "err"); }
+    });
+    $("#tgReloadMine", view).addEventListener("click", loadMine);
+    mineEl.addEventListener("click", async (ev) => {
+      const tgl = ev.target.closest(".js-tg-toggle");
+      if (tgl) {
+        const chat = tgl.dataset.chat || "";
+        const enabled = !(tgl.dataset.en === "1");
+        try {
+          await api(`/admin/telegram/bindings/${encodeURIComponent(chat)}/enabled?enabled=${enabled ? "true" : "false"}`, { method: "PATCH" });
+          toast(enabled ? "Enabled" : "Disabled", "ok");
+          loadMine();
+        } catch (e) { toast(e.message || e, "err"); }
+        return;
+      }
+      const del = ev.target.closest(".js-tg-unbind");
+      if (del) {
+        const chat = del.dataset.chat || "";
+        if (!chat) return;
+        if (!confirm(`Unbind chat ${chat}?`)) return;
+        try {
+          await api(`/admin/telegram/bindings/${encodeURIComponent(chat)}`, { method: "DELETE" });
+          toast("Unbound", "ok");
+          loadMine();
+        } catch (e) { toast(e.message || e, "err"); }
+      }
+    });
+    loadMine();
   });
 
   // Audit
@@ -1680,7 +1806,9 @@
       try {
         const d = await api("/audit?" + qs.toString());
         const items = d.items || [];
-        $("#auditList").innerHTML = items.length === 0
+        const auditListEl = $("#auditList", view);
+        if (!auditListEl) return;
+        auditListEl.innerHTML = items.length === 0
           ? `<p class="muted">No rows.</p>`
           : `<div class="table-wrap"><table class="t">
               <thead><tr><th>Time</th><th>actor</th><th>action</th><th>target</th><th>detail</th></tr></thead>
@@ -1722,6 +1850,23 @@
         <div class="divider"></div>
         <div id="userTable"></div>
       </div>
+
+      ${isSuper ? `<div class="card">
+        <h3>Global sharing</h3>
+        <p class="muted">Search all share grants, create/update a grant, or revoke directly.</p>
+        <div class="inline-form">
+          <label class="field"><span>Device ID</span><input id="gs_device" placeholder="SN-..." /></label>
+          <label class="field"><span>Grantee</span><input id="gs_user" placeholder="admin_x / user_x" /></label>
+          <label class="field"><span>View</span><input id="gs_view" type="checkbox" checked /></label>
+          <label class="field"><span>Operate</span><input id="gs_operate" type="checkbox" /></label>
+          <div class="row wide" style="justify-content:flex-end;gap:8px;flex-wrap:wrap">
+            <button class="btn btn-tap" id="gs_grant" type="button">Grant / Update</button>
+            <button class="btn secondary btn-tap" id="gs_query" type="button">Query</button>
+            <label class="field" style="margin:0"><span>Include revoked</span><input id="gs_inc_rev" type="checkbox" /></label>
+          </div>
+        </div>
+        <div id="gsList" style="margin-top:10px"></div>
+      </div>` : ""}
 
       <div class="card" id="createPanel" style="display:none">
         <h3>New user</h3>
@@ -1779,6 +1924,18 @@
         <div class="row" style="margin-top:10px">
           <button class="btn secondary" id="tgTest" type="button">Send test to all chats</button>
         </div>
+        <div class="divider"></div>
+        <h4 style="margin:0 0 8px">Command chat binding</h4>
+        <p class="muted" style="margin:0 0 8px">User sends <span class="mono">/start</span> to bot, copies <span class="mono">chat_id</span>, then binds here. No password in Telegram.</p>
+        <div class="inline-form">
+          <label class="field"><span>chat_id</span><input id="tgBindChatId" placeholder="e.g. 2082431201 or -100xxxx" /></label>
+          <label class="field"><span>Enabled</span><input id="tgBindEnabled" type="checkbox" checked /></label>
+          <div class="row wide" style="justify-content:flex-end">
+            <button class="btn" id="tgBindSelf" type="button">Bind this chat</button>
+            <button class="btn secondary" id="tgReloadBindings" type="button">Refresh bindings</button>
+          </div>
+        </div>
+        <div id="tgBindings" style="margin-top:10px"></div>
       </div>
 
       ${isSuper ? `<div class="card">
@@ -1829,6 +1986,42 @@
       }
     };
 
+    const loadGlobalShares = async () => {
+      if (!isSuper) return;
+      const listEl = $v("#gsList");
+      if (!listEl) return;
+      const qs = new URLSearchParams();
+      const device = ($v("#gs_device").value || "").trim();
+      const user = ($v("#gs_user").value || "").trim();
+      if (device) qs.set("device_id", device);
+      if (user) qs.set("grantee_username", user);
+      if ($v("#gs_inc_rev") && $v("#gs_inc_rev").checked) qs.set("include_revoked", "true");
+      qs.set("limit", "500");
+      listEl.innerHTML = `<p class="muted">Loading shares…</p>`;
+      try {
+        const d = await api("/admin/shares?" + qs.toString(), { timeoutMs: 8000 });
+        const items = d.items || [];
+        listEl.innerHTML = items.length === 0
+          ? `<p class="muted">No matching shares.</p>`
+          : `<div class="table-wrap"><table class="t">
+              <thead><tr><th>Device</th><th>Owner</th><th>Grantee</th><th>Role</th><th>View</th><th>Operate</th><th>Granted by</th><th>Status</th><th></th></tr></thead>
+              <tbody>${items.map((it) => `
+                <tr>
+                  <td class="mono">${escapeHtml(it.device_id || "")}</td>
+                  <td class="mono">${escapeHtml(it.owner_admin || "—")}</td>
+                  <td class="mono">${escapeHtml(it.grantee_username || "")}</td>
+                  <td>${escapeHtml(it.grantee_role || "—")}</td>
+                  <td>${it.can_view ? "yes" : "no"}</td>
+                  <td>${it.can_operate ? "yes" : "no"}</td>
+                  <td class="mono">${escapeHtml(it.granted_by || "")}</td>
+                  <td>${it.revoked_at ? `<span class="badge offline">revoked</span>` : `<span class="badge online">active</span>`}</td>
+                  <td>${it.revoked_at ? "" : `<button class="btn sm danger js-gs-revoke" data-device="${escapeHtml(it.device_id || "")}" data-user="${escapeHtml(it.grantee_username || "")}">Revoke</button>`}</td>
+                </tr>`).join("")}</tbody></table></div>`;
+      } catch (e) {
+        listEl.innerHTML = `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`;
+      }
+    };
+
     $v("#reloadUsers").addEventListener("click", loadUsers);
     $v("#showCreate").addEventListener("click", () => {
       $v("#createPanel").style.display = "";
@@ -1856,6 +2049,40 @@
         loadUsers();
       } catch (e) { toast(e.message || e, "err"); }
     });
+
+    if (isSuper) {
+      $v("#gs_query").addEventListener("click", loadGlobalShares);
+      $v("#gs_grant").addEventListener("click", async () => {
+        const device = ($v("#gs_device").value || "").trim();
+        const user = ($v("#gs_user").value || "").trim();
+        const canView = !!$v("#gs_view").checked;
+        const canOperate = !!$v("#gs_operate").checked;
+        if (!device || !user) { toast("Device ID and grantee required", "err"); return; }
+        if (!canView && !canOperate) { toast("Select view and/or operate", "err"); return; }
+        try {
+          await api(`/admin/devices/${encodeURIComponent(device)}/share`, {
+            method: "POST",
+            body: { grantee_username: user, can_view: canView, can_operate: canOperate },
+          });
+          toast("Share updated", "ok");
+          loadGlobalShares();
+        } catch (e) { toast(e.message || e, "err"); }
+      });
+      $v("#gsList").addEventListener("click", async (ev) => {
+        const btn = ev.target.closest(".js-gs-revoke");
+        if (!btn) return;
+        const device = btn.dataset.device || "";
+        const user = btn.dataset.user || "";
+        if (!device || !user) return;
+        if (!confirm(`Revoke ${user} from ${device}?`)) return;
+        try {
+          await api(`/admin/devices/${encodeURIComponent(device)}/share/${encodeURIComponent(user)}`, { method: "DELETE" });
+          toast("Share revoked", "ok");
+          loadGlobalShares();
+        } catch (e) { toast(e.message || e, "err"); }
+      });
+      loadGlobalShares();
+    }
 
     const openPolicy = async (username, trRow) => {
       const cell = trRow.querySelector("td");
@@ -2027,11 +2254,57 @@
         tgEl.innerHTML = `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`;
       }
     };
+    const loadTgBindings = async () => {
+      const el = $v("#tgBindings");
+      if (!el) return;
+      el.innerHTML = `<p class="muted">Loading bindings…</p>`;
+      try {
+        const d = await api("/admin/telegram/bindings", { timeoutMs: 8000 });
+        const items = d.items || [];
+        el.innerHTML = items.length === 0
+          ? `<p class="muted">No bindings yet.</p>`
+          : `<div class="table-wrap"><table class="t">
+              <thead><tr><th>chat_id</th><th>username</th><th>enabled</th><th>updated</th><th></th></tr></thead>
+              <tbody>${items.map((it) => `
+                <tr>
+                  <td class="mono">${escapeHtml(it.chat_id || "")}</td>
+                  <td>${escapeHtml(it.username || "")}</td>
+                  <td>${it.enabled ? `<span class="badge online">on</span>` : `<span class="badge offline">off</span>`}</td>
+                  <td>${escapeHtml(fmtTs(it.updated_at || it.created_at))}</td>
+                  <td><button class="btn sm danger js-tg-unbind" data-chat="${escapeHtml(String(it.chat_id || ""))}">Unbind</button></td>
+                </tr>`).join("")}</tbody></table></div>`;
+      } catch (e) {
+        el.innerHTML = `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`;
+      }
+    };
     $v("#tgTest").addEventListener("click", async () => {
       try {
         const r = await api("/admin/telegram/test", { method: "POST", body: { text: "Croc Sentinel UI test" } });
         toast(r.detail || "ok", "ok");
         loadTgStatus();
+      } catch (e) { toast(e.message || e, "err"); }
+    });
+    $v("#tgBindSelf").addEventListener("click", async () => {
+      const chat_id = ($v("#tgBindChatId").value || "").trim();
+      const enabled = !!$v("#tgBindEnabled").checked;
+      if (!chat_id) { toast("Enter chat_id", "err"); return; }
+      try {
+        await api("/admin/telegram/bind-self", { method: "POST", body: { chat_id, enabled } });
+        toast("Chat bound", "ok");
+        loadTgBindings();
+      } catch (e) { toast(e.message || e, "err"); }
+    });
+    $v("#tgReloadBindings").addEventListener("click", loadTgBindings);
+    $v("#tgBindings").addEventListener("click", async (ev) => {
+      const btn = ev.target.closest(".js-tg-unbind");
+      if (!btn) return;
+      const chat = btn.dataset.chat || "";
+      if (!chat) return;
+      if (!confirm(`Unbind chat ${chat}?`)) return;
+      try {
+        await api(`/admin/telegram/bindings/${encodeURIComponent(chat)}`, { method: "DELETE" });
+        toast("Unbound", "ok");
+        loadTgBindings();
       } catch (e) { toast(e.message || e, "err"); }
     });
     $v("#recipientList").addEventListener("click", async (ev) => {
@@ -2051,6 +2324,7 @@
     loadSmtpStatus();
     loadRecipients();
     loadTgStatus();
+    loadTgBindings();
 
     // Pending admin signups (superadmin approval queue)
     const loadPendAdmins = async () => {
@@ -2100,7 +2374,7 @@
   });
 
   // Unified: device alarms + dashboard/API remote siren (who / what / when / where / fan-out)
-  async function renderSignalsPage(view) {
+  async function renderSignalsPage(view, _args, routeSeq) {
     setCrumb("Signals");
     view.innerHTML = `
       <div class="card">
@@ -2121,11 +2395,16 @@
       const hours = parseInt($("#sig_hours").value, 10) || 168;
       const qs = new URLSearchParams({ limit: "200", since_hours: String(hours) });
       try {
+        if (!isRouteCurrent(routeSeq)) return;
         const [d, sumR] = await Promise.all([
           api("/activity/signals?" + qs.toString()),
           api("/alarms/summary").catch(() => ({ last_24h: 0, last_7d: 0, top_sources_7d: [] })),
         ]);
-        $("#sigSummary").innerHTML = [
+        if (!isRouteCurrent(routeSeq)) return;
+        const sigSummaryEl = $("#sigSummary", view);
+        const sigListEl = $("#sigList", view);
+        if (!sigSummaryEl || !sigListEl) return;
+        sigSummaryEl.innerHTML = [
           ["Alarms 24h", sumR.last_24h || 0, "device-side alarm rows"],
           ["Alarms 7d", sumR.last_7d || 0, "same scope"],
           ["Top source 7d", (sumR.top_sources_7d || []).slice(0, 1).map((x) => `${x.source_id} × ${x.c}`).join("") || "—", "by count"],
@@ -2136,7 +2415,7 @@
           network: "MQTT / network",
           api: "API / automation",
         }[w] || w);
-        $("#sigList").innerHTML = items.length === 0
+        sigListEl.innerHTML = items.length === 0
           ? `<p class="muted">No rows in this window.</p>`
           : `<div class="table-wrap"><table class="t">
               <thead><tr><th>When (UTC)</th><th>What</th><th>Where</th><th>Device</th><th>Group</th><th>Name</th><th>Who</th><th>Fan-out</th><th>Email</th></tr></thead>
@@ -2159,7 +2438,10 @@
                   <td class="mono">${escapeHtml(em)}</td>
                 </tr>`;
           }).join("")}</tbody></table></div>`;
-      } catch (e) { toast(e.message || e, "err"); }
+      } catch (e) {
+        if (!isRouteCurrent(routeSeq)) return;
+        toast(e.message || e, "err");
+      }
     };
     $("#sig_reload").addEventListener("click", reload);
     reload();
@@ -2199,7 +2481,7 @@
       </tr>`;
   }
 
-  registerRoute("ota", async (view) => {
+  registerRoute("ota", async (view, _args, routeSeq) => {
     setCrumb("OTA");
     const me = state.me || { username: "", role: "" };
     if (!hasRole("admin")) { view.innerHTML = `<div class="card"><p class="muted">OTA is available to admin and above.</p></div>`; return; }
@@ -2240,13 +2522,17 @@
 
     async function loadCampaigns() {
       try {
-        const r = await api("/ota/campaigns");
+        if (!isRouteCurrent(routeSeq)) return;
+        const r = await api("/ota/campaigns", { timeoutMs: 10000 });
+        if (!isRouteCurrent(routeSeq)) return;
         const list = r.items || [];
+        const campListEl = $("#campList", view);
+        if (!campListEl) return;
         if (list.length === 0) {
-          $("#campList").innerHTML = `<p class="muted">No OTA campaigns.</p>`;
+          campListEl.innerHTML = `<p class="muted">No OTA campaigns.</p>`;
           return;
         }
-        $("#campList").innerHTML = `<div class="table-wrap"><table class="t">
+        campListEl.innerHTML = `<div class="table-wrap"><table class="t">
           <thead><tr><th>ID</th><th>Version</th><th>URL</th><th>State</th><th>Progress</th><th>My decision</th><th>Created</th><th></th></tr></thead>
           <tbody>${list.map((c) => renderOtaCampaignRow(c, me)).join("")}</tbody>
         </table></div>`;
@@ -2272,7 +2558,10 @@
         view.querySelectorAll(".js-detail").forEach((b) => b.addEventListener("click", async () => {
           try {
             const c = await api(`/ota/campaigns/${encodeURIComponent(b.dataset.id)}`);
-            $("#campDetail").innerHTML = `<div class="card">
+            if (!isRouteCurrent(routeSeq)) return;
+            const campDetailEl = $("#campDetail", view);
+            if (!campDetailEl) return;
+            campDetailEl.innerHTML = `<div class="card">
               <h3>Campaign ${escapeHtml(c.id)}</h3>
               <p class="muted">FW ${escapeHtml(c.fw_version)} · ${escapeHtml(c.state)} · created ${escapeHtml(c.created_at)}</p>
               <p class="mono" style="word-break:break-all">${escapeHtml(c.url)}</p>
@@ -2291,15 +2580,26 @@
                   </tr>`).join("")}</tbody>
               </table></div>
             </div>`;
-          } catch (e) { toast(e.message || e, "err"); }
+          } catch (e) {
+            if (!isRouteCurrent(routeSeq)) return;
+            toast(e.message || e, "err");
+          }
         }));
-      } catch (e) { $("#campList").innerHTML = `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`; }
+      } catch (e) {
+        if (!isRouteCurrent(routeSeq)) return;
+        const campListEl = $("#campList", view);
+        if (!campListEl) return;
+        campListEl.innerHTML = `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`;
+      }
     }
 
     if (isSuper) {
       try {
-        const fw = await api("/ota/firmwares");
-        $("#fwList").innerHTML = (fw.items || []).length === 0
+        const fw = await api("/ota/firmwares", { timeoutMs: 10000 });
+        if (!isRouteCurrent(routeSeq)) return;
+        const fwListEl = $("#fwList", view);
+        if (!fwListEl) return;
+        fwListEl.innerHTML = (fw.items || []).length === 0
           ? `<p class="muted">No .bin files under ${escapeHtml(fw.dir || "/opt/sentinel/firmware")}.</p>`
           : `<div class="table-wrap"><table class="t">
               <thead><tr><th>File</th><th>Size</th><th>SHA-256</th><th>Modified</th><th></th></tr></thead>
@@ -2313,32 +2613,51 @@
                 </tr>`).join("")}</tbody></table></div>`;
         view.querySelectorAll(".js-use").forEach((b) => {
           b.addEventListener("click", () => {
-            $("#c_url").value = b.dataset.url;
-            $("#c_fw").value = b.dataset.fw;
-            if ($("#c_sha") && b.dataset.sha) $("#c_sha").value = b.dataset.sha;
+            const cUrl = $("#c_url", view);
+            const cFw = $("#c_fw", view);
+            const cSha = $("#c_sha", view);
+            if (cUrl) cUrl.value = b.dataset.url;
+            if (cFw) cFw.value = b.dataset.fw;
+            if (cSha && b.dataset.sha) cSha.value = b.dataset.sha;
           });
         });
-      } catch (e) { $("#fwList").innerHTML = `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`; }
+      } catch (e) {
+        if (!isRouteCurrent(routeSeq)) return;
+        const fwListEl = $("#fwList", view);
+        if (fwListEl) fwListEl.innerHTML = `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`;
+      }
 
-      $("#c_send").addEventListener("click", async () => {
-        const url = ($("#c_url").value || "").trim();
-        const fw = ($("#c_fw").value || "").trim();
-        const sha = ($("#c_sha").value || "").trim();
-        const notes = ($("#c_notes").value || "").trim();
-        const adminsRaw = ($("#c_admins").value || "").trim();
+      const cSend = $("#c_send", view);
+      if (cSend) cSend.addEventListener("click", async () => {
+        const url = (($("#c_url", view) && $("#c_url", view).value) || "").trim();
+        const fw = (($("#c_fw", view) && $("#c_fw", view).value) || "").trim();
+        const sha = (($("#c_sha", view) && $("#c_sha", view).value) || "").trim();
+        const notes = (($("#c_notes", view) && $("#c_notes", view).value) || "").trim();
+        const adminsRaw = (($("#c_admins", view) && $("#c_admins", view).value) || "").trim();
         const target_admins = adminsRaw ? adminsRaw.split(/[ ,;\n]+/).filter(Boolean) : ["*"];
         if (!url || !fw) { toast("Firmware version and URL required", "err"); return; }
         if (!confirm(`Create OTA campaign? Target admins: ${target_admins.join(", ") || "ALL"}`)) return;
         try {
           const r = await api("/ota/campaigns", { method: "POST", body: { fw_version: fw, url, sha256: sha || undefined, notes, target_admins } });
+          if (!isRouteCurrent(routeSeq)) return;
           toast(`Campaign ${r.campaign_id} · ${r.target_admins.length} admin(s)`, "ok");
-          $("#c_url").value = ""; $("#c_fw").value = ""; $("#c_sha").value = ""; $("#c_notes").value = ""; $("#c_admins").value = "";
+          const cUrl = $("#c_url", view);
+          const cFw = $("#c_fw", view);
+          const cSha = $("#c_sha", view);
+          const cNotes = $("#c_notes", view);
+          const cAdmins = $("#c_admins", view);
+          if (cUrl) cUrl.value = "";
+          if (cFw) cFw.value = "";
+          if (cSha) cSha.value = "";
+          if (cNotes) cNotes.value = "";
+          if (cAdmins) cAdmins.value = "";
           loadCampaigns();
         } catch (e) { toast(e.message || e, "err"); }
       });
     }
 
-    $("#camp_reload").addEventListener("click", loadCampaigns);
+    const campReload = $("#camp_reload", view);
+    if (campReload) campReload.addEventListener("click", loadCampaigns);
     loadCampaigns();
   });
 
