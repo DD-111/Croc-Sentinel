@@ -102,6 +102,8 @@
 
   /** Default ceiling so a stuck reverse-proxy / API cannot leave the SPA on “Loading…” forever. */
   const DEFAULT_API_TIMEOUT_MS = 30000;
+  /** Route-level async guard: any page render taking too long fails fast. */
+  const ROUTE_RENDER_TIMEOUT_MS = 15000;
 
   /**
    * fetch() with AbortController timeout. opts.timeoutMs: number ms, false = no limit.
@@ -201,6 +203,14 @@
     if (ct.includes("application/json")) return r.json();
     if (opts.raw) return r;
     return r.text();
+  }
+
+  async function apiOr(path, fallback, opts) {
+    try {
+      return await api(path, opts);
+    } catch (e) {
+      return (typeof fallback === "function") ? fallback(e) : fallback;
+    }
   }
 
   async function login(username, password) {
@@ -399,7 +409,12 @@
       // network I/O before finishing; the View Transition API then hits a DOM-update
       // timeout and rejects. (Also avoids races where a later route replaces #view while
       // an older handler is still awaiting.)
-      await swap();
+      await Promise.race([
+        swap(),
+        new Promise((_, reject) => {
+          setTimeout(() => reject(new Error("Page render timed out. Please retry.")), ROUTE_RENDER_TIMEOUT_MS);
+        }),
+      ]);
       renderNav();
       renderHealthPills();
     } catch (e) {
@@ -1217,7 +1232,11 @@
   registerRoute("alerts", async (view) => {
     setCrumb("Siren");
     const enabled = can("can_alert");
-    const list = await api("/devices").catch(() => ({ items: [] }));
+    let devicesLoadErr = "";
+    const list = await apiOr("/devices", (e) => {
+      devicesLoadErr = String((e && e.message) || e || "load failed");
+      return { items: [] };
+    }, { timeoutMs: 8000 });
     const devices = list.items || [];
 
     view.innerHTML = `
@@ -1225,6 +1244,7 @@
         <h2>Bulk siren</h2>
         <p class="muted">MQTT <span class="mono">siren_on</span> / <span class="mono">siren_off</span>. Requires <span class="mono">can_alert</span>.</p>
         ${enabled ? "" : `<p class="badge revoked">No can_alert — ask admin (Policies).</p>`}
+        ${devicesLoadErr ? `<p class="badge offline">Device list fallback: ${escapeHtml(devicesLoadErr)}</p>` : ""}
         <div class="inline-form" style="margin-top:12px">
           <label class="field"><span>Action</span>
             <select id="action"><option value="on">ON</option><option value="off">OFF</option></select>
@@ -1384,14 +1404,18 @@
       }
     } catch (_) {}
 
-    const data = await api("/provision/pending").catch(() => ({ items: [] }));
+    let pendingErr = "";
+    const data = await apiOr("/provision/pending", (e) => {
+      pendingErr = String((e && e.message) || e || "load failed");
+      return { items: [] };
+    }, { timeoutMs: 8000 });
     const items = data.items || [];
     const pendListEl = view.querySelector("#pendList");
     if (!pendListEl) return;
     pendListEl.innerHTML = `
       <div class="table-wrap"><table class="t">
         <thead><tr><th>MAC</th><th>Serial / proposed ID</th><th>QR</th><th>Firmware</th><th>Last seen</th></tr></thead>
-        <tbody>${items.length === 0 ? `<tr><td colspan="5" class="muted">None</td></tr>` :
+        <tbody>${items.length === 0 ? `<tr><td colspan="5" class="muted">${pendingErr ? "Load failed (retry with Refresh)." : "None"}</td></tr>` :
           items.map((p) => `<tr>
             <td class="mono">${escapeHtml(p.mac_nocolon || p.mac || "")}</td>
             <td class="mono">${escapeHtml(p.proposed_device_id || "—")}</td>
@@ -1535,14 +1559,18 @@
     async function loadHistory() {
       try {
         const p = currentFilters(); p.set("limit", "200");
-        const r = await api("/events?" + p.toString());
+        const r = await api("/events?" + p.toString(), { timeoutMs: 8000 });
         buffer = (r.items || []).slice();
         if (window.__pendingEvListRaf) {
           cancelAnimationFrame(window.__pendingEvListRaf);
           window.__pendingEvListRaf = 0;
         }
         flushEvRender();
-      } catch (e) { toast(e.message || e, "err"); }
+      } catch (e) {
+        const listEl = document.getElementById("evList");
+        if (listEl) listEl.innerHTML = `<p class="badge offline">${escapeHtml(e.message || e)}</p>`;
+        toast(e.message || e, "err");
+      }
     }
 
     function closeStream() {
@@ -1586,7 +1614,7 @@
     $("#evReload").addEventListener("click", loadHistory);
     $("#evStats").addEventListener("click", async () => {
       try {
-        const r = await api("/events/stats/by-device?hours=168&limit=200");
+        const r = await api("/events/stats/by-device?hours=168&limit=200", { timeoutMs: 8000 });
         const items = r.items || [];
         $("#evStatsBox").style.display = "block";
         if (items.length === 0) {
@@ -1677,7 +1705,7 @@
     const isSuper = state.me.role === "superadmin";
     let admins = [];
     if (isSuper) {
-      try { admins = (await api("/auth/admins")).items || []; } catch { admins = []; }
+      try { admins = (await api("/auth/admins", { timeoutMs: 8000 })).items || []; } catch { admins = []; }
     }
 
     view.innerHTML = `
@@ -1772,7 +1800,7 @@
     // users
     const loadUsers = async () => {
       try {
-        const d = await api("/auth/users");
+        const d = await api("/auth/users", { timeoutMs: 8000 });
         const users = d.items || [];
         const userTableEl = $v("#userTable");
         if (!userTableEl) return;
@@ -1834,7 +1862,7 @@
       cell.innerHTML = `<span class="muted">Loading…</span>`;
       trRow.style.display = "";
       try {
-        const p = await api(`/auth/users/${encodeURIComponent(username)}/policy`);
+          const p = await api(`/auth/users/${encodeURIComponent(username)}/policy`, { timeoutMs: 8000 });
         cell.innerHTML = renderPolicyPanel(username, p);
         cell.querySelector(".js-save").addEventListener("click", async () => {
           const body = {};
@@ -1904,7 +1932,7 @@
     // SMTP status + recipients
     const loadSmtpStatus = async () => {
       try {
-        const s = await api("/admin/smtp/status");
+        const s = await api("/admin/smtp/status", { timeoutMs: 8000 });
         const smtpEl = $v("#smtpStatus");
         if (!smtpEl) return;
         const okBadge = s.enabled
@@ -1926,7 +1954,7 @@
     };
     const loadRecipients = async () => {
       try {
-        const d = await api("/admin/alert-recipients");
+        const d = await api("/admin/alert-recipients", { timeoutMs: 8000 });
         const items = d.items || [];
         const listEl = $v("#recipientList");
         if (!listEl) return;
@@ -1973,7 +2001,7 @@
     });
     const loadTgStatus = async () => {
       try {
-        const t = await api("/admin/telegram/status");
+        const t = await api("/admin/telegram/status", { timeoutMs: 8000 });
         const tgEl = $v("#tgStatus");
         if (!tgEl) return;
         const badge = t.enabled
@@ -2028,7 +2056,7 @@
     const loadPendAdmins = async () => {
       if (!isSuper) return;
       try {
-        const d = await api("/auth/signup/pending");
+        const d = await api("/auth/signup/pending", { timeoutMs: 8000 });
         const items = d.items || [];
         const pendEl = $v("#pendAdmins");
         if (!pendEl) return;
