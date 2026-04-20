@@ -533,6 +533,23 @@ def init_db() -> None:
         )
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS device_acl (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL,
+                grantee_username TEXT NOT NULL,
+                can_view INTEGER NOT NULL DEFAULT 1,
+                can_operate INTEGER NOT NULL DEFAULT 0,
+                granted_by TEXT NOT NULL,
+                granted_at TEXT NOT NULL,
+                revoked_at TEXT,
+                UNIQUE(device_id, grantee_username)
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_device_acl_device ON device_acl(device_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_device_acl_user ON device_acl(grantee_username)")
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS alarms (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_id TEXT NOT NULL,
@@ -1287,27 +1304,58 @@ def require_capability(principal: Principal, capability: str) -> None:
         raise HTTPException(status_code=403, detail=f"capability denied: {capability}")
 
 
-def assert_device_owner(principal: Principal, device_id: str) -> None:
+def _device_access_flags(principal: Principal, device_id: str) -> tuple[bool, bool]:
+    """Return (can_view, can_operate) after ownership + sharing ACL checks."""
     if principal.role == "superadmin":
-        return
+        return True, True
+    manager = get_manager_admin(principal.username) if principal.role == "user" else ""
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
         cur.execute("SELECT owner_admin FROM device_ownership WHERE device_id = ?", (device_id,))
-        row = cur.fetchone()
+        own = cur.fetchone()
+        cur.execute(
+            """
+            SELECT can_view, can_operate
+            FROM device_acl
+            WHERE device_id = ? AND grantee_username = ? AND revoked_at IS NULL
+            LIMIT 1
+            """,
+            (device_id, principal.username),
+        )
+        acl = cur.fetchone()
         conn.close()
-    if not row:
-        if ALLOW_LEGACY_UNOWNED:
-            return
-        raise HTTPException(status_code=403, detail="device ownership missing")
-    owner = str(row["owner_admin"])
+    owner = str(own["owner_admin"]) if own and own["owner_admin"] is not None else ""
+    acl_view = bool(int(acl["can_view"])) if acl else False
+    acl_operate = bool(int(acl["can_operate"])) if acl else False
     if principal.role == "admin":
-        if owner != principal.username:
-            raise HTTPException(status_code=403, detail="device owned by another admin")
-        return
-    manager = get_manager_admin(principal.username)
-    if not manager or owner != manager:
-        raise HTTPException(status_code=403, detail="device not in your admin scope")
+        owner_view = bool(owner) and owner == principal.username
+        if not owner and ALLOW_LEGACY_UNOWNED:
+            owner_view = True
+        owner_operate = bool(owner) and owner == principal.username
+        return (owner_view or acl_view or acl_operate), (owner_operate or acl_operate)
+    owner_view = bool(owner) and bool(manager) and owner == manager
+    if not owner and ALLOW_LEGACY_UNOWNED and bool(manager):
+        owner_view = True
+    owner_operate = bool(owner) and bool(manager) and owner == manager
+    return (owner_view or acl_view or acl_operate), (owner_operate or acl_operate)
+
+
+def assert_device_view_access(principal: Principal, device_id: str) -> None:
+    can_view, _ = _device_access_flags(principal, device_id)
+    if not can_view:
+        raise HTTPException(status_code=403, detail="device not in your scope")
+
+
+def assert_device_operate_access(principal: Principal, device_id: str) -> None:
+    _, can_operate = _device_access_flags(principal, device_id)
+    if not can_operate:
+        raise HTTPException(status_code=403, detail="device operation denied")
+
+
+def assert_device_owner(principal: Principal, device_id: str) -> None:
+    # Backward-compatible alias used by existing routes.
+    assert_device_operate_access(principal, device_id)
 
 
 def owner_sql_suffix(principal: Principal, alias: str = "d") -> tuple[str, list[Any]]:
@@ -1322,32 +1370,44 @@ def owner_sql_suffix(principal: Principal, alias: str = "d") -> tuple[str, list[
     return f" AND ({col} = ? {'OR '+col+' IS NULL' if ALLOW_LEGACY_UNOWNED else ''}) ", [manager]
 
 
-def owner_scope_clause_for_device_state(principal: Principal) -> tuple[str, list[Any]]:
+def owner_scope_clause_for_device_state(principal: Principal, device_alias: str = "device_state") -> tuple[str, list[Any]]:
     if principal.role == "superadmin":
         return "", []
     if principal.role == "admin":
+        acl_clause = (
+            f"EXISTS (SELECT 1 FROM device_acl a WHERE a.device_id={device_alias}.device_id "
+            "AND a.grantee_username=? AND a.revoked_at IS NULL AND (a.can_view=1 OR a.can_operate=1))"
+        )
         if ALLOW_LEGACY_UNOWNED:
             return (
-                " AND ((EXISTS (SELECT 1 FROM device_ownership o WHERE o.device_id=device_state.device_id AND o.owner_admin=?)) "
-                "OR (NOT EXISTS (SELECT 1 FROM device_ownership o2 WHERE o2.device_id=device_state.device_id))) ",
-                [principal.username],
+                f" AND ((EXISTS (SELECT 1 FROM device_ownership o WHERE o.device_id={device_alias}.device_id AND o.owner_admin=?)) "
+                "OR (" + acl_clause + ") "
+                f"OR (NOT EXISTS (SELECT 1 FROM device_ownership o2 WHERE o2.device_id={device_alias}.device_id))) ",
+                [principal.username, principal.username],
             )
         return (
-            " AND EXISTS (SELECT 1 FROM device_ownership o WHERE o.device_id=device_state.device_id AND o.owner_admin=?) ",
-            [principal.username],
+            f" AND ((EXISTS (SELECT 1 FROM device_ownership o WHERE o.device_id={device_alias}.device_id AND o.owner_admin=?)) "
+            "OR (" + acl_clause + ")) ",
+            [principal.username, principal.username],
         )
     manager = get_manager_admin(principal.username)
     if not manager:
         return " AND 1=0 ", []
+    acl_clause = (
+        f"EXISTS (SELECT 1 FROM device_acl a WHERE a.device_id={device_alias}.device_id "
+        "AND a.grantee_username=? AND a.revoked_at IS NULL AND (a.can_view=1 OR a.can_operate=1))"
+    )
     if ALLOW_LEGACY_UNOWNED:
         return (
-            " AND ((EXISTS (SELECT 1 FROM device_ownership o WHERE o.device_id=device_state.device_id AND o.owner_admin=?)) "
-            "OR (NOT EXISTS (SELECT 1 FROM device_ownership o2 WHERE o2.device_id=device_state.device_id))) ",
-            [manager],
+            f" AND ((EXISTS (SELECT 1 FROM device_ownership o WHERE o.device_id={device_alias}.device_id AND o.owner_admin=?)) "
+            "OR (" + acl_clause + ") "
+            f"OR (NOT EXISTS (SELECT 1 FROM device_ownership o2 WHERE o2.device_id={device_alias}.device_id))) ",
+            [manager, principal.username],
         )
     return (
-        " AND EXISTS (SELECT 1 FROM device_ownership o WHERE o.device_id=device_state.device_id AND o.owner_admin=?) ",
-        [manager],
+        f" AND ((EXISTS (SELECT 1 FROM device_ownership o WHERE o.device_id={device_alias}.device_id AND o.owner_admin=?)) "
+        "OR (" + acl_clause + ")) ",
+        [manager, principal.username],
     )
 
 
@@ -4371,20 +4431,22 @@ def list_devices(principal: Principal = Depends(require_principal)) -> dict[str,
     cached = cache_get(cache_key)
     if cached is not None:
         return cached
-    zs, za = zone_sql_suffix(principal)
-    osf, osa = owner_scope_clause_for_device_state(principal)
+    zs, za = zone_sql_suffix(principal, "d.zone")
+    osf, osa = owner_scope_clause_for_device_state(principal, "d")
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
         cur.execute(
             f"""
-            SELECT device_id, fw, chip_target, board_profile, net_type, zone, provisioned,
+            SELECT d.device_id, d.fw, d.chip_target, d.board_profile, d.net_type, d.zone, d.provisioned,
+                   o.owner_admin,
                    IFNULL(display_label, '') AS display_label,
                    IFNULL(notification_group, '') AS notification_group, updated_at,
                    last_status_json, last_heartbeat_json, last_ack_json, last_event_json
-            FROM device_state
+            FROM device_state d
+            LEFT JOIN device_ownership o ON d.device_id = o.device_id
             WHERE 1=1 {zs} {osf}
-            ORDER BY updated_at DESC
+            ORDER BY d.updated_at DESC
             """,
             tuple(za + osa),
         )
@@ -4397,6 +4459,8 @@ def list_devices(principal: Principal = Depends(require_principal)) -> dict[str,
             d.pop("last_heartbeat_json", None)
             d.pop("last_ack_json", None)
             d.pop("last_event_json", None)
+            if principal.role != "superadmin":
+                d.pop("owner_admin", None)
             rows_out.append(d)
         conn.close()
     out = {"items": rows_out}
@@ -4407,7 +4471,7 @@ def list_devices(principal: Principal = Depends(require_principal)) -> dict[str,
 @app.get("/devices/{device_id}")
 def get_device(device_id: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     assert_min_role(principal, "user")
-    assert_device_owner(principal, device_id)
+    assert_device_view_access(principal, device_id)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -4431,6 +4495,16 @@ def get_device(device_id: str, principal: Principal = Depends(require_principal)
         str(out.get("updated_at") or ""),
         now_s,
     )
+    if principal.role == "superadmin":
+        with db_lock:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute("SELECT owner_admin, assigned_by, assigned_at FROM device_ownership WHERE device_id = ?", (device_id,))
+            ow = cur.fetchone()
+            conn.close()
+        out["owner_admin"] = str(ow["owner_admin"]) if ow else ""
+        out["registered_by"] = str(ow["assigned_by"]) if ow else ""
+        out["registered_at"] = str(ow["assigned_at"]) if ow else ""
     return out
 
 
@@ -4441,6 +4515,12 @@ class DeviceDisplayLabelBody(BaseModel):
 class DeviceProfileBody(BaseModel):
     display_label: Optional[str] = Field(default=None, max_length=80)
     notification_group: Optional[str] = Field(default=None, max_length=80)
+
+
+class DeviceShareRequest(BaseModel):
+    grantee_username: str = Field(min_length=2, max_length=64)
+    can_view: bool = True
+    can_operate: bool = False
 
 
 def _apply_device_profile_update(
@@ -4527,6 +4607,123 @@ def patch_device_display_label(
     )
 
 
+@app.get("/admin/devices/{device_id}/shares")
+def list_device_shares(device_id: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "superadmin")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT a.device_id, a.grantee_username, u.role AS grantee_role,
+                   a.can_view, a.can_operate, a.granted_by, a.granted_at, a.revoked_at
+            FROM device_acl a
+            LEFT JOIN dashboard_users u ON u.username = a.grantee_username
+            WHERE a.device_id = ?
+            ORDER BY a.revoked_at IS NOT NULL ASC, a.granted_at DESC
+            """,
+            (device_id,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+    return {"items": rows}
+
+
+@app.post("/admin/devices/{device_id}/share")
+def share_device(
+    device_id: str,
+    req: DeviceShareRequest,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    assert_min_role(principal, "superadmin")
+    grantee = req.grantee_username.strip()
+    if not grantee:
+        raise HTTPException(status_code=400, detail="grantee_username required")
+    if not req.can_view and not req.can_operate:
+        raise HTTPException(status_code=400, detail="at least one permission is required")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM device_state WHERE device_id = ?", (device_id,))
+        if not cur.fetchone():
+            conn.close()
+            raise HTTPException(status_code=404, detail="device not found")
+        cur.execute("SELECT role, status FROM dashboard_users WHERE username = ?", (grantee,))
+        ur = cur.fetchone()
+        if not ur:
+            conn.close()
+            raise HTTPException(status_code=404, detail="grantee not found")
+        role = str(ur["role"] or "")
+        status = str(ur["status"] or "active")
+        if role not in ("admin", "user"):
+            conn.close()
+            raise HTTPException(status_code=400, detail="only admin/user can be shared")
+        if status not in ("active", ""):
+            conn.close()
+            raise HTTPException(status_code=400, detail=f"grantee is not active: {status}")
+        now = utc_now_iso()
+        cur.execute(
+            """
+            INSERT INTO device_acl (
+                device_id, grantee_username, can_view, can_operate, granted_by, granted_at, revoked_at
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL)
+            ON CONFLICT(device_id, grantee_username) DO UPDATE SET
+                can_view = excluded.can_view,
+                can_operate = excluded.can_operate,
+                granted_by = excluded.granted_by,
+                granted_at = excluded.granted_at,
+                revoked_at = NULL
+            """,
+            (device_id, grantee, 1 if req.can_view else 0, 1 if req.can_operate else 0, principal.username, now),
+        )
+        conn.commit()
+        conn.close()
+    cache_invalidate("devices")
+    cache_invalidate("overview")
+    audit_event(
+        principal.username,
+        "device.share.grant",
+        device_id,
+        {"grantee_username": grantee, "can_view": bool(req.can_view), "can_operate": bool(req.can_operate)},
+    )
+    return {
+        "ok": True,
+        "device_id": device_id,
+        "grantee_username": grantee,
+        "can_view": bool(req.can_view),
+        "can_operate": bool(req.can_operate),
+    }
+
+
+@app.delete("/admin/devices/{device_id}/share/{grantee_username}")
+def unshare_device(
+    device_id: str,
+    grantee_username: str,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    assert_min_role(principal, "superadmin")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE device_acl
+            SET revoked_at = ?
+            WHERE device_id = ? AND grantee_username = ? AND revoked_at IS NULL
+            """,
+            (utc_now_iso(), device_id, grantee_username),
+        )
+        changed = cur.rowcount
+        conn.commit()
+        conn.close()
+    if changed == 0:
+        raise HTTPException(status_code=404, detail="active share not found")
+    cache_invalidate("devices")
+    cache_invalidate("overview")
+    audit_event(principal.username, "device.share.revoke", device_id, {"grantee_username": grantee_username})
+    return {"ok": True, "device_id": device_id, "grantee_username": grantee_username}
+
+
 @app.get("/devices/{device_id}/messages")
 def get_device_messages(
     device_id: str,
@@ -4535,7 +4732,7 @@ def get_device_messages(
     principal: Principal = Depends(require_principal),
 ) -> dict[str, Any]:
     assert_min_role(principal, "user")
-    assert_device_owner(principal, device_id)
+    assert_device_view_access(principal, device_id)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -4679,7 +4876,31 @@ def enqueue_scheduled_command(device_id: str, cmd: str, params: dict[str, Any], 
 def resolve_target_devices(device_ids: list[str], principal: Optional[Principal] = None) -> list[str]:
     unique = sorted(set([d for d in device_ids if d]))
     zs, za = zone_sql_suffix(principal) if principal else ("", [])
-    osf, osa = owner_sql_suffix(principal, "o") if principal else ("", [])
+    osf, osa = ("", [])
+    if principal and not principal.is_superadmin():
+        if principal.role == "admin":
+            osf = (
+                " AND ("
+                "o.owner_admin = ? "
+                "OR EXISTS (SELECT 1 FROM device_acl a WHERE a.device_id=d.device_id "
+                "AND a.grantee_username=? AND a.revoked_at IS NULL AND a.can_operate=1)"
+                ") "
+            )
+            osa = [principal.username, principal.username]
+        else:
+            manager = get_manager_admin(principal.username)
+            if not manager:
+                osf = " AND 1=0 "
+                osa = []
+            else:
+                osf = (
+                    " AND ("
+                    "o.owner_admin = ? "
+                    "OR EXISTS (SELECT 1 FROM device_acl a WHERE a.device_id=d.device_id "
+                    "AND a.grantee_username=? AND a.revoked_at IS NULL AND a.can_operate=1)"
+                    ") "
+                )
+                osa = [manager, principal.username]
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -4887,7 +5108,7 @@ def claim_device(req: ClaimDeviceRequest, principal: Principal = Depends(require
         existing = cur.fetchone()
         if existing:
             conn.close()
-            raise HTTPException(status_code=409, detail=f"device already claimed as {existing['device_id']}")
+            raise HTTPException(status_code=409, detail="device already claimed")
 
         claim_nonce = str(pending["claim_nonce"])
         qr_code = req.qr_code if req.qr_code else (str(pending["qr_code"] or "") or f"CROC-{mac_nocolon}")
@@ -5019,6 +5240,7 @@ def list_audit_events(
             "(SELECT device_id FROM device_ownership WHERE owner_admin = ?))"
         )
         args.extend([principal.username, principal.username, principal.username])
+        clauses.append("actor NOT IN (SELECT username FROM dashboard_users WHERE role = 'superadmin')")
     if actor:
         clauses.append("actor = ?")
         args.append(actor)
@@ -5076,7 +5298,7 @@ def get_logs_messages(
         query += " AND m.channel = ?"
         args.append(channel)
     if device_id:
-        assert_device_owner(principal, device_id)
+        assert_device_view_access(principal, device_id)
         query += " AND m.device_id = ?"
         args.append(device_id)
         with db_lock:
@@ -6654,12 +6876,18 @@ def _event_scope_sql(principal: Principal) -> tuple[str, list[Any]]:
     if principal.role == "superadmin":
         return "", []
     if principal.role == "admin":
-        frag = " AND (owner_admin = ? OR actor = ? OR target = ?) "
+        frag = (
+            " AND (owner_admin = ? OR actor = ? OR target = ?) "
+            " AND actor NOT IN (SELECT username FROM dashboard_users WHERE role = 'superadmin') "
+        )
         return frag, [principal.username, principal.username, principal.username]
     my_admin = get_manager_admin(principal.username) or ""
     if not my_admin:
         return " AND 1=0 ", []
-    frag = " AND (owner_admin = ? AND (actor = ? OR target = ? OR level IN ('warn','error','critical'))) "
+    frag = (
+        " AND (owner_admin = ? AND (actor = ? OR target = ? OR level IN ('warn','error','critical'))) "
+        " AND actor NOT IN (SELECT username FROM dashboard_users WHERE role = 'superadmin') "
+    )
     return frag, [my_admin, principal.username, principal.username]
 
 
@@ -7101,7 +7329,7 @@ def provision_identify(
 
       - unknown_serial       -> the serial is not in our factory registry
       - blocked              -> factory revoked this serial (RMA etc.)
-      - already_registered   -> device is claimed; caller learns who owns it
+      - already_registered   -> device is claimed
       - offline              -> device is in factory registry but has never
                                 published bootstrap.register, i.e. it was
                                 never online. Operator must power it up and
@@ -7158,16 +7386,18 @@ def provision_identify(
         you = owner and (owner == principal.username or (
             principal.role == "user" and owner == get_manager_admin(principal.username)
         ))
-        return {
+        resp: dict[str, Any] = {
             "status": "already_registered",
             "serial": serial,
             "device_id": str(prov["device_id"]),
             "mac_nocolon": str(prov["mac_nocolon"]),
             "claimed_at": str(prov["claimed_at"]),
-            "owner_admin": owner,
-            "by_you": bool(you),
-            "message": "设备已被登记" + ("（属于你）" if you else "（属于其他管理员，无法再次注册）"),
+            "message": "设备已被登记，无法再次注册",
         }
+        if principal.role == "superadmin":
+            resp["owner_admin"] = owner
+            resp["by_you"] = bool(you)
+        return resp
     # Does it appear in pending_claims? That only happens after the device
     # comes online and publishes bootstrap.register on MQTT.
     mac_for_lookup = str(fdev["mac_nocolon"] or "").upper()

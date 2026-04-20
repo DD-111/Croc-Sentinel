@@ -56,6 +56,7 @@
     me: null,
     mqttConnected: false,
     health: null,
+    overviewCache: null,
   };
 
   /** Route redirect timer (signup / activate → login); cleared on navigation. */
@@ -760,7 +761,27 @@
   // Overview
   registerRoute("overview", async (view) => {
     setCrumb("Overview");
-    const [ov, list] = await Promise.all([api("/dashboard/overview"), api("/devices")]);
+    const [ovRes, listRes] = await Promise.allSettled([
+      api("/dashboard/overview", { timeoutMs: 8000 }),
+      api("/devices", { timeoutMs: 8000 }),
+    ]);
+    let ov = (ovRes.status === "fulfilled" && ovRes.value) ? ovRes.value : null;
+    let list = (listRes.status === "fulfilled" && listRes.value) ? listRes.value : null;
+    if (!ov || !list) {
+      const cached = state.overviewCache;
+      if (cached && cached.ov && cached.list) {
+        ov = ov || cached.ov;
+        list = list || cached.list;
+        toast("Overview is partially loaded from cache; refreshing in background.", "warn");
+      }
+    }
+    if (!ov) ov = { presence: {}, throughput: {}, total_devices: 0, alarms_24h: 0, mqtt_connected: false };
+    if (!list) list = { items: [] };
+    if (ovRes.status !== "fulfilled" || listRes.status !== "fulfilled") {
+      const err = ovRes.status !== "fulfilled" ? ovRes.reason : listRes.reason;
+      toast(`Overview request slowed down: ${String((err && err.message) || err || "unknown error")}`, "warn");
+    }
+    state.overviewCache = { ov, list, ts: Date.now() };
     const devices = list.items || [];
     const online = (ov.presence && ov.presence.online != null) ? ov.presence.online : devices.filter(isOnline).length;
     const offline = (ov.presence && ov.presence.offline_total != null) ? ov.presence.offline_total : Math.max(0, devices.length - online);
@@ -881,6 +902,31 @@
     const wifiChDd = (netT === "wifi" && s.wifi_channel != null && Number(s.wifi_channel) > 0)
       ? escapeHtml(String(s.wifi_channel))
       : "—";
+    const sharePanel = state.me && state.me.role === "superadmin" ? `
+      <div class="card" id="sharePanel">
+        <div class="row">
+          <h3 style="margin:0">Sharing</h3>
+          <span class="muted">Grant or revoke per-account access</span>
+          <button class="btn secondary right" id="shareRefresh">Refresh</button>
+        </div>
+        <div class="divider"></div>
+        <div class="inline-form" style="margin-top:10px">
+          <label class="field grow"><span>Grantee username</span>
+            <input id="shareUser" placeholder="admin_x or user_x" />
+          </label>
+          <label class="field"><span>View</span>
+            <input id="shareCanView" type="checkbox" checked />
+          </label>
+          <label class="field"><span>Operate</span>
+            <input id="shareCanOperate" type="checkbox" />
+          </label>
+          <div class="row wide" style="justify-content:flex-end">
+            <button class="btn btn-tap" id="shareGrant">Grant / Update</button>
+          </div>
+        </div>
+        <div id="shareList" style="margin-top:12px"></div>
+      </div>
+    ` : "";
     view.innerHTML = `
       <div class="card">
         <div class="row" style="align-items:flex-start;flex-wrap:wrap;gap:10px">
@@ -951,6 +997,7 @@
           </div>
         </div>
       </div>
+      ${sharePanel}
 
       <div class="card" id="wifiCtlCard">
         <h3>Wi‑Fi (device)</h3>
@@ -1096,6 +1143,74 @@
         } catch (e) { toast(e.message || e, "err"); if (st) st.textContent = String(e.message || e); }
       });
     }
+
+    const shareListEl = $("#shareList");
+    const renderShares = async () => {
+      if (!shareListEl) return;
+      shareListEl.innerHTML = `<p class="muted">Loading shares…</p>`;
+      try {
+        const r = await api(`/admin/devices/${encodeURIComponent(id)}/shares`, { timeoutMs: 8000 });
+        const items = r.items || [];
+        shareListEl.innerHTML = `
+          <div class="table-wrap"><table class="t">
+            <thead><tr><th>User</th><th>Role</th><th>View</th><th>Operate</th><th>Granted by</th><th>Granted at</th><th>Status</th><th></th></tr></thead>
+            <tbody>${
+              items.length === 0
+                ? `<tr><td colspan="8" class="muted">No shares</td></tr>`
+                : items.map((it) => `
+                  <tr>
+                    <td class="mono">${escapeHtml(it.grantee_username || "")}</td>
+                    <td>${escapeHtml(it.grantee_role || "—")}</td>
+                    <td>${it.can_view ? "yes" : "no"}</td>
+                    <td>${it.can_operate ? "yes" : "no"}</td>
+                    <td class="mono">${escapeHtml(it.granted_by || "")}</td>
+                    <td>${escapeHtml(fmtTs(it.granted_at))}</td>
+                    <td>${it.revoked_at ? `<span class="badge offline">revoked</span>` : `<span class="badge online">active</span>`}</td>
+                    <td>${it.revoked_at ? "" : `<button class="btn ghost shareRevokeBtn" data-user="${escapeHtml(it.grantee_username || "")}">Revoke</button>`}</td>
+                  </tr>
+                `).join("")
+            }</tbody>
+          </table></div>
+        `;
+        $$(".shareRevokeBtn", shareListEl).forEach((btn) => {
+          btn.addEventListener("click", async () => {
+            const u = btn.getAttribute("data-user") || "";
+            if (!u) return;
+            if (!confirm(`Revoke share for ${u}?`)) return;
+            try {
+              await api(`/admin/devices/${encodeURIComponent(id)}/share/${encodeURIComponent(u)}`, { method: "DELETE" });
+              toast("Share revoked", "ok");
+              await renderShares();
+            } catch (e) { toast(e.message || e, "err"); }
+          });
+        });
+      } catch (e) {
+        shareListEl.innerHTML = `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`;
+      }
+    };
+    const shareGrantBtn = $("#shareGrant");
+    if (shareGrantBtn) {
+      shareGrantBtn.addEventListener("click", async () => {
+        const grantee = ($("#shareUser").value || "").trim();
+        const canView = !!$("#shareCanView").checked;
+        const canOperate = !!$("#shareCanOperate").checked;
+        if (!grantee) { toast("Enter grantee username", "err"); return; }
+        if (!canView && !canOperate) { toast("Select view and/or operate", "err"); return; }
+        try {
+          await api(`/admin/devices/${encodeURIComponent(id)}/share`, {
+            method: "POST",
+            body: { grantee_username: grantee, can_view: canView, can_operate: canOperate },
+          });
+          toast("Share granted", "ok");
+          await renderShares();
+        } catch (e) { toast(e.message || e, "err"); }
+      });
+    }
+    const shareRefreshBtn = $("#shareRefresh");
+    if (shareRefreshBtn) {
+      shareRefreshBtn.addEventListener("click", () => renderShares());
+      renderShares();
+    }
   });
 
   // Alerts
@@ -1233,10 +1348,13 @@
             showClaimForm(r.serial, r.mac_nocolon, raw.startsWith("CROC|") ? raw : "");
             break;
           case "already_registered":
-            resultBox.innerHTML = `${drawBadge("err", r.by_you ? "Already yours" : "Owned by another admin")}
-              <dl class="kv">${kv("Serial", r.serial)}${kv("device_id", r.device_id)}${kv("Owner admin", r.owner_admin || "—")}${kv("Claimed at", r.claimed_at)}</dl>
+            const canSeeOwner = !!(state.me && state.me.role === "superadmin");
+            const ownerKv = canSeeOwner ? kv("Owner admin", r.owner_admin || "—") : "";
+            const byYou = !!r.by_you;
+            resultBox.innerHTML = `${drawBadge("err", byYou ? "Already yours" : "Already registered")}
+              <dl class="kv">${kv("Serial", r.serial)}${kv("device_id", r.device_id)}${ownerKv}${kv("Claimed at", r.claimed_at)}</dl>
               <p class="muted">${escapeHtml(r.message)}</p>
-              ${r.by_you ? `<a class="btn secondary" href="#/devices/${encodeURIComponent(r.device_id)}">Open device</a>` : ""}`;
+              ${byYou ? `<a class="btn secondary" href="#/devices/${encodeURIComponent(r.device_id)}">Open device</a>` : ""}`;
             break;
           case "offline":
             resultBox.innerHTML = `${drawBadge("", "Waiting for device")}
