@@ -639,6 +639,46 @@ def init_db() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS ix_group_card_settings_group ON group_card_settings(group_key)")
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS trigger_policies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_admin TEXT NOT NULL,
+                scope_group TEXT NOT NULL DEFAULT '',
+                panic_local_siren INTEGER NOT NULL DEFAULT 1,
+                remote_silent_link_enabled INTEGER NOT NULL DEFAULT 1,
+                remote_loud_link_enabled INTEGER NOT NULL DEFAULT 1,
+                remote_loud_duration_ms INTEGER NOT NULL DEFAULT 10000,
+                fanout_exclude_self INTEGER NOT NULL DEFAULT 1,
+                updated_by TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(owner_admin, scope_group)
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_trigger_policies_owner ON trigger_policies(owner_admin)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_trigger_policies_group ON trigger_policies(scope_group)")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS provision_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL UNIQUE,
+                owner_admin TEXT,
+                device_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                progress INTEGER NOT NULL DEFAULT 0,
+                message TEXT,
+                request_json TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_provision_tasks_device ON provision_tasks(device_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_provision_tasks_owner ON provision_tasks(owner_admin)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_provision_tasks_updated ON provision_tasks(updated_at)")
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS login_failures (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ip TEXT NOT NULL,
@@ -1701,6 +1741,7 @@ def _tenant_siblings(
     *,
     source_zone: str = "",
     source_group: str = "",
+    include_source: bool = False,
 ) -> list[tuple[str, str]]:
     """Siblings in the same tenant to fan out an alarm to.
 
@@ -1755,7 +1796,7 @@ def _tenant_siblings(
     out: list[tuple[str, str]] = []
     for r in rows:
         did = str(r["device_id"])
-        if did == source_id and not ALARM_FANOUT_SELF:
+        if did == source_id and not include_source:
             continue
         out.append((did, str(r["zone"] or "")))
     return out[:ALARM_FANOUT_MAX_TARGETS]
@@ -1870,6 +1911,45 @@ def _device_notify_labels(device_id: str) -> tuple[str, str]:
     if not row:
         return "", ""
     return str(row[0] or "").strip(), str(row[1] or "").strip()
+
+
+def _trigger_policy_defaults() -> dict[str, Any]:
+    return {
+        "panic_local_siren": True,
+        "remote_silent_link_enabled": True,
+        "remote_loud_link_enabled": True,
+        "remote_loud_duration_ms": int(ALARM_FANOUT_DURATION_MS),
+        "fanout_exclude_self": True,
+    }
+
+
+def _trigger_policy_for(owner_admin: Optional[str], scope_group: str) -> dict[str, Any]:
+    base = _trigger_policy_defaults()
+    if not owner_admin:
+        return base
+    group_key = scope_group.strip()
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT panic_local_siren, remote_silent_link_enabled, remote_loud_link_enabled,
+                   remote_loud_duration_ms, fanout_exclude_self
+            FROM trigger_policies
+            WHERE owner_admin = ? AND scope_group = ?
+            """,
+            (owner_admin, group_key),
+        )
+        row = cur.fetchone()
+        conn.close()
+    if not row:
+        return base
+    base["panic_local_siren"] = bool(row["panic_local_siren"])
+    base["remote_silent_link_enabled"] = bool(row["remote_silent_link_enabled"])
+    base["remote_loud_link_enabled"] = bool(row["remote_loud_link_enabled"])
+    base["remote_loud_duration_ms"] = int(row["remote_loud_duration_ms"] or ALARM_FANOUT_DURATION_MS)
+    base["fanout_exclude_self"] = bool(row["fanout_exclude_self"])
+    return base
 
 
 def _notify_subject_prefix(device_id: str) -> str:
@@ -2357,6 +2437,7 @@ def _fan_out_alarm(device_id: str, payload: dict[str, Any]) -> None:
     triggered_by = str(payload.get("trigger_kind") or ("remote_button" if local_trigger else "network"))
     owner_admin = _lookup_owner_admin(device_id)
     source_group, _source_label = _device_notify_labels(device_id)
+    policy = _trigger_policy_for(owner_admin, source_group)
 
     alarm_id = _insert_alarm(device_id, owner_admin, source_zone, triggered_by, payload)
     emit_event(
@@ -2380,11 +2461,18 @@ def _fan_out_alarm(device_id: str, payload: dict[str, Any]) -> None:
         "network",
         "group_link",
     )
+    if triggered_by == "remote_silent_button" and not bool(policy.get("remote_silent_link_enabled", True)):
+        should_fanout = False
+    if triggered_by in ("remote_button", "remote_loud_button", "network", "group_link") and not bool(
+        policy.get("remote_loud_link_enabled", True)
+    ):
+        should_fanout = False
     targets = _tenant_siblings(
         owner_admin,
         device_id,
         source_zone=source_zone,
         source_group=source_group,
+        include_source=not bool(policy.get("fanout_exclude_self", True)),
     ) if should_fanout else []
     sent = 0
     failures: list[str] = []
@@ -2392,7 +2480,7 @@ def _fan_out_alarm(device_id: str, payload: dict[str, Any]) -> None:
         for did, _z in targets:
             try:
                 cmd = "siren_on"
-                params: dict[str, Any] = {"duration_ms": ALARM_FANOUT_DURATION_MS}
+                params: dict[str, Any] = {"duration_ms": int(policy.get("remote_loud_duration_ms", ALARM_FANOUT_DURATION_MS))}
                 # Remote silent button: link to sibling devices without siren sound.
                 if triggered_by == "remote_silent_button":
                     cmd = "alarm_signal"
@@ -2679,6 +2767,19 @@ class BulkAlertRequest(BaseModel):
     action: str = Field(pattern="^(on|off)$")
     duration_ms: int = Field(default=8000, ge=500, le=120000)
     device_ids: list[str] = Field(default_factory=list)
+
+
+class ProvisionWifiTaskRequest(BaseModel):
+    ssid: str = Field(min_length=1, max_length=32)
+    password: str = Field(default="", max_length=64)
+
+
+class TriggerPolicyBody(BaseModel):
+    panic_local_siren: bool = True
+    remote_silent_link_enabled: bool = True
+    remote_loud_link_enabled: bool = True
+    remote_loud_duration_ms: int = Field(default=10000, ge=500, le=120000)
+    fanout_exclude_self: bool = True
 
 
 class DeviceChallengeRequest(BaseModel):
@@ -6271,6 +6372,210 @@ def send_device_command(
         },
     )
     return {"ok": True, "topic": topic, "target_id": target}
+
+
+def _load_device_row_for_task(device_id: str) -> tuple[dict[str, Any], Optional[str]]:
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT zone, IFNULL(notification_group,'') AS notification_group, IFNULL(last_ack_json,'') AS last_ack_json FROM device_state WHERE device_id = ?", (device_id,))
+        row = cur.fetchone()
+        cur.execute("SELECT owner_admin FROM device_ownership WHERE device_id = ?", (device_id,))
+        ow = cur.fetchone()
+        owner = str(ow["owner_admin"]) if ow and ow["owner_admin"] else None
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="device not found")
+    return dict(row), owner
+
+
+@app.get("/devices/{device_id}/trigger-policy")
+def get_device_trigger_policy(device_id: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "user")
+    assert_device_owner(principal, device_id)
+    row, owner = _load_device_row_for_task(device_id)
+    assert_zone_for_device(principal, str(row.get("zone") or ""))
+    group_key = str(row.get("notification_group") or "")
+    pol = _trigger_policy_for(owner, group_key)
+    return {"ok": True, "device_id": device_id, "scope_group": group_key, "policy": pol}
+
+
+@app.put("/devices/{device_id}/trigger-policy")
+def save_device_trigger_policy(
+    device_id: str,
+    body: TriggerPolicyBody,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    assert_min_role(principal, "admin")
+    require_capability(principal, "can_send_command")
+    assert_device_owner(principal, device_id)
+    row, owner = _load_device_row_for_task(device_id)
+    assert_zone_for_device(principal, str(row.get("zone") or ""))
+    group_key = str(row.get("notification_group") or "")
+    now = utc_now_iso()
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO trigger_policies (
+                owner_admin, scope_group, panic_local_siren, remote_silent_link_enabled,
+                remote_loud_link_enabled, remote_loud_duration_ms, fanout_exclude_self, updated_by, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(owner_admin, scope_group) DO UPDATE SET
+                panic_local_siren=excluded.panic_local_siren,
+                remote_silent_link_enabled=excluded.remote_silent_link_enabled,
+                remote_loud_link_enabled=excluded.remote_loud_link_enabled,
+                remote_loud_duration_ms=excluded.remote_loud_duration_ms,
+                fanout_exclude_self=excluded.fanout_exclude_self,
+                updated_by=excluded.updated_by,
+                updated_at=excluded.updated_at
+            """,
+            (
+                owner or "",
+                group_key,
+                1 if body.panic_local_siren else 0,
+                1 if body.remote_silent_link_enabled else 0,
+                1 if body.remote_loud_link_enabled else 0,
+                int(body.remote_loud_duration_ms),
+                1 if body.fanout_exclude_self else 0,
+                principal.username,
+                now,
+            ),
+        )
+        conn.commit()
+        conn.close()
+    audit_event(principal.username, "trigger.policy.save", target=device_id, detail={"group": group_key, "owner_admin": owner or ""})
+    return {"ok": True, "device_id": device_id, "scope_group": group_key}
+
+
+@app.post("/devices/{device_id}/provision/wifi-task")
+def start_wifi_provision_task(
+    device_id: str,
+    body: ProvisionWifiTaskRequest,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    assert_min_role(principal, "admin")
+    require_capability(principal, "can_send_command")
+    ensure_not_revoked(device_id)
+    assert_device_owner(principal, device_id)
+    row, owner = _load_device_row_for_task(device_id)
+    assert_zone_for_device(principal, str(row.get("zone") or ""))
+    now = utc_now_iso()
+    task_id = secrets.token_hex(12)
+    publish_command(
+        topic=f"{TOPIC_ROOT}/{device_id}/cmd",
+        cmd="wifi_config",
+        params={"ssid": body.ssid, "password": body.password},
+        target_id=device_id,
+        proto=CMD_PROTO,
+        cmd_key=get_cmd_key_for_device(device_id),
+    )
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO provision_tasks (
+                task_id, owner_admin, device_id, kind, status, progress, message,
+                request_json, created_by, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                owner or "",
+                device_id,
+                "wifi_config",
+                "running",
+                35,
+                "command sent, waiting ack",
+                json.dumps({"ssid": body.ssid}, ensure_ascii=False),
+                principal.username,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        conn.close()
+    emit_event(
+        level="info",
+        category="provision",
+        event_type="provision.wifi.task.start",
+        summary=f"wifi task started for {device_id}",
+        actor=principal.username,
+        target=device_id,
+        owner_admin=owner or "",
+        device_id=device_id,
+        detail={"task_id": task_id},
+    )
+    return {"ok": True, "task_id": task_id, "status": "running", "progress": 35}
+
+
+@app.get("/devices/{device_id}/provision/wifi-task/{task_id}")
+def get_wifi_provision_task(
+    device_id: str,
+    task_id: str,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    assert_min_role(principal, "user")
+    assert_device_owner(principal, device_id)
+    row, owner = _load_device_row_for_task(device_id)
+    assert_zone_for_device(principal, str(row.get("zone") or ""))
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT task_id, status, progress, message, created_at, updated_at, request_json
+            FROM provision_tasks
+            WHERE task_id = ? AND device_id = ?
+            """,
+            (task_id, device_id),
+        )
+        tr = cur.fetchone()
+        if not tr:
+            conn.close()
+            raise HTTPException(status_code=404, detail="task not found")
+        status = str(tr["status"])
+        progress = int(tr["progress"] or 0)
+        message = str(tr["message"] or "")
+        if status == "running":
+            ack_obj: dict[str, Any] = {}
+            try:
+                ack_raw = str(row.get("last_ack_json") or "")
+                ack_obj = json.loads(ack_raw) if ack_raw else {}
+            except Exception:
+                ack_obj = {}
+            if str(ack_obj.get("cmd") or "") == "wifi_config" and isinstance(ack_obj.get("ok"), bool):
+                status = "success" if bool(ack_obj.get("ok")) else "failed"
+                progress = 100
+                message = str(ack_obj.get("detail") or ("wifi saved" if status == "success" else "wifi rejected"))
+                cur.execute(
+                    "UPDATE provision_tasks SET status=?, progress=?, message=?, updated_at=? WHERE task_id=?",
+                    (status, progress, message, utc_now_iso(), task_id),
+                )
+                conn.commit()
+            else:
+                progress = max(progress, 60)
+                message = "waiting device ack/reboot"
+        req_obj: dict[str, Any] = {}
+        try:
+            req_obj = json.loads(str(tr["request_json"] or "{}"))
+        except Exception:
+            req_obj = {}
+        conn.close()
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "device_id": device_id,
+        "owner_admin": owner or "",
+        "status": status,
+        "progress": progress,
+        "message": message,
+        "request": req_obj,
+        "created_at": tr["created_at"],
+        "updated_at": tr["updated_at"],
+    }
 
 
 @app.post("/devices/{device_id}/alert/on")

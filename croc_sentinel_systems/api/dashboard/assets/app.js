@@ -2133,17 +2133,38 @@
 
       <div class="card" id="wifiCtlCard">
         <h3>Wi‑Fi (device)</h3>
-        <p class="muted">SSID / channel come from the last <span class="mono">status</span> report (STA). Enter a <strong>2.4&nbsp;GHz</strong> SSID and password manually — credentials are stored in device NVS as the <strong>first</strong> preferred network, then the device reboots. Production builds often leave compile-time <span class="mono">WIFI_SSID</span> slots empty and rely on this field or factory burn.</p>
+        <p class="muted">Online/offline unified provisioning: create a Wi‑Fi task, then poll task progress until success/fail. Credentials are saved to device NVS and device reboots.</p>
         ${can("can_send_command") ? `
         <div class="inline-form" style="margin-top:10px">
           <label class="field grow"><span>New SSID</span><input id="wifiNewSsid" maxlength="32" autocomplete="off" placeholder="2.4 GHz network name" /></label>
           <label class="field grow"><span>Password</span><input id="wifiNewPass" type="password" maxlength="64" autocomplete="new-password" placeholder="empty if open network" /></label>
           <div class="row wide" style="justify-content:flex-end;flex-wrap:wrap;gap:8px">
-            <button class="btn btn-tap" type="button" id="wifiApplyBtn">Save & reboot</button>
+            <button class="btn btn-tap" type="button" id="wifiApplyBtn">Start provision task</button>
             <button class="btn danger btn-tap" type="button" id="wifiClearBtn">Clear saved Wi‑Fi & reboot</button>
           </div>
         </div>
+        <div style="margin-top:8px">
+          <progress id="wifiTaskProgress" value="0" max="100" style="width:100%;height:12px"></progress>
+        </div>
         <p class="muted" id="wifiScanStatus" style="margin-top:8px;min-height:1.3em"></p>` : `<p class="muted">Requires <span class="mono">can_send_command</span>.</p>`}
+      </div>
+
+      <div class="card" id="triggerPolicyCard">
+        <h3>Trigger policy (server persisted)</h3>
+        <p class="muted">Scope: owner account + group <span class="mono">${escapeHtml(d.notification_group || "(default)")}</span>. Controls remote linkage behavior.</p>
+        ${can("can_send_command") ? `
+        <div class="inline-form" style="margin-top:8px;gap:12px;flex-wrap:wrap">
+          <label class="field"><span>Panic local siren</span><input type="checkbox" id="tpPanicLocal" /></label>
+          <label class="field"><span>Remote silent link</span><input type="checkbox" id="tpSilentLink" /></label>
+          <label class="field"><span>Remote loud link</span><input type="checkbox" id="tpLoudLink" /></label>
+          <label class="field"><span>Exclude self</span><input type="checkbox" id="tpExcludeSelf" /></label>
+          <label class="field"><span>Loud duration (ms)</span><input id="tpLoudDur" type="number" min="500" max="120000" value="10000" /></label>
+          <div class="row wide" style="justify-content:flex-end">
+            <button class="btn secondary btn-tap" type="button" id="tpRefresh">Refresh policy</button>
+            <button class="btn btn-tap" type="button" id="tpSave">Save policy</button>
+          </div>
+        </div>
+        <p class="muted" id="tpStatus" style="margin-top:8px;min-height:1.3em"></p>` : `<p class="muted">Requires <span class="mono">can_send_command</span>.</p>`}
       </div>
 
       ${mqttMsgPanel}`;
@@ -2238,6 +2259,35 @@
     };
 
     const wifiApplyBtn = $("#wifiApplyBtn");
+    const wifiTaskProgress = $("#wifiTaskProgress");
+    const setWifiProgress = (n) => {
+      if (!wifiTaskProgress) return;
+      const v = Math.max(0, Math.min(100, Number(n || 0)));
+      wifiTaskProgress.value = v;
+    };
+    const pollWifiTask = async (taskId) => {
+      const st = $("#wifiScanStatus");
+      for (let i = 0; i < 120; i++) {
+        await new Promise((r) => setTimeout(r, 1000));
+        try {
+          const t = await api(`/devices/${encodeURIComponent(id)}/provision/wifi-task/${encodeURIComponent(taskId)}`, { timeoutMs: 8000 });
+          setWifiProgress(t.progress || 0);
+          if (st) st.textContent = String(t.message || t.status || "");
+          if (t.status === "success") {
+            toast("Provision success", "ok");
+            return;
+          }
+          if (t.status === "failed") {
+            toast(t.message || "Provision failed", "err");
+            return;
+          }
+        } catch (e) {
+          if (st) st.textContent = String(e.message || e);
+        }
+      }
+      if (st) st.textContent = "Timed out waiting task result";
+      toast("Provision task timeout", "err");
+    };
     if (wifiApplyBtn) {
       wifiApplyBtn.addEventListener("click", async () => {
         const ssid = ($("#wifiNewSsid").value || "").trim();
@@ -2246,17 +2296,15 @@
         if (!ssid) { toast("Enter SSID", "err"); return; }
         if (!confirm("Save Wi‑Fi on device and reboot? You may lose contact until it joins the new network.")) return;
         try {
-          if (st) st.textContent = "Sending wifi_config…";
-          await api(`/devices/${encodeURIComponent(id)}/commands`, { method: "POST", body: { cmd: "wifi_config", params: { ssid, password } } });
-          if (st) st.textContent = "Waiting for device ack (then reboot)…";
-          const a = await waitForCmdAck("wifi_config");
-          if (a) {
-            if (st) st.textContent = a.ok ? String(a.detail || "Saved.") : String(a.detail || "wifi_config rejected");
-            toast(a.ok ? "Wi‑Fi saved on device; rebooting." : (a.detail || "wifi_config rejected"), a.ok ? "ok" : "err");
-          } else {
-            if (st) st.textContent = "No ack yet — device may still reboot; check Events.";
-            toast("Command sent; no ack seen yet.", "");
-          }
+          setWifiProgress(10);
+          if (st) st.textContent = "Creating provision task…";
+          const r = await api(`/devices/${encodeURIComponent(id)}/provision/wifi-task`, {
+            method: "POST",
+            body: { ssid, password },
+          });
+          setWifiProgress(r.progress || 35);
+          if (st) st.textContent = `Task ${r.task_id} running…`;
+          await pollWifiTask(r.task_id);
         } catch (e) { toast(e.message || e, "err"); if (st) st.textContent = String(e.message || e); }
       });
     }
@@ -2279,6 +2327,59 @@
           }
         } catch (e) { toast(e.message || e, "err"); if (st) st.textContent = String(e.message || e); }
       });
+    }
+
+    const tpPanicLocal = $("#tpPanicLocal");
+    const tpSilentLink = $("#tpSilentLink");
+    const tpLoudLink = $("#tpLoudLink");
+    const tpExcludeSelf = $("#tpExcludeSelf");
+    const tpLoudDur = $("#tpLoudDur");
+    const tpStatus = $("#tpStatus");
+    const loadTriggerPolicy = async () => {
+      if (!tpPanicLocal || !tpSilentLink || !tpLoudLink || !tpExcludeSelf || !tpLoudDur) return;
+      try {
+        if (tpStatus) tpStatus.textContent = "Loading policy…";
+        const r = await api(`/devices/${encodeURIComponent(id)}/trigger-policy`, { timeoutMs: 8000 });
+        const p = r.policy || {};
+        tpPanicLocal.checked = !!p.panic_local_siren;
+        tpSilentLink.checked = !!p.remote_silent_link_enabled;
+        tpLoudLink.checked = !!p.remote_loud_link_enabled;
+        tpExcludeSelf.checked = !!p.fanout_exclude_self;
+        tpLoudDur.value = String(Number(p.remote_loud_duration_ms || 10000));
+        if (tpStatus) tpStatus.textContent = `Loaded for group ${r.scope_group || "(default)"}`;
+      } catch (e) {
+        if (tpStatus) tpStatus.textContent = String(e.message || e);
+      }
+    };
+    const tpRefresh = $("#tpRefresh");
+    if (tpRefresh) tpRefresh.addEventListener("click", () => loadTriggerPolicy());
+    const tpSave = $("#tpSave");
+    if (tpSave) {
+      tpSave.addEventListener("click", async () => {
+        try {
+          const duration = parseInt((tpLoudDur && tpLoudDur.value) || "10000", 10);
+          if (!Number.isFinite(duration) || duration < 500 || duration > 120000) {
+            throw new Error("Loud duration must be 500-120000 ms");
+          }
+          if (tpStatus) tpStatus.textContent = "Saving policy…";
+          await api(`/devices/${encodeURIComponent(id)}/trigger-policy`, {
+            method: "PUT",
+            body: {
+              panic_local_siren: !!(tpPanicLocal && tpPanicLocal.checked),
+              remote_silent_link_enabled: !!(tpSilentLink && tpSilentLink.checked),
+              remote_loud_link_enabled: !!(tpLoudLink && tpLoudLink.checked),
+              fanout_exclude_self: !!(tpExcludeSelf && tpExcludeSelf.checked),
+              remote_loud_duration_ms: duration,
+            },
+          });
+          if (tpStatus) tpStatus.textContent = "Policy saved";
+          toast("Trigger policy saved", "ok");
+        } catch (e) {
+          if (tpStatus) tpStatus.textContent = String(e.message || e);
+          toast(e.message || e, "err");
+        }
+      });
+      loadTriggerPolicy();
     }
 
     const shareListEl = $("#shareList");
