@@ -44,6 +44,7 @@
       title: "Governance",
       items: [
         { id: "telegram", label: "Telegram", ico: "✆", path: "#/telegram", min: "user" },
+        { id: "account", label: "Account", ico: "◍", path: "#/account", min: "user" },
         { id: "audit", label: "Audit", ico: "≡", path: "#/audit", min: "admin" },
         { id: "admin", label: "Admin & users", ico: "☼", path: "#/admin", min: "admin" },
       ],
@@ -752,7 +753,7 @@
             <p class="auth-card__lead">Email verification · creates an <strong>admin</strong> account</p>
           </header>
           <div class="auth-card__body">
-            <p class="auth-card__note muted">Server seed superadmin is separate. By default you can use the account right after email verification; the server can require superadmin approval via <span class="mono">ADMIN_SIGNUP_REQUIRE_APPROVAL=1</span>.</p>
+            <p class="auth-card__note muted">After email verification your account is ready to sign in.</p>
             <ol class="auth-steps" aria-label="Steps">
               <li id="r_step_ind1" class="is-active"><span class="auth-steps__n">1</span><span class="auth-steps__t">Your details</span></li>
               <li id="r_step_ind2"><span class="auth-steps__n">2</span><span class="auth-steps__t">Email code</span></li>
@@ -815,12 +816,8 @@
         });
         const j = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(j.detail || `${r.status}`);
-        if (j.status === "awaiting_approval") {
-          m2.innerHTML = `<span class="badge online">OK</span> Awaiting superadmin approval before login.`;
-        } else {
-          m2.innerHTML = `<span class="badge online">OK</span> Redirecting to sign in…`;
-          scheduleRouteRedirect(3000, "#/login");
-        }
+        m2.innerHTML = `<span class="badge online">OK</span> Redirecting to sign in…`;
+        scheduleRouteRedirect(3000, "#/login");
       } catch (e) { m2.textContent = String(e.message || e); }
     });
     $("#r_back_step").addEventListener("click", () => {
@@ -901,6 +898,66 @@
         if (!r.ok) throw new Error(j.detail || `${r.status}`);
         msg.textContent = "Resend requested — check inbox and spam.";
       } catch (e) { msg.textContent = String(e.message || e); }
+    });
+  });
+
+  registerRoute("account", async (view) => {
+    setCrumb("Account");
+    if (!hasRole("user")) { view.innerHTML = `<div class="card"><p class="muted">Sign in required.</p></div>`; return; }
+    const me = state.me || { username: "", role: "" };
+    view.innerHTML = `
+      <div class="card">
+        <h2>My account</h2>
+        <p class="muted">User: <span class="mono">${escapeHtml(me.username)}</span> · Role: <span class="mono">${escapeHtml(me.role)}</span></p>
+      </div>
+      <div class="card">
+        <h3>Change password</h3>
+        <label class="field"><span>Current password</span><input id="acc_old" type="password" autocomplete="current-password"/></label>
+        <label class="field field--spaced"><span>New password</span><input id="acc_new1" type="password" autocomplete="new-password"/></label>
+        <label class="field field--spaced"><span>Confirm new password</span><input id="acc_new2" type="password" autocomplete="new-password"/></label>
+        <div class="row" style="justify-content:flex-end;margin-top:10px">
+          <button class="btn" id="accChangePw">Update password</button>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Delete account</h3>
+        <p class="muted">This action is irreversible. Type <span class="mono">DELETE</span> and confirm your password.</p>
+        <label class="field"><span>Current password</span><input id="accDelPw" type="password" autocomplete="current-password"/></label>
+        <label class="field field--spaced"><span>Type DELETE</span><input id="accDelText" placeholder="DELETE"/></label>
+        <div class="row" style="justify-content:flex-end;margin-top:10px">
+          <button class="btn danger" id="accDeleteSelf">Delete my account</button>
+        </div>
+      </div>
+    `;
+    $("#accChangePw", view).addEventListener("click", async () => {
+      try {
+        await api("/auth/me/password", {
+          method: "PATCH",
+          body: {
+            current_password: ($("#acc_old", view).value || ""),
+            new_password: ($("#acc_new1", view).value || ""),
+            new_password_confirm: ($("#acc_new2", view).value || ""),
+          },
+        });
+        toast("Password updated", "ok");
+        $("#acc_old", view).value = "";
+        $("#acc_new1", view).value = "";
+        $("#acc_new2", view).value = "";
+      } catch (e) { toast(e.message || e, "err"); }
+    });
+    $("#accDeleteSelf", view).addEventListener("click", async () => {
+      if (!confirm("Delete your account permanently?")) return;
+      try {
+        await api("/auth/me", {
+          method: "DELETE",
+          body: {
+            password: ($("#accDelPw", view).value || ""),
+            confirm_text: ($("#accDelText", view).value || ""),
+          },
+        });
+        toast("Account deleted", "ok");
+        setToken(""); state.me = null; location.hash = "#/login"; renderAuthState();
+      } catch (e) { toast(e.message || e, "err"); }
     });
   });
 
@@ -1020,6 +1077,11 @@
       const ids = Array.isArray(meta[g] && meta[g].device_ids) ? meta[g].device_ids : [];
       return ids.filter((x) => byId.has(String(x)));
     };
+    const groupSharedBy = (g) => {
+      const rows = groupDeviceIds(g).map((id) => byId.get(String(id))).filter(Boolean);
+      const sharedFrom = new Set(rows.map((d) => String(d.shared_by || "")).filter(Boolean));
+      return Array.from(sharedFrom);
+    };
     const renderDeviceCard = (d) => {
       const on = isOnline(d);
       const primary = escapeHtml(d.display_label || d.device_id || "unknown");
@@ -1029,6 +1091,7 @@
         <div><span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>
           ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
           ${d.fw ? `<span class="chip">v${escapeHtml(d.fw)}</span>` : ""}
+          ${d.is_shared ? `<span class="badge accent" title="shared device">sharing by ${escapeHtml(d.shared_by || "?")}</span>` : ""}
         </div>
         <div class="meta">
           Platform: ${escapeHtml(maskPlatform(`${d.chip_target || ""}/${d.board_profile || ""}`))}<br/>
@@ -1050,16 +1113,20 @@
         const on = rows.filter((d) => isOnline(d)).length;
         const off = Math.max(0, total - on);
         const m = meta[g] || {};
+        const sharedBy = groupSharedBy(g);
+        const isSharedGroup = sharedBy.length > 0;
         return `<article class="device-card js-group-card ${selectedGroup === g ? "is-selected" : ""}" data-group="${escapeHtml(g)}" style="cursor:pointer">
           <h3><div class="device-primary-name">${escapeHtml(m.display_name || g)}</div><div class="device-id-sub mono">${escapeHtml(g)}</div></h3>
           <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
             <span class="badge neutral">total ${total}</span>
             <span class="badge online">online ${on}</span>
             <span class="badge offline">offline ${off}</span>
+            ${isSharedGroup ? `<span class="badge accent" title="shared group">shared by ${escapeHtml(sharedBy.join(", "))}</span>` : ""}
           </div>
           <div class="meta">Owner: ${escapeHtml(m.owner_name || "—")} · ${escapeHtml(m.phone || "—")} · ${escapeHtml(m.email || "—")}</div>
           <div class="row" style="margin-top:8px;gap:6px;flex-wrap:wrap">
-            <button class="btn sm secondary js-edit-group" data-group="${escapeHtml(g)}" type="button">Edit</button>
+            <button class="btn sm secondary js-edit-group" data-group="${escapeHtml(g)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group: device membership is read-only\"" : ""}>Edit</button>
+            <button class="btn sm danger js-del-group" data-group="${escapeHtml(g)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group cannot be deleted\"" : ""}>Delete group</button>
             <button class="btn sm danger js-alert-on" data-group="${escapeHtml(g)}" type="button">Alarm ON</button>
             <button class="btn sm secondary js-alert-off" data-group="${escapeHtml(g)}" type="button">Alarm OFF</button>
           </div>
@@ -1076,8 +1143,12 @@
       $("#gmEmail", view).value = m.email || "";
       const sel = new Set((m.device_ids || []).map(String));
       const pick = $("#gmDevices", view);
+      const isSharedGroup = groupSharedBy(g || "").length > 0;
       if (pick) {
-        pick.innerHTML = devices.map((d) => `<label class="grp-pick-item"><input type="checkbox" value="${escapeHtml(d.device_id)}" ${sel.has(String(d.device_id)) ? "checked" : ""}/> <span>${escapeHtml(d.display_label || d.device_id)} <span class="mono">(${escapeHtml(d.device_id)})</span></span></label>`).join("");
+        pick.innerHTML = devices.map((d) => `<label class="grp-pick-item"><input type="checkbox" value="${escapeHtml(d.device_id)}" ${sel.has(String(d.device_id)) ? "checked" : ""} ${isSharedGroup ? "disabled" : ""}/> <span>${escapeHtml(d.display_label || d.device_id)} <span class="mono">(${escapeHtml(d.device_id)})</span></span></label>`).join("");
+        if (isSharedGroup) {
+          pick.insertAdjacentHTML("afterbegin", `<p class="muted" style="margin:0 0 6px">Shared group: device membership is read-only.</p>`);
+        }
       }
       grpModalEl.style.display = "flex";
     };
@@ -1105,6 +1176,15 @@
         if (!g) return;
         if (btn.classList.contains("js-edit-group")) {
           openGroupModal(g);
+          return;
+        }
+        if (btn.classList.contains("js-del-group")) {
+          if (groupSharedBy(g).length > 0) { toast("Shared group cannot be deleted", "err"); return; }
+          if (!confirm(`Delete group card "${g}"?`)) return;
+          delete meta[g];
+          saveGroupMeta(meta);
+          renderGroups();
+          toast("Group deleted", "ok");
           return;
         }
         if (!can("can_alert")) { toast("No can_alert capability", "err"); return; }
@@ -1148,6 +1228,7 @@
     const gm = meta[g] || { display_name: g, owner_name: "", phone: "", email: "", device_ids: [] };
     const ids = Array.isArray(gm.device_ids) ? gm.device_ids.map(String) : [];
     const rows = ids.map((id) => byId.get(id)).filter(Boolean);
+    const isSharedGroup = rows.some((d) => !!d.is_shared);
     const online = rows.filter((d) => isOnline(d)).length;
     const offline = Math.max(0, rows.length - online);
     setCrumb(`Group · ${gm.display_name || g}`);
@@ -1155,6 +1236,7 @@
       <section class="card">
         <div class="row">
           <h2 style="margin:0">${escapeHtml(gm.display_name || g)}</h2>
+          <button class="btn sm danger right" id="grpDelete" ${isSharedGroup ? "disabled title=\"Shared group cannot be deleted\"" : ""}>Delete group</button>
           <a href="#/overview" class="btn ghost right">← Back</a>
         </div>
         <div class="divider"></div>
@@ -1187,6 +1269,7 @@
           <div><span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>
             ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
             ${d.fw ? `<span class="chip">v${escapeHtml(d.fw)}</span>` : ""}
+            ${d.is_shared ? `<span class="badge accent" title="shared device">sharing by ${escapeHtml(d.shared_by || "?")}</span>` : ""}
           </div>
           <div class="meta">Platform: ${escapeHtml(maskPlatform(`${d.chip_target || ""}/${d.board_profile || ""}`))}<br/>Manufacturer: ESA Sibu</div>
         </a>`;
@@ -1201,8 +1284,19 @@
     };
     const alarmOnBtn = $("#grpAlarmOn", view);
     const alarmOffBtn = $("#grpAlarmOff", view);
+    const delGroupBtn = $("#grpDelete", view);
     if (alarmOnBtn) alarmOnBtn.addEventListener("click", () => sendAlert("on"));
     if (alarmOffBtn) alarmOffBtn.addEventListener("click", () => sendAlert("off"));
+    if (delGroupBtn) {
+      delGroupBtn.addEventListener("click", () => {
+        if (isSharedGroup) { toast("Shared group cannot be deleted", "err"); return; }
+        if (!confirm(`Delete group card "${g}"?`)) return;
+        delete meta[g];
+        localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(meta));
+        toast("Group deleted", "ok");
+        location.hash = "#/overview";
+      });
+    }
   });
 
   // Device detail
@@ -1342,6 +1436,7 @@
       <div class="split">
         <div class="card">
           <h3>Quick actions</h3>
+          ${d.is_shared ? `<p class="muted" style="margin:0 0 8px">Shared by <span class="mono">${escapeHtml(d.shared_by || "?")}</span>. Delete/Revoke actions are disabled for shared devices.</p>` : ""}
           <div class="row">
             <button class="btn" id="alertOn" ${can("can_alert") ? "" : "disabled"}>Siren ON</button>
             <button class="btn secondary" id="alertOff" ${can("can_alert") ? "" : "disabled"}>Siren OFF</button>
@@ -1352,8 +1447,8 @@
             <button class="btn secondary" id="doReboot" ${can("can_send_command") ? "" : "disabled"}>Schedule reboot</button>
           </div>
           <div class="row" style="margin-top:14px">
-            <button class="btn danger" id="revoke" ${can("can_send_command") ? "" : "disabled"}>Revoke</button>
-            <button class="btn secondary" id="unrevoke" ${can("can_send_command") ? "" : "disabled"}>Unrevoke</button>
+            <button class="btn danger" id="revoke" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Revoke</button>
+            <button class="btn secondary" id="unrevoke" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Unrevoke</button>
           </div>
         </div>
         <div class="card">

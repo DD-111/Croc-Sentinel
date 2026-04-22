@@ -2638,6 +2638,17 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=128)
 
 
+class SelfPasswordChangeRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+    new_password_confirm: str = Field(min_length=8, max_length=128)
+
+
+class SelfDeleteRequest(BaseModel):
+    password: str = Field(min_length=1, max_length=128)
+    confirm_text: str = Field(min_length=3, max_length=32)
+
+
 class ForgotStartRequest(BaseModel):
     username: str = Field(min_length=1, max_length=64)
 
@@ -3747,6 +3758,59 @@ def auth_me(principal: Principal = Depends(require_principal)) -> dict[str, Any]
     }
 
 
+@app.patch("/auth/me/password")
+def auth_me_change_password(body: SelfPasswordChangeRequest, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "user")
+    if body.new_password != body.new_password_confirm:
+        raise HTTPException(status_code=400, detail="new password confirmation does not match")
+    if body.new_password == body.current_password:
+        raise HTTPException(status_code=400, detail="new password must be different")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT password_hash, role FROM dashboard_users WHERE username = ?", (principal.username,))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(status_code=404, detail="user not found")
+        if not verify_password(body.current_password, str(row["password_hash"])):
+            conn.close()
+            raise HTTPException(status_code=401, detail="current password invalid")
+        cur.execute(
+            "UPDATE dashboard_users SET password_hash = ? WHERE username = ?",
+            (hash_password(body.new_password), principal.username),
+        )
+        conn.commit()
+        conn.close()
+    audit_event(principal.username, "auth.password.change", principal.username, {})
+    return {"ok": True}
+
+
+@app.delete("/auth/me")
+def auth_me_delete(body: SelfDeleteRequest, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "user")
+    if body.confirm_text.strip().upper() != "DELETE":
+        raise HTTPException(status_code=400, detail="confirm_text must be DELETE")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT password_hash FROM dashboard_users WHERE username = ?", (principal.username,))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(status_code=404, detail="user not found")
+        if not verify_password(body.password, str(row["password_hash"])):
+            conn.close()
+            raise HTTPException(status_code=401, detail="password invalid")
+        cur.execute("DELETE FROM dashboard_users WHERE username = ?", (principal.username,))
+        cur.execute("DELETE FROM role_policies WHERE username = ?", (principal.username,))
+        cur.execute("DELETE FROM device_acl WHERE grantee_username = ?", (principal.username,))
+        conn.commit()
+        conn.close()
+    audit_event(principal.username, "auth.account.delete.self", principal.username, {})
+    return {"ok": True}
+
+
 @app.get("/auth/admins")
 def auth_list_admins(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     """For superadmin only. Returns admins usable as manager_admin."""
@@ -4549,11 +4613,17 @@ def list_devices(principal: Principal = Depends(require_principal)) -> dict[str,
         for r in cur.fetchall():
             d = dict(r)
             d["is_online"] = _device_is_online_sql_row(d, now_s)
+            owner_admin = str(d.get("owner_admin") or "")
             d.pop("last_status_json", None)
             d.pop("last_heartbeat_json", None)
             d.pop("last_ack_json", None)
             d.pop("last_event_json", None)
             if principal.role != "superadmin":
+                viewer_admin = principal.username if principal.role == "admin" else (get_manager_admin(principal.username) or "")
+                is_shared = bool(owner_admin) and bool(viewer_admin) and owner_admin != viewer_admin
+                d["is_shared"] = bool(is_shared)
+                if is_shared:
+                    d["shared_by"] = owner_admin
                 d.pop("owner_admin", None)
             rows_out.append(d)
         conn.close()
@@ -4599,6 +4669,19 @@ def get_device(device_id: str, principal: Principal = Depends(require_principal)
         out["owner_admin"] = str(ow["owner_admin"]) if ow else ""
         out["registered_by"] = str(ow["assigned_by"]) if ow else ""
         out["registered_at"] = str(ow["assigned_at"]) if ow else ""
+    else:
+        with db_lock:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute("SELECT owner_admin FROM device_ownership WHERE device_id = ?", (device_id,))
+            ow = cur.fetchone()
+            conn.close()
+        owner_admin = str(ow["owner_admin"]) if ow and ow["owner_admin"] is not None else ""
+        viewer_admin = principal.username if principal.role == "admin" else (get_manager_admin(principal.username) or "")
+        is_shared = bool(owner_admin) and bool(viewer_admin) and owner_admin != viewer_admin
+        out["is_shared"] = bool(is_shared)
+        if is_shared:
+            out["shared_by"] = owner_admin
     return out
 
 
