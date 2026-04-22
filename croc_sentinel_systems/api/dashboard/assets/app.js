@@ -378,7 +378,16 @@
           }
           const t = await r.text().catch(() => "");
           let msg;
-          try { msg = JSON.parse(t).detail || t; } catch { msg = t; }
+          try {
+            const j = JSON.parse(t);
+            let d = j.detail;
+            if (Array.isArray(d)) {
+              d = d.map((x) => (x && x.msg) ? x.msg : String(x)).join("; ");
+            }
+            msg = d || t;
+          } catch {
+            msg = t;
+          }
           throw new Error(`${r.status} ${msg || r.statusText}`);
         }
         const ct = r.headers.get("content-type") || "";
@@ -1354,15 +1363,16 @@
     setCrumb("Account");
     if (!hasRole("user")) { view.innerHTML = `<div class="card"><p class="muted">Sign in required.</p></div>`; return; }
     const me = state.me || { username: "", role: "" };
+    const roleNorm = String(me.role || "").trim().toLowerCase();
     const deleteSection = (() => {
-      if (me.role === "superadmin") {
+      if (roleNorm === "superadmin") {
         return `
       <div class="card">
         <h3>Delete account</h3>
         <p class="muted">Superadmin accounts cannot be removed through this console (API blocks self-deletion).</p>
       </div>`;
       }
-      if (me.role === "admin") {
+      if (roleNorm === "admin") {
         return `
       <div class="card" style="border-color:color-mix(in srgb,var(--danger)35%,var(--border))">
         <h3>Close tenant · 注销管理员账号</h3>
@@ -1430,13 +1440,12 @@
       } catch (e) { toast(e.message || e, "err"); }
     });
     $("#accDeleteSelf", view).addEventListener("click", async () => {
-      const role = me.role || "";
-      if (role === "superadmin") return;
-      const msg = role === "admin"
+      if (roleNorm === "superadmin") return;
+      const msg = roleNorm === "admin"
         ? "Close this admin tenant permanently? All owned devices will be factory-unclaimed and sub-users deleted."
         : "Delete your account permanently?";
       if (!confirm(msg)) return;
-      if (role === "admin") {
+      if (roleNorm === "admin") {
         const ack = $("#accAckTenant", view);
         if (!ack || !ack.checked) {
           toast("Confirm the checklist: devices will be released and sub-users removed.", "err");
@@ -1446,11 +1455,11 @@
       try {
         const body = {
           password: ($("#accDelPw", view).value || ""),
-          confirm_text: ($("#accDelText", view).value || ""),
-          acknowledge_admin_tenant_closure: role === "admin",
+          confirm_text: ($("#accDelText", view).value || "").trim(),
+          acknowledge_admin_tenant_closure: roleNorm === "admin",
         };
-        await api("/auth/me", { method: "DELETE", body });
-        toast(role === "admin" ? "Tenant closed" : "Account deleted", "ok");
+        await api("/auth/me/delete", { method: "POST", body });
+        toast(roleNorm === "admin" ? "Tenant closed" : "Account deleted", "ok");
         setToken("");
         state.me = null;
         clearHealthPollTimer();

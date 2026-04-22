@@ -43,10 +43,23 @@ from security import (
     zones_from_json,
 )
 from notifier import notifier, render_alarm_email, render_remote_siren_email
+from email_templates import (
+    render_otp_email,
+    render_password_changed_email,
+    render_smtp_test_email,
+    render_welcome_email,
+)
 
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_delete_confirm(raw: str) -> str:
+    """Strip invisible chars / odd spacing so pasted confirmation still matches DELETE."""
+    s = raw or ""
+    s = re.sub(r"[\u200b-\u200d\ufeff]", "", s)
+    return re.sub(r"\s+", " ", s).strip().upper()
 
 
 MQTT_HOST = os.getenv("MQTT_HOST", "mosquitto")
@@ -878,6 +891,7 @@ def init_db() -> None:
         ensure_column(conn, "dashboard_users", "phone_verified_at", "TEXT")
         # status ∈ pending | active | disabled | awaiting_approval
         ensure_column(conn, "dashboard_users", "status", "TEXT")
+        ensure_column(conn, "dashboard_users", "welcome_email_sent", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "role_policies", "tg_view_logs", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "role_policies", "tg_view_devices", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "role_policies", "tg_siren_on", "INTEGER NOT NULL DEFAULT 0")
@@ -3256,57 +3270,15 @@ def _record_signup_attempt(ip: str, email: str) -> None:
 
 
 def _send_email_otp(to: str, code: str, purpose: str) -> None:
-    """Queue a registration / activation / reset OTP with professional HTML."""
+    """Registration / activation / reset OTP — distinct HTML themes + no-reply footer."""
     subject_prefix = (os.getenv("SMTP_SUBJECT_PREFIX", "[Sentinel]") or "[Sentinel]").strip()
-    purpose_en = {
-        "signup": "Admin signup verification",
-        "activate": "Account activation",
-        "reset": "Password recovery",
-    }.get(purpose, "Verification")
     ttl_min = max(1, int(OTP_TTL_SECONDS // 60))
-    code_up = str(code or "").strip().upper()
-    subject = f"{subject_prefix} {purpose_en} — code {code_up}"
-    body = (
-        f"Croc Sentinel — {purpose_en}\n\n"
-        f"Your one-time verification code is:\n\n"
-        f"    {code_up}\n\n"
-        f"This code expires in {ttl_min} minutes.\n"
-        f"If you did not request this email, you can ignore it.\n"
+    subject, body, body_html = render_otp_email(
+        purpose=purpose,
+        code=code,
+        ttl_min=ttl_min,
+        subject_prefix=subject_prefix,
     )
-    body_html = (
-        "<div style='margin:0;padding:0;background:#f5f7fb;font-family:Arial,Helvetica,sans-serif'>"
-        "<table role='presentation' width='100%' cellpadding='0' cellspacing='0' style='background:#f5f7fb;padding:24px 0'>"
-        "<tr><td align='center'>"
-        "<table role='presentation' width='620' cellpadding='0' cellspacing='0' style='max-width:620px;background:#ffffff;border:1px solid #e5e7eb;border-radius:12px;overflow:hidden'>"
-        "<tr><td style='background:#0f172a;color:#ffffff;padding:18px 22px;font-size:14px;font-weight:700;letter-spacing:.08em;text-transform:uppercase'>"
-        "CROC SENTINEL SECURITY CONSOLE"
-        "</td></tr>"
-        "<tr><td style='padding:22px'>"
-        f"<div style='font-size:13px;color:#64748b;letter-spacing:.08em;text-transform:uppercase;font-weight:700'>{purpose_en}</div>"
-        "<h2 style='margin:8px 0 12px;font-size:22px;color:#0f172a'>Verification Required</h2>"
-        "<p style='margin:0 0 12px;color:#334155;font-size:14px;line-height:1.65'>Use the verification code below to continue.</p>"
-        "<div style='margin:18px 0;padding:18px;border:1px solid #cbd5e1;border-radius:10px;background:#f8fafc;text-align:center'>"
-        "<div style='font-size:12px;color:#64748b;letter-spacing:.12em;text-transform:uppercase'>Verification Code</div>"
-        f"<div style='margin-top:8px;font-size:40px;line-height:1.2;font-weight:800;letter-spacing:.22em;color:#0f172a'>{code_up}</div>"
-        "</div>"
-        "<table role='presentation' width='100%' cellpadding='0' cellspacing='0' style='margin-top:8px;border-collapse:collapse'>"
-        "<tr>"
-        "<td style='padding:8px 0;color:#64748b;font-size:12px;text-transform:uppercase;letter-spacing:.08em'>Validity</td>"
-        f"<td style='padding:8px 0;color:#0f172a;font-size:14px;font-weight:700;text-align:right'>{ttl_min} minutes</td>"
-        "</tr>"
-        "</table>"
-        "<p style='margin:14px 0 0;color:#64748b;font-size:12px;line-height:1.6'>"
-        "If this action was not requested by you, please ignore this email. Do not share this code with anyone."
-        "</p>"
-        "</td></tr>"
-        "<tr><td style='padding:14px 22px;border-top:1px solid #e2e8f0;color:#94a3b8;font-size:11px'>"
-        "CROC SENTINEL · Automated Security Notification"
-        "</td></tr>"
-        "</table>"
-        "</td></tr></table></div>"
-    )
-    # Use synchronous SMTP for OTP mail: async queue would return 200 before delivery,
-    # so authentication flows could claim success while the worker silently failed.
     notifier.send_sync([to], subject, body, body_html)
 
 
@@ -4195,6 +4167,25 @@ def auth_login(body: LoginRequest, request: Request) -> dict[str, Any]:
     ok_detail["owner_admin"] = owner_admin
     ok_detail["login_user"] = str(row["username"])
     audit_event(str(row["username"]), "auth.login.ok", str(row["username"]), ok_detail)
+    # One-time welcome email after first successful login (requires SMTP + stored email).
+    try:
+        email_u = str(row["email"] or "").strip()
+        rk = row.keys()
+        wel_sent = int(row["welcome_email_sent"] or 0) if "welcome_email_sent" in rk else 0
+        if notifier.enabled() and email_u and wel_sent == 0:
+            ws, wt, wh = render_welcome_email(username=str(row["username"]), role=str(row["role"]))
+            notifier.send_sync([email_u], ws, wt, wh)
+            with db_lock:
+                conn = get_conn()
+                cur = conn.cursor()
+                cur.execute(
+                    "UPDATE dashboard_users SET welcome_email_sent = 1 WHERE username = ?",
+                    (body.username,),
+                )
+                conn.commit()
+                conn.close()
+    except Exception:
+        logger.warning("welcome email skipped or failed for %s", body.username, exc_info=True)
     return {"access_token": token, "token_type": "bearer", "role": row["role"], "zones": zones}
 
 
@@ -4220,7 +4211,10 @@ def auth_me_change_password(body: SelfPasswordChangeRequest, principal: Principa
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute("SELECT password_hash, role FROM dashboard_users WHERE username = ?", (principal.username,))
+        cur.execute(
+            "SELECT password_hash, role, email FROM dashboard_users WHERE username = ?",
+            (principal.username,),
+        )
         row = cur.fetchone()
         if not row:
             conn.close()
@@ -4228,6 +4222,8 @@ def auth_me_change_password(body: SelfPasswordChangeRequest, principal: Principa
         if not verify_password(body.current_password, str(row["password_hash"])):
             conn.close()
             raise HTTPException(status_code=401, detail="current password invalid")
+        rk = row.keys()
+        notify_email = str(row["email"] or "").strip() if "email" in rk else ""
         cur.execute(
             "UPDATE dashboard_users SET password_hash = ? WHERE username = ?",
             (hash_password(body.new_password), principal.username),
@@ -4235,14 +4231,19 @@ def auth_me_change_password(body: SelfPasswordChangeRequest, principal: Principa
         conn.commit()
         conn.close()
     audit_event(principal.username, "auth.password.change", principal.username, {})
+    if notify_email and notifier.enabled():
+        try:
+            ps, pt, ph = render_password_changed_email(username=principal.username, iso_ts=utc_now_iso())
+            notifier.send_sync([notify_email], ps, pt, ph)
+        except Exception:
+            logger.warning("password-changed email failed for %s", principal.username, exc_info=True)
     return {"ok": True}
 
 
-@app.delete("/auth/me")
-def auth_me_delete(body: SelfDeleteRequest, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+def _auth_me_delete_impl(body: SelfDeleteRequest, principal: Principal) -> dict[str, Any]:
     assert_min_role(principal, "user")
-    if body.confirm_text.strip().upper() != "DELETE":
-        raise HTTPException(status_code=400, detail="confirm_text must be DELETE")
+    if _normalize_delete_confirm(body.confirm_text) != "DELETE":
+        raise HTTPException(status_code=400, detail="confirm_text must be exactly: DELETE")
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -4280,6 +4281,18 @@ def auth_me_delete(body: SelfDeleteRequest, principal: Principal = Depends(requi
     cache_invalidate("overview")
     audit_event(principal.username, "auth.account.delete.self", principal.username, {})
     return {"ok": True}
+
+
+@app.delete("/auth/me")
+def auth_me_delete(body: SelfDeleteRequest, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    """Self-service account deletion. Prefer POST /auth/me/delete behind proxies that strip DELETE bodies."""
+    return _auth_me_delete_impl(body, principal)
+
+
+@app.post("/auth/me/delete")
+def auth_me_delete_post(body: SelfDeleteRequest, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    """Same as DELETE /auth/me — JSON body is reliably forwarded by nginx/CDN stacks."""
+    return _auth_me_delete_impl(body, principal)
 
 
 @app.get("/auth/admins")
@@ -7796,13 +7809,13 @@ def smtp_test(req: SmtpTestRequest, principal: Principal = Depends(require_princ
     assert_min_role(principal, "admin")
     if "@" not in req.to:
         raise HTTPException(status_code=400, detail="invalid recipient")
-    subject = req.subject or f"[Croc Sentinel] Mail test by {principal.username}"
-    text = (
-        f"This is a test email sent by {principal.username} at {utc_now_iso()}.\n"
-        "If you received this, your mail channel configuration is working.\n"
+    subject, text, html_body = render_smtp_test_email(
+        actor_username=principal.username,
+        iso_ts=utc_now_iso(),
+        subject_override=req.subject,
     )
     try:
-        notifier.send_sync([req.to], subject, text)
+        notifier.send_sync([req.to], subject, text, html_body)
     except Exception as exc:
         audit_event(principal.username, "smtp.test.fail", req.to, {"error": str(exc)})
         raise HTTPException(status_code=502, detail=f"Mail channel error: {exc}")
