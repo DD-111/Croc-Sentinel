@@ -547,7 +547,7 @@
     }
     const sm = state.health.smtp || {};
     const tg = state.health.telegram || {};
-    const smtpOk = !!sm.configured && !!sm.worker_running;
+    const mailOk = !!sm.configured && !!sm.worker_running;
     const tgOn = !!tg.enabled;
     const tgOk = tgOn && !!tg.worker_running;
     const tgErr = String(tg.last_error || "").trim();
@@ -557,9 +557,9 @@
     const mqLastUp = String(state.health.mqtt_last_connect_at || "");
     const mqLastDown = String(state.health.mqtt_last_disconnect_at || "");
     const mqLastReason = String(state.health.mqtt_last_disconnect_reason || "");
-    const smtpTitle = sm.configured
-      ? (smtpOk ? "SMTP worker running — OTP mail can be sent" : "SMTP configured but worker not running — check API logs")
-      : "SMTP not configured — set SMTP_HOST (and auth) for email OTP";
+    const mailTitle = sm.configured
+      ? (mailOk ? "Mail worker running — verification email can be sent" : "Mail channel configured but worker not running — check API logs")
+      : "Mail channel not configured on server";
     const tgTitle = tgOn
       ? (tgOk
         ? (tgErr ? `Telegram worker up — last API error: ${tgErr}` : "Telegram worker running — events at min_level+ are queued")
@@ -572,7 +572,7 @@
       : `MQTT disconnected — check broker/TLS/network. last_down=${mqLastDown || "—"} reason=${mqLastReason || "—"}`;
     el.innerHTML = `
       <span class="health-pill ${mqConn ? (mqDrop > 0 ? "warn" : "ok") : "off"}" title="${escapeHtml(mqttTitle)}">MQTT</span>
-      <span class="health-pill ${smtpOk ? "ok" : sm.configured ? "warn" : "off"}" title="${escapeHtml(smtpTitle)}">SMTP</span>
+      <span class="health-pill ${mailOk ? "ok" : sm.configured ? "warn" : "off"}" title="${escapeHtml(mailTitle)}">MAIL</span>
       <span class="health-pill ${tgOk ? "ok" : tgOn ? "warn" : "off"}" title="${escapeHtml(tgTitle)}">TG</span>`;
   }
 
@@ -2259,6 +2259,10 @@
           <div class="row" style="margin-top:14px">
             <button class="btn danger" id="revoke" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Revoke</button>
             <button class="btn secondary" id="unrevoke" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Unrevoke</button>
+            <button class="btn danger" id="deleteReset" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Delete & reset</button>
+            ${(state.me && state.me.role === "superadmin")
+              ? `<button class="btn danger" id="factoryUnregister" ${!d.is_shared ? "" : "disabled"}>Unregister (keep serial)</button>`
+              : ""}
           </div>
         </div>
         ${rawCommandPanel}
@@ -2391,6 +2395,38 @@
     });
     $("#unrevoke").addEventListener("click", withDev(() =>
       api(`/devices/${encodeURIComponent(id)}/unrevoke`, { method: "POST" })));
+    const deleteResetBtn = $("#deleteReset", view);
+    if (deleteResetBtn) {
+      deleteResetBtn.addEventListener("click", async () => {
+        if (!confirm("Delete this device from current account records? You can re-add and reconfigure later.")) return;
+        const typed = String(prompt(`Type device ID to confirm delete/reset:\n${id}`) || "").trim();
+        if (typed !== id) { toast("Confirmation mismatch", "err"); return; }
+        try {
+          await api(`/devices/${encodeURIComponent(id)}/delete-reset`, {
+            method: "POST",
+            body: { confirm_text: typed },
+          });
+          toast("Device deleted/reset. Re-add from Activate flow.", "ok");
+          location.hash = "#/overview";
+        } catch (e) { toast(e.message || e, "err"); }
+      });
+    }
+    const factoryUnregisterBtn = $("#factoryUnregister", view);
+    if (factoryUnregisterBtn) {
+      factoryUnregisterBtn.addEventListener("click", async () => {
+        if (!confirm("Superadmin action: rollback to UNREGISTERED while keeping factory serial. Continue?")) return;
+        const typed = String(prompt(`Type device ID to confirm factory-unregister:\n${id}`) || "").trim();
+        if (typed !== id) { toast("Confirmation mismatch", "err"); return; }
+        try {
+          await api(`/devices/${encodeURIComponent(id)}/factory-unregister`, {
+            method: "POST",
+            body: { confirm_text: typed },
+          });
+          toast("Device rolled back to unregistered (serial preserved).", "ok");
+          location.hash = "#/overview";
+        } catch (e) { toast(e.message || e, "err"); }
+      });
+    }
 
     const sendCmdBtn = $("#sendCmd");
     if (sendCmdBtn) {
@@ -3339,7 +3375,7 @@
         <p class="muted">${isSuper
           ? "Superadmin: create admin/user, assign manager_admin and policies."
           : "Admin: manage users under you and toggle their capabilities."}</p>
-        <p class="muted" style="margin-top:8px">Registration OTP email uses <span class="mono">SMTP_*</span> in server <span class="mono">.env</span>; set <span class="mono">SMTP_FROM</span> to a valid address (or leave blank to use <span class="mono">SMTP_USERNAME</span>). Telegram alerts need <span class="mono">TELEGRAM_BOT_TOKEN</span> and <span class="mono">TELEGRAM_CHAT_IDS</span>; restart the API after changing those. Status: top bar pills (from <span class="mono">/health</span>).</p>
+        <p class="muted" style="margin-top:8px">Registration and reset codes are sent via your configured mail channel on server <span class="mono">.env</span>. Telegram alerts need <span class="mono">TELEGRAM_BOT_TOKEN</span> and <span class="mono">TELEGRAM_CHAT_IDS</span>; restart the API after changing those. Status: top bar pills (from <span class="mono">/health</span>).</p>
         <div class="row right-end" style="justify-content:flex-end;flex-wrap:wrap;gap:10px">
           <button class="btn btn-tap" id="showCreate" type="button">New user</button>
           <button class="btn secondary btn-tap" id="reloadUsers" type="button">Refresh</button>
@@ -3400,7 +3436,7 @@
 
       <div class="card">
         <h3>Alert email recipients</h3>
-        <p class="muted">Inbox list for alarm emails when SMTP is configured on the server.</p>
+        <p class="muted">Inbox list for alarm emails when mail channel is configured on the server.</p>
         <div id="smtpStatus" class="row" style="gap:6px"></div>
         <div class="divider"></div>
         <div class="inline-form">
@@ -3408,7 +3444,7 @@
           <label class="field"><span>Label</span><input id="r_label" autocomplete="off" placeholder="on-call"/></label>
           <div class="row wide" style="justify-content:flex-end">
             <button class="btn" id="r_add">Add</button>
-            <button class="btn ghost" id="r_test">Send test email</button>
+            <button class="btn ghost" id="r_test">Send test mail</button>
           </div>
         </div>
         <div id="recipientList" style="margin-top:10px"></div>
@@ -3660,8 +3696,8 @@
         const smtpEl = $v("#smtpStatus");
         if (!smtpEl) return;
         const okBadge = s.enabled
-          ? `<span class="badge online">SMTP on</span>`
-          : `<span class="badge offline">SMTP off</span>`;
+          ? `<span class="badge online">Mail on</span>`
+          : `<span class="badge offline">Mail off</span>`;
         const last = s.last_error ? `<span class="chip" title="last error">${escapeHtml(s.last_error)}</span>` : "";
         smtpEl.innerHTML = `${okBadge}
           <span class="chip">host: ${escapeHtml(s.host || "—")}:${escapeHtml(String(s.port || "—"))}</span>
@@ -3719,7 +3755,7 @@
       if (!email) { toast("Enter recipient email first", "err"); return; }
       try {
         await api("/admin/smtp/test", { method: "POST", body: { to: email } });
-        toast("SMTP test sent", "ok");
+        toast("Mail test sent", "ok");
         loadSmtpStatus();
       } catch (e) { toast(e.message || e, "err"); }
     });

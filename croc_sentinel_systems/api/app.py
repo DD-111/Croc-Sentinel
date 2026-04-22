@@ -2798,6 +2798,10 @@ class DeviceRevokeRequest(BaseModel):
     reason: str = Field(default="manual revoke", min_length=3, max_length=200)
 
 
+class DeviceDeleteRequest(BaseModel):
+    confirm_text: str = Field(min_length=3, max_length=128)
+
+
 class LoginRequest(BaseModel):
     username: str = Field(min_length=1, max_length=64)
     password: str = Field(min_length=1, max_length=128)
@@ -3240,7 +3244,7 @@ def _record_signup_attempt(ip: str, email: str) -> None:
 
 
 def _send_email_otp(to: str, code: str, purpose: str) -> None:
-    """Queue a registration / activation / reset OTP (English-only for deliverability)."""
+    """Queue a registration / activation / reset OTP with professional HTML."""
     subject_prefix = (os.getenv("SMTP_SUBJECT_PREFIX", "[Sentinel]") or "[Sentinel]").strip()
     purpose_en = {
         "signup": "Admin signup verification",
@@ -3248,18 +3252,51 @@ def _send_email_otp(to: str, code: str, purpose: str) -> None:
         "reset": "Password recovery",
     }.get(purpose, "Verification")
     ttl_min = max(1, int(OTP_TTL_SECONDS // 60))
-    subject = f"{subject_prefix} {purpose_en} — code {code}"
+    code_up = str(code or "").strip().upper()
+    subject = f"{subject_prefix} {purpose_en} — code {code_up}"
     body = (
         f"Croc Sentinel — {purpose_en}\n\n"
         f"Your one-time verification code is:\n\n"
-        f"    {code}\n\n"
+        f"    {code_up}\n\n"
         f"This code expires in {ttl_min} minutes.\n"
         f"If you did not request this email, you can ignore it.\n"
     )
-    ok = notifier.enqueue(to=[to], subject=subject, body_text=body)
+    body_html = (
+        "<div style='margin:0;padding:0;background:#f5f7fb;font-family:Arial,Helvetica,sans-serif'>"
+        "<table role='presentation' width='100%' cellpadding='0' cellspacing='0' style='background:#f5f7fb;padding:24px 0'>"
+        "<tr><td align='center'>"
+        "<table role='presentation' width='620' cellpadding='0' cellspacing='0' style='max-width:620px;background:#ffffff;border:1px solid #e5e7eb;border-radius:12px;overflow:hidden'>"
+        "<tr><td style='background:#0f172a;color:#ffffff;padding:18px 22px;font-size:14px;font-weight:700;letter-spacing:.08em;text-transform:uppercase'>"
+        "CROC SENTINEL SECURITY CONSOLE"
+        "</td></tr>"
+        "<tr><td style='padding:22px'>"
+        f"<div style='font-size:13px;color:#64748b;letter-spacing:.08em;text-transform:uppercase;font-weight:700'>{purpose_en}</div>"
+        "<h2 style='margin:8px 0 12px;font-size:22px;color:#0f172a'>Verification Required</h2>"
+        "<p style='margin:0 0 12px;color:#334155;font-size:14px;line-height:1.65'>Use the verification code below to continue.</p>"
+        "<div style='margin:18px 0;padding:18px;border:1px solid #cbd5e1;border-radius:10px;background:#f8fafc;text-align:center'>"
+        "<div style='font-size:12px;color:#64748b;letter-spacing:.12em;text-transform:uppercase'>Verification Code</div>"
+        f"<div style='margin-top:8px;font-size:40px;line-height:1.2;font-weight:800;letter-spacing:.22em;color:#0f172a'>{code_up}</div>"
+        "</div>"
+        "<table role='presentation' width='100%' cellpadding='0' cellspacing='0' style='margin-top:8px;border-collapse:collapse'>"
+        "<tr>"
+        "<td style='padding:8px 0;color:#64748b;font-size:12px;text-transform:uppercase;letter-spacing:.08em'>Validity</td>"
+        f"<td style='padding:8px 0;color:#0f172a;font-size:14px;font-weight:700;text-align:right'>{ttl_min} minutes</td>"
+        "</tr>"
+        "</table>"
+        "<p style='margin:14px 0 0;color:#64748b;font-size:12px;line-height:1.6'>"
+        "If this action was not requested by you, please ignore this email. Do not share this code with anyone."
+        "</p>"
+        "</td></tr>"
+        "<tr><td style='padding:14px 22px;border-top:1px solid #e2e8f0;color:#94a3b8;font-size:11px'>"
+        "CROC SENTINEL · Automated Security Notification"
+        "</td></tr>"
+        "</table>"
+        "</td></tr></table></div>"
+    )
+    ok = notifier.enqueue(to=[to], subject=subject, body_text=body, body_html=body_html)
     if not ok:
         raise RuntimeError(
-            "SMTP is not configured (set SMTP_HOST and related env) or the mail queue rejected the job"
+            "Email sender is not configured or the mail queue rejected the job"
         )
 
 
@@ -4676,6 +4713,97 @@ def unrevoke_device(device_id: str, principal: Principal = Depends(require_princ
         conn.close()
     audit_event(principal.username, "device.unrevoke", device_id, {})
     return {"ok": True, "device_id": device_id}
+
+
+def _device_delete_reset_impl(
+    device_id: str,
+    principal: Principal,
+    req: DeviceDeleteRequest,
+    *,
+    super_unclaim: bool,
+) -> dict[str, Any]:
+    assert_min_role(principal, "admin")
+    if str(req.confirm_text or "").strip().upper() != str(device_id or "").strip().upper():
+        raise HTTPException(status_code=400, detail="confirm_text must exactly match device_id")
+    if principal.role == "admin":
+        require_capability(principal, "can_send_command")
+    if super_unclaim:
+        assert_min_role(principal, "superadmin")
+    else:
+        assert_device_owner(principal, device_id)
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT mac_nocolon FROM provisioned_credentials WHERE device_id = ?", (device_id,))
+        p = cur.fetchone()
+        mac_nocolon = str(p["mac_nocolon"]) if p and p["mac_nocolon"] else ""
+        cur.execute("DELETE FROM provisioned_credentials WHERE device_id = ?", (device_id,))
+        del_cred = int(cur.rowcount or 0)
+        cur.execute("DELETE FROM device_ownership WHERE device_id = ?", (device_id,))
+        del_owner = int(cur.rowcount or 0)
+        cur.execute("DELETE FROM device_acl WHERE device_id = ?", (device_id,))
+        del_acl = int(cur.rowcount or 0)
+        cur.execute("DELETE FROM revoked_devices WHERE device_id = ?", (device_id,))
+        del_revoked = int(cur.rowcount or 0)
+        cur.execute("DELETE FROM device_state WHERE device_id = ?", (device_id,))
+        del_state = int(cur.rowcount or 0)
+        cur.execute("DELETE FROM scheduled_commands WHERE device_id = ?", (device_id,))
+        del_sched = int(cur.rowcount or 0)
+        if super_unclaim:
+            if mac_nocolon:
+                cur.execute(
+                    "UPDATE factory_devices SET status='unclaimed', updated_at=? WHERE mac_nocolon = ?",
+                    (utc_now_iso(), mac_nocolon),
+                )
+            else:
+                cur.execute(
+                    "UPDATE factory_devices SET status='unclaimed', updated_at=? WHERE serial = ?",
+                    (utc_now_iso(), device_id),
+                )
+        conn.commit()
+        conn.close()
+    action = "device.factory_unclaim" if super_unclaim else "device.delete_reset"
+    audit_event(
+        principal.username,
+        action,
+        device_id,
+        {
+            "mac_nocolon": mac_nocolon or "",
+            "deleted_credentials": del_cred,
+            "deleted_owner": del_owner,
+            "deleted_acl": del_acl,
+            "deleted_revoked": del_revoked,
+            "deleted_state": del_state,
+            "deleted_scheduled": del_sched,
+            "factory_unclaimed": super_unclaim,
+        },
+    )
+    return {
+        "ok": True,
+        "device_id": device_id,
+        "mode": "factory_unclaim" if super_unclaim else "delete_reset",
+        "factory_unclaimed": super_unclaim,
+    }
+
+
+@app.post("/devices/{device_id}/delete-reset")
+def device_delete_reset(
+    device_id: str,
+    req: DeviceDeleteRequest,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    """Admin/superadmin: delete device records so it can be re-added/reset."""
+    return _device_delete_reset_impl(device_id, principal, req, super_unclaim=False)
+
+
+@app.post("/devices/{device_id}/factory-unregister")
+def device_factory_unregister(
+    device_id: str,
+    req: DeviceDeleteRequest,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    """Superadmin only: rollback to unregistered while keeping factory serial row."""
+    return _device_delete_reset_impl(device_id, principal, req, super_unclaim=True)
 
 
 @app.get("/health")
@@ -7422,16 +7550,16 @@ def smtp_test(req: SmtpTestRequest, principal: Principal = Depends(require_princ
     assert_min_role(principal, "admin")
     if "@" not in req.to:
         raise HTTPException(status_code=400, detail="invalid recipient")
-    subject = req.subject or f"[Croc Sentinel] SMTP test by {principal.username}"
+    subject = req.subject or f"[Croc Sentinel] Mail test by {principal.username}"
     text = (
         f"This is a test email sent by {principal.username} at {utc_now_iso()}.\n"
-        "If you received this, your SMTP configuration is working.\n"
+        "If you received this, your mail channel configuration is working.\n"
     )
     try:
         notifier.send_sync([req.to], subject, text)
     except Exception as exc:
         audit_event(principal.username, "smtp.test.fail", req.to, {"error": str(exc)})
-        raise HTTPException(status_code=502, detail=f"SMTP error: {exc}")
+        raise HTTPException(status_code=502, detail=f"Mail channel error: {exc}")
     audit_event(principal.username, "smtp.test.ok", req.to, {})
     return {"ok": True, "status": notifier.status()}
 
