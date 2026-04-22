@@ -137,6 +137,8 @@ class _TelegramQueue:
                     keep["owner_admin"] = d.get("owner_admin")
                 if "device_ids" in d and isinstance(d.get("device_ids"), list):
                     keep["device_ids"] = d.get("device_ids")
+                if "owner_admins" in d and isinstance(d.get("owner_admins"), list):
+                    keep["owner_admins"] = d.get("owner_admins")
                 # Trigger source is always important for alarm actions.
                 for k in ("trigger_kind", "client_kind"):
                     if k in d and d.get(k) not in (None, ""):
@@ -193,6 +195,10 @@ class _TelegramQueue:
             dids = [str(x) for x in detail_map.get("device_ids") if str(x).strip()]
             if dids:
                 lines.append(f"device_ids: {','.join(dids[:12])}")
+        if "owner_admins" in detail_map and isinstance(detail_map.get("owner_admins"), list):
+            ows = [str(x) for x in detail_map.get("owner_admins") if str(x).strip()]
+            if ows:
+                lines.append(f"owner_admins: {','.join(ows[:12])}")
         for k in ("ip", "geo", "platform", "device_type", "mac_hint", "reason", "error", "result", "state", "duration_ms", "fanout_count"):
             if k in detail_map and detail_map.get(k) not in (None, ""):
                 lines.append(f"{k}: {detail_map.get(k)}")

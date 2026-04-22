@@ -127,6 +127,22 @@
       clearTimeout(tid);
     }
   }
+  function _sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+  function _isTransientFetchError(err) {
+    const s = String((err && err.message) || err || "").toLowerCase();
+    return (
+      s.includes("timed out") ||
+      s.includes("networkerror") ||
+      s.includes("failed to fetch") ||
+      s.includes("load failed") ||
+      s.includes("temporarily unavailable")
+    );
+  }
+  function _isRetryableHttpStatus(code) {
+    return code === 408 || code === 425 || code === 429 || code === 502 || code === 503 || code === 504;
+  }
 
   function getToken() { return localStorage.getItem(LS.token) || ""; }
   function setToken(t) { t ? localStorage.setItem(LS.token, t) : localStorage.removeItem(LS.token); }
@@ -288,27 +304,47 @@
       headers["Content-Type"] = "application/json";
       body = JSON.stringify(body);
     }
-    const r = await fetchWithDeadline(
-      apiBase() + path,
-      { method: opts.method || "GET", headers, body },
-      opts.timeoutMs,
-    );
-    if (r.status === 401) {
-      setToken("");
-      state.me = null;
-      if (location.hash !== "#/login") location.hash = "#/login";
-      throw new Error("401 Unauthorized or session expired");
+    const method = String(opts.method || "GET").toUpperCase();
+    const retryable = opts.retryable != null ? !!opts.retryable : (method === "GET" || method === "HEAD");
+    const retries = Number.isFinite(Number(opts.retries)) ? Math.max(0, Number(opts.retries)) : (retryable ? 2 : 0);
+    let lastErr;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        const r = await fetchWithDeadline(
+          apiBase() + path,
+          { method, headers, body },
+          opts.timeoutMs,
+        );
+        if (r.status === 401) {
+          setToken("");
+          state.me = null;
+          if (location.hash !== "#/login") location.hash = "#/login";
+          throw new Error("401 Unauthorized or session expired");
+        }
+        if (!r.ok) {
+          if (retryable && attempt < retries && _isRetryableHttpStatus(Number(r.status))) {
+            await _sleep(250 * (2 ** attempt));
+            continue;
+          }
+          const t = await r.text().catch(() => "");
+          let msg;
+          try { msg = JSON.parse(t).detail || t; } catch { msg = t; }
+          throw new Error(`${r.status} ${msg || r.statusText}`);
+        }
+        const ct = r.headers.get("content-type") || "";
+        if (ct.includes("application/json")) return r.json();
+        if (opts.raw) return r;
+        return r.text();
+      } catch (e) {
+        lastErr = e;
+        if (retryable && attempt < retries && _isTransientFetchError(e)) {
+          await _sleep(250 * (2 ** attempt));
+          continue;
+        }
+        throw e;
+      }
     }
-    if (!r.ok) {
-      const t = await r.text().catch(() => "");
-      let msg;
-      try { msg = JSON.parse(t).detail || t; } catch { msg = t; }
-      throw new Error(`${r.status} ${msg || r.statusText}`);
-    }
-    const ct = r.headers.get("content-type") || "";
-    if (ct.includes("application/json")) return r.json();
-    if (opts.raw) return r;
-    return r.text();
+    throw lastErr || new Error("request failed");
   }
 
   async function apiOr(path, fallback, opts) {
@@ -1212,7 +1248,7 @@
           </div>
           <div class="meta">Owner: ${escapeHtml(m.owner_name || "—")} · ${escapeHtml(m.phone || "—")} · ${escapeHtml(m.email || "—")}</div>
           <div class="row" style="margin-top:8px;gap:6px;flex-wrap:wrap">
-            <button class="btn sm secondary js-group-settings" data-group="${escapeHtml(g)}" type="button">Settings</button>
+            <button class="btn sm secondary js-group-settings" data-group="${escapeHtml(g)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group follows owner settings\"" : ""}>Settings</button>
             <button class="btn sm secondary js-edit-group" data-group="${escapeHtml(g)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group: device membership is read-only\"" : ""}>Edit</button>
             <button class="btn sm danger js-alert-on" data-group="${escapeHtml(g)}" type="button">Alarm ON</button>
             <button class="btn sm secondary js-alert-off" data-group="${escapeHtml(g)}" type="button">Alarm OFF</button>
@@ -1451,9 +1487,28 @@
         const action = btn.classList.contains("js-alert-on") ? "on" : "off";
         if (!confirm(`${action === "on" ? "Open" : "Close"} alarm for ${ids.length} devices in ${g}?`)) return;
         try {
-          const gs = groupSettingsMap.get(g) || {};
-          const durationMs = Number(gs.trigger_duration_ms || 10000);
-          await api("/alerts", { method: "POST", body: { action, duration_ms: durationMs, device_ids: ids } });
+          if (action === "on") {
+            // Alarm ON should honor group settings (delay/continuous/reboot flow) via server apply.
+            try {
+              await api(`/group-cards/${encodeURIComponent(g)}/apply`, { method: "POST" });
+            } catch (eApply) {
+              const msgApply = String((eApply && eApply.message) || eApply || "");
+              if (msgApply.includes("404") || msgApply.includes("405") || msgApply.includes("501")) {
+                const gs = groupSettingsMap.get(g) || {};
+                const payload = {
+                  trigger_mode: String(gs.trigger_mode || "continuous"),
+                  trigger_duration_ms: Number(gs.trigger_duration_ms || 10000),
+                  delay_seconds: Number(gs.delay_seconds || 0),
+                  reboot_self_check: !!gs.reboot_self_check,
+                };
+                await applyGroupSettingsFallback(g, payload);
+              } else {
+                throw eApply;
+              }
+            }
+          } else {
+            await api("/alerts", { method: "POST", body: { action, duration_ms: 10000, device_ids: ids } });
+          }
           toast(`${action === "on" ? "Alarm ON" : "Alarm OFF"} · ${ids.length}`, "ok");
         } catch (e) {
           toast(e.message || e, "err");

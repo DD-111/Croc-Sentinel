@@ -23,6 +23,7 @@ from typing import Any, Optional
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
 import paho.mqtt.client as mqtt
 from cryptography.hazmat.primitives import hashes, serialization
@@ -2789,6 +2790,7 @@ async def _app_lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Croc Sentinel API", version="1.1.0", lifespan=_app_lifespan)
+app.add_middleware(GZipMiddleware, minimum_size=700)
 
 _dash_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard")
 if os.path.isdir(_dash_dir):
@@ -4874,6 +4876,30 @@ def _group_settings_defaults(group_key: str) -> dict[str, Any]:
     }
 
 
+def _group_devices_with_owner(group_key: str, principal: Principal) -> list[dict[str, str]]:
+    g = (group_key or "").strip()
+    if not g:
+        return []
+    zs, za = zone_sql_suffix(principal, "d.zone")
+    osf, osa = owner_scope_clause_for_device_state(principal, "d")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT d.device_id, IFNULL(o.owner_admin,'') AS owner_admin
+            FROM device_state d
+            LEFT JOIN device_ownership o ON d.device_id = o.device_id
+            WHERE IFNULL(d.notification_group,'') = ? {zs} {osf}
+            ORDER BY d.device_id ASC
+            """,
+            tuple([g] + za + osa),
+        )
+        rows = [{"device_id": str(r["device_id"]), "owner_admin": str(r["owner_admin"] or "")} for r in cur.fetchall()]
+        conn.close()
+    return rows
+
+
 @app.get("/group-cards/settings")
 def list_group_card_settings(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     assert_min_role(principal, "user")
@@ -4953,6 +4979,15 @@ def save_group_card_settings(
     if not g:
         raise HTTPException(status_code=400, detail="group_key required")
     owner_scope = _group_owner_scope(principal)
+    rows = _group_devices_with_owner(g, principal)
+    if not rows:
+        raise HTTPException(status_code=404, detail="group not found in your scope")
+    # Shared groups are owner-managed: grantee cannot override owner strategy.
+    if principal.role != "superadmin":
+        for r in rows:
+            o = str(r.get("owner_admin") or "")
+            if o and o != owner_scope:
+                raise HTTPException(status_code=403, detail="shared group settings are managed by owner")
     now = utc_now_iso()
     with db_lock:
         conn = get_conn()
@@ -5018,38 +5053,43 @@ def apply_group_card_settings(
     if not g:
         raise HTTPException(status_code=400, detail="group_key required")
     owner_scope = _group_owner_scope(principal)
-    zs, za = zone_sql_suffix(principal, "d.zone")
-    osf, osa = owner_scope_clause_for_device_state(principal, "d")
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            f"""
-            SELECT d.device_id
-            FROM device_state d
-            WHERE IFNULL(d.notification_group,'') = ? {zs} {osf}
-            ORDER BY d.device_id ASC
-            """,
-            tuple([g] + za + osa),
-        )
-        targets = [str(r["device_id"]) for r in cur.fetchall()]
-        cur.execute(
-            """
-            SELECT trigger_mode, trigger_duration_ms, delay_seconds, reboot_self_check
-            FROM group_card_settings
-            WHERE owner_admin = ? AND group_key = ?
-            """,
-            (owner_scope, g),
-        )
-        st = cur.fetchone()
-        conn.close()
+    rows = _group_devices_with_owner(g, principal)
+    targets = [str(r["device_id"]) for r in rows if r.get("device_id")]
     if not targets:
         raise HTTPException(status_code=404, detail="group has no devices in your scope")
-    cfg = dict(st) if st else _group_settings_defaults(g)
-    mode = str(cfg.get("trigger_mode") or "continuous")
-    dur_ms = int(cfg.get("trigger_duration_ms") or 10000)
-    delay_seconds = int(cfg.get("delay_seconds") or 0)
-    reboot_self_check = bool(int(cfg.get("reboot_self_check") or 0)) if st else bool(cfg.get("reboot_self_check"))
+
+    # Settings ownership policy:
+    # - own devices => use caller's owner_scope setting
+    # - shared devices => follow real owner's setting (read-only for grantee)
+    device_owner_map: dict[str, str] = {str(r["device_id"]): str(r.get("owner_admin") or "") for r in rows}
+    owners_needed: set[str] = set()
+    for did in targets:
+        owner_real = str(device_owner_map.get(did) or "")
+        owner_for_cfg = owner_real or owner_scope
+        owners_needed.add(owner_for_cfg)
+    settings_by_owner: dict[str, dict[str, Any]] = {}
+    if owners_needed:
+        ph = ",".join(["?"] * len(owners_needed))
+        args = [g] + list(owners_needed)
+        with db_lock:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute(
+                f"""
+                SELECT owner_admin, trigger_mode, trigger_duration_ms, delay_seconds, reboot_self_check
+                FROM group_card_settings
+                WHERE group_key = ? AND owner_admin IN ({ph})
+                """,
+                tuple(args),
+            )
+            for r in cur.fetchall():
+                settings_by_owner[str(r["owner_admin"])] = {
+                    "trigger_mode": str(r["trigger_mode"] or "continuous"),
+                    "trigger_duration_ms": int(r["trigger_duration_ms"] or 10000),
+                    "delay_seconds": int(r["delay_seconds"] or 0),
+                    "reboot_self_check": bool(int(r["reboot_self_check"] or 0)),
+                }
+            conn.close()
 
     now_ts = int(time.time())
     siren_sent = 0
@@ -5058,6 +5098,13 @@ def apply_group_card_settings(
     self_tests = 0
     for did in targets:
         ensure_not_revoked(did)
+        owner_real = str(device_owner_map.get(did) or "")
+        owner_for_cfg = owner_real or owner_scope
+        cfg = settings_by_owner.get(owner_for_cfg, _group_settings_defaults(g))
+        mode = str(cfg.get("trigger_mode") or "continuous")
+        dur_ms = int(cfg.get("trigger_duration_ms") or 10000)
+        delay_seconds = int(cfg.get("delay_seconds") or 0)
+        reboot_self_check = bool(cfg.get("reboot_self_check"))
         if mode == "delay" and delay_seconds > 0:
             enqueue_scheduled_command(
                 device_id=did,
@@ -5102,6 +5149,13 @@ def apply_group_card_settings(
             reboot_jobs += 1
 
     owner = _lookup_owner_admin(targets[0]) if targets else ""
+    # Report the first owner's effective setting for compact response fields.
+    first_owner = str(device_owner_map.get(targets[0]) or owner_scope) if targets else owner_scope
+    first_cfg = settings_by_owner.get(first_owner, _group_settings_defaults(g))
+    mode = str(first_cfg.get("trigger_mode") or "continuous")
+    dur_ms = int(first_cfg.get("trigger_duration_ms") or 10000)
+    delay_seconds = int(first_cfg.get("delay_seconds") or 0)
+    reboot_self_check = bool(first_cfg.get("reboot_self_check"))
     _log_signal_trigger(
         "group_card_apply",
         "*",
@@ -5135,6 +5189,8 @@ def apply_group_card_settings(
             "duration_ms": dur_ms,
             "delay_seconds": delay_seconds,
             "reboot_self_check": reboot_self_check,
+            "owner_scope": owner_scope,
+            "owners_count": len(owners_needed),
             "device_count": len(targets),
             "sent_now": siren_sent,
             "scheduled": siren_scheduled,
@@ -6227,6 +6283,18 @@ def bulk_alert(req: BulkAlertRequest, request: Request, principal: Principal = D
 
     if sent > 0:
         own = _lookup_owner_admin(targets[0])
+        owner_admins: list[str] = []
+        with db_lock:
+            conn = get_conn()
+            cur = conn.cursor()
+            ph = ",".join(["?"] * len(targets))
+            cur.execute(
+                f"SELECT DISTINCT IFNULL(owner_admin,'') AS owner_admin FROM device_ownership WHERE device_id IN ({ph})",
+                tuple(targets),
+            )
+            owner_admins = [str(r["owner_admin"]) for r in cur.fetchall() if r["owner_admin"]]
+            conn.close()
+        ctx = _client_context(request)
         _log_signal_trigger(
             f"bulk_siren_{req.action}",
             "*",
@@ -6235,7 +6303,7 @@ def bulk_alert(req: BulkAlertRequest, request: Request, principal: Principal = D
             own,
             duration_ms=req.duration_ms if req.action == "on" else None,
             target_count=sent,
-            detail={"device_ids": targets, **_client_context(request)},
+            detail={"device_ids": targets, "owner_admins": owner_admins[:16], **ctx},
         )
         if notifier.enabled() and own:
             rec = _recipients_for_admin(own)
@@ -6251,7 +6319,17 @@ def bulk_alert(req: BulkAlertRequest, request: Request, principal: Principal = D
             actor=principal.username,
             target=",".join(targets[:8]),
             owner_admin=own or "",
-            detail={"count": sent, "device_ids": targets[:64]},
+            detail={
+                "count": sent,
+                "device_ids": targets[:64],
+                "owner_admins": owner_admins[:16],
+                "trigger_kind": ctx.get("client_kind", "web"),
+                "ip": ctx.get("ip", ""),
+                "platform": ctx.get("platform", ""),
+                "device_type": ctx.get("device_type", ""),
+                "mac_hint": ctx.get("mac_hint", ""),
+                "geo": ctx.get("geo", ""),
+            },
         )
 
     return {
