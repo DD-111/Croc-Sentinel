@@ -210,6 +210,8 @@
     const rows = [];
     for (const [k, raw] of Object.entries(payload)) {
       if (raw == null || raw === "") continue;
+      if (String(k || "").startsWith("_")) continue;
+      if (/^(ts|timestamp|nonce|seq|message_id|msg_id)$/i.test(String(k || ""))) continue;
       const str = typeof raw === "object" ? JSON.stringify(raw) : String(raw);
       if (!str.trim()) continue;
       let display = str;
@@ -409,6 +411,12 @@
     const tgOn = !!tg.enabled;
     const tgOk = tgOn && !!tg.worker_running;
     const tgErr = String(tg.last_error || "").trim();
+    const mqConn = !!state.health.mqtt_connected;
+    const mqQ = Number(state.health.mqtt_ingest_queue_depth || 0);
+    const mqDrop = Number(state.health.mqtt_ingest_dropped || 0);
+    const mqLastUp = String(state.health.mqtt_last_connect_at || "");
+    const mqLastDown = String(state.health.mqtt_last_disconnect_at || "");
+    const mqLastReason = String(state.health.mqtt_last_disconnect_reason || "");
     const smtpTitle = sm.configured
       ? (smtpOk ? "SMTP worker running — OTP mail can be sent" : "SMTP configured but worker not running — check API logs")
       : "SMTP not configured — set SMTP_HOST (and auth) for email OTP";
@@ -417,7 +425,13 @@
         ? (tgErr ? `Telegram worker up — last API error: ${tgErr}` : "Telegram worker running — events at min_level+ are queued")
         : "Telegram enabled but worker not running — check API logs")
       : "Telegram disabled — set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS (numeric chat id; start a chat with the bot first)";
+    const mqttTitle = mqConn
+      ? (mqDrop > 0
+        ? `MQTT connected, but ingest dropped ${mqDrop} message(s); queue depth=${mqQ}. last_up=${mqLastUp || "—"}`
+        : `MQTT connected; ingest queue depth=${mqQ}. last_up=${mqLastUp || "—"}`)
+      : `MQTT disconnected — check broker/TLS/network. last_down=${mqLastDown || "—"} reason=${mqLastReason || "—"}`;
     el.innerHTML = `
+      <span class="health-pill ${mqConn ? (mqDrop > 0 ? "warn" : "ok") : "off"}" title="${escapeHtml(mqttTitle)}">MQTT</span>
       <span class="health-pill ${smtpOk ? "ok" : sm.configured ? "warn" : "off"}" title="${escapeHtml(smtpTitle)}">SMTP</span>
       <span class="health-pill ${tgOk ? "ok" : tgOn ? "warn" : "off"}" title="${escapeHtml(tgTitle)}">TG</span>`;
   }
@@ -906,6 +920,31 @@
     const offline = (ov.presence && ov.presence.offline_total != null) ? ov.presence.offline_total : Math.max(0, devices.length - online);
     const pr = ov.presence || {};
     const tp = ov.throughput || {};
+    const hh = state.health || {};
+    const mqConnected = !!(hh.mqtt_connected ?? ov.mqtt_connected);
+    const mqQDepth = Number(hh.mqtt_ingest_queue_depth || 0);
+    const mqDropped = Number(hh.mqtt_ingest_dropped || 0);
+    const mqLastUp = String(hh.mqtt_last_connect_at || "");
+    const mqLastDown = String(hh.mqtt_last_disconnect_at || "");
+    const mqReason = String(hh.mqtt_last_disconnect_reason || "");
+    let mqRiskLabel = "Healthy";
+    let mqRiskClass = "online";
+    let mqRiskDetail = `queue=${mqQDepth} · dropped=${mqDropped}`;
+    if (!mqConnected) {
+      mqRiskLabel = "Disconnected";
+      mqRiskClass = "revoked";
+      mqRiskDetail = `last_down=${mqLastDown || "—"}${mqReason ? ` · reason=${mqReason}` : ""}`;
+    } else if (mqDropped >= 100 || mqQDepth >= 700) {
+      mqRiskLabel = "High risk";
+      mqRiskClass = "revoked";
+      mqRiskDetail = `queue=${mqQDepth} · dropped=${mqDropped} (overflow risk)`;
+    } else if (mqDropped > 0 || mqQDepth >= 300) {
+      mqRiskLabel = "Warning";
+      mqRiskClass = "offline";
+      mqRiskDetail = `queue=${mqQDepth} · dropped=${mqDropped}`;
+    } else {
+      mqRiskDetail = `queue=${mqQDepth} · dropped=${mqDropped} · last_up=${mqLastUp || "—"}`;
+    }
     const bps = (v) => {
       v = Number(v || 0);
       if (v < 1024) return v.toFixed(0) + " B/s";
@@ -928,6 +967,35 @@
 
     view.innerHTML = `
       <section class="stats">${stats}</section>
+      <section class="card">
+        <div class="row">
+          <h3 style="margin:0">MQTT risk</h3>
+          <span class="badge ${mqRiskClass}">${mqRiskLabel}</span>
+        </div>
+        <div class="divider"></div>
+        <section class="stats">
+          <div class="stat">
+            <div class="k">Broker link</div>
+            <div class="v">${mqConnected ? "up" : "down"}</div>
+            <div class="sub">${escapeHtml(mqConnected ? `last_up=${mqLastUp || "—"}` : `last_down=${mqLastDown || "—"}`)}</div>
+          </div>
+          <div class="stat">
+            <div class="k">Ingest queue depth</div>
+            <div class="v">${mqQDepth}</div>
+            <div class="sub">>=300 warn, >=700 high</div>
+          </div>
+          <div class="stat">
+            <div class="k">Dropped messages</div>
+            <div class="v">${mqDropped}</div>
+            <div class="sub">${escapeHtml(mqReason || "0 is ideal")}</div>
+          </div>
+          <div class="stat">
+            <div class="k">Assessment</div>
+            <div class="v">${escapeHtml(mqRiskLabel)}</div>
+            <div class="sub">${escapeHtml(mqRiskDetail)}</div>
+          </div>
+        </section>
+      </section>
       <section class="card">
         <div class="row">
           <h3 style="margin:0">Offline breakdown</h3>
@@ -989,11 +1057,9 @@
   registerRoute("devices", async (view, args) => {
     const id = decodeURIComponent(args[0] || "");
     if (!id) { location.hash = "#/overview"; return; }
+    const isSuperViewer = !!(state.me && state.me.role === "superadmin");
 
-    const [d, msgs] = await Promise.all([
-      api(`/devices/${encodeURIComponent(id)}`),
-      api(`/devices/${encodeURIComponent(id)}/messages?limit=25`).catch(() => ({ items: [] })),
-    ]);
+    const d = await api(`/devices/${encodeURIComponent(id)}`);
     setCrumb(d.display_label ? `Device · ${d.display_label}` : `Device · ${id}`);
     const on = isOnline(d);
     const s = d.last_status_json || {};
@@ -1046,10 +1112,10 @@
         <div id="shareList" style="margin-top:12px"></div>
       </div>
     ` : "";
-    const msgItems = msgs.items || [];
-    const msgFeedHtml = msgItems.length === 0
-      ? `<p class="muted audit-empty">No messages.</p>`
-      : `<div class="audit-feed">${msgItems.map((m) => {
+    const renderMsgFeed = (items) => {
+      const msgItems = Array.isArray(items) ? items : [];
+      if (msgItems.length === 0) return `<p class="muted audit-empty">No messages.</p>`;
+      return `<div class="audit-feed">${msgItems.map((m) => {
         const plRows = messagePayloadRows(m.payload || {});
         const extra = plRows.length
           ? `<div class="audit-extra">${plRows.map((row) =>
@@ -1057,16 +1123,26 @@
           ).join("")}</div>`
           : "";
         return `<article class="audit-item">
-        <div class="audit-item-top">
-          <div class="audit-time">
-            <span class="audit-ts mono">${escapeHtml((m.ts_received || "").replace("T", " ").replace(/\..*/, ""))}</span>
-            <span class="muted audit-rel">${escapeHtml(fmtRel(m.ts_received))}</span>
+          <div class="audit-item-top">
+            <div class="audit-time">
+              <span class="audit-ts mono">${escapeHtml((m.ts_received || "").replace("T", " ").replace(/\..*/, ""))}</span>
+              <span class="muted audit-rel">${escapeHtml(fmtRel(m.ts_received))}</span>
+            </div>
+            <span class="chip">${escapeHtml(m.channel || "—")}</span>
           </div>
-          <span class="chip">${escapeHtml(m.channel || "—")}</span>
-        </div>
-        ${extra}
-      </article>`;
+          ${extra}
+        </article>`;
       }).join("")}</div>`;
+    };
+    const mqttMsgPanel = isSuperViewer ? `
+      <div class="card">
+        <details id="mqttMsgDetails">
+          <summary style="cursor:pointer;font-weight:600">MQTT debug messages (latest 25)</summary>
+          <p class="muted" style="margin:8px 0 0">Debug-only raw device uplink snapshots. Hidden by default to keep the page clean.</p>
+          <div class="divider"></div>
+          <div class="audit-feed-wrap" id="devMsgsList"><p class="muted">Expand to load…</p></div>
+        </details>
+      </div>` : "";
     view.innerHTML = `
       <div class="card">
         <div class="row" style="align-items:flex-start;flex-wrap:wrap;gap:10px">
@@ -1154,14 +1230,28 @@
         <p class="muted" id="wifiScanStatus" style="margin-top:8px;min-height:1.3em"></p>` : `<p class="muted">Requires <span class="mono">can_send_command</span>.</p>`}
       </div>
 
-      <div class="card">
-        <div class="row">
-          <h3 style="margin:0">Recent MQTT messages</h3>
-          <span class="muted">last 25</span>
-        </div>
-        <div class="divider"></div>
-        <div class="audit-feed-wrap" id="devMsgsList">${msgFeedHtml}</div>
-      </div>`;
+      ${mqttMsgPanel}`;
+    if (isSuperViewer) {
+      const det = $("#mqttMsgDetails", view);
+      const box = $("#devMsgsList", view);
+      let loaded = false;
+      const loadDebugMsgs = async () => {
+        if (loaded || !box) return;
+        loaded = true;
+        box.innerHTML = `<p class="muted">Loading…</p>`;
+        try {
+          const msgs = await api(`/devices/${encodeURIComponent(id)}/messages?limit=25`, { timeoutMs: 8000 });
+          box.innerHTML = renderMsgFeed(msgs.items || []);
+        } catch (e) {
+          box.innerHTML = `<p class="badge offline">${escapeHtml(e.message || e)}</p>`;
+        }
+      };
+      if (det) {
+        det.addEventListener("toggle", () => {
+          if (det.open) loadDebugMsgs();
+        });
+      }
+    }
 
     $("#saveProfile").addEventListener("click", async () => {
       try {

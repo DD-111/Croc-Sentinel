@@ -204,6 +204,9 @@ mqtt_ingest_queue: _stdqueue.Queue[Optional[dict[str, Any]]] = _stdqueue.Queue(m
 mqtt_worker_stop = threading.Event()
 mqtt_worker_thread: Optional[threading.Thread] = None
 mqtt_ingest_dropped = 0
+mqtt_last_connect_at = ""
+mqtt_last_disconnect_at = ""
+mqtt_last_disconnect_reason = ""
 # Deferred bootstrap: ASGI binds immediately; heavy IO runs on api-bootstrap thread.
 api_ready_event = threading.Event()
 api_bootstrap_error: Optional[str] = None
@@ -1608,9 +1611,11 @@ def insert_message(topic: str, channel: str, device_id: Optional[str], payload: 
 
 
 def on_connect(client: mqtt.Client, _userdata: Any, _flags: Any, rc: int, _properties: Any = None) -> None:
-    global mqtt_connected
+    global mqtt_connected, mqtt_last_connect_at, mqtt_last_disconnect_reason
     mqtt_connected = rc == 0
     if rc == 0:
+        mqtt_last_connect_at = utc_now_iso()
+        mqtt_last_disconnect_reason = ""
         logger.info("MQTT connected")
         client.subscribe(TOPIC_HEARTBEAT, qos=1)
         client.subscribe(TOPIC_STATUS, qos=1)
@@ -1622,9 +1627,11 @@ def on_connect(client: mqtt.Client, _userdata: Any, _flags: Any, rc: int, _prope
 
 
 def on_disconnect(_client: mqtt.Client, _userdata: Any, _disconnect_flags: Any, _reason_code: Any, _properties: Any = None) -> None:
-    global mqtt_connected
+    global mqtt_connected, mqtt_last_disconnect_at, mqtt_last_disconnect_reason
     mqtt_connected = False
-    logger.warning("MQTT disconnected")
+    mqtt_last_disconnect_at = utc_now_iso()
+    mqtt_last_disconnect_reason = str(_reason_code or "")
+    logger.warning("MQTT disconnected reason=%s", mqtt_last_disconnect_reason)
 
 
 def _lookup_owner_admin(device_id: str) -> Optional[str]:
@@ -4222,6 +4229,9 @@ def health() -> dict[str, Any]:
         "mqtt_connected": mqtt_connected,
         "mqtt_ingest_queue_depth": mqtt_ingest_queue.qsize(),
         "mqtt_ingest_dropped": mqtt_ingest_dropped,
+        "mqtt_last_connect_at": mqtt_last_connect_at,
+        "mqtt_last_disconnect_at": mqtt_last_disconnect_at,
+        "mqtt_last_disconnect_reason": mqtt_last_disconnect_reason,
         "smtp": {
             "configured": notifier.enabled(),
             "worker_running": notifier.worker_alive(),
