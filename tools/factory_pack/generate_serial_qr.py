@@ -13,6 +13,7 @@ from pathlib import Path
 
 from factory_core import (
     append_pending_push_queue,
+    build_output_dir_name,
     DEFAULT_FACTORY_UI_API_BASE,
     DEFAULT_QR_POLICY,
     default_dotenv_path,
@@ -108,10 +109,11 @@ def main() -> None:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(3)
 
-    default_out = root / "factory_serial_exports" / f"output_{int(time.time())}"
+    default_out = root / "factory_serial_exports" / build_output_dir_name(len(items))
     out = Path(args.out) if args.out else default_out
-    write_batch_files(out, items, batch)
+    write_batch_files(out, items, batch, qr_secret=secret)
     print(f"Wrote {len(items)} devices to:\n  {out}")
+    print("QR verification: policy + signature checks passed for all items.")
     queue_path = root / "factory_serial_exports" / "pending_push_queue.json"
     (out / "BATCH_ID.txt").write_text(batch + "\n", encoding="utf-8")
 

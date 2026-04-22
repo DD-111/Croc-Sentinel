@@ -751,13 +751,13 @@
     });
   });
 
-  // Forgot password — offline RSA decrypt flow
+  // Forgot password — email + SHA code flow
   registerRoute("forgot-password", async (view) => {
     setCrumb("Forgot password");
     document.body.dataset.auth = "none";
     let enabled = true;
     try {
-      const r = await fetch(apiBase() + "/auth/forgot/enabled");
+      const r = await fetch(apiBase() + "/auth/forgot/email/enabled");
       const j = await r.json();
       enabled = !!j.enabled;
     } catch { enabled = false; }
@@ -767,32 +767,27 @@
           <header class="auth-card__head">
             <div class="auth-card__logo" aria-hidden="true"></div>
             <h1 class="auth-card__title">Account recovery</h1>
-            <p class="auth-card__lead">Offline RSA — private key never sent to the server</p>
+            <p class="auth-card__lead">Email SHA code recovery</p>
           </header>
           <div class="auth-card__body">
           <p class="muted auth-card__prose">
-            Offline RSA recovery: after <strong>Get blob</strong> you receive <span class="mono">recovery_blob_hex</span>
-            (long hex, length ≈ 2×<span class="mono">blob_byte_len</span>). Copy the <strong>entire</strong> string — no line breaks.
-            Decrypt offline with <span class="mono">password_recovery_offline/decrypt_recovery_blob.py</span> and <span class="mono">private.pem</span>,
-            paste the one-line JSON below, then set a new password.
+            Enter your username and the same email used at registration.
+            The server sends a SHA-style verification code to that email.
+            Enter the code to set a new password (saved permanently on server).
           </p>
-          ${enabled ? "" : `<p class="badge revoked" style="margin:10px 0">Server has no <span class="mono">PASSWORD_RECOVERY_PUBLIC_KEY_*</span> — recovery disabled.</p>`}
+          ${enabled ? "" : `<p class="badge revoked" style="margin:10px 0">Email sender is not configured on server.</p>`}
           <div id="fpStep1">
             <label class="field"><span>Username</span><input id="fp_user" autocomplete="username" /></label>
+            <label class="field field--spaced"><span>Registered email</span><input id="fp_email" autocomplete="email" /></label>
             <div class="auth-card__submit">
-              <button class="btn btn-tap btn-block" type="button" id="fp_go" ${enabled ? "" : "disabled"}>Get recovery blob</button>
+              <button class="btn btn-tap btn-block" type="button" id="fp_go" ${enabled ? "" : "disabled"}>Send SHA code</button>
               <a class="auth-link auth-link--center" href="#/login">Back to sign in</a>
             </div>
             <p class="auth-card__msg muted" id="fp_msg1" aria-live="polite"></p>
           </div>
           <div id="fpStep2" style="display:none">
-            <label class="field"><span>recovery_blob_hex</span>
-              <textarea id="fp_blob" readonly rows="6" class="mono" style="width:100%;font-size:11px"></textarea>
-            </label>
-            <p class="muted" id="fp_blob_hint" style="margin-top:6px;font-size:12px"></p>
-            <p class="muted" id="fp_meta"></p>
-            <label class="field field--spaced"><span>Decrypted JSON (one line)</span>
-              <textarea id="fp_plain" rows="3" placeholder='{"jti":"...","u":"...","s":"...","e":...}' style="width:100%"></textarea>
+            <label class="field"><span>SHA code (from email)</span>
+              <input id="fp_sha_code" class="mono" maxlength="32" autocomplete="one-time-code" />
             </label>
             <label class="field field--spaced"><span>New password (≥8)</span><input id="fp_p1" type="password" autocomplete="new-password" /></label>
             <label class="field field--spaced"><span>Confirm password</span><input id="fp_p2" type="password" autocomplete="new-password" /></label>
@@ -809,12 +804,13 @@
     $("#fp_go").addEventListener("click", async () => {
       m1.textContent = "";
       const username = $("#fp_user").value.trim();
-      if (!username) { m1.textContent = "Enter username"; return; }
+      const email = ($("#fp_email").value || "").trim().toLowerCase();
+      if (!username || !email) { m1.textContent = "Enter username and email"; return; }
       try {
-        const r = await fetch(apiBase() + "/auth/forgot/start", {
+        const r = await fetch(apiBase() + "/auth/forgot/email/start", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ username }),
+          body: JSON.stringify({ username, email }),
         });
         const d = await r.json().catch(() => ({}));
         if (!r.ok) {
@@ -822,15 +818,7 @@
           const msg = Array.isArray(det) ? det.map((x) => x.msg || JSON.stringify(x)).join("; ") : (det || r.statusText);
           throw new Error(msg);
         }
-        const hex = d.recovery_blob_hex || "";
-        $("#fp_blob").value = hex;
-        const bl = d.blob_byte_len;
-        const hexLen = hex.length;
-        $("#fp_blob_hint").textContent =
-          bl != null
-            ? `Hex length ${hexLen} (expected 2×${bl}=${2 * Number(bl)}). Copy all of it.`
-            : `Hex length ${hexLen}. Copy the full blob.`;
-        $("#fp_meta").textContent = `TTL ~ ${((d.ttl_seconds || 0) / 3600).toFixed(1)} h · raw bytes ${bl != null ? bl : "—"}`;
+        m1.textContent = `Code sent if account/email matched. TTL ${(Number(d.ttl_seconds || 0) / 60).toFixed(0)} min.`;
         $("#fpStep1").style.display = "none";
         $("#fpStep2").style.display = "block";
       } catch (e) { m1.textContent = String(e.message || e); }
@@ -843,16 +831,17 @@
     $("#fp_done").addEventListener("click", async () => {
       m2.textContent = "";
       const username = $("#fp_user").value.trim();
-      const recovery_plain = ($("#fp_plain").value || "").trim();
+      const email = ($("#fp_email").value || "").trim().toLowerCase();
+      const sha_code = ($("#fp_sha_code").value || "").trim().toUpperCase();
       const password = $("#fp_p1").value;
       const password_confirm = $("#fp_p2").value;
-      if (!recovery_plain || !password) { m2.textContent = "Enter decrypted JSON and password"; return; }
+      if (!email || !sha_code || !password) { m2.textContent = "Enter email, SHA code, and password"; return; }
       if (password !== password_confirm) { m2.textContent = "Passwords do not match"; return; }
       try {
-        const r = await fetch(apiBase() + "/auth/forgot/complete", {
+        const r = await fetch(apiBase() + "/auth/forgot/email/complete", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ username, recovery_plain, password, password_confirm }),
+          body: JSON.stringify({ username, email, sha_code, password, password_confirm }),
         });
         const d = await r.json().catch(() => ({}));
         if (!r.ok) {

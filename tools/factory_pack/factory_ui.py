@@ -17,6 +17,7 @@ if str(_PACK) not in sys.path:
 
 from factory_core import (  # noqa: E402
     append_pending_push_queue,
+    build_output_dir_name,
     DEFAULT_FACTORY_UI_API_BASE,
     default_dotenv_path,
     drain_pending_push_queue,
@@ -176,9 +177,10 @@ class FactoryApp(tk.Tk):
             batch = self._batch.get().strip() or f"GUI_{int(time.time())}"
             ui(self._append, f"[gen] count={n} batch={batch}")
             items = generate_items(n, secret, batch)
-            out = repo_root() / "factory_serial_exports" / f"output_{int(time.time())}"
-            write_batch_files(out, items, batch)
+            out = repo_root() / "factory_serial_exports" / build_output_dir_name(len(items))
+            write_batch_files(out, items, batch, qr_secret=secret)
             ui(self._append, f"[ok] 已写入: {out}")
+            ui(self._append, "[qr] policy+signature verification passed for all generated items")
 
             if self._auto_push.get():
                 api = self._api_base.get().strip().rstrip("/")

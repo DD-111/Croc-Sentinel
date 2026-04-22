@@ -108,7 +108,19 @@ def generate_items(
     return items
 
 
-def write_batch_files(out: Path, items: list[dict[str, str | None]], batch: str) -> None:
+def build_output_dir_name(count: int, now_ts: int | None = None) -> str:
+    ts = int(now_ts if now_ts is not None else time.time())
+    dt = datetime.fromtimestamp(ts)
+    return f"output_{dt.strftime('%Y%m%d_%H%M%S')}_{int(count)}devices"
+
+
+def write_batch_files(
+    out: Path,
+    items: list[dict[str, str | None]],
+    batch: str,
+    *,
+    qr_secret: str = "",
+) -> None:
     import qrcode  # local import so verify-only tools can skip PIL
 
     out.mkdir(parents=True, exist_ok=True)
@@ -118,6 +130,10 @@ def write_batch_files(out: Path, items: list[dict[str, str | None]], batch: str)
     for it in items:
         serial = str(it["serial"])
         qr = str(it["qr_code"] or "")
+        if not DEFAULT_QR_POLICY.fullmatch(qr):
+            raise ValueError(f"QR policy check failed for {serial}")
+        if qr_secret and not verify_qr_local(qr, qr_secret):
+            raise ValueError(f"QR signature check failed for {serial}")
         b = str(it.get("batch") or batch)
         csv_lines.append(f"{serial},,{qr},{b}")
         img = qrcode.make(qr, border=2)

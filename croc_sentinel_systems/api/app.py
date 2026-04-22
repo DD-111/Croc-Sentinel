@@ -2818,6 +2818,19 @@ class ForgotStartRequest(BaseModel):
     username: str = Field(min_length=1, max_length=64)
 
 
+class ForgotEmailStartRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    email: str = Field(min_length=3, max_length=254)
+
+
+class ForgotEmailCompleteRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    email: str = Field(min_length=3, max_length=254)
+    sha_code: str = Field(min_length=6, max_length=32)
+    password: str = Field(min_length=8, max_length=128)
+    password_confirm: str = Field(min_length=8, max_length=128)
+
+
 class ForgotCompleteRequest(BaseModel):
     username: str = Field(min_length=1, max_length=64)
     recovery_plain: str = Field(min_length=8, max_length=4096)
@@ -3186,6 +3199,12 @@ def _generate_otp() -> str:
     return f"{n:06d}"
 
 
+def _generate_sha_code() -> str:
+    """10-char SHA-like reset code for email delivery."""
+    seed = f"{time.time_ns()}|{secrets.token_hex(16)}"
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:10].upper()
+
+
 def _check_signup_rate(ip: str, email: str) -> None:
     cutoff = int(time.time()) - SIGNUP_RATE_WINDOW_SECONDS
     with db_lock:
@@ -3257,11 +3276,18 @@ def _send_sms_otp(phone: str, code: str, purpose: str) -> None:
     )
 
 
-def _issue_verification(username: str, channel: str, target: str, purpose: str) -> int:
+def _issue_verification(
+    username: str,
+    channel: str,
+    target: str,
+    purpose: str,
+    *,
+    explicit_code: Optional[str] = None,
+) -> int:
     """Create and deliver a fresh OTP. Returns remaining TTL in seconds."""
     if channel not in ("email", "phone"):
         raise ValueError("channel must be email|phone")
-    code = _generate_otp()
+    code = explicit_code or _generate_otp()
     code_hash = _hash_otp(code)
     expires_at = int(time.time()) + OTP_TTL_SECONDS
     with db_lock:
@@ -3752,6 +3778,101 @@ def _prune_password_reset_tokens() -> None:
 @app.get("/auth/forgot/enabled")
 def auth_forgot_enabled() -> dict[str, Any]:
     return {"enabled": bool(_password_recovery_load_public())}
+
+
+@app.get("/auth/forgot/email/enabled")
+def auth_forgot_email_enabled() -> dict[str, Any]:
+    return {"enabled": bool(notifier.enabled())}
+
+
+@app.post("/auth/forgot/email/start")
+def auth_forgot_email_start(body: ForgotEmailStartRequest, request: Request) -> dict[str, Any]:
+    ip = _client_ip(request)
+    _check_forgot_ip_rate(ip)
+    username = body.username.strip()
+    email = body.email.strip().lower()
+    if not _looks_like_email(email):
+        raise HTTPException(status_code=400, detail="email format invalid")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT username, role, status, email FROM dashboard_users WHERE username = ?",
+            (username,),
+        )
+        row = cur.fetchone()
+        conn.close()
+    # Keep error response generic to avoid account probing.
+    if not row:
+        return {"ok": True, "ttl_seconds": OTP_TTL_SECONDS}
+    if str(row["status"] or "active") == "disabled":
+        return {"ok": True, "ttl_seconds": OTP_TTL_SECONDS}
+    reg_email = str(row["email"] or "").strip().lower()
+    if not reg_email or reg_email != email:
+        return {"ok": True, "ttl_seconds": OTP_TTL_SECONDS}
+    if not notifier.enabled():
+        raise HTTPException(status_code=503, detail="email sender is not configured")
+    sha_code = _generate_sha_code()
+    ttl = _issue_verification(username, "email", email, "reset", explicit_code=sha_code)
+    emit_event(
+        level="info",
+        category="auth",
+        event_type="auth.password_reset.email_code.started",
+        summary=f"password reset sha code sent for {username}",
+        actor=f"ip:{ip}",
+        target=username,
+        owner_admin=username if str(row["role"] or "") == "admin" else get_manager_admin(username),
+        detail={"email": email},
+    )
+    return {"ok": True, "ttl_seconds": ttl}
+
+
+@app.post("/auth/forgot/email/complete")
+def auth_forgot_email_complete(body: ForgotEmailCompleteRequest, request: Request) -> dict[str, Any]:
+    if body.password != body.password_confirm:
+        raise HTTPException(status_code=400, detail="passwords do not match")
+    username = body.username.strip()
+    email = body.email.strip().lower()
+    if not _looks_like_email(email):
+        raise HTTPException(status_code=400, detail="email format invalid")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT status, role, email FROM dashboard_users WHERE username = ?", (username,))
+        urow = cur.fetchone()
+        conn.close()
+    if not urow:
+        raise HTTPException(status_code=404, detail="user not found")
+    if str(urow["status"] or "active") == "disabled":
+        raise HTTPException(status_code=403, detail="account disabled")
+    if str(urow["email"] or "").strip().lower() != email:
+        raise HTTPException(status_code=400, detail="email does not match registered email")
+    ok = _consume_verification(username, "email", "reset", body.sha_code.strip())
+    if not ok:
+        raise HTTPException(status_code=400, detail="invalid or expired sha code")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE dashboard_users SET password_hash = ? WHERE username = ?",
+            (hash_password(body.password), username),
+        )
+        conn.commit()
+        conn.close()
+    _clear_login_failures(username)
+    ip = _client_ip(request)
+    audit_event(username, "auth.password_reset.email_code.ok", "", {"ip": ip, "email": email})
+    emit_event(
+        level="warn",
+        category="auth",
+        event_type="auth.password_reset.email_code.completed",
+        summary=f"password reset via email code for {username}",
+        actor=username,
+        target=username,
+        owner_admin=username if str(urow["role"] or "") == "admin" else get_manager_admin(username),
+        detail={"ip": ip, "email": email},
+    )
+    return {"ok": True}
 
 
 @app.post("/auth/forgot/start")
