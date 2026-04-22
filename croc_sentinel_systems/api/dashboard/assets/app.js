@@ -1354,6 +1354,47 @@
     setCrumb("Account");
     if (!hasRole("user")) { view.innerHTML = `<div class="card"><p class="muted">Sign in required.</p></div>`; return; }
     const me = state.me || { username: "", role: "" };
+    const deleteSection = (() => {
+      if (me.role === "superadmin") {
+        return `
+      <div class="card">
+        <h3>Delete account</h3>
+        <p class="muted">Superadmin accounts cannot be removed through this console (API blocks self-deletion).</p>
+      </div>`;
+      }
+      if (me.role === "admin") {
+        return `
+      <div class="card" style="border-color:color-mix(in srgb,var(--danger)35%,var(--border))">
+        <h3>Close tenant · 注销管理员账号</h3>
+        <p class="muted" style="margin:0 0 10px">If you close this admin tenant:</p>
+        <ul class="muted" style="margin:0 0 12px;padding-left:1.25em;line-height:1.55">
+          <li><strong>Devices</strong> you own are <strong>factory-unclaimed</strong> (dashboard records removed; devices return to unregistered / reclaimable state).</li>
+          <li><strong>Subordinate users</strong> created under your account are <strong>deleted</strong>.</li>
+          <li>Your <strong>username</strong> and <strong>email</strong> become available for new registration.</li>
+        </ul>
+        <label class="checkbox" style="margin-bottom:12px;display:flex;gap:8px;align-items:flex-start">
+          <input id="accAckTenant" type="checkbox" />
+          <span>I understand all devices under this tenant will be released and sub-users removed.</span>
+        </label>
+        <p class="muted">Type <span class="mono">DELETE</span> and your password to confirm.</p>
+        <label class="field"><span>Current password</span><input id="accDelPw" type="password" autocomplete="current-password"/></label>
+        <label class="field field--spaced"><span>Type DELETE</span><input id="accDelText" placeholder="DELETE"/></label>
+        <div class="row" style="justify-content:flex-end;margin-top:10px">
+          <button class="btn danger" id="accDeleteSelf">Close tenant permanently</button>
+        </div>
+      </div>`;
+      }
+      return `
+      <div class="card">
+        <h3>Delete account</h3>
+        <p class="muted">This action is irreversible. Type <span class="mono">DELETE</span> and confirm your password.</p>
+        <label class="field"><span>Current password</span><input id="accDelPw" type="password" autocomplete="current-password"/></label>
+        <label class="field field--spaced"><span>Type DELETE</span><input id="accDelText" placeholder="DELETE"/></label>
+        <div class="row" style="justify-content:flex-end;margin-top:10px">
+          <button class="btn danger" id="accDeleteSelf">Delete my account</button>
+        </div>
+      </div>`;
+    })();
     view.innerHTML = `
       <div class="card">
         <h2>My account</h2>
@@ -1368,15 +1409,7 @@
           <button class="btn" id="accChangePw">Update password</button>
         </div>
       </div>
-      <div class="card">
-        <h3>Delete account</h3>
-        <p class="muted">This action is irreversible. Type <span class="mono">DELETE</span> and confirm your password.</p>
-        <label class="field"><span>Current password</span><input id="accDelPw" type="password" autocomplete="current-password"/></label>
-        <label class="field field--spaced"><span>Type DELETE</span><input id="accDelText" placeholder="DELETE"/></label>
-        <div class="row" style="justify-content:flex-end;margin-top:10px">
-          <button class="btn danger" id="accDeleteSelf">Delete my account</button>
-        </div>
-      </div>
+      ${deleteSection}
     `;
     $("#accChangePw", view).addEventListener("click", async () => {
       try {
@@ -1397,16 +1430,27 @@
       } catch (e) { toast(e.message || e, "err"); }
     });
     $("#accDeleteSelf", view).addEventListener("click", async () => {
-      if (!confirm("Delete your account permanently?")) return;
+      const role = me.role || "";
+      if (role === "superadmin") return;
+      const msg = role === "admin"
+        ? "Close this admin tenant permanently? All owned devices will be factory-unclaimed and sub-users deleted."
+        : "Delete your account permanently?";
+      if (!confirm(msg)) return;
+      if (role === "admin") {
+        const ack = $("#accAckTenant", view);
+        if (!ack || !ack.checked) {
+          toast("Confirm the checklist: devices will be released and sub-users removed.", "err");
+          return;
+        }
+      }
       try {
-        await api("/auth/me", {
-          method: "DELETE",
-          body: {
-            password: ($("#accDelPw", view).value || ""),
-            confirm_text: ($("#accDelText", view).value || ""),
-          },
-        });
-        toast("Account deleted", "ok");
+        const body = {
+          password: ($("#accDelPw", view).value || ""),
+          confirm_text: ($("#accDelText", view).value || ""),
+          acknowledge_admin_tenant_closure: role === "admin",
+        };
+        await api("/auth/me", { method: "DELETE", body });
+        toast(role === "admin" ? "Tenant closed" : "Account deleted", "ok");
         setToken("");
         state.me = null;
         clearHealthPollTimer();
@@ -3820,7 +3864,11 @@
               <thead><tr><th>User</th><th>Role</th><th>manager</th><th>tenant</th><th>Created</th><th></th></tr></thead>
               <tbody>${users.map((u) => {
                 const isUser = u.role === "user";
+                const isAdminRow = u.role === "admin";
                 const self = u.username === (state.me && state.me.username);
+                const closeTenantBtn = isSuper && isAdminRow && !self
+                  ? `<button type="button" class="btn sm danger js-close-admin" data-u="${escapeHtml(u.username)}">Close tenant</button>`
+                  : "";
                 return `<tr>
                   <td><strong>${escapeHtml(u.username)}</strong></td>
                   <td><span class="chip">${escapeHtml(u.role)}</span></td>
@@ -3828,8 +3876,9 @@
                   <td class="mono">${escapeHtml(u.tenant || "—")}</td>
                   <td>${escapeHtml(fmtTs(u.created_at))}</td>
                   <td>
-                    ${isUser ? `<button class="btn sm secondary js-pol" data-u="${escapeHtml(u.username)}">Policy</button>` : ""}
-                    ${self ? "" : `<button class="btn sm danger js-del" data-u="${escapeHtml(u.username)}">Delete</button>`}
+                    ${isUser ? `<button type="button" class="btn sm secondary js-pol" data-u="${escapeHtml(u.username)}">Policy</button>` : ""}
+                    ${closeTenantBtn}
+                    ${self ? "" : (isAdminRow ? "" : `<button type="button" class="btn sm danger js-del" data-u="${escapeHtml(u.username)}">Delete</button>`)}
                   </td>
                 </tr><tr class="sub" style="display:none" data-pol-row="${escapeHtml(u.username)}"><td colspan="6"></td></tr>`;
               }).join("")}</tbody></table></div>`;
@@ -3971,6 +4020,38 @@
         if (!row) return;
         if (row.style.display === "") { row.style.display = "none"; return; }
         openPolicy(u, row);
+      }
+      if (t.classList.contains("js-close-admin")) {
+        if (!isSuper) return;
+        if (!u) return;
+        if (!confirm(
+          `Close admin tenant "${u}"?\n\n` +
+            "· Devices: factory-unclaim all, OR transfer to another admin in the next prompt.\n" +
+            "· All subordinate users under this admin will be deleted.\n" +
+            "· That username and email are released for new signups."
+        )) return;
+        const transfer = window.prompt(
+          "Optional: target admin username to receive ALL this admin’s devices (leave empty to unclaim every device):"
+        );
+        if (transfer === null) return;
+        const transferTo = String(transfer).trim() || null;
+        const confirmText = window.prompt("Type exactly: CLOSE TENANT");
+        if (confirmText === null) return;
+        if (String(confirmText).trim() !== "CLOSE TENANT") {
+          toast("Confirmation must be exactly: CLOSE TENANT", "err");
+          return;
+        }
+        try {
+          const r = await api(`/auth/admins/${encodeURIComponent(u)}/close`, {
+            method: "POST",
+            body: { confirm_text: "CLOSE TENANT", transfer_devices_to: transferTo },
+          });
+          toast(
+            `Tenant closed — unclaimed ${Number(r.devices_unclaimed || 0)}, transferred ${Number(r.devices_transferred || 0)}, removed ${Number(r.subordinate_users_deleted || 0)} user(s).`,
+            "ok",
+          );
+          loadUsers();
+        } catch (e) { toast(e.message || e, "err"); }
       }
     });
 

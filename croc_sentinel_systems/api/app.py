@@ -2819,6 +2819,15 @@ class SelfPasswordChangeRequest(BaseModel):
 class SelfDeleteRequest(BaseModel):
     password: str = Field(min_length=1, max_length=128)
     confirm_text: str = Field(min_length=3, max_length=32)
+    # Admin only: must be true — unclaims all owned devices (factory unclaimed) and deletes subordinate users.
+    acknowledge_admin_tenant_closure: bool = Field(default=False)
+
+
+class AdminTenantCloseRequest(BaseModel):
+    """Superadmin closes another admin tenant; optional device transfer instead of unclaim."""
+
+    confirm_text: str = Field(min_length=8, max_length=64)
+    transfer_devices_to: Optional[str] = Field(default=None, max_length=64)
 
 
 class ForgotStartRequest(BaseModel):
@@ -4237,7 +4246,7 @@ def auth_me_delete(body: SelfDeleteRequest, principal: Principal = Depends(requi
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute("SELECT password_hash FROM dashboard_users WHERE username = ?", (principal.username,))
+        cur.execute("SELECT password_hash, role FROM dashboard_users WHERE username = ?", (principal.username,))
         row = cur.fetchone()
         if not row:
             conn.close()
@@ -4245,11 +4254,30 @@ def auth_me_delete(body: SelfDeleteRequest, principal: Principal = Depends(requi
         if not verify_password(body.password, str(row["password_hash"])):
             conn.close()
             raise HTTPException(status_code=401, detail="password invalid")
-        cur.execute("DELETE FROM dashboard_users WHERE username = ?", (principal.username,))
-        cur.execute("DELETE FROM role_policies WHERE username = ?", (principal.username,))
-        cur.execute("DELETE FROM device_acl WHERE grantee_username = ?", (principal.username,))
+        role = str(row["role"] or "")
+        if role == "superadmin":
+            conn.close()
+            raise HTTPException(status_code=400, detail="superadmin account cannot be deleted via self-service")
+        if role == "admin":
+            if not body.acknowledge_admin_tenant_closure:
+                conn.close()
+                raise HTTPException(
+                    status_code=400,
+                    detail="admin tenant closure requires acknowledge_admin_tenant_closure=true "
+                    "(all owned devices unclaimed to factory; subordinate users removed; email released)",
+                )
+            summary = _close_admin_tenant_cur(cur, principal.username, None, principal.username)
+            conn.commit()
+            conn.close()
+            cache_invalidate("devices")
+            cache_invalidate("overview")
+            audit_event(principal.username, "auth.account.delete.admin_tenant", principal.username, summary)
+            return {"ok": True, **summary}
+        _delete_user_auxiliary_cur(cur, principal.username)
         conn.commit()
         conn.close()
+    cache_invalidate("devices")
+    cache_invalidate("overview")
     audit_event(principal.username, "auth.account.delete.self", principal.username, {})
     return {"ok": True}
 
@@ -4267,6 +4295,32 @@ def auth_list_admins(principal: Principal = Depends(require_principal)) -> dict[
         rows = [str(r["username"]) for r in cur.fetchall()]
         conn.close()
     return {"items": rows}
+
+
+@app.post("/auth/admins/{username}/close")
+def auth_close_admin_tenant(
+    username: str,
+    body: AdminTenantCloseRequest,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    """Superadmin: close an admin tenant — unclaim devices (or transfer to another admin) and delete the admin."""
+    assert_min_role(principal, "superadmin")
+    if body.confirm_text.strip() != "CLOSE TENANT":
+        raise HTTPException(status_code=400, detail="confirm_text must be exactly: CLOSE TENANT")
+    target = username.strip()
+    if secrets.compare_digest(target, principal.username):
+        raise HTTPException(status_code=400, detail="use Account page to close your own tenant if you are an admin")
+    transfer_to = (body.transfer_devices_to or "").strip() or None
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        summary = _close_admin_tenant_cur(cur, target, transfer_to, principal.username)
+        conn.commit()
+        conn.close()
+    cache_invalidate("devices")
+    cache_invalidate("overview")
+    audit_event(principal.username, "auth.admin.tenant.close", target, summary)
+    return {"ok": True, **summary}
 
 
 @app.get("/auth/users")
@@ -4437,13 +4491,28 @@ def auth_delete_user(username: str, principal: Principal = Depends(require_princ
             if str(row["role"]) != "user" or str(row["manager_admin"] or "") != principal.username:
                 conn.close()
                 raise HTTPException(status_code=403, detail="cannot delete this user")
-        cur.execute("DELETE FROM dashboard_users WHERE username = ?", (username,))
-        cur.execute("DELETE FROM role_policies WHERE username = ?", (username,))
+        else:
+            cur.execute("SELECT role FROM dashboard_users WHERE username = ?", (username,))
+            row = cur.fetchone()
+            if not row:
+                conn.close()
+                raise HTTPException(status_code=404, detail="user not found")
+            if str(row["role"] or "") == "admin":
+                conn.close()
+                raise HTTPException(
+                    status_code=400,
+                    detail="use POST /auth/admins/{username}/close to remove an admin tenant",
+                )
+        cur.execute("SELECT username FROM dashboard_users WHERE username = ?", (username,))
+        exists = cur.fetchone()
+        if not exists:
+            conn.close()
+            raise HTTPException(status_code=404, detail="user not found")
+        _delete_user_auxiliary_cur(cur, username)
         conn.commit()
-        deleted = cur.rowcount
         conn.close()
-    if deleted == 0:
-        raise HTTPException(status_code=404, detail="user not found")
+    cache_invalidate("devices")
+    cache_invalidate("overview")
     audit_event(principal.username, "user.delete", username, {})
     return {"ok": True}
 
@@ -4786,6 +4855,103 @@ def unrevoke_device(device_id: str, principal: Principal = Depends(require_princ
     cache_invalidate("overview")
     audit_event(principal.username, "device.unrevoke", device_id, {})
     return {"ok": True, "device_id": device_id}
+
+
+def _delete_user_auxiliary_cur(cur: Any, username: str) -> None:
+    """Remove dashboard user row and attached rows (not device ownership)."""
+    cur.execute("DELETE FROM role_policies WHERE username = ?", (username,))
+    cur.execute("DELETE FROM verifications WHERE username = ?", (username,))
+    cur.execute("DELETE FROM device_acl WHERE grantee_username = ?", (username,))
+    cur.execute("DELETE FROM telegram_chat_bindings WHERE username = ?", (username,))
+    cur.execute("DELETE FROM telegram_link_tokens WHERE username = ?", (username,))
+    cur.execute("DELETE FROM password_reset_tokens WHERE username = ?", (username,))
+    cur.execute("DELETE FROM dashboard_users WHERE username = ?", (username,))
+
+
+def _apply_device_factory_unclaim_cur(cur: Any, device_id: str) -> None:
+    """Same data effect as factory-unregister: unclaim in DB + factory_devices status (caller holds lock)."""
+    cur.execute("SELECT mac_nocolon FROM provisioned_credentials WHERE device_id = ?", (device_id,))
+    p = cur.fetchone()
+    mac_nocolon = str(p["mac_nocolon"]) if p and p["mac_nocolon"] else ""
+    cur.execute("DELETE FROM provisioned_credentials WHERE device_id = ?", (device_id,))
+    cur.execute("DELETE FROM device_ownership WHERE device_id = ?", (device_id,))
+    cur.execute("DELETE FROM device_acl WHERE device_id = ?", (device_id,))
+    cur.execute("DELETE FROM revoked_devices WHERE device_id = ?", (device_id,))
+    cur.execute("DELETE FROM device_state WHERE device_id = ?", (device_id,))
+    cur.execute("DELETE FROM scheduled_commands WHERE device_id = ?", (device_id,))
+    if mac_nocolon:
+        cur.execute(
+            "UPDATE factory_devices SET status='unclaimed', updated_at=? WHERE mac_nocolon = ?",
+            (utc_now_iso(), mac_nocolon),
+        )
+    else:
+        cur.execute(
+            "UPDATE factory_devices SET status='unclaimed', updated_at=? WHERE serial = ?",
+            (utc_now_iso(), device_id),
+        )
+
+
+def _close_admin_tenant_cur(
+    cur: Any,
+    admin_username: str,
+    transfer_devices_to: Optional[str],
+    actor_username: str,
+) -> dict[str, Any]:
+    """
+    admin_username: role must be 'admin'. Transfers or unclaims all owned devices, deletes
+    subordinate users, then deletes the admin row. Does not commit.
+    """
+    cur.execute("SELECT role FROM dashboard_users WHERE username = ?", (admin_username,))
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="user not found")
+    role = str(row["role"] or "")
+    if role == "superadmin":
+        raise HTTPException(status_code=400, detail="cannot close a superadmin account with this action")
+    if role != "admin":
+        raise HTTPException(status_code=400, detail="target is not an admin tenant")
+    summary: dict[str, Any] = {
+        "admin": admin_username,
+        "devices_unclaimed": 0,
+        "devices_transferred": 0,
+        "subordinate_users_deleted": 0,
+    }
+    transfer_to = (transfer_devices_to or "").strip() or None
+    if transfer_to:
+        cur.execute("SELECT role FROM dashboard_users WHERE username = ?", (transfer_to,))
+        trow = cur.fetchone()
+        if not trow or str(trow["role"] or "") not in ("admin", "superadmin"):
+            raise HTTPException(status_code=400, detail="transfer_devices_to must be an existing admin or superadmin")
+        if secrets.compare_digest(transfer_to, admin_username):
+            raise HTTPException(status_code=400, detail="cannot transfer to the same admin")
+        cur.execute(
+            """
+            UPDATE device_ownership
+            SET owner_admin = ?, assigned_by = ?, assigned_at = ?
+            WHERE owner_admin = ?
+            """,
+            (transfer_to, actor_username, utc_now_iso(), admin_username),
+        )
+        summary["devices_transferred"] = int(cur.rowcount or 0)
+    else:
+        cur.execute("SELECT device_id FROM device_ownership WHERE owner_admin = ?", (admin_username,))
+        for r in cur.fetchall():
+            did = str(r["device_id"] or "")
+            if not did:
+                continue
+            _apply_device_factory_unclaim_cur(cur, did)
+            summary["devices_unclaimed"] += 1
+    cur.execute(
+        "SELECT username FROM dashboard_users WHERE manager_admin = ? AND role = 'user'",
+        (admin_username,),
+    )
+    for r in cur.fetchall():
+        su = str(r["username"] or "")
+        if su:
+            _delete_user_auxiliary_cur(cur, su)
+            summary["subordinate_users_deleted"] += 1
+    _delete_user_auxiliary_cur(cur, admin_username)
+    return summary
 
 
 def _device_delete_reset_impl(
