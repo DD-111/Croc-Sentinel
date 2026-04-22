@@ -1695,7 +1695,13 @@ def _lookup_owner_admin(device_id: str) -> Optional[str]:
     return None
 
 
-def _tenant_siblings(owner_admin: Optional[str], source_id: str) -> list[tuple[str, str]]:
+def _tenant_siblings(
+    owner_admin: Optional[str],
+    source_id: str,
+    *,
+    source_zone: str = "",
+    source_group: str = "",
+) -> list[tuple[str, str]]:
     """Siblings in the same tenant to fan out an alarm to.
 
     Returns list of (device_id, zone). Excludes revoked devices. If
@@ -1705,29 +1711,45 @@ def _tenant_siblings(owner_admin: Optional[str], source_id: str) -> list[tuple[s
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
+        zone_filter = source_zone.strip()
+        group_filter = source_group.strip()
         if owner_admin:
-            cur.execute(
-                """
+            sql = """
                 SELECT d.device_id, d.zone
                 FROM device_state d
                 JOIN device_ownership o ON o.device_id = d.device_id
                 LEFT JOIN revoked_devices r ON r.device_id = d.device_id
                 WHERE o.owner_admin = ? AND r.device_id IS NULL
-                """,
-                (owner_admin,),
+            """
+            args: list[Any] = [owner_admin]
+            if zone_filter and zone_filter.lower() not in ("all", "*"):
+                sql += " AND IFNULL(d.zone,'') = ?"
+                args.append(zone_filter)
+            if group_filter:
+                sql += " AND IFNULL(d.notification_group,'') = ?"
+                args.append(group_filter)
+            cur.execute(
+                sql,
+                args,
             )
         else:
             # No owner: treat as legacy-unowned pool. Only fan out to other
             # legacy-unowned devices to avoid leaking into tenants.
-            cur.execute(
-                """
+            sql = """
                 SELECT d.device_id, d.zone
                 FROM device_state d
                 LEFT JOIN device_ownership o ON o.device_id = d.device_id
                 LEFT JOIN revoked_devices r ON r.device_id = d.device_id
                 WHERE o.device_id IS NULL AND r.device_id IS NULL
-                """
-            )
+            """
+            args = []
+            if zone_filter and zone_filter.lower() not in ("all", "*"):
+                sql += " AND IFNULL(d.zone,'') = ?"
+                args.append(zone_filter)
+            if group_filter:
+                sql += " AND IFNULL(d.notification_group,'') = ?"
+                args.append(group_filter)
+            cur.execute(sql, args)
         rows = cur.fetchall()
         conn.close()
     out: list[tuple[str, str]] = []
@@ -2334,6 +2356,7 @@ def _fan_out_alarm(device_id: str, payload: dict[str, Any]) -> None:
     local_trigger = bool(payload.get("local_trigger"))
     triggered_by = str(payload.get("trigger_kind") or ("remote_button" if local_trigger else "network"))
     owner_admin = _lookup_owner_admin(device_id)
+    source_group, _source_label = _device_notify_labels(device_id)
 
     alarm_id = _insert_alarm(device_id, owner_admin, source_zone, triggered_by, payload)
     emit_event(
@@ -2350,22 +2373,41 @@ def _fan_out_alarm(device_id: str, payload: dict[str, Any]) -> None:
         ref_id=alarm_id,
     )
 
-    targets = _tenant_siblings(owner_admin, device_id)
+    should_fanout = triggered_by in (
+        "remote_button",
+        "remote_loud_button",
+        "remote_silent_button",
+        "network",
+        "group_link",
+    )
+    targets = _tenant_siblings(
+        owner_admin,
+        device_id,
+        source_zone=source_zone,
+        source_group=source_group,
+    ) if should_fanout else []
     sent = 0
     failures: list[str] = []
-    for did, _z in targets:
-        try:
-            publish_command(
-                topic=f"{TOPIC_ROOT}/{did}/cmd",
-                cmd="siren_on",
-                params={"duration_ms": ALARM_FANOUT_DURATION_MS},
-                target_id=did,
-                proto=CMD_PROTO,
-                cmd_key=get_cmd_key_for_device(did),
-            )
-            sent += 1
-        except Exception as exc:
-            failures.append(f"{did}:{exc}")
+    if should_fanout:
+        for did, _z in targets:
+            try:
+                cmd = "siren_on"
+                params: dict[str, Any] = {"duration_ms": ALARM_FANOUT_DURATION_MS}
+                # Remote silent button: link to sibling devices without siren sound.
+                if triggered_by == "remote_silent_button":
+                    cmd = "alarm_signal"
+                    params = {"kind": "silent"}
+                publish_command(
+                    topic=f"{TOPIC_ROOT}/{did}/cmd",
+                    cmd=cmd,
+                    params=params,
+                    target_id=did,
+                    proto=CMD_PROTO,
+                    cmd_key=get_cmd_key_for_device(did),
+                )
+                sent += 1
+            except Exception as exc:
+                failures.append(f"{did}:{exc}")
 
     email_sent = False
     email_detail = ""

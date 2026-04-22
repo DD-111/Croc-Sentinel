@@ -354,6 +354,54 @@
       return (typeof fallback === "function") ? fallback(e) : fallback;
     }
   }
+  function isGroupRouteMissingError(err) {
+    const msg = String((err && err.message) || err || "");
+    return msg.includes("404") || msg.includes("405") || msg.includes("501");
+  }
+  function groupTriggerPayloadFromSettings(gs) {
+    const s = gs || {};
+    return {
+      trigger_mode: String(s.trigger_mode || "continuous"),
+      trigger_duration_ms: Number(s.trigger_duration_ms || 10000),
+      delay_seconds: Number(s.delay_seconds || 0),
+      reboot_self_check: !!s.reboot_self_check,
+    };
+  }
+  async function runGroupApplyOnAction(ctx) {
+    const { groupKey, payload, apiCaps, saveApiCaps, tryApplyRoute, applyFallback } = ctx;
+    if (apiCaps && apiCaps.apply && typeof tryApplyRoute === "function") {
+      try {
+        return await tryApplyRoute(groupKey);
+      } catch (e) {
+        if (isGroupRouteMissingError(e)) {
+          apiCaps.apply = false;
+          if (typeof saveApiCaps === "function") saveApiCaps(apiCaps);
+          return await applyFallback(groupKey, payload);
+        }
+        throw e;
+      }
+    }
+    return await applyFallback(groupKey, payload);
+  }
+  async function runGroupDeleteAction(ctx) {
+    const { groupKey, apiCaps, saveApiCaps, tryDeletePostRoute, tryDeleteRoute, clearFallback } = ctx;
+    if (apiCaps && apiCaps.delete === false) return await clearFallback(groupKey);
+    try {
+      return await tryDeletePostRoute(groupKey);
+    } catch (e) {
+      if (!isGroupRouteMissingError(e)) throw e;
+      try {
+        return await tryDeleteRoute(groupKey);
+      } catch (e2) {
+        if (isGroupRouteMissingError(e2)) {
+          if (apiCaps) apiCaps.delete = false;
+          if (typeof saveApiCaps === "function" && apiCaps) saveApiCaps(apiCaps);
+          return await clearFallback(groupKey);
+        }
+        throw e2;
+      }
+    }
+  }
 
   async function grantShareMatrix(deviceIds, usernames, perms, onProgress) {
     const dids = (Array.isArray(deviceIds) ? deviceIds : []).map((x) => String(x || "").trim()).filter(Boolean);
@@ -1494,23 +1542,14 @@
         const payload = collectSettingsPayload();
         await saveGroupSettingsCompat(editingSettingsGroup, payload);
         groupSettingsMap.set(editingSettingsGroup, payload);
-        let r;
-        if (groupApiCaps.apply) {
-          try {
-            r = await tryGroupApiCall(`/${encodeURIComponent(editingSettingsGroup)}/apply`, { method: "POST" });
-          } catch (e) {
-            const msg = String((e && e.message) || e || "");
-            if (msg.includes("404") || msg.includes("405") || msg.includes("501")) {
-              groupApiCaps.apply = false;
-              saveGroupApiCaps(groupApiCaps);
-              r = await applyGroupSettingsFallback(editingSettingsGroup, payload);
-            } else {
-              throw e;
-            }
-          }
-        } else {
-          r = await applyGroupSettingsFallback(editingSettingsGroup, payload);
-        }
+        const r = await runGroupApplyOnAction({
+          groupKey: editingSettingsGroup,
+          payload,
+          apiCaps: groupApiCaps,
+          saveApiCaps: saveGroupApiCaps,
+          tryApplyRoute: (gk) => tryGroupApiCall(`/${encodeURIComponent(gk)}/apply`, { method: "POST" }),
+          applyFallback: applyGroupSettingsFallback,
+        });
         renderGroups();
         closeSettingsModal();
         toast(`Applied to ${Number(r.device_count || 0)} devices${r && r.fallback ? " (fallback mode)" : ""}`, "ok");
@@ -1531,30 +1570,14 @@
       }
       return { ok: true, changed };
     };
-    const deleteGroupCard = async (groupKey) => {
-      // Prefer POST /delete for proxy compatibility; fallback to DELETE.
-      if (!groupApiCaps.delete) return clearGroupByDevicePatch(groupKey);
-      try {
-        return await tryGroupApiCall(`/${encodeURIComponent(groupKey)}/delete`, { method: "POST" });
-      } catch (e) {
-        const msg = String((e && e.message) || e || "");
-        if (msg.includes("404") || msg.includes("405") || msg.includes("501")) {
-          try {
-            return await tryGroupApiCall(`/${encodeURIComponent(groupKey)}`, { method: "DELETE" });
-          } catch (e2) {
-            const msg2 = String((e2 && e2.message) || e2 || "");
-            // Backward-compatible fallback: clear group assignment per device.
-            if (msg2.includes("404") || msg2.includes("405") || msg2.includes("501")) {
-              groupApiCaps.delete = false;
-              saveGroupApiCaps(groupApiCaps);
-              return await clearGroupByDevicePatch(groupKey);
-            }
-            throw e2;
-          }
-        }
-        throw e;
-      }
-    };
+    const deleteGroupCard = async (groupKey) => runGroupDeleteAction({
+      groupKey,
+      apiCaps: groupApiCaps,
+      saveApiCaps: saveGroupApiCaps,
+      tryDeletePostRoute: (gk) => tryGroupApiCall(`/${encodeURIComponent(gk)}/delete`, { method: "POST" }),
+      tryDeleteRoute: (gk) => tryGroupApiCall(`/${encodeURIComponent(gk)}`, { method: "DELETE" }),
+      clearFallback: clearGroupByDevicePatch,
+    });
     const openGroupModal = (g) => {
       editingGroup = g || "";
       const m = meta[g] || { display_name: g || "", owner_name: "", phone: "", email: "", device_ids: [] };
@@ -1717,36 +1740,15 @@
         try {
           if (action === "on") {
             // Alarm ON should honor group settings (delay/continuous/reboot flow) via server apply.
-            if (groupApiCaps.apply) {
-              try {
-                await tryGroupApiCall(`/${encodeURIComponent(g)}/apply`, { method: "POST" });
-              } catch (eApply) {
-                const msgApply = String((eApply && eApply.message) || eApply || "");
-                if (msgApply.includes("404") || msgApply.includes("405") || msgApply.includes("501")) {
-                  groupApiCaps.apply = false;
-                  saveGroupApiCaps(groupApiCaps);
-                  const gs = groupSettingsMap.get(g) || {};
-                  const payload = {
-                    trigger_mode: String(gs.trigger_mode || "continuous"),
-                    trigger_duration_ms: Number(gs.trigger_duration_ms || 10000),
-                    delay_seconds: Number(gs.delay_seconds || 0),
-                    reboot_self_check: !!gs.reboot_self_check,
-                  };
-                  await applyGroupSettingsFallback(g, payload);
-                } else {
-                  throw eApply;
-                }
-              }
-            } else {
-              const gs = groupSettingsMap.get(g) || {};
-              const payload = {
-                trigger_mode: String(gs.trigger_mode || "continuous"),
-                trigger_duration_ms: Number(gs.trigger_duration_ms || 10000),
-                delay_seconds: Number(gs.delay_seconds || 0),
-                reboot_self_check: !!gs.reboot_self_check,
-              };
-              await applyGroupSettingsFallback(g, payload);
-            }
+            const payload = groupTriggerPayloadFromSettings(groupSettingsMap.get(g) || {});
+            await runGroupApplyOnAction({
+              groupKey: g,
+              payload,
+              apiCaps: groupApiCaps,
+              saveApiCaps: saveGroupApiCaps,
+              tryApplyRoute: (gk) => tryGroupApiCall(`/${encodeURIComponent(gk)}/apply`, { method: "POST" }),
+              applyFallback: applyGroupSettingsFallback,
+            });
           } else {
             const prevTimer = groupDelayTimers.get(g);
             if (prevTimer) {
@@ -1776,6 +1778,7 @@
     const groupScope = (state.me && state.me.username) ? state.me.username : "anon";
     const GROUP_META_LS_KEY = `croc.group.meta.v2.${groupScope}`;
     const GROUP_SETTINGS_LS_KEY = `croc.group.settings.v1.${groupScope}`;
+    const GROUP_API_CAPS_LS_KEY = `croc.group.api.caps.v2.${groupScope}`;
     const loadGroupMeta = () => {
       try {
         const raw = localStorage.getItem(GROUP_META_LS_KEY);
@@ -1790,9 +1793,24 @@
         return (obj && typeof obj === "object") ? obj : {};
       } catch { return {}; }
     };
+    const loadGroupApiCaps = () => {
+      try {
+        const raw = localStorage.getItem(GROUP_API_CAPS_LS_KEY);
+        const obj = raw ? JSON.parse(raw) : {};
+        return {
+          apply: obj && obj.apply === false ? false : true,
+          delete: obj && obj.delete === false ? false : true,
+        };
+      } catch { return { apply: true, delete: true }; }
+    };
+    const saveGroupApiCaps = (caps) => localStorage.setItem(GROUP_API_CAPS_LS_KEY, JSON.stringify({
+      apply: !!(caps && caps.apply),
+      delete: !!(caps && caps.delete),
+    }));
     window.__groupDelayTimers = window.__groupDelayTimers || new Map();
     const meta = loadGroupMeta();
     const gsMap = loadGroupSettings();
+    const groupApiCaps = loadGroupApiCaps();
     const [listRes] = await Promise.allSettled([apiGetCached("/devices", { timeoutMs: 8000 }, 3000)]);
     const list = (listRes.status === "fulfilled" && listRes.value) ? listRes.value : { items: [] };
     const byId = new Map((list.items || []).map((d) => [String(d.device_id), d]));
@@ -1846,13 +1864,7 @@
         </a>`;
       }).join("") : `<p class="muted">No devices in this group.</p>`;
     }
-    const deleteGroupCardCompat = async (groupKey) => {
-      const attempt = async (path, method) => api(path, { method });
-      try { return await attempt(`/group-cards/${encodeURIComponent(groupKey)}/delete`, "POST"); } catch {}
-      try { return await attempt(`/api/group-cards/${encodeURIComponent(groupKey)}/delete`, "POST"); } catch {}
-      try { return await attempt(`/group-cards/${encodeURIComponent(groupKey)}`, "DELETE"); } catch {}
-      try { return await attempt(`/api/group-cards/${encodeURIComponent(groupKey)}`, "DELETE"); } catch {}
-      // Fallback for old backend: clear notification_group per device.
+    const clearGroupByDevicePatchCompat = async () => {
       let changed = 0;
       for (const id of ids) {
         await api(`/devices/${encodeURIComponent(id)}/profile`, { method: "PATCH", body: { notification_group: "" } });
@@ -1860,30 +1872,62 @@
       }
       return { ok: true, changed };
     };
+    const deleteGroupCardCompat = async (groupKey) => runGroupDeleteAction({
+      groupKey,
+      apiCaps: groupApiCaps,
+      saveApiCaps: saveGroupApiCaps,
+      tryDeletePostRoute: async (gk) => {
+        try { return await api(`/group-cards/${encodeURIComponent(gk)}/delete`, { method: "POST" }); } catch (e) {
+          if (!isGroupRouteMissingError(e)) throw e;
+        }
+        return await api(`/api/group-cards/${encodeURIComponent(gk)}/delete`, { method: "POST" });
+      },
+      tryDeleteRoute: async (gk) => {
+        try { return await api(`/group-cards/${encodeURIComponent(gk)}`, { method: "DELETE" }); } catch (e) {
+          if (!isGroupRouteMissingError(e)) throw e;
+        }
+        return await api(`/api/group-cards/${encodeURIComponent(gk)}`, { method: "DELETE" });
+      },
+      clearFallback: clearGroupByDevicePatchCompat,
+    });
+    const applyGroupSettingsFallbackCompat = async (groupKey, payload) => {
+      const durationMs = Number(payload.trigger_duration_ms || 10000);
+      const delaySeconds = Number(payload.delay_seconds || 0);
+      const prev = window.__groupDelayTimers.get(groupKey);
+      if (prev) {
+        clearTimeout(prev);
+        window.__groupDelayTimers.delete(groupKey);
+      }
+      if (String(payload.trigger_mode || "continuous") === "delay" && delaySeconds > 0) {
+        const tid = setTimeout(async () => {
+          try { await api("/alerts", { method: "POST", body: { action: "on", duration_ms: durationMs, device_ids: ids } }); } catch {}
+        }, delaySeconds * 1000);
+        window.__groupDelayTimers.set(groupKey, tid);
+      } else {
+        await api("/alerts", { method: "POST", body: { action: "on", duration_ms: durationMs, device_ids: ids } });
+      }
+      return { ok: true, fallback: true, device_count: ids.length };
+    };
+    const tryApplyRouteCompat = async (groupKey) => {
+      try { return await api(`/group-cards/${encodeURIComponent(groupKey)}/apply`, { method: "POST" }); } catch (e) {
+        if (!isGroupRouteMissingError(e)) throw e;
+      }
+      return await api(`/api/group-cards/${encodeURIComponent(groupKey)}/apply`, { method: "POST" });
+    };
     const sendAlert = async (action) => {
       if (!can("can_alert")) { toast("No can_alert capability", "err"); return; }
       if (ids.length === 0) { toast("No devices in this group", "warn"); return; }
       if (!confirm(`${action === "on" ? "Open" : "Close"} alarm for ${ids.length} devices in ${g}?`)) return;
       if (action === "on") {
-        const cfg = gsMap[g] || {};
-        const durationMs = Number(cfg.trigger_duration_ms || 10000);
-        const delaySeconds = Number(cfg.delay_seconds || 0);
-        const mode = String(cfg.trigger_mode || "continuous");
-        const prev = window.__groupDelayTimers.get(g);
-        if (prev) {
-          clearTimeout(prev);
-          window.__groupDelayTimers.delete(g);
-        }
-        if (mode === "delay" && delaySeconds > 0) {
-          const tid = setTimeout(async () => {
-            try {
-              await api("/alerts", { method: "POST", body: { action: "on", duration_ms: durationMs, device_ids: ids } });
-            } catch {}
-          }, delaySeconds * 1000);
-          window.__groupDelayTimers.set(g, tid);
-        } else {
-          await api("/alerts", { method: "POST", body: { action: "on", duration_ms: durationMs, device_ids: ids } });
-        }
+        const payload = groupTriggerPayloadFromSettings(gsMap[g] || {});
+        await runGroupApplyOnAction({
+          groupKey: g,
+          payload,
+          apiCaps: groupApiCaps,
+          saveApiCaps: saveGroupApiCaps,
+          tryApplyRoute: tryApplyRouteCompat,
+          applyFallback: applyGroupSettingsFallbackCompat,
+        });
       } else {
         const prev = window.__groupDelayTimers.get(g);
         if (prev) {

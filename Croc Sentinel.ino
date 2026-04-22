@@ -556,8 +556,12 @@ unsigned long sirenDurationMs = 0;
 bool sirenActive = false;
 unsigned long lastAlarmAt = 0;
 
-unsigned long lastTriggerReadAt = 0;
-bool triggerPrevLevel = true;
+unsigned long lastTriggerDirectReadAt = 0;
+unsigned long lastTriggerRemoteReadAt = 0;
+unsigned long lastTriggerSilentReadAt = 0;
+bool triggerDirectPrevLevel = true;
+bool triggerRemotePrevLevel = true;
+bool triggerSilentPrevLevel = true;
 
 char lastError[48] = "none";
 bool ntpSynced = false;
@@ -1313,7 +1317,7 @@ void publishStatus() {
   publishRaw(topicStatus, buf, true);
 }
 
-void publishAlarmEvent(bool localTrigger) {
+void publishAlarmEvent(const char *triggerKind, bool localSiren) {
   // NOTE: server-side fan-out model.
   // Device publishes the alarm only on its own /event topic. The API verifies
   // ownership (owner_admin) and dispatches siren_on commands to all sibling
@@ -1323,8 +1327,8 @@ void publishAlarmEvent(bool localTrigger) {
   doc["type"]           = "alarm.trigger";
   doc["source_id"]      = deviceId;
   doc["source_zone"]    = deviceZone;
-  doc["local_trigger"]  = localTrigger;
-  doc["trigger_kind"]   = localTrigger ? "remote_button" : "network";
+  doc["local_trigger"]  = localSiren;
+  doc["trigger_kind"]   = (triggerKind && strlen(triggerKind) > 0) ? triggerKind : (localSiren ? "panic_button" : "network");
   unsigned long nowTs   = tsNow();
   uint32_t nonce        = esp_random();
   char sig[17];
@@ -1445,6 +1449,15 @@ void executeCommand(const char *cmd, JsonVariant params) {
     snprintf(detail, sizeof(detail), "self_test %s net=%d mqtt=%d heap=%d vbat=%.2f",
              overallOk ? "ok" : "fail", netOk ? 1 : 0, mqttOk ? 1 : 0, heapOk ? 1 : 0, vbat);
     publishAck(resolvedCmd, overallOk, detail);
+    return;
+  }
+
+  // Silent linkage command: receives a linked silent alert from server fanout.
+  // Intentionally does not sound siren; only refreshes state/telemetry.
+  if (strcmp(resolvedCmd, "alarm_signal") == 0) {
+    publishHeartbeatEvent("alarm_signal");
+    publishStatus();
+    publishAck(resolvedCmd, true, "alarm signal received");
     return;
   }
 
@@ -1744,6 +1757,7 @@ void publishCommandTable() {
   arr.add("siren_on");
   arr.add("siren_off");
   arr.add("self_test");
+  arr.add("alarm_signal");
   arr.add("reboot");
   arr.add("schedule_reboot");
   arr.add("cancel_scheduled_reboot");
@@ -2035,21 +2049,50 @@ void checkNTPSync() {
 
 void handleTriggerInput() {
   unsigned long now = millis();
-  if (now - lastTriggerReadAt < DEBOUNCE_MS) return;
-  lastTriggerReadAt = now;
+  bool fired = false;
 
-  bool level = (digitalRead(TRIGGER_GPIO) == HIGH);
-  bool fallingEdge = (triggerPrevLevel && !level);
-  triggerPrevLevel = level;
-  if (!fallingEdge) return;
-  if (alarmInCooldown()) {
-    return;
+  // Panic button: local response + report.
+  if (now - lastTriggerDirectReadAt >= BUTTON_DEBOUNCE_MS) {
+    lastTriggerDirectReadAt = now;
+    bool level = (digitalRead(PANIC_BUTTON_GPIO) == HIGH);
+    bool fallingEdge = (triggerDirectPrevLevel && !level);
+    triggerDirectPrevLevel = level;
+    if (fallingEdge && !alarmInCooldown()) {
+      logLine("[trigger] panic_button");
+      publishAlarmEvent("panic_button", true);
+      publishHeartbeatEvent("alarm_panic");
+      if (TRIGGER_SELF_SIREN) activateSiren(rtSirenMs);
+      fired = true;
+    }
   }
 
-  logLine("[trigger] alarm");
-  publishAlarmEvent(true);
-  publishHeartbeatEvent("alarm");
-  if (TRIGGER_SELF_SIREN) activateSiren(rtSirenMs);
+  // Remote loud button: report + fanout siren_on to siblings (exclude self by server policy).
+  if (!fired && now - lastTriggerRemoteReadAt >= BUTTON_DEBOUNCE_MS) {
+    lastTriggerRemoteReadAt = now;
+    bool level = (digitalRead(REMOTE_LOUD_BUTTON_GPIO) == HIGH);
+    bool fallingEdge = (triggerRemotePrevLevel && !level);
+    triggerRemotePrevLevel = level;
+    if (fallingEdge && !alarmInCooldown()) {
+      logLine("[trigger] remote_loud_button");
+      publishAlarmEvent("remote_loud_button", false);
+      publishHeartbeatEvent("alarm_remote_loud");
+      fired = true;
+    }
+  }
+
+  // Remote silent button: report + silent fanout (no siren sound).
+  if (!fired && now - lastTriggerSilentReadAt >= BUTTON_DEBOUNCE_MS) {
+    lastTriggerSilentReadAt = now;
+    bool level = (digitalRead(REMOTE_SILENT_BUTTON_GPIO) == HIGH);
+    bool fallingEdge = (triggerSilentPrevLevel && !level);
+    triggerSilentPrevLevel = level;
+    if (fallingEdge && !alarmInCooldown()) {
+      logLine("[trigger] remote_silent_button");
+      publishAlarmEvent("remote_silent_button", false);
+      publishHeartbeatEvent("alarm_remote_silent");
+      fired = true;
+    }
+  }
 }
 
 // ═══════════════════════════════════════════════
@@ -2118,16 +2161,27 @@ void setup() {
 
   pinMode(SIREN_GPIO, OUTPUT);
   pinMode(STATUS_LED_GPIO, OUTPUT);
-  pinMode(TRIGGER_GPIO, INPUT_PULLUP);
+  pinMode(PANIC_BUTTON_GPIO, INPUT_PULLUP);
+  pinMode(REMOTE_LOUD_BUTTON_GPIO, INPUT_PULLUP);
+  pinMode(REMOTE_SILENT_BUTTON_GPIO, INPUT_PULLUP);
   digitalWrite(SIREN_GPIO, SIREN_OFF);
   digitalWrite(STATUS_LED_GPIO, LOW);
   // Sync edge-detector baseline to actual pin (assumes NO switch to GND + pull-up: idle HIGH).
   delay(10);
-  triggerPrevLevel = (digitalRead(TRIGGER_GPIO) == HIGH);
+  triggerDirectPrevLevel = (digitalRead(PANIC_BUTTON_GPIO) == HIGH);
+  triggerRemotePrevLevel = (digitalRead(REMOTE_LOUD_BUTTON_GPIO) == HIGH);
+  triggerSilentPrevLevel = (digitalRead(REMOTE_SILENT_BUTTON_GPIO) == HIGH);
   {
-    char tline[96];
-    snprintf(tline, sizeof(tline), "[boot] trigger_gpio=%d idle=%s",
-             TRIGGER_GPIO, triggerPrevLevel ? "HIGH" : "LOW");
+    char tline[180];
+    const char *silentIdle = triggerSilentPrevLevel ? "HIGH" : "LOW";
+    snprintf(
+      tline,
+      sizeof(tline),
+      "[boot] panic_btn=%d(%s) remote_loud_btn=%d(%s) remote_silent_btn=%d(%s)",
+      PANIC_BUTTON_GPIO, triggerDirectPrevLevel ? "HIGH" : "LOW",
+      REMOTE_LOUD_BUTTON_GPIO, triggerRemotePrevLevel ? "HIGH" : "LOW",
+      REMOTE_SILENT_BUTTON_GPIO, silentIdle
+    );
     logLine(tline);
   }
 
