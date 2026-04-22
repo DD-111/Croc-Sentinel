@@ -4740,6 +4740,62 @@ class DeviceShareRequest(BaseModel):
     can_operate: bool = False
 
 
+@app.delete("/group-cards/{group_key}")
+def delete_group_card(group_key: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    """Delete a group card by clearing notification_group on target devices.
+
+    Security rule:
+      - admin: can only delete groups fully owned by self (shared devices block deletion)
+      - superadmin: can delete any group
+    """
+    assert_min_role(principal, "admin")
+    g = (group_key or "").strip()
+    if not g:
+        raise HTTPException(status_code=400, detail="group_key required")
+    zs, za = zone_sql_suffix(principal, "d.zone")
+    osf, osa = owner_scope_clause_for_device_state(principal, "d")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT d.device_id, IFNULL(o.owner_admin,'') AS owner_admin
+            FROM device_state d
+            LEFT JOIN device_ownership o ON d.device_id = o.device_id
+            WHERE IFNULL(d.notification_group,'') = ? {zs} {osf}
+            ORDER BY d.device_id ASC
+            """,
+            tuple([g] + za + osa),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        if not rows:
+            conn.close()
+            raise HTTPException(status_code=404, detail="group not found in your scope")
+        if principal.role != "superadmin":
+            # Shared group/device must not be deletable by grantee.
+            for r in rows:
+                owner = str(r.get("owner_admin") or "")
+                if owner and owner != principal.username:
+                    conn.close()
+                    raise HTTPException(status_code=403, detail="shared group cannot be deleted")
+                if not owner:
+                    conn.close()
+                    raise HTTPException(status_code=403, detail="unowned group cannot be deleted by admin")
+        ids = [str(r["device_id"]) for r in rows if r.get("device_id")]
+        ph = ",".join(["?"] * len(ids))
+        cur.execute(
+            f"UPDATE device_state SET notification_group = '' WHERE device_id IN ({ph})",
+            tuple(ids),
+        )
+        changed = int(cur.rowcount or 0)
+        conn.commit()
+        conn.close()
+    cache_invalidate("devices")
+    cache_invalidate("overview")
+    audit_event(principal.username, "group.delete", g, {"device_count": len(ids), "changed": changed})
+    return {"ok": True, "group_key": g, "device_count": len(ids), "changed": changed}
+
+
 def _apply_device_profile_update(
     device_id: str,
     principal: Principal,

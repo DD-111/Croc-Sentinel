@@ -1181,10 +1181,15 @@
         if (btn.classList.contains("js-del-group")) {
           if (groupSharedBy(g).length > 0) { toast("Shared group cannot be deleted", "err"); return; }
           if (!confirm(`Delete group card "${g}"?`)) return;
-          delete meta[g];
-          saveGroupMeta(meta);
-          renderGroups();
-          toast("Group deleted", "ok");
+          try {
+            await api(`/group-cards/${encodeURIComponent(g)}`, { method: "DELETE" });
+            delete meta[g];
+            saveGroupMeta(meta);
+            renderGroups();
+            toast("Group deleted", "ok");
+          } catch (e) {
+            toast(e.message || e, "err");
+          }
           return;
         }
         if (!can("can_alert")) { toast("No can_alert capability", "err"); return; }
@@ -1288,13 +1293,18 @@
     if (alarmOnBtn) alarmOnBtn.addEventListener("click", () => sendAlert("on"));
     if (alarmOffBtn) alarmOffBtn.addEventListener("click", () => sendAlert("off"));
     if (delGroupBtn) {
-      delGroupBtn.addEventListener("click", () => {
+      delGroupBtn.addEventListener("click", async () => {
         if (isSharedGroup) { toast("Shared group cannot be deleted", "err"); return; }
         if (!confirm(`Delete group card "${g}"?`)) return;
-        delete meta[g];
-        localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(meta));
-        toast("Group deleted", "ok");
-        location.hash = "#/overview";
+        try {
+          await api(`/group-cards/${encodeURIComponent(g)}`, { method: "DELETE" });
+          delete meta[g];
+          localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(meta));
+          toast("Group deleted", "ok");
+          location.hash = "#/overview";
+        } catch (e) {
+          toast(e.message || e, "err");
+        }
       });
     }
   });
