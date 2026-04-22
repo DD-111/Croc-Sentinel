@@ -3,6 +3,10 @@
 #
 # Default compose does NOT publish :8088 publicly (only Traefik 80/443).
 # Use this override for emergency direct access on loopback (curl / Arduino smoke test):
+#
+# IMPORTANT: Do NOT override `services.traefik.command` unless you repeat the full
+# entrypoints (web, websecure) + certificatesresolvers.le from docker-compose.yml.
+# Replacing `command` with a short list breaks HTTPS (missing websecure / le).
 
 services:
   api:

@@ -116,6 +116,10 @@ services:
       - croc_net
 
 
+  # Full static config: entrypoints web+websecure, cert resolver "le" (ACME).
+  # If logs show "EntryPoint websecure doesn't exist" or "nonexistent certificate resolver le",
+  # your Traefik is NOT running this command — often docker-compose.override.yml replaced
+  # `services.traefik.command` entirely. Merge fixes into override or remove that block.
   traefik:
     image: traefik:latest
     container_name: traefik
@@ -154,4 +158,5 @@ services:
 
 networks:
   croc_net:
+    name: croc_net
     driver: bridge
