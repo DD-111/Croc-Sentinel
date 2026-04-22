@@ -15,6 +15,7 @@ import queue
 import re
 import ssl
 import threading
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Optional
@@ -56,6 +57,8 @@ class _TelegramQueue:
         # Lazy SSL context: some minimal/container images throw or lack CA data at import time.
         self._ssl_ctx: Optional[ssl.SSLContext] = None
         self._ssl_ctx_init_done = False
+        self._recent_fingerprint_ts: dict[str, float] = {}
+        self._dedupe_window_s = 35.0
         self.reload_from_env()
 
     def _get_ssl_context(self) -> Optional[ssl.SSLContext]:
@@ -101,20 +104,42 @@ class _TelegramQueue:
         lvl = str(ev.get("level") or "info").lower()
         if _LEVEL_RANK.get(lvl, 1) < self._min_rank:
             return
-        # Plain text (no HTML) — avoids Telegram parse errors from arbitrary JSON/symbols.
+        cat = str(ev.get("category") or "")
+        et = str(ev.get("event_type") or "")
+        actor = str(ev.get("actor") or "-")
+        target = str(ev.get("target") or "-")
+        device_id = str(ev.get("device_id") or "-")
+        summary = str(ev.get("summary") or et or "").strip()
+        # Keep Telegram signal clean: debug/info system chatter is skipped unless alarm/auth/ota.
+        if lvl in ("debug", "info") and cat not in ("alarm", "auth", "ota"):
+            return
+        detail_short = ""
+        try:
+            d = ev.get("detail") or {}
+            if isinstance(d, dict) and d:
+                keep = {}
+                for k in ("reason", "error", "result", "state", "duration_ms", "fanout_count"):
+                    if k in d and d.get(k) not in (None, ""):
+                        keep[k] = d.get(k)
+                if keep:
+                    detail_short = " · " + ", ".join([f"{k}={keep[k]}" for k in keep.keys()])
+        except Exception:
+            pass
         line = (
-            f"[{lvl.upper()}] {ev.get('category')}/{ev.get('event_type')}\n"
-            f"{ev.get('summary') or ''}\n"
-            f"actor={ev.get('actor') or '-'} target={ev.get('target') or '-'} "
-            f"device={ev.get('device_id') or '-'}"
+            f"[{lvl.upper()}] {cat}/{et}\n"
+            f"{summary}\n"
+            f"device={device_id} actor={actor} target={target}{detail_short}"
         )
-        if ev.get("detail"):
-            try:
-                d = ev["detail"]
-                if isinstance(d, dict) and d:
-                    line += "\n" + json.dumps(d, ensure_ascii=True)[:900]
-            except Exception:
-                pass
+        fp = f"{lvl}|{cat}|{et}|{device_id}|{summary}"
+        now = time.time()
+        prev = float(self._recent_fingerprint_ts.get(fp, 0.0))
+        if prev and (now - prev) < self._dedupe_window_s:
+            return
+        self._recent_fingerprint_ts[fp] = now
+        # Periodic map cleanup to avoid unbounded growth.
+        if len(self._recent_fingerprint_ts) > 1200:
+            cutoff = now - (self._dedupe_window_s * 4.0)
+            self._recent_fingerprint_ts = {k: ts for k, ts in self._recent_fingerprint_ts.items() if ts >= cutoff}
         try:
             self._q.put_nowait(line)
         except queue.Full:

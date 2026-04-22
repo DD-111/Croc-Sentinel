@@ -345,6 +345,45 @@ body[data-layout="auth"] .view {
   line-height: 1.45;
 }
 .audit-empty { padding: 20px 0; text-align: center; }
+.device-card.is-selected {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 25%, transparent), var(--shadow);
+}
+.grp-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45);
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+.grp-modal-card {
+  width: min(760px, 100%);
+  max-height: 88vh;
+  overflow: auto;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+  padding: 14px;
+}
+.grp-pick-list {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  max-height: 220px;
+  overflow: auto;
+  padding: 8px;
+  background: var(--bg-muted);
+}
+.grp-pick-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  padding: 4px 0;
+}
 
 /* Cards & layout */
 .card {

@@ -971,6 +971,8 @@ def _event_visible(principal: "Principal", ev: dict[str, Any]) -> bool:
     owner = str(ev.get("owner_admin") or "")
     actor = str(ev.get("actor") or "")
     target = str(ev.get("target") or "")
+    if _is_superadmin_username(actor):
+        return False
     if principal.role == "admin":
         if owner == principal.username:
             return True
@@ -1014,6 +1016,30 @@ def _event_matches_filters(ev: dict[str, Any], filters: dict[str, Any]) -> bool:
 
 
 event_bus = _EventBus(ring_size=EVENT_RING_SIZE)
+_superadmin_cache: set[str] = set()
+_superadmin_cache_ts = 0.0
+
+
+def _is_superadmin_username(username: str) -> bool:
+    u = str(username or "").strip()
+    if not u:
+        return False
+    global _superadmin_cache_ts, _superadmin_cache
+    now = time.time()
+    if (now - _superadmin_cache_ts) > 20.0:
+        if not db_lock.acquire(blocking=False):
+            # Avoid lock inversion on hot paths; conservative fallback still hides default superadmin names.
+            return u.lower().startswith("superadmin")
+        try:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute("SELECT username FROM dashboard_users WHERE role = 'superadmin'")
+            _superadmin_cache = {str(r["username"]) for r in cur.fetchall() if r["username"]}
+            conn.close()
+        finally:
+            db_lock.release()
+        _superadmin_cache_ts = now
+    return u in _superadmin_cache
 
 
 def _insert_event_row(ev: dict[str, Any]) -> int:
@@ -1097,7 +1123,8 @@ def emit_event(
     try:
         from telegram_notify import maybe_notify_telegram
 
-        maybe_notify_telegram(ev)
+        if not _is_superadmin_username(str(ev.get("actor") or "")):
+            maybe_notify_telegram(ev)
     except Exception as exc:
         # Avoid silent failures when Telegram module/env is misconfigured (default log level INFO).
         logger.warning("telegram_notify skipped: %s", exc)
@@ -5126,7 +5153,11 @@ def list_pending_claims(
                 """
                 SELECT mac_nocolon, mac, qr_code, fw, claim_nonce, proposed_device_id, last_seen_at
                 FROM pending_claims
-                WHERE mac_nocolon LIKE ? OR UPPER(mac) LIKE ? OR IFNULL(qr_code,'') LIKE ?
+                WHERE (mac_nocolon LIKE ? OR UPPER(mac) LIKE ? OR IFNULL(qr_code,'') LIKE ?)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM provisioned_credentials pc
+                    WHERE pc.device_id = pending_claims.proposed_device_id
+                  )
                 ORDER BY last_seen_at DESC
                 """,
                 (like_mac, like, like),
@@ -5136,6 +5167,10 @@ def list_pending_claims(
                 """
                 SELECT mac_nocolon, mac, qr_code, fw, claim_nonce, proposed_device_id, last_seen_at
                 FROM pending_claims
+                WHERE NOT EXISTS (
+                  SELECT 1 FROM provisioned_credentials pc
+                  WHERE pc.device_id = pending_claims.proposed_device_id
+                )
                 ORDER BY last_seen_at DESC
                 """
             )
@@ -5894,6 +5929,9 @@ def list_activity_signals(
             tuple([since_arg] + list(scope_args) + [limit]),
         )
         alarm_rows = [dict(r) for r in cur.fetchall()]
+        sig_actor_hide = ""
+        if principal.role != "superadmin":
+            sig_actor_hide = " AND s.actor_username NOT IN (SELECT username FROM dashboard_users WHERE role = 'superadmin') "
         cur.execute(
             f"""
             SELECT s.id, s.created_at, s.kind, s.device_id, s.zone,
@@ -5903,7 +5941,7 @@ def list_activity_signals(
                    IFNULL(d.notification_group, '') AS notification_group, s.detail_json
             FROM signal_triggers s
             LEFT JOIN device_state d ON d.device_id = s.device_id
-            WHERE s.created_at >= datetime('now', ?) {st_scope}
+            WHERE s.created_at >= datetime('now', ?) {st_scope} {sig_actor_hide}
             ORDER BY s.id DESC LIMIT ?
             """,
             tuple([since_arg] + list(scope_args) + [limit]),

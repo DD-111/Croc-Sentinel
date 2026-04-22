@@ -135,13 +135,22 @@
       .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
   }
 
+  const MY_TZ = "Asia/Kuala_Lumpur";
   function fmtTs(v) {
     if (!v) return "—";
     const t = typeof v === "number" ? (v > 1e12 ? v : v * 1000) : Date.parse(v);
     if (!Number.isFinite(t)) return String(v);
     const d = new Date(t);
-    const pad = (n) => String(n).padStart(2, "0");
-    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: MY_TZ,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    }).format(d).replace(",", "");
   }
 
   function fmtRel(v) {
@@ -153,6 +162,10 @@
     if (diff < 3600_000) return `${Math.floor(diff / 60000)}m ago`;
     if (diff < 86400_000) return `${Math.floor(diff / 3600000)}h ago`;
     return `${Math.floor(diff / 86400000)}d ago`;
+  }
+
+  function maskPlatform(_raw) {
+    return "e**********";
   }
 
   /** Audit log: prefix of action before first "." (for styling). */
@@ -908,182 +921,155 @@
         toast("Overview is partially loaded from cache; refreshing in background.", "warn");
       }
     }
-    if (!ov) ov = { presence: {}, throughput: {}, total_devices: 0, alarms_24h: 0, mqtt_connected: false };
+    if (!ov) ov = { mqtt_connected: false };
     if (!list) list = { items: [] };
-    if (ovRes.status !== "fulfilled" || listRes.status !== "fulfilled") {
-      const err = ovRes.status !== "fulfilled" ? ovRes.reason : listRes.reason;
-      toast(`Overview request slowed down: ${String((err && err.message) || err || "unknown error")}`, "warn");
-    }
     state.overviewCache = { ov, list, ts: Date.now() };
     const devices = list.items || [];
-    const hh = state.health || {};
-    const mqConnected = !!(hh.mqtt_connected ?? ov.mqtt_connected);
-    const mqQDepth = Number(hh.mqtt_ingest_queue_depth || 0);
-    const mqDropped = Number(hh.mqtt_ingest_dropped || 0);
-    const mqLastUp = String(hh.mqtt_last_connect_at || "");
-    const mqLastDown = String(hh.mqtt_last_disconnect_at || "");
-    const mqReason = String(hh.mqtt_last_disconnect_reason || "");
-    let mqRiskLabel = "Healthy";
-    let mqRiskClass = "online";
-    let mqRiskDetail = `queue=${mqQDepth} · dropped=${mqDropped}`;
-    if (!mqConnected) {
-      mqRiskLabel = "Disconnected";
-      mqRiskClass = "revoked";
-      mqRiskDetail = `last_down=${mqLastDown || "—"}${mqReason ? ` · reason=${mqReason}` : ""}`;
-    } else if (mqDropped >= 100 || mqQDepth >= 700) {
-      mqRiskLabel = "High risk";
-      mqRiskClass = "revoked";
-      mqRiskDetail = `queue=${mqQDepth} · dropped=${mqDropped} (overflow risk)`;
-    } else if (mqDropped > 0 || mqQDepth >= 300) {
-      mqRiskLabel = "Warning";
-      mqRiskClass = "offline";
-      mqRiskDetail = `queue=${mqQDepth} · dropped=${mqDropped}`;
-    } else {
-      mqRiskDetail = `queue=${mqQDepth} · dropped=${mqDropped} · last_up=${mqLastUp || "—"}`;
-    }
+    const byId = new Map(devices.map((d) => [String(d.device_id), d]));
 
-    // Group metadata: browser-side profile card (name/owner/phone/email).
-    const GROUP_META_LS_KEY = "croc.group.meta.v1";
+    const groupScope = (state.me && state.me.username) ? state.me.username : "anon";
+    const GROUP_META_LS_KEY = `croc.group.meta.v2.${groupScope}`;
     const loadGroupMeta = () => {
       try {
         const raw = localStorage.getItem(GROUP_META_LS_KEY);
         const obj = raw ? JSON.parse(raw) : {};
         return (obj && typeof obj === "object") ? obj : {};
-      } catch {
-        return {};
-      }
+      } catch { return {}; }
     };
-    const saveGroupMeta = (obj) => {
-      localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(obj || {}));
-    };
-    const groupMetaMap = loadGroupMeta();
-    const normalizeGroup = (s) => {
-      const t = String(s || "").trim();
-      return t || "Ungrouped";
-    };
-    const groups = new Map();
+    const saveGroupMeta = (obj) => localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(obj || {}));
+    const normalizeGroup = (s) => String(s || "").trim() || "Ungrouped";
+    const meta = loadGroupMeta();
+    const notifMap = new Map();
     for (const d of devices) {
       const g = normalizeGroup(d.notification_group);
-      if (!groups.has(g)) groups.set(g, []);
-      groups.get(g).push(d);
+      if (!notifMap.has(g)) notifMap.set(g, []);
+      notifMap.get(g).push(String(d.device_id));
     }
-    const groupNames = Array.from(groups.keys()).sort((a, b) => a.localeCompare(b));
-    let selectedGroup = groupNames[0] || "";
+    for (const [g, ids] of notifMap.entries()) {
+      if (!meta[g]) meta[g] = { display_name: g, owner_name: "", phone: "", email: "", device_ids: ids };
+    }
+    saveGroupMeta(meta);
 
-    const renderDeviceCard = (d) => {
-      const on = isOnline(d);
-      const primary = escapeHtml(d.display_label || d.device_id || "unknown");
-      const subId = d.display_label ? `<div class="device-id-sub mono">${escapeHtml(d.device_id || "")}</div>` : "";
-      const platform = `${d.chip_target || "—"} / ${d.board_profile || "—"}`;
-      return `<a class="device-card" href="#/devices/${encodeURIComponent(d.device_id)}" style="text-decoration:none;color:inherit">
-        <h3><div class="device-primary-name">${primary}</div>${subId}</h3>
-        <div><span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>
-          ${d.notification_group ? `<span class="chip">${escapeHtml(d.notification_group)}</span>` : ""}
-          ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
-          ${d.fw ? `<span class="chip">v${escapeHtml(d.fw)}</span>` : ""}
-        </div>
-        <div class="meta">
-          Platform: ${escapeHtml(platform)}<br/>
-          Net: ${escapeHtml(d.net_type || "—")}<br/>
-          Manufacturer: ESA Sibu<br/>
-          Updated: ${escapeHtml(fmtRel(d.updated_at))}
-        </div>
-      </a>`;
+    let selectedGroup = "";
+    const hh = state.health || {};
+    const mqConnected = !!(hh.mqtt_connected ?? ov.mqtt_connected);
+    const mqQDepth = Number(hh.mqtt_ingest_queue_depth || 0);
+    const mqDropped = Number(hh.mqtt_ingest_dropped || 0);
+    const totalDevices = Number(ov.total_devices != null ? ov.total_devices : devices.length);
+    const onlineDevices = Number((ov.presence && ov.presence.online != null) ? ov.presence.online : devices.filter(isOnline).length);
+    const offlineDevices = Math.max(0, totalDevices - onlineDevices);
+    const txBps = Number((ov.throughput && ov.throughput.tx_bps_total) || 0);
+    const rxBps = Number((ov.throughput && ov.throughput.rx_bps_total) || 0);
+    const bps = (v) => {
+      v = Number(v || 0);
+      if (v < 1024) return `${v.toFixed(0)} B/s`;
+      if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)} KB/s`;
+      return `${(v / 1024 / 1024).toFixed(2)} MB/s`;
     };
+    const mqStatus = !mqConnected ? "Disconnected" : (mqDropped > 0 || mqQDepth >= 300 ? "Warning" : "Healthy");
+    const mqClass = !mqConnected ? "revoked" : (mqStatus === "Warning" ? "offline" : "online");
 
     view.innerHTML = `
+      <section class="stats">
+        <div class="stat"><div class="k">Server</div><div class="v">${mqConnected ? "Connected" : "Disconnected"}</div><div class="sub">MQTT broker link</div></div>
+        <div class="stat"><div class="k">Devices</div><div class="v">${totalDevices}</div><div class="sub">total in scope</div></div>
+        <div class="stat"><div class="k">Online</div><div class="v">${onlineDevices}</div><div class="sub">active now</div></div>
+        <div class="stat"><div class="k">Offline</div><div class="v">${offlineDevices}</div><div class="sub">inactive now</div></div>
+        <div class="stat"><div class="k">TX</div><div class="v">${escapeHtml(bps(txBps))}</div><div class="sub">aggregate uplink</div></div>
+        <div class="stat"><div class="k">RX</div><div class="v">${escapeHtml(bps(rxBps))}</div><div class="sub">aggregate downlink</div></div>
+      </section>
       <section class="card">
         <div class="row">
           <h3 style="margin:0">MQTT risk</h3>
-          <span class="badge ${mqRiskClass}">${mqRiskLabel}</span>
+          <span class="badge ${mqClass}">${mqStatus}</span>
         </div>
         <div class="divider"></div>
-        <div class="muted">${escapeHtml(mqRiskDetail)}</div>
+        <div class="muted">queue=${mqQDepth} · dropped=${mqDropped}</div>
       </section>
-
       <section class="card">
-        <div class="row" style="align-items:center;gap:8px;flex-wrap:wrap">
-          <h2 style="margin:0">Groups</h2>
-          <span class="muted">${groupNames.length} groups</span>
+        <div class="row">
+          <h2 style="margin:0">Group cards</h2>
+          <button class="btn sm secondary right" id="grpNew">New group</button>
         </div>
         <div class="divider"></div>
         <div id="groupCards" class="device-grid"></div>
       </section>
-
-      <section class="card">
-        <div class="row" style="align-items:center;gap:8px;flex-wrap:wrap">
-          <h2 style="margin:0">Group devices</h2>
+      <section class="card" id="groupDevicesPanel" style="display:none">
+        <div class="row">
+          <h2 style="margin:0">Devices in group</h2>
           <span class="chip" id="groupNowChip">—</span>
         </div>
         <div class="divider"></div>
         <div id="groupDevices" class="device-grid"></div>
       </section>
-    `;
+      <div id="grpModal" class="grp-modal" style="display:none">
+        <div class="grp-modal-card">
+          <h3 style="margin:0 0 8px">Edit group card</h3>
+          <label class="field"><span>Group key</span><input id="gmKey" placeholder="e.g. Warehouse-A"/></label>
+          <label class="field"><span>Display name</span><input id="gmName"/></label>
+          <label class="field"><span>Owner name</span><input id="gmOwner"/></label>
+          <label class="field"><span>Phone</span><input id="gmPhone"/></label>
+          <label class="field"><span>Email</span><input id="gmEmail"/></label>
+          <div class="field"><span>Devices</span><div id="gmDevices" class="grp-pick-list"></div></div>
+          <div class="row" style="justify-content:flex-end;gap:8px;margin-top:10px">
+            <button class="btn sm secondary" id="gmCancel" type="button">Cancel</button>
+            <button class="btn sm" id="gmSave" type="button">Save</button>
+          </div>
+        </div>
+      </div>`;
 
     const groupCardsEl = $("#groupCards", view);
     const groupDevicesEl = $("#groupDevices", view);
     const groupNowChipEl = $("#groupNowChip", view);
-    if (!groupCardsEl || !groupDevicesEl || !groupNowChipEl) return;
+    const groupDevicesPanelEl = $("#groupDevicesPanel", view);
+    const grpModalEl = $("#grpModal", view);
+    if (!groupCardsEl || !groupDevicesEl || !groupNowChipEl || !groupDevicesPanelEl || !grpModalEl) return;
 
-    const runGroupAlert = async (groupName, action) => {
-      const rows = groups.get(groupName) || [];
-      const ids = rows.map((x) => x.device_id).filter(Boolean);
-      if (ids.length === 0) {
-        toast("No devices in this group", "warn");
-        return;
-      }
-      if (!can("can_alert")) {
-        toast("No can_alert capability", "err");
-        return;
-      }
-      const ok = confirm(`${action === "on" ? "Open alarm" : "Close alarm"} for group "${groupName}" on ${ids.length} devices?`);
-      if (!ok) return;
-      await api("/alerts", { method: "POST", body: { action, duration_ms: 10000, device_ids: ids } });
-      toast(`${action === "on" ? "Alarm ON" : "Alarm OFF"} · ${ids.length} devices`, "ok");
+    let editingGroup = "";
+    const groupKeys = () => Object.keys(meta).sort((a, b) => a.localeCompare(b));
+    const groupDeviceIds = (g) => {
+      const ids = Array.isArray(meta[g] && meta[g].device_ids) ? meta[g].device_ids : [];
+      return ids.filter((x) => byId.has(String(x)));
     };
-
-    const renderGroupDevices = () => {
-      const rows = groups.get(selectedGroup) || [];
-      groupNowChipEl.textContent = selectedGroup || "—";
-      if (rows.length === 0) {
-        groupDevicesEl.innerHTML = `<p class="muted">No devices in selected group.</p>`;
-        return;
-      }
-      groupDevicesEl.innerHTML = rows.map(renderDeviceCard).join("");
+    const renderDeviceCard = (d) => {
+      const on = isOnline(d);
+      const primary = escapeHtml(d.display_label || d.device_id || "unknown");
+      const subId = d.display_label ? `<div class="device-id-sub mono">${escapeHtml(d.device_id || "")}</div>` : "";
+      return `<a class="device-card" href="#/devices/${encodeURIComponent(d.device_id)}" style="text-decoration:none;color:inherit">
+        <h3><div class="device-primary-name">${primary}</div>${subId}</h3>
+        <div><span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>
+          ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
+          ${d.fw ? `<span class="chip">v${escapeHtml(d.fw)}</span>` : ""}
+        </div>
+        <div class="meta">
+          Platform: ${escapeHtml(maskPlatform(`${d.chip_target || ""}/${d.board_profile || ""}`))}<br/>
+          Manufacturer: ESA Sibu<br/>
+          Updated: ${escapeHtml(fmtRel(d.updated_at))}
+        </div>
+      </a>`;
     };
-
-    const renderGroupCards = () => {
-      if (groupNames.length === 0) {
-        groupCardsEl.innerHTML = `<p class="muted">No groups.</p>`;
-        groupDevicesEl.innerHTML = `<p class="muted">No devices.</p>`;
+    const renderGroups = () => {
+      const keys = groupKeys();
+      if (keys.length === 0) {
+        groupCardsEl.innerHTML = `<p class="muted">No groups yet.</p>`;
         return;
       }
-      groupCardsEl.innerHTML = groupNames.map((g) => {
-        const rows = groups.get(g) || [];
+      groupCardsEl.innerHTML = keys.map((g) => {
+        const ids = groupDeviceIds(g);
+        const rows = ids.map((id) => byId.get(String(id))).filter(Boolean);
         const total = rows.length;
-        const online = rows.filter((d) => isOnline(d)).length;
-        const offline = Math.max(0, total - online);
-        const meta = groupMetaMap[g] || {};
-        const groupLabel = String(meta.display_name || g);
-        const owner = String(meta.owner_name || "—");
-        const phone = String(meta.phone || "—");
-        const email = String(meta.email || "—");
+        const on = rows.filter((d) => isOnline(d)).length;
+        const off = Math.max(0, total - on);
+        const m = meta[g] || {};
         return `<article class="device-card js-group-card ${selectedGroup === g ? "is-selected" : ""}" data-group="${escapeHtml(g)}" style="cursor:pointer">
-          <h3>
-            <div class="device-primary-name">${escapeHtml(groupLabel)}</div>
-            <div class="device-id-sub mono">${escapeHtml(g)}</div>
-          </h3>
+          <h3><div class="device-primary-name">${escapeHtml(m.display_name || g)}</div><div class="device-id-sub mono">${escapeHtml(g)}</div></h3>
           <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
-            <span class="badge neutral">Total ${total}</span>
-            <span class="badge online">Online ${online}</span>
-            <span class="badge offline">Offline ${offline}</span>
+            <span class="badge neutral">total ${total}</span>
+            <span class="badge online">online ${on}</span>
+            <span class="badge offline">offline ${off}</span>
           </div>
-          <div class="meta">
-            Owner: ${escapeHtml(owner)}<br/>
-            Phone: ${escapeHtml(phone)}<br/>
-            Email: ${escapeHtml(email)}
-          </div>
-          <div class="row" style="margin-top:10px;gap:6px;flex-wrap:wrap">
+          <div class="meta">Owner: ${escapeHtml(m.owner_name || "—")} · ${escapeHtml(m.phone || "—")} · ${escapeHtml(m.email || "—")}</div>
+          <div class="row" style="margin-top:8px;gap:6px;flex-wrap:wrap">
             <button class="btn sm secondary js-edit-group" data-group="${escapeHtml(g)}" type="button">Edit</button>
             <button class="btn sm danger js-alert-on" data-group="${escapeHtml(g)}" type="button">Alarm ON</button>
             <button class="btn sm secondary js-alert-off" data-group="${escapeHtml(g)}" type="button">Alarm OFF</button>
@@ -1091,36 +1077,70 @@
         </article>`;
       }).join("");
     };
-
+    const renderGroupDevices = () => {
+      if (!selectedGroup) {
+        groupDevicesPanelEl.style.display = "none";
+        return;
+      }
+      const ids = groupDeviceIds(selectedGroup);
+      const rows = ids.map((id) => byId.get(String(id))).filter(Boolean);
+      groupDevicesPanelEl.style.display = "";
+      groupNowChipEl.textContent = selectedGroup;
+      groupDevicesEl.innerHTML = rows.length ? rows.map(renderDeviceCard).join("") : `<p class="muted">No devices in this group.</p>`;
+    };
+    const openGroupModal = (g) => {
+      editingGroup = g || "";
+      const m = meta[g] || { display_name: g || "", owner_name: "", phone: "", email: "", device_ids: [] };
+      $("#gmKey", view).value = g || "";
+      $("#gmName", view).value = m.display_name || "";
+      $("#gmOwner", view).value = m.owner_name || "";
+      $("#gmPhone", view).value = m.phone || "";
+      $("#gmEmail", view).value = m.email || "";
+      const sel = new Set((m.device_ids || []).map(String));
+      const pick = $("#gmDevices", view);
+      if (pick) {
+        pick.innerHTML = devices.map((d) => `<label class="grp-pick-item"><input type="checkbox" value="${escapeHtml(d.device_id)}" ${sel.has(String(d.device_id)) ? "checked" : ""}/> <span>${escapeHtml(d.display_label || d.device_id)} <span class="mono">(${escapeHtml(d.device_id)})</span></span></label>`).join("");
+      }
+      grpModalEl.style.display = "flex";
+    };
+    const closeGroupModal = () => { grpModalEl.style.display = "none"; };
+    $("#grpNew", view).addEventListener("click", () => openGroupModal(""));
+    $("#gmCancel", view).addEventListener("click", closeGroupModal);
+    $("#gmSave", view).addEventListener("click", () => {
+      const key = String($("#gmKey", view).value || "").trim();
+      if (!key) { toast("Group key required", "err"); return; }
+      const display_name = String($("#gmName", view).value || "").trim();
+      const owner_name = String($("#gmOwner", view).value || "").trim();
+      const phone = String($("#gmPhone", view).value || "").trim();
+      const email = String($("#gmEmail", view).value || "").trim();
+      const picks = Array.from($$("#gmDevices input[type='checkbox']", view)).filter((x) => x.checked).map((x) => x.value);
+      if (editingGroup && editingGroup !== key && meta[editingGroup]) delete meta[editingGroup];
+      meta[key] = { display_name, owner_name, phone, email, device_ids: picks };
+      saveGroupMeta(meta);
+      closeGroupModal();
+      renderGroups();
+      if (selectedGroup === editingGroup || selectedGroup === key) {
+        selectedGroup = key;
+        renderGroupDevices();
+      }
+    });
     groupCardsEl.addEventListener("click", async (ev) => {
-      const b = ev.target.closest("button");
-      if (b) {
-        const g = b.dataset.group || "";
+      const btn = ev.target.closest("button");
+      if (btn) {
+        const g = btn.dataset.group || "";
         if (!g) return;
+        if (btn.classList.contains("js-edit-group")) {
+          openGroupModal(g);
+          return;
+        }
+        if (!can("can_alert")) { toast("No can_alert capability", "err"); return; }
+        const ids = groupDeviceIds(g);
+        if (ids.length === 0) { toast("No devices in this group", "warn"); return; }
+        const action = btn.classList.contains("js-alert-on") ? "on" : "off";
+        if (!confirm(`${action === "on" ? "Open" : "Close"} alarm for ${ids.length} devices in ${g}?`)) return;
         try {
-          if (b.classList.contains("js-alert-on")) {
-            await runGroupAlert(g, "on");
-          } else if (b.classList.contains("js-alert-off")) {
-            await runGroupAlert(g, "off");
-          } else if (b.classList.contains("js-edit-group")) {
-            const old = groupMetaMap[g] || {};
-            const display_name = prompt("Group display name", old.display_name || g);
-            if (display_name == null) return;
-            const owner_name = prompt("Owner name", old.owner_name || "");
-            if (owner_name == null) return;
-            const phone = prompt("Phone", old.phone || "");
-            if (phone == null) return;
-            const email = prompt("Email", old.email || "");
-            if (email == null) return;
-            groupMetaMap[g] = {
-              display_name: String(display_name || "").trim(),
-              owner_name: String(owner_name || "").trim(),
-              phone: String(phone || "").trim(),
-              email: String(email || "").trim(),
-            };
-            saveGroupMeta(groupMetaMap);
-            renderGroupCards();
-          }
+          await api("/alerts", { method: "POST", body: { action, duration_ms: 10000, device_ids: ids } });
+          toast(`${action === "on" ? "Alarm ON" : "Alarm OFF"} · ${ids.length}`, "ok");
         } catch (e) {
           toast(e.message || e, "err");
         }
@@ -1128,14 +1148,11 @@
       }
       const card = ev.target.closest(".js-group-card");
       if (!card) return;
-      const g = card.dataset.group || "";
-      if (!g) return;
-      selectedGroup = g;
-      renderGroupCards();
+      selectedGroup = card.dataset.group || "";
+      renderGroups();
       renderGroupDevices();
     });
-
-    renderGroupCards();
+    renderGroups();
     renderGroupDevices();
   });
 
@@ -1257,7 +1274,7 @@
         </div>
         <dl class="kv">
           <dt>Firmware</dt><dd class="mono">${escapeHtml(d.fw || "—")}</dd>
-          <dt>Platform</dt><dd class="mono">${escapeHtml(`${d.chip_target || "—"} / ${d.board_profile || "—"}`)}</dd>
+          <dt>Platform</dt><dd class="mono">${escapeHtml(maskPlatform(`${d.chip_target || ""}/${d.board_profile || ""}`))}</dd>
           <dt>Manufacturer</dt><dd class="mono">ESA Sibu</dd>
           <dt>Network</dt><dd class="mono">${escapeHtml(d.net_type || "—")} · ${escapeHtml(s.ip || "—")}</dd>
           <dt>Wi‑Fi SSID</dt><dd>${wifiSsidDd}</dd>
