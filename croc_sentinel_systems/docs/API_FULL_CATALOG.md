@@ -96,6 +96,7 @@ Auth:
 - `POST /admin/smtp/test`
 - `GET /admin/telegram/status`
 - `POST /admin/telegram/test`
+- `GET /admin/telegram/webhook-info` (Bot API `getWebhookInfo`; debug when `/start` gets no reply)
 - `POST /admin/telegram/bind-self`
 - `GET /admin/telegram/bindings`
 - `DELETE /admin/telegram/bindings/{chat_id}`

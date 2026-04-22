@@ -280,3 +280,33 @@ def send_telegram_chat_text(chat_id: str, text: str) -> tuple[bool, str]:
     if not ok:
         return False, getattr(_tg, "_last_error", "") or "send failed"
     return True, "sent"
+
+
+def telegram_get_webhook_info() -> tuple[bool, str, dict[str, Any]]:
+    """Call Bot API getWebhookInfo (for dashboard diagnostics)."""
+    _tg.reload_from_env()
+    if not _tg._token:
+        return False, "TELEGRAM_BOT_TOKEN empty", {}
+    url = f"https://api.telegram.org/bot{_tg._token}/getWebhookInfo"
+    req = urllib.request.Request(
+        url,
+        method="GET",
+        headers={"User-Agent": "CrocSentinel-TelegramNotify/1.0"},
+    )
+    try:
+        ctx = _tg._get_ssl_context()
+        kw: dict[str, Any] = {"timeout": 20}
+        if ctx is not None:
+            kw["context"] = ctx
+        with urllib.request.urlopen(req, **kw) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            j = json.loads(raw)
+        if not j.get("ok"):
+            return False, str(j.get("description") or raw[:300]), {}
+        return True, "", dict(j.get("result") or {})
+    except urllib.error.HTTPError as exc:
+        err_body = exc.read().decode("utf-8", errors="replace")[:400]
+        return False, f"HTTPError {exc.code}: {err_body}", {}
+    except Exception as exc:
+        logger.warning("telegram getWebhookInfo failed: %s", exc)
+        return False, str(exc), {}

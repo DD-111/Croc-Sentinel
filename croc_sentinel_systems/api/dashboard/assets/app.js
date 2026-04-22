@@ -155,6 +155,56 @@
     return `${Math.floor(diff / 86400000)}d ago`;
   }
 
+  /** Audit log: prefix of action before first "." (for styling). */
+  function auditActionPrefix(action) {
+    const s = String(action || "").trim();
+    const i = s.indexOf(".");
+    return i > 0 ? s.slice(0, i) : (s || "other");
+  }
+
+  /** Strip detail fields that duplicate the row's actor/target columns. */
+  function auditDetailDedupedRows(detail, actor, target) {
+    if (!detail || typeof detail !== "object" || Array.isArray(detail)) return [];
+    const a = String(actor || "").trim();
+    const t = String(target || "").trim();
+    const rows = [];
+    for (const [k, raw] of Object.entries(detail)) {
+      if (raw == null || raw === "") continue;
+      const str = typeof raw === "object" ? JSON.stringify(raw) : String(raw);
+      if (!str.trim()) continue;
+      if (str === a && /^(actor|username|user|owner|owner_admin|created_by)$/i.test(k)) continue;
+      if (t && str === t && /^(target|device_id|deviceId|source_id)$/i.test(k)) continue;
+      let display = str;
+      if (display.length > 220) display = `${display.slice(0, 217)}…`;
+      rows.push({ k, v: display });
+    }
+    return rows;
+  }
+
+  function auditChipClass(action) {
+    const p = auditActionPrefix(action);
+    const map = {
+      alarm: "audit-pfx-alarm",
+      provision: "audit-pfx-prov",
+      factory: "audit-pfx-factory",
+      telegram: "audit-pfx-tg",
+      auth: "audit-pfx-auth",
+      admin: "audit-pfx-admin",
+      user: "audit-pfx-user",
+      command: "audit-pfx-cmd",
+      mqtt: "audit-pfx-sys",
+      device: "audit-pfx-dev",
+      ota: "audit-pfx-ota",
+      bulk: "audit-pfx-cmd",
+      remote: "audit-pfx-alarm",
+      signal: "audit-pfx-alarm",
+      schedule: "audit-pfx-sys",
+      login: "audit-pfx-auth",
+      signup: "audit-pfx-auth",
+    };
+    return map[p] || "audit-pfx-other";
+  }
+
   function roleWeight(r) { return ROLE_WEIGHT[r] || 0; }
   function hasRole(min) { return state.me && roleWeight(state.me.role) >= roleWeight(min); }
   function can(cap) { return !!(state.me && state.me.policy && state.me.policy[cap]); }
@@ -1682,27 +1732,42 @@
     setCrumb("Telegram");
     if (!hasRole("user")) { view.innerHTML = `<div class="card"><p class="muted">Sign in required.</p></div>`; return; }
     view.innerHTML = `
+      <div class="ui-shell telegram-shell">
       <div class="card">
-        <h2>Telegram connect</h2>
-        <p class="muted">No password in Telegram. Click <strong>Generate connect link</strong>, open it, then send <span class="mono">/start</span> in Telegram to bind instantly.</p>
-        <div class="row" style="gap:8px;flex-wrap:wrap">
-          <button class="btn" id="tgGenLink">Generate connect link</button>
-          <button class="btn secondary" id="tgReloadMine">Refresh my bindings</button>
+        <div class="ui-section-head">
+          <div>
+            <h2 class="ui-section-title">Telegram connect</h2>
+            <p class="ui-section-sub">No password in Telegram. Generate link, open chat, send <span class="mono">/start</span>, done.</p>
+          </div>
+          <div class="ui-section-actions">
+            <button class="btn" id="tgGenLink">Generate connect link</button>
+            <button class="btn secondary" id="tgReloadMine">Refresh bindings</button>
+          </div>
         </div>
         <div id="tgLinkBox" style="margin-top:10px"></div>
       </div>
       <div class="card">
-        <h3 style="margin-top:0">My chat bindings</h3>
+        <div class="ui-section-head">
+          <div>
+            <h3 class="ui-section-title">My chat bindings</h3>
+            <p class="ui-section-sub">Enable, disable, or unbind your own Telegram chats.</p>
+          </div>
+        </div>
         <div id="tgMineList"></div>
       </div>
       <div class="card">
-        <h3 style="margin-top:0">Manual bind (fallback)</h3>
-        <p class="muted">If deep link fails: send <span class="mono">/start</span> to bot, copy <span class="mono">chat_id</span>, then bind manually.</p>
+        <div class="ui-section-head">
+          <div>
+            <h3 class="ui-section-title">Manual bind (fallback)</h3>
+            <p class="ui-section-sub">If deep link cannot open Telegram, use <span class="mono">/start</span> to get chat_id, then bind manually.</p>
+          </div>
+        </div>
         <div class="inline-form">
           <label class="field"><span>chat_id</span><input id="tgManualChatId" placeholder="e.g. 2082431201 or -100xxxx" /></label>
           <label class="field"><span>Enabled</span><input id="tgManualEnabled" type="checkbox" checked /></label>
           <div class="row wide" style="justify-content:flex-end"><button class="btn" id="tgManualBind">Bind manually</button></div>
         </div>
+      </div>
       </div>
     `;
     const mineEl = $("#tgMineList", view);
@@ -1735,9 +1800,15 @@
       try {
         const r = await api("/telegram/link-token", { method: "POST", body: { enabled_on_bind: true } });
         const deep = r.deep_link || "";
+        const openChat = r.open_chat_url || "";
+        const payload = r.start_payload || "";
         linkEl.innerHTML = deep
-          ? `<p><a class="btn" href="${escapeHtml(deep)}" target="_blank" rel="noopener">Open Telegram connect link</a></p><p class="muted mono">${escapeHtml(deep)}</p>`
-          : `<p class="muted">Set <span class="mono">TELEGRAM_BOT_USERNAME</span> on server, then retry. Payload: <span class="mono">${escapeHtml(r.start_payload || "")}</span></p>`;
+          ? `<div class="ui-status-strip">
+               <div class="ui-status-item"><div class="k">Step 1</div><div class="v"><a class="btn" href="${escapeHtml(openChat || deep)}" target="_blank" rel="noopener">Open bot chat</a></div></div>
+               <div class="ui-status-item"><div class="k">Step 2</div><div class="v"><a class="btn secondary" href="${escapeHtml(deep)}" target="_blank" rel="noopener">Run one-click bind</a></div></div>
+             </div>
+             <p class="muted mono" style="margin-top:8px">${escapeHtml(deep)}</p>`
+          : `<p class="muted">Set <span class="mono">TELEGRAM_BOT_USERNAME</span> on server, then retry.<br/>Fallback: send <span class="mono">/start ${escapeHtml(payload)}</span> in your bot chat.</p>`;
       } catch (e) {
         linkEl.innerHTML = `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`;
       }
@@ -1781,48 +1852,104 @@
   });
 
   // Audit
-  registerRoute("audit", async (view) => {
+  registerRoute("audit", async (view, _args, routeSeq) => {
     setCrumb("Audit");
     if (!hasRole("admin")) { view.innerHTML = `<div class="card"><p class="muted">Admins only.</p></div>`; return; }
     view.innerHTML = `
-      <div class="card">
-        <div class="row">
-          <h2 style="margin:0">Audit log</h2>
-          <label class="field" style="max-width:180px"><span>actor</span><input id="f_actor" /></label>
-          <label class="field" style="max-width:180px"><span>action prefix</span><input id="f_action" placeholder="device / user / command" /></label>
-          <label class="field" style="max-width:180px"><span>target</span><input id="f_target" /></label>
-          <button class="btn secondary right" id="f_reload">Query</button>
+      <div class="ui-shell card audit-page">
+        <div class="ui-section-head">
+          <div>
+            <h2 class="ui-section-title">Audit</h2>
+            <p class="ui-section-sub">Who did what, when — extra fields only when they add information beyond actor / target.</p>
+          </div>
+          <div class="ui-section-actions audit-filters">
+            <label class="field compact"><span>Actor</span><input id="f_actor" type="search" autocomplete="off" placeholder="username" /></label>
+            <label class="field compact"><span>Action</span><input id="f_action" type="search" autocomplete="off" placeholder="prefix e.g. provision" /></label>
+            <label class="field compact"><span>Target</span><input id="f_target" type="search" autocomplete="off" placeholder="device or user" /></label>
+            <button class="btn secondary btn-tap" id="f_reload" type="button">Apply</button>
+          </div>
+        </div>
+        <div class="ui-status-strip" id="auditStrip">
+          <span class="ui-status-item"><strong id="auditCount">—</strong> entries</span>
+          <span class="ui-status-item muted">Newest first · max 200</span>
         </div>
         <div class="divider"></div>
-        <div id="auditList"></div>
+        <div id="auditList" class="audit-feed-wrap"></div>
       </div>`;
 
     const reload = async () => {
       const qs = new URLSearchParams();
-      const a = $("#f_actor").value.trim(); if (a) qs.set("actor", a);
-      const ac = $("#f_action").value.trim(); if (ac) qs.set("action", ac);
-      const t = $("#f_target").value.trim(); if (t) qs.set("target", t);
-      qs.set("limit", "150");
+      const elA = $("#f_actor", view);
+      const elAc = $("#f_action", view);
+      const elT = $("#f_target", view);
+      const a = (elA && elA.value ? String(elA.value) : "").trim();
+      const ac = (elAc && elAc.value ? String(elAc.value) : "").trim();
+      const t = (elT && elT.value ? String(elT.value) : "").trim();
+      if (a) qs.set("actor", a);
+      if (ac) qs.set("action", ac);
+      if (t) qs.set("target", t);
+      qs.set("limit", "200");
+      let d;
       try {
-        const d = await api("/audit?" + qs.toString());
-        const items = d.items || [];
-        const auditListEl = $("#auditList", view);
-        if (!auditListEl) return;
-        auditListEl.innerHTML = items.length === 0
-          ? `<p class="muted">No rows.</p>`
-          : `<div class="table-wrap"><table class="t">
-              <thead><tr><th>Time</th><th>actor</th><th>action</th><th>target</th><th>detail</th></tr></thead>
-              <tbody>${items.map((e) => `
-                <tr>
-                  <td>${escapeHtml(fmtTs(e.created_at))}</td>
-                  <td>${escapeHtml(e.actor)}</td>
-                  <td><span class="chip">${escapeHtml(e.action)}</span></td>
-                  <td class="mono">${escapeHtml(e.target || "")}</td>
-                  <td><pre class="code">${escapeHtml(JSON.stringify(e.detail || {}))}</pre></td>
-                </tr>`).join("")}</tbody></table></div>`;
-      } catch (e) { toast(e.message || e, "err"); }
+        d = await api("/audit?" + qs.toString(), { timeoutMs: 12000 });
+      } catch (e) {
+        toast(e.message || e, "err");
+        return;
+      }
+      if (!isRouteCurrent(routeSeq)) return;
+      const items = d.items || [];
+      const auditListEl = $("#auditList", view);
+      const countEl = $("#auditCount", view);
+      if (!auditListEl) return;
+      if (countEl) countEl.textContent = String(items.length);
+
+      if (items.length === 0) {
+        auditListEl.innerHTML = `<p class="muted audit-empty">No matching entries.</p>`;
+        return;
+      }
+
+      auditListEl.innerHTML = `<div class="audit-feed">${items.map((e) => {
+        const actor = e.actor || "";
+        const tgt = e.target || "";
+        const action = e.action || "";
+        const extras = auditDetailDedupedRows(e.detail || {}, actor, tgt);
+        const extrasHtml = extras.length
+          ? `<div class="audit-extra">${extras.map((row) =>
+              `<div class="audit-extra-row"><span class="audit-k">${escapeHtml(row.k)}</span><span class="audit-v mono">${escapeHtml(row.v)}</span></div>`,
+            ).join("")}</div>`
+          : "";
+        const tgtHtml = tgt
+          ? `<span class="audit-target mono" title="target">${escapeHtml(tgt)}</span>`
+          : `<span class="muted">—</span>`;
+        return `
+          <article class="audit-item">
+            <div class="audit-item-top">
+              <div class="audit-time">
+                <span class="audit-ts">${escapeHtml(fmtTs(e.created_at))}</span>
+                <span class="muted audit-rel">${escapeHtml(fmtRel(e.created_at))}</span>
+              </div>
+              <span class="audit-action-chip ${auditChipClass(action)}" title="${escapeHtml(action)}">${escapeHtml(action)}</span>
+            </div>
+            <div class="audit-item-line">
+              <span class="audit-actor">${escapeHtml(actor)}</span>
+              <span class="audit-arrow" aria-hidden="true">→</span>
+              ${tgtHtml}
+            </div>
+            ${extrasHtml}
+          </article>`;
+      }).join("")}</div>`;
     };
-    $("#f_reload").addEventListener("click", reload);
+
+    const onFilterKey = (ev) => {
+      if (ev.key === "Enter") reload();
+    };
+    $("#f_reload", view).addEventListener("click", reload);
+    const fa = $("#f_actor", view);
+    const fac = $("#f_action", view);
+    const ft = $("#f_target", view);
+    if (fa) fa.addEventListener("keydown", onFilterKey);
+    if (fac) fac.addEventListener("keydown", onFilterKey);
+    if (ft) ft.addEventListener("keydown", onFilterKey);
     reload();
   });
 

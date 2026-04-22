@@ -1149,7 +1149,7 @@ const char *resolveDisconnectReason(float vbat, int rssi) {
 
 void activateSiren(uint32_t durationMs) {
   bool wasActive = sirenActive;
-  digitalWrite(SIREN_GPIO, HIGH);
+  digitalWrite(SIREN_GPIO, SIREN_ON);
   sirenActive = true;
   sirenStartAt = millis();
   sirenDurationMs = durationMs;
@@ -1164,7 +1164,7 @@ void activateSiren(uint32_t durationMs) {
 
 void deactivateSiren() {
   bool wasActive = sirenActive;
-  digitalWrite(SIREN_GPIO, LOW);
+  digitalWrite(SIREN_GPIO, SIREN_OFF);
   sirenActive = false;
   sirenDurationMs = 0;
   if (wasActive) publishHeartbeatEvent("siren_off");
@@ -2119,7 +2119,7 @@ void setup() {
   pinMode(SIREN_GPIO, OUTPUT);
   pinMode(STATUS_LED_GPIO, OUTPUT);
   pinMode(TRIGGER_GPIO, INPUT_PULLUP);
-  digitalWrite(SIREN_GPIO, LOW);
+  digitalWrite(SIREN_GPIO, SIREN_OFF);
   digitalWrite(STATUS_LED_GPIO, LOW);
   // Sync edge-detector baseline to actual pin (assumes NO switch to GND + pull-up: idle HIGH).
   delay(10);

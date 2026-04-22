@@ -212,6 +212,18 @@
 #define STATUS_LED_GPIO BOARD_DEFAULT_STATUS_LED_GPIO
 #endif
 
+// Siren driver polarity: 0 = HIGH turns siren ON, 1 = LOW turns siren ON (many relay boards).
+#ifndef SIREN_ACTIVE_LOW
+#define SIREN_ACTIVE_LOW 0
+#endif
+#if SIREN_ACTIVE_LOW
+#define SIREN_ON LOW
+#define SIREN_OFF HIGH
+#else
+#define SIREN_ON HIGH
+#define SIREN_OFF LOW
+#endif
+
 // ── Behaviour ──
 // When 1: local alarm input sounds this unit immediately. Recommended for
 // single-device sites: server fan-out excludes the source by default

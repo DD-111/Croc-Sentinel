@@ -2737,6 +2737,9 @@ def _readiness_public_paths(path: str) -> bool:
         "/favicon.ico",
     ):
         return True
+    # Telegram pushes updates during boot; handler returns 503 until DB ready so Telegram retries.
+    if path == "/integrations/telegram/webhook":
+        return True
     # Mounted dashboard (StaticFiles at DASHBOARD_PATH) — was missing and caused 503 on entire UI.
     base = DASHBOARD_PATH
     if path == base or path.startswith(base + "/"):
@@ -6143,6 +6146,23 @@ def telegram_admin_test(
     return {"ok": True, "detail": detail, "telegram": telegram_status()}
 
 
+@app.get("/admin/telegram/webhook-info")
+def telegram_admin_webhook_info(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    """Shows Telegram getWebhookInfo (URL, last_error, pending updates) for debugging /start no-reply."""
+    assert_min_role(principal, "admin")
+    try:
+        from telegram_notify import telegram_get_webhook_info
+    except ModuleNotFoundError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="telegram_notify module missing from deployment image",
+        ) from exc
+    ok, err, info = telegram_get_webhook_info()
+    if not ok:
+        raise HTTPException(status_code=502, detail=err)
+    return {"ok": True, "webhook": info, "expected_path": "/integrations/telegram/webhook"}
+
+
 class TelegramBindRequest(BaseModel):
     chat_id: str = Field(min_length=1, max_length=64)
     enabled: bool = True
@@ -6158,6 +6178,12 @@ def _telegram_cmd_send_reply(chat_id: str, text: str) -> tuple[bool, str]:
     except Exception as exc:
         return False, f"telegram module unavailable: {exc}"
     return send_telegram_chat_text(chat_id, text)
+
+
+def _telegram_cmd_send_reply_logged(chat_id: str, text: str, context: str) -> None:
+    ok, detail = _telegram_cmd_send_reply(chat_id, text)
+    if not ok:
+        logger.warning("telegram webhook: send failed (%s) chat_id=%s: %s", context, chat_id, detail)
 
 
 def _telegram_bind_chat(chat_id: str, username: str, enabled: bool) -> None:
@@ -6443,11 +6469,15 @@ def telegram_link_token(
         conn.close()
     payload = f"bind_{token}"
     deep_link = ""
+    open_chat_url = ""
     if TELEGRAM_BOT_USERNAME:
+        open_chat_url = f"https://t.me/{TELEGRAM_BOT_USERNAME}"
         deep_link = f"https://t.me/{TELEGRAM_BOT_USERNAME}?start={payload}"
     return {
         "ok": True,
         "token": token,
+        "bot_username": TELEGRAM_BOT_USERNAME,
+        "open_chat_url": open_chat_url,
         "start_payload": payload,
         "deep_link": deep_link,
         "expires_at_ts": expires_at_ts,
@@ -6532,12 +6562,26 @@ def telegram_binding_set_enabled(
 
 @app.post("/integrations/telegram/webhook")
 def telegram_webhook(
+    request: Request,
     payload: dict[str, Any],
     x_telegram_bot_api_secret_token: Optional[str] = Header(default=None, alias="X-Telegram-Bot-Api-Secret-Token"),
 ) -> dict[str, Any]:
-    if TELEGRAM_COMMAND_SECRET and (x_telegram_bot_api_secret_token or "").strip() != TELEGRAM_COMMAND_SECRET:
+    if not api_ready_event.is_set():
+        raise HTTPException(status_code=503, detail="service starting")
+    if api_bootstrap_error:
+        raise HTTPException(status_code=503, detail="bootstrap failed")
+    # Proxies sometimes preserve header casing differently; fall back to raw request.
+    secret_hdr = (x_telegram_bot_api_secret_token or "").strip()
+    if not secret_hdr:
+        secret_hdr = (request.headers.get("x-telegram-bot-api-secret-token") or "").strip()
+    if TELEGRAM_COMMAND_SECRET and secret_hdr != TELEGRAM_COMMAND_SECRET:
+        logger.warning(
+            "telegram webhook: rejected (TELEGRAM_COMMAND_SECRET mismatch or missing secret header). "
+            "Set BotFather webhook secret_token to the same value as TELEGRAM_COMMAND_SECRET, "
+            "or leave TELEGRAM_COMMAND_SECRET empty if not using a webhook secret."
+        )
         return {"ok": True, "ignored": "bad_secret"}
-    msg = payload.get("message") or payload.get("channel_post") or {}
+    msg = payload.get("message") or payload.get("channel_post") or payload.get("edited_message") or {}
     if not isinstance(msg, dict):
         return {"ok": True, "ignored": "no_message"}
     chat = msg.get("chat") or {}
@@ -6568,24 +6612,34 @@ def telegram_webhook(
                 row = cur.fetchone()
                 if not row:
                     conn.close()
-                    _telegram_cmd_send_reply(chat_id, "Invalid link token. Generate a new one from dashboard.")
+                    _telegram_cmd_send_reply_logged(
+                        chat_id, "Invalid link token. Generate a new one from dashboard.", "bind_bad_token"
+                    )
                     return {"ok": True, "processed": True, "bound": False, "reason": "bad_token"}
                 if row["used_at"]:
                     conn.close()
-                    _telegram_cmd_send_reply(chat_id, "This link token is already used.")
+                    _telegram_cmd_send_reply_logged(chat_id, "This link token is already used.", "bind_used_token")
                     return {"ok": True, "processed": True, "bound": False, "reason": "used_token"}
                 if int(row["expires_at_ts"]) < int(time.time()):
                     conn.close()
-                    _telegram_cmd_send_reply(chat_id, "Link token expired. Generate a new one from dashboard.")
+                    _telegram_cmd_send_reply_logged(
+                        chat_id, "Link token expired. Generate a new one from dashboard.", "bind_expired"
+                    )
                     return {"ok": True, "processed": True, "bound": False, "reason": "expired_token"}
                 username = str(row["username"])
                 cur.execute("UPDATE telegram_link_tokens SET used_at = ? WHERE token = ?", (utc_now_iso(), token))
                 conn.commit()
                 conn.close()
             _telegram_bind_chat(chat_id, username, True)
-            _telegram_cmd_send_reply(chat_id, f"Bound OK: {username}\nYou can now use bot commands.")
+            _telegram_cmd_send_reply_logged(
+                chat_id, f"Bound OK: {username}\nYou can now use bot commands.", "bind_ok"
+            )
             return {"ok": True, "processed": True, "bound": True, "username": username}
-        _telegram_cmd_send_reply(chat_id, f"chat_id={chat_id}\nBind this in dashboard Telegram settings.")
+        _telegram_cmd_send_reply_logged(
+            chat_id,
+            f"chat_id={chat_id}\nBind this in dashboard Telegram settings (or use a dashboard-generated bind link).",
+            "start_chat_id",
+        )
         return {"ok": True, "processed": True, "bound": False}
 
     # Command allowlist applies to command execution (not /start binding flow).
@@ -6600,9 +6654,7 @@ def telegram_webhook(
     except Exception as exc:
         logger.exception("telegram command failed")
         reply = f"Error: {exc}"
-    ok, detail = _telegram_cmd_send_reply(chat_id, reply)
-    if not ok:
-        logger.warning("telegram webhook reply failed chat=%s: %s", chat_id, detail)
+    _telegram_cmd_send_reply_logged(chat_id, reply, "command_reply")
     return {"ok": True, "processed": True}
 
 
