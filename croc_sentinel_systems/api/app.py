@@ -4740,8 +4740,7 @@ class DeviceShareRequest(BaseModel):
     can_operate: bool = False
 
 
-@app.delete("/group-cards/{group_key}")
-def delete_group_card(group_key: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+def _delete_group_card_impl(group_key: str, principal: Principal) -> dict[str, Any]:
     """Delete a group card by clearing notification_group on target devices.
 
     Security rule:
@@ -4794,6 +4793,17 @@ def delete_group_card(group_key: str, principal: Principal = Depends(require_pri
     cache_invalidate("overview")
     audit_event(principal.username, "group.delete", g, {"device_count": len(ids), "changed": changed})
     return {"ok": True, "group_key": g, "device_count": len(ids), "changed": changed}
+
+
+@app.delete("/group-cards/{group_key}")
+def delete_group_card(group_key: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    return _delete_group_card_impl(group_key, principal)
+
+
+@app.post("/group-cards/{group_key}/delete")
+def delete_group_card_post(group_key: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    """Proxy-friendly delete route for environments that block HTTP DELETE."""
+    return _delete_group_card_impl(group_key, principal)
 
 
 def _apply_device_profile_update(

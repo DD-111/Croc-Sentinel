@@ -384,6 +384,29 @@ body[data-layout="auth"] .view {
   font-size: 12.5px;
   padding: 4px 0;
 }
+.group-del-ico {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-muted);
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+.group-del-ico:hover:not(:disabled) {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 50%, var(--border));
+  background: var(--danger-weak);
+}
+.group-del-ico:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
 
 /* Cards & layout */
 .card {

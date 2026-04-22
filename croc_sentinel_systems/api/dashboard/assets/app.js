@@ -1115,7 +1115,8 @@
         const m = meta[g] || {};
         const sharedBy = groupSharedBy(g);
         const isSharedGroup = sharedBy.length > 0;
-        return `<article class="device-card js-group-card ${selectedGroup === g ? "is-selected" : ""}" data-group="${escapeHtml(g)}" style="cursor:pointer">
+        return `<article class="device-card js-group-card ${selectedGroup === g ? "is-selected" : ""}" data-group="${escapeHtml(g)}" style="cursor:pointer;position:relative">
+          <button class="group-del-ico js-del-group" data-group="${escapeHtml(g)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group cannot be deleted\"" : "title=\"Delete group\""} aria-label="Delete group">✕</button>
           <h3><div class="device-primary-name">${escapeHtml(m.display_name || g)}</div><div class="device-id-sub mono">${escapeHtml(g)}</div></h3>
           <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
             <span class="badge neutral">total ${total}</span>
@@ -1126,12 +1127,23 @@
           <div class="meta">Owner: ${escapeHtml(m.owner_name || "—")} · ${escapeHtml(m.phone || "—")} · ${escapeHtml(m.email || "—")}</div>
           <div class="row" style="margin-top:8px;gap:6px;flex-wrap:wrap">
             <button class="btn sm secondary js-edit-group" data-group="${escapeHtml(g)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group: device membership is read-only\"" : ""}>Edit</button>
-            <button class="btn sm danger js-del-group" data-group="${escapeHtml(g)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group cannot be deleted\"" : ""}>Delete group</button>
             <button class="btn sm danger js-alert-on" data-group="${escapeHtml(g)}" type="button">Alarm ON</button>
             <button class="btn sm secondary js-alert-off" data-group="${escapeHtml(g)}" type="button">Alarm OFF</button>
           </div>
         </article>`;
       }).join("");
+    };
+    const deleteGroupCard = async (groupKey) => {
+      // Prefer POST /delete for proxy compatibility; fallback to DELETE.
+      try {
+        return await api(`/group-cards/${encodeURIComponent(groupKey)}/delete`, { method: "POST" });
+      } catch (e) {
+        const msg = String((e && e.message) || e || "");
+        if (msg.includes("404") || msg.includes("405") || msg.includes("501")) {
+          return await api(`/group-cards/${encodeURIComponent(groupKey)}`, { method: "DELETE" });
+        }
+        throw e;
+      }
     };
     const openGroupModal = (g) => {
       editingGroup = g || "";
@@ -1182,7 +1194,7 @@
           if (groupSharedBy(g).length > 0) { toast("Shared group cannot be deleted", "err"); return; }
           if (!confirm(`Delete group card "${g}"?`)) return;
           try {
-            await api(`/group-cards/${encodeURIComponent(g)}`, { method: "DELETE" });
+            await deleteGroupCard(g);
             delete meta[g];
             saveGroupMeta(meta);
             renderGroups();
@@ -1297,7 +1309,7 @@
         if (isSharedGroup) { toast("Shared group cannot be deleted", "err"); return; }
         if (!confirm(`Delete group card "${g}"?`)) return;
         try {
-          await api(`/group-cards/${encodeURIComponent(g)}`, { method: "DELETE" });
+          await deleteGroupCard(g);
           delete meta[g];
           localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(meta));
           toast("Group deleted", "ok");
