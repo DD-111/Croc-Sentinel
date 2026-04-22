@@ -561,6 +561,7 @@
   registerRoute("login", async (view) => {
     setCrumb("Sign in");
     document.body.dataset.auth = "none";
+    const AUTH_UI_REV = "UI rev 2026.04.22";
     const cleanAuthMessage = (raw) => {
       const s = String(raw || "").trim();
       if (!s) return "Request failed. Please try again.";
@@ -575,6 +576,7 @@
       <div class="auth-page" role="main">
         <div class="auth-card" data-auth-card>
           <header class="auth-card__head">
+            <div class="auth-rev">${AUTH_UI_REV}</div>
             <div class="auth-card__logo" aria-hidden="true"></div>
             <h1 class="auth-card__title">Sign in</h1>
             <p class="auth-card__lead">Welcome back. Sign in to continue.</p>
@@ -754,6 +756,7 @@
   registerRoute("register", async (view) => {
     setCrumb("Register admin");
     document.body.dataset.auth = "none";
+    const AUTH_UI_REV = "UI rev 2026.04.22";
     const cleanSignupMessage = (raw) => {
       const s = String(raw || "").trim();
       if (!s) return "Request failed. Please try again.";
@@ -767,6 +770,7 @@
       <div class="auth-page" role="main">
         <div class="auth-card auth-card--wide" data-auth-card>
           <header class="auth-card__head">
+            <div class="auth-rev">${AUTH_UI_REV}</div>
             <div class="auth-card__logo" aria-hidden="true"></div>
             <h1 class="auth-card__title">Create admin</h1>
             <p class="auth-card__lead">Create your admin account with email verification.</p>
@@ -924,6 +928,16 @@
     setCrumb("Account");
     if (!hasRole("user")) { view.innerHTML = `<div class="card"><p class="muted">Sign in required.</p></div>`; return; }
     const me = state.me || { username: "", role: "" };
+    const rawCommandPanel = (state.me && state.me.role === "superadmin") ? `
+        <div class="card">
+          <h3>Raw command</h3>
+          <label class="field"><span>cmd</span><input id="cmdName" placeholder="get_info / ota" ${can("can_send_command") ? "" : "disabled"} /></label>
+          <label class="field" style="margin-top:8px"><span>params (JSON)</span><textarea id="cmdParams" placeholder='{"key":"value"}' ${can("can_send_command") ? "" : "disabled"}></textarea></label>
+          <div class="row" style="margin-top:8px;justify-content:flex-end">
+            <button class="btn" id="sendCmd" ${can("can_send_command") ? "" : "disabled"}>Send</button>
+          </div>
+        </div>
+      ` : "";
     view.innerHTML = `
       <div class="card">
         <h2>My account</h2>
@@ -1006,10 +1020,10 @@
       : [];
     const devices = list.items || [];
     const byId = new Map(devices.map((d) => [String(d.device_id), d]));
-    const groupSettingsMap = new Map(groupSettingsItems.map((x) => [String(x.group_key || ""), x]));
 
     const groupScope = (state.me && state.me.username) ? state.me.username : "anon";
     const GROUP_META_LS_KEY = `croc.group.meta.v2.${groupScope}`;
+    const GROUP_SETTINGS_LS_KEY = `croc.group.settings.v1.${groupScope}`;
     const loadGroupMeta = () => {
       try {
         const raw = localStorage.getItem(GROUP_META_LS_KEY);
@@ -1018,6 +1032,18 @@
       } catch { return {}; }
     };
     const saveGroupMeta = (obj) => localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(obj || {}));
+    const loadLocalGroupSettings = () => {
+      try {
+        const raw = localStorage.getItem(GROUP_SETTINGS_LS_KEY);
+        const obj = raw ? JSON.parse(raw) : {};
+        return (obj && typeof obj === "object") ? obj : {};
+      } catch { return {}; }
+    };
+    const saveLocalGroupSettings = (obj) => localStorage.setItem(GROUP_SETTINGS_LS_KEY, JSON.stringify(obj || {}));
+    const localGroupSettings = loadLocalGroupSettings();
+    const groupSettingsMap = new Map();
+    for (const [k, v] of Object.entries(localGroupSettings)) groupSettingsMap.set(String(k), v || {});
+    for (const x of groupSettingsItems) groupSettingsMap.set(String(x.group_key || ""), x);
     const normalizeGroup = (s) => String(s || "").trim();
     const meta = loadGroupMeta();
     const notifMap = new Map();
@@ -1233,15 +1259,63 @@
         reboot_self_check: reboot,
       };
     };
+    const persistSettingsLocal = (groupKey, payload) => {
+      const all = loadLocalGroupSettings();
+      all[groupKey] = Object.assign({}, payload || {});
+      saveLocalGroupSettings(all);
+    };
+    const saveGroupSettingsCompat = async (groupKey, payload) => {
+      try {
+        return await api(`/group-cards/${encodeURIComponent(groupKey)}/settings`, {
+          method: "PUT",
+          body: payload,
+        });
+      } catch (e) {
+        const msg = String((e && e.message) || e || "");
+        if (msg.includes("404") || msg.includes("405") || msg.includes("501")) {
+          persistSettingsLocal(groupKey, payload);
+          return payload;
+        }
+        throw e;
+      }
+    };
+    const applyGroupSettingsFallback = async (groupKey, payload) => {
+      const ids = groupDeviceIds(groupKey);
+      if (!ids.length) throw new Error("No devices in this group");
+      if (!can("can_alert")) throw new Error("No can_alert capability");
+      const durationMs = Number(payload.trigger_duration_ms || 10000);
+      const delaySeconds = Number(payload.delay_seconds || 0);
+      if (String(payload.trigger_mode || "continuous") === "delay" && delaySeconds > 0) {
+        setTimeout(async () => {
+          try {
+            await api("/alerts", { method: "POST", body: { action: "on", duration_ms: durationMs, device_ids: ids } });
+          } catch {}
+        }, delaySeconds * 1000);
+      } else {
+        await api("/alerts", { method: "POST", body: { action: "on", duration_ms: durationMs, device_ids: ids } });
+      }
+      let rebootJobs = 0;
+      let selfTests = 0;
+      if (payload.reboot_self_check) {
+        if (!can("can_send_command")) throw new Error("Reboot+self-check needs can_send_command");
+        for (const did of ids) {
+          await api(`/devices/${encodeURIComponent(did)}/self-test`, { method: "POST" });
+          selfTests += 1;
+          await api(`/devices/${encodeURIComponent(did)}/schedule-reboot`, {
+            method: "POST",
+            body: { delay_s: Math.max(5, delaySeconds + 5) },
+          });
+          rebootJobs += 1;
+        }
+      }
+      return { ok: true, fallback: true, device_count: ids.length, self_tests: selfTests, reboot_jobs: rebootJobs };
+    };
     $("#gsCancel", view).addEventListener("click", closeSettingsModal);
     $("#gsSave", view).addEventListener("click", async () => {
       try {
         if (!editingSettingsGroup) throw new Error("No group selected");
         const payload = collectSettingsPayload();
-        const r = await api(`/group-cards/${encodeURIComponent(editingSettingsGroup)}/settings`, {
-          method: "PUT",
-          body: payload,
-        });
+        const r = await saveGroupSettingsCompat(editingSettingsGroup, payload);
         groupSettingsMap.set(editingSettingsGroup, r || payload);
         renderGroups();
         closeSettingsModal();
@@ -1254,15 +1328,22 @@
       try {
         if (!editingSettingsGroup) throw new Error("No group selected");
         const payload = collectSettingsPayload();
-        await api(`/group-cards/${encodeURIComponent(editingSettingsGroup)}/settings`, {
-          method: "PUT",
-          body: payload,
-        });
+        await saveGroupSettingsCompat(editingSettingsGroup, payload);
         groupSettingsMap.set(editingSettingsGroup, payload);
-        const r = await api(`/group-cards/${encodeURIComponent(editingSettingsGroup)}/apply`, { method: "POST" });
+        let r;
+        try {
+          r = await api(`/group-cards/${encodeURIComponent(editingSettingsGroup)}/apply`, { method: "POST" });
+        } catch (e) {
+          const msg = String((e && e.message) || e || "");
+          if (msg.includes("404") || msg.includes("405") || msg.includes("501")) {
+            r = await applyGroupSettingsFallback(editingSettingsGroup, payload);
+          } else {
+            throw e;
+          }
+        }
         renderGroups();
         closeSettingsModal();
-        toast(`Applied to ${Number(r.device_count || 0)} devices`, "ok");
+        toast(`Applied to ${Number(r.device_count || 0)} devices${r && r.fallback ? " (fallback mode)" : ""}`, "ok");
       } catch (e) {
         toast(e.message || e, "err");
       }
@@ -1635,14 +1716,7 @@
             <button class="btn secondary" id="unrevoke" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Unrevoke</button>
           </div>
         </div>
-        <div class="card">
-          <h3>Raw command</h3>
-          <label class="field"><span>cmd</span><input id="cmdName" placeholder="get_info / ota" ${can("can_send_command") ? "" : "disabled"} /></label>
-          <label class="field" style="margin-top:8px"><span>params (JSON)</span><textarea id="cmdParams" placeholder='{"key":"value"}' ${can("can_send_command") ? "" : "disabled"}></textarea></label>
-          <div class="row" style="margin-top:8px;justify-content:flex-end">
-            <button class="btn" id="sendCmd" ${can("can_send_command") ? "" : "disabled"}>Send</button>
-          </div>
-        </div>
+        ${rawCommandPanel}
       </div>
       ${sharePanel}
 
@@ -1723,19 +1797,22 @@
     $("#unrevoke").addEventListener("click", withDev(() =>
       api(`/devices/${encodeURIComponent(id)}/unrevoke`, { method: "POST" })));
 
-    $("#sendCmd").addEventListener("click", async () => {
-      const name = ($("#cmdName").value || "").trim();
-      if (!name) { toast("Enter cmd", "err"); return; }
-      let params = {};
-      const raw = ($("#cmdParams").value || "").trim();
-      if (raw) {
-        try { params = JSON.parse(raw); } catch { toast("Invalid JSON in params", "err"); return; }
-      }
-      try {
-        await api(`/devices/${encodeURIComponent(id)}/commands`, { method: "POST", body: { cmd: name, params } });
-        toast("Command sent", "ok");
-      } catch (e) { toast(e.message || e, "err"); }
-    });
+    const sendCmdBtn = $("#sendCmd");
+    if (sendCmdBtn) {
+      sendCmdBtn.addEventListener("click", async () => {
+        const name = ($("#cmdName").value || "").trim();
+        if (!name) { toast("Enter cmd", "err"); return; }
+        let params = {};
+        const raw = ($("#cmdParams").value || "").trim();
+        if (raw) {
+          try { params = JSON.parse(raw); } catch { toast("Invalid JSON in params", "err"); return; }
+        }
+        try {
+          await api(`/devices/${encodeURIComponent(id)}/commands`, { method: "POST", body: { cmd: name, params } });
+          toast("Command sent", "ok");
+        } catch (e) { toast(e.message || e, "err"); }
+      });
+    }
 
     const waitForCmdAck = async (expectedCmd) => {
       for (let i = 0; i < 36; i++) {

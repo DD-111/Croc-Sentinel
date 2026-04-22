@@ -129,11 +129,14 @@ class _TelegramQueue:
                         keep[k] = d.get(k)
                 if "login_user" in d and d.get("login_user") not in (None, ""):
                     keep["login_user"] = d.get("login_user")
-                # Rich login/device context is kept only for superadmin actor events.
-                if bool(ev.get("_actor_superadmin")):
-                    for k in ("ip", "platform", "device_type", "mac_hint", "geo"):
-                        if k in d and d.get(k) not in (None, ""):
-                            keep[k] = d.get(k)
+                # Keep rich client context for auth/alarm visibility parity.
+                for k in ("ip", "platform", "device_type", "mac_hint", "geo"):
+                    if k in d and d.get(k) not in (None, ""):
+                        keep[k] = d.get(k)
+                if "owner_admin" in d and d.get("owner_admin") not in (None, ""):
+                    keep["owner_admin"] = d.get("owner_admin")
+                if "device_ids" in d and isinstance(d.get("device_ids"), list):
+                    keep["device_ids"] = d.get("device_ids")
                 # Trigger source is always important for alarm actions.
                 for k in ("trigger_kind", "client_kind"):
                     if k in d and d.get(k) not in (None, ""):
@@ -160,6 +163,10 @@ class _TelegramQueue:
                 f"target: {target}",
             ]
         elif cat == "alarm":
+            if device_id in ("", "-", "none", "None"):
+                dids = detail_map.get("device_ids") if isinstance(detail_map.get("device_ids"), list) else []
+                if dids:
+                    device_id = str(dids[0])
             lines = [
                 f"[{lvl.upper()}] alarm",
                 f"event: {et}",
@@ -180,6 +187,12 @@ class _TelegramQueue:
             lines.insert(3, f"device_name: {dev_name}")
         if trigger:
             lines.append(f"trigger: {trigger}")
+        if "owner_admin" in detail_map and detail_map.get("owner_admin") not in (None, ""):
+            lines.append(f"owner_admin: {detail_map.get('owner_admin')}")
+        if "device_ids" in detail_map and isinstance(detail_map.get("device_ids"), list):
+            dids = [str(x) for x in detail_map.get("device_ids") if str(x).strip()]
+            if dids:
+                lines.append(f"device_ids: {','.join(dids[:12])}")
         for k in ("ip", "geo", "platform", "device_type", "mac_hint", "reason", "error", "result", "state", "duration_ms", "fanout_count"):
             if k in detail_map and detail_map.get(k) not in (None, ""):
                 lines.append(f"{k}: {detail_map.get(k)}")
