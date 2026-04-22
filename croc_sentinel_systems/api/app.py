@@ -4856,6 +4856,23 @@ def delete_group_card_post(group_key: str, principal: Principal = Depends(requir
     return _delete_group_card_impl(group_key, principal)
 
 
+@app.get("/group-cards/capabilities")
+def group_cards_capabilities(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "user")
+    return {
+        "ok": True,
+        "prefixes": ["/group-cards", "/api/group-cards"],
+        "routes": {
+            "settings_list": ["GET /group-cards/settings", "GET /api/group-cards/settings"],
+            "settings_get": ["GET /group-cards/{group_key}/settings", "GET /api/group-cards/{group_key}/settings"],
+            "settings_put": ["PUT /group-cards/{group_key}/settings", "PUT /api/group-cards/{group_key}/settings"],
+            "apply": ["POST /group-cards/{group_key}/apply", "POST /api/group-cards/{group_key}/apply"],
+            "delete_post": ["POST /group-cards/{group_key}/delete", "POST /api/group-cards/{group_key}/delete"],
+            "delete_delete": ["DELETE /group-cards/{group_key}", "DELETE /api/group-cards/{group_key}"],
+        },
+    }
+
+
 def _group_owner_scope(principal: Principal) -> str:
     if principal.role == "admin":
         return principal.username
@@ -4934,6 +4951,11 @@ def list_group_card_settings(principal: Principal = Depends(require_principal)) 
     return {"items": out}
 
 
+@app.get("/api/group-cards/settings")
+def list_group_card_settings_api(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    return list_group_card_settings(principal)
+
+
 @app.get("/group-cards/{group_key}/settings")
 def get_group_card_settings(group_key: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     assert_min_role(principal, "user")
@@ -4966,6 +4988,11 @@ def get_group_card_settings(group_key: str, principal: Principal = Depends(requi
         "updated_by": str(r.get("updated_by") or ""),
         "updated_at": str(r.get("updated_at") or ""),
     }
+
+
+@app.get("/api/group-cards/{group_key}/settings")
+def get_group_card_settings_api(group_key: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    return get_group_card_settings(group_key, principal)
 
 
 @app.put("/group-cards/{group_key}/settings")
@@ -5041,6 +5068,15 @@ def save_group_card_settings(
         "updated_by": principal.username,
         "updated_at": now,
     }
+
+
+@app.put("/api/group-cards/{group_key}/settings")
+def save_group_card_settings_api(
+    group_key: str,
+    body: GroupCardSettingsBody,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    return save_group_card_settings(group_key, body, principal)
 
 
 @app.post("/group-cards/{group_key}/apply")
@@ -5211,6 +5247,24 @@ def apply_group_card_settings(
         "self_tests": self_tests,
         "reboot_jobs": reboot_jobs,
     }
+
+
+@app.post("/api/group-cards/{group_key}/apply")
+def apply_group_card_settings_api(
+    group_key: str,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    return apply_group_card_settings(group_key, principal)
+
+
+@app.delete("/api/group-cards/{group_key}")
+def delete_group_card_api(group_key: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    return _delete_group_card_impl(group_key, principal)
+
+
+@app.post("/api/group-cards/{group_key}/delete")
+def delete_group_card_post_api(group_key: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    return _delete_group_card_impl(group_key, principal)
 
 
 def _apply_device_profile_update(

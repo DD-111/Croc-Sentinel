@@ -1033,10 +1033,69 @@
   // Overview
   registerRoute("overview", async (view) => {
     setCrumb("Overview");
+    const groupScope = (state.me && state.me.username) ? state.me.username : "anon";
+    const GROUP_API_CAPS_LS_KEY = `croc.group.api.caps.v2.${groupScope}`;
+    const loadGroupApiCaps = () => {
+      try {
+        const raw = localStorage.getItem(GROUP_API_CAPS_LS_KEY);
+        const obj = raw ? JSON.parse(raw) : {};
+        return {
+          settings: obj && obj.settings === false ? false : true,
+          apply: obj && obj.apply === false ? false : true,
+          delete: obj && obj.delete === false ? false : true,
+          prefix: (obj && (obj.prefix === "/api" || obj.prefix === "")) ? obj.prefix : "",
+        };
+      } catch {
+        return { settings: true, apply: true, delete: true, prefix: "" };
+      }
+    };
+    const saveGroupApiCaps = (caps) => {
+      localStorage.setItem(GROUP_API_CAPS_LS_KEY, JSON.stringify({
+        settings: !!(caps && caps.settings),
+        apply: !!(caps && caps.apply),
+        delete: !!(caps && caps.delete),
+        prefix: (caps && caps.prefix === "/api") ? "/api" : "",
+      }));
+    };
+    const groupApiCaps = loadGroupApiCaps();
+    const tryGroupApiCall = async (suffix, opts) => {
+      const lastErrs = [];
+      const prefixes = groupApiCaps.prefix === "/api" ? ["/api", ""] : ["", "/api"];
+      for (const px of prefixes) {
+        try {
+          const r = await api(`${px}/group-cards${suffix}`, opts);
+          if (groupApiCaps.prefix !== px) {
+            groupApiCaps.prefix = px;
+            saveGroupApiCaps(groupApiCaps);
+          }
+          return r;
+        } catch (e) {
+          const msg = String((e && e.message) || e || "");
+          lastErrs.push(e);
+          if (msg.includes("404") || msg.includes("405") || msg.includes("501")) continue;
+          throw e;
+        }
+      }
+      throw lastErrs[lastErrs.length - 1] || new Error("group route unavailable");
+    };
+    const loadGroupSettingsCompat = async () => {
+      if (!groupApiCaps.settings) return { items: [] };
+      try {
+        return await tryGroupApiCall("/settings", { timeoutMs: 6000, retries: 1 });
+      } catch (e) {
+        const msg = String((e && e.message) || e || "");
+        if (msg.includes("404") || msg.includes("405") || msg.includes("501")) {
+          groupApiCaps.settings = false;
+          saveGroupApiCaps(groupApiCaps);
+          return { items: [] };
+        }
+        throw e;
+      }
+    };
     const [ovRes, listRes, grpSetRes] = await Promise.allSettled([
       apiGetCached("/dashboard/overview", { timeoutMs: 8000 }, 4000),
       apiGetCached("/devices", { timeoutMs: 8000 }, 4000),
-      apiOr("/group-cards/settings", { items: [] }, { timeoutMs: 6000 }),
+      loadGroupSettingsCompat(),
     ]);
     let ov = (ovRes.status === "fulfilled" && ovRes.value) ? ovRes.value : null;
     let list = (listRes.status === "fulfilled" && listRes.value) ? listRes.value : null;
@@ -1057,7 +1116,6 @@
     const devices = list.items || [];
     const byId = new Map(devices.map((d) => [String(d.device_id), d]));
 
-    const groupScope = (state.me && state.me.username) ? state.me.username : "anon";
     const GROUP_META_LS_KEY = `croc.group.meta.v2.${groupScope}`;
     const GROUP_SETTINGS_LS_KEY = `croc.group.settings.v1.${groupScope}`;
     const loadGroupMeta = () => {
@@ -1076,6 +1134,7 @@
       } catch { return {}; }
     };
     const saveLocalGroupSettings = (obj) => localStorage.setItem(GROUP_SETTINGS_LS_KEY, JSON.stringify(obj || {}));
+    const groupDelayTimers = new Map();
     const localGroupSettings = loadLocalGroupSettings();
     const groupSettingsMap = new Map();
     for (const [k, v] of Object.entries(localGroupSettings)) groupSettingsMap.set(String(k), v || {});
@@ -1301,14 +1360,20 @@
       saveLocalGroupSettings(all);
     };
     const saveGroupSettingsCompat = async (groupKey, payload) => {
+      if (!groupApiCaps.settings) {
+        persistSettingsLocal(groupKey, payload);
+        return payload;
+      }
       try {
-        return await api(`/group-cards/${encodeURIComponent(groupKey)}/settings`, {
+        return await tryGroupApiCall(`/${encodeURIComponent(groupKey)}/settings`, {
           method: "PUT",
           body: payload,
         });
       } catch (e) {
         const msg = String((e && e.message) || e || "");
         if (msg.includes("404") || msg.includes("405") || msg.includes("501")) {
+          groupApiCaps.settings = false;
+          saveGroupApiCaps(groupApiCaps);
           persistSettingsLocal(groupKey, payload);
           return payload;
         }
@@ -1321,12 +1386,18 @@
       if (!can("can_alert")) throw new Error("No can_alert capability");
       const durationMs = Number(payload.trigger_duration_ms || 10000);
       const delaySeconds = Number(payload.delay_seconds || 0);
+      const prevTimer = groupDelayTimers.get(groupKey);
+      if (prevTimer) {
+        clearTimeout(prevTimer);
+        groupDelayTimers.delete(groupKey);
+      }
       if (String(payload.trigger_mode || "continuous") === "delay" && delaySeconds > 0) {
-        setTimeout(async () => {
+        const tid = setTimeout(async () => {
           try {
             await api("/alerts", { method: "POST", body: { action: "on", duration_ms: durationMs, device_ids: ids } });
           } catch {}
         }, delaySeconds * 1000);
+        groupDelayTimers.set(groupKey, tid);
       } else {
         await api("/alerts", { method: "POST", body: { action: "on", duration_ms: durationMs, device_ids: ids } });
       }
@@ -1367,15 +1438,21 @@
         await saveGroupSettingsCompat(editingSettingsGroup, payload);
         groupSettingsMap.set(editingSettingsGroup, payload);
         let r;
-        try {
-          r = await api(`/group-cards/${encodeURIComponent(editingSettingsGroup)}/apply`, { method: "POST" });
-        } catch (e) {
-          const msg = String((e && e.message) || e || "");
-          if (msg.includes("404") || msg.includes("405") || msg.includes("501")) {
-            r = await applyGroupSettingsFallback(editingSettingsGroup, payload);
-          } else {
-            throw e;
+        if (groupApiCaps.apply) {
+          try {
+            r = await tryGroupApiCall(`/${encodeURIComponent(editingSettingsGroup)}/apply`, { method: "POST" });
+          } catch (e) {
+            const msg = String((e && e.message) || e || "");
+            if (msg.includes("404") || msg.includes("405") || msg.includes("501")) {
+              groupApiCaps.apply = false;
+              saveGroupApiCaps(groupApiCaps);
+              r = await applyGroupSettingsFallback(editingSettingsGroup, payload);
+            } else {
+              throw e;
+            }
           }
+        } else {
+          r = await applyGroupSettingsFallback(editingSettingsGroup, payload);
         }
         renderGroups();
         closeSettingsModal();
@@ -1399,17 +1476,20 @@
     };
     const deleteGroupCard = async (groupKey) => {
       // Prefer POST /delete for proxy compatibility; fallback to DELETE.
+      if (!groupApiCaps.delete) return clearGroupByDevicePatch(groupKey);
       try {
-        return await api(`/group-cards/${encodeURIComponent(groupKey)}/delete`, { method: "POST" });
+        return await tryGroupApiCall(`/${encodeURIComponent(groupKey)}/delete`, { method: "POST" });
       } catch (e) {
         const msg = String((e && e.message) || e || "");
         if (msg.includes("404") || msg.includes("405") || msg.includes("501")) {
           try {
-            return await api(`/group-cards/${encodeURIComponent(groupKey)}`, { method: "DELETE" });
+            return await tryGroupApiCall(`/${encodeURIComponent(groupKey)}`, { method: "DELETE" });
           } catch (e2) {
             const msg2 = String((e2 && e2.message) || e2 || "");
             // Backward-compatible fallback: clear group assignment per device.
             if (msg2.includes("404") || msg2.includes("405") || msg2.includes("501")) {
+              groupApiCaps.delete = false;
+              saveGroupApiCaps(groupApiCaps);
               return await clearGroupByDevicePatch(groupKey);
             }
             throw e2;
@@ -1489,24 +1569,42 @@
         try {
           if (action === "on") {
             // Alarm ON should honor group settings (delay/continuous/reboot flow) via server apply.
-            try {
-              await api(`/group-cards/${encodeURIComponent(g)}/apply`, { method: "POST" });
-            } catch (eApply) {
-              const msgApply = String((eApply && eApply.message) || eApply || "");
-              if (msgApply.includes("404") || msgApply.includes("405") || msgApply.includes("501")) {
-                const gs = groupSettingsMap.get(g) || {};
-                const payload = {
-                  trigger_mode: String(gs.trigger_mode || "continuous"),
-                  trigger_duration_ms: Number(gs.trigger_duration_ms || 10000),
-                  delay_seconds: Number(gs.delay_seconds || 0),
-                  reboot_self_check: !!gs.reboot_self_check,
-                };
-                await applyGroupSettingsFallback(g, payload);
-              } else {
-                throw eApply;
+            if (groupApiCaps.apply) {
+              try {
+                await tryGroupApiCall(`/${encodeURIComponent(g)}/apply`, { method: "POST" });
+              } catch (eApply) {
+                const msgApply = String((eApply && eApply.message) || eApply || "");
+                if (msgApply.includes("404") || msgApply.includes("405") || msgApply.includes("501")) {
+                  groupApiCaps.apply = false;
+                  saveGroupApiCaps(groupApiCaps);
+                  const gs = groupSettingsMap.get(g) || {};
+                  const payload = {
+                    trigger_mode: String(gs.trigger_mode || "continuous"),
+                    trigger_duration_ms: Number(gs.trigger_duration_ms || 10000),
+                    delay_seconds: Number(gs.delay_seconds || 0),
+                    reboot_self_check: !!gs.reboot_self_check,
+                  };
+                  await applyGroupSettingsFallback(g, payload);
+                } else {
+                  throw eApply;
+                }
               }
+            } else {
+              const gs = groupSettingsMap.get(g) || {};
+              const payload = {
+                trigger_mode: String(gs.trigger_mode || "continuous"),
+                trigger_duration_ms: Number(gs.trigger_duration_ms || 10000),
+                delay_seconds: Number(gs.delay_seconds || 0),
+                reboot_self_check: !!gs.reboot_self_check,
+              };
+              await applyGroupSettingsFallback(g, payload);
             }
           } else {
+            const prevTimer = groupDelayTimers.get(g);
+            if (prevTimer) {
+              clearTimeout(prevTimer);
+              groupDelayTimers.delete(g);
+            }
             await api("/alerts", { method: "POST", body: { action, duration_ms: 10000, device_ids: ids } });
           }
           toast(`${action === "on" ? "Alarm ON" : "Alarm OFF"} · ${ids.length}`, "ok");
