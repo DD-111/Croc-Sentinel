@@ -18,7 +18,8 @@ CROCKFORD = "ABCDEFGHJKLMNPQRSTUVWXYZ234567"
 
 # Default API root when .env does not set FACTORY_UI_API_BASE (no path suffix; /factory/* on this host).
 # Production: API behind Traefik with PathPrefix /api (StripPrefix). Use /api — no trailing slash.
-DEFAULT_FACTORY_UI_API_BASE = "https://esasecure.com/api"
+# Plain HTTP API publish (docker-compose maps host 18999 → container 8088). Restore https://…/api when Traefik+TLS is enabled.
+DEFAULT_FACTORY_UI_API_BASE = "http://esasecure.com:18999"
 
 DEFAULT_QR_POLICY = re.compile(
     r"^CROC\|SN-[A-Z2-7]{16}\|\d{10}\|[A-Za-z0-9_-]{20,120}$"

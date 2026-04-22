@@ -136,11 +136,11 @@
 
   /**
    * REST base URL. Production (Traefik + StripPrefix): index.html meta `croc-api-base` is `/api`.
-   * Direct access on host :8088 / :18088 always uses origin root so local/dev matches FastAPI routes.
+   * Direct access on published API ports (no /api prefix): :8088 / :18088 / :18999.
    */
   function apiBase() {
     const lp = location.port || "";
-    if (lp === "8088" || lp === "18088") {
+    if (lp === "8088" || lp === "18088" || lp === "18999") {
       return location.origin;
     }
     const m = document.querySelector('meta[name="croc-api-base"]');

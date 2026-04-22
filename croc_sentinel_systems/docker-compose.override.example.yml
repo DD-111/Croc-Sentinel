@@ -1,14 +1,12 @@
 # Copy to docker-compose.override.yml (same folder as docker-compose.yml).
 # Compose merges this automatically — no change to the default compose file.
 #
-# Default compose does NOT publish :8088 publicly (only Traefik 80/443).
-# Use this override for emergency direct access on loopback (curl / Arduino smoke test):
+# Main docker-compose already maps :18999 -> api:8088. Use this only to *add*
+# localhost-only bind or change mapping, e.g.:
 #
-# IMPORTANT: Do NOT override `services.traefik.command` unless you repeat the full
-# entrypoints (web, websecure) + certificatesresolvers.le from docker-compose.yml.
-# Replacing `command` with a short list breaks HTTPS (missing websecure / le).
+# services:
+#   api:
+#     ports:
+#       - "127.0.0.1:18999:8088"
 
-services:
-  api:
-    ports:
-      - "127.0.0.1:8088:8088"
+services: {}
