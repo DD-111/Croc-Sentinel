@@ -116,6 +116,9 @@ class _TelegramQueue:
         # Device alarm raw echoes are noisy; the normalized alarm/* event follows.
         if cat == "device" and "alarm.trigger" in et:
             return
+        # audit mirror for alarm fanout duplicates alarm category line.
+        if et.startswith("audit.alarm.fanout"):
+            return
         detail_map: dict[str, Any] = {}
         try:
             d = ev.get("detail") or {}
@@ -124,6 +127,8 @@ class _TelegramQueue:
                 for k in ("reason", "error", "result", "state", "duration_ms", "fanout_count"):
                     if k in d and d.get(k) not in (None, ""):
                         keep[k] = d.get(k)
+                if "login_user" in d and d.get("login_user") not in (None, ""):
+                    keep["login_user"] = d.get("login_user")
                 # Rich login/device context is kept only for superadmin actor events.
                 if bool(ev.get("_actor_superadmin")):
                     for k in ("ip", "platform", "device_type", "mac_hint", "geo"):
@@ -146,18 +151,36 @@ class _TelegramQueue:
             dev_name = summary.split("·", 1)[0].strip()
             if dev_name.startswith("[") and "]" in dev_name:
                 dev_name = dev_name.split("]", 1)[1].strip() or dev_name
-        lines = [
-            f"[{lvl.upper()}] {cat}/{et}",
-            summary,
-            f"device: {device_id}",
-            f"actor: {actor}",
-            f"target: {target}",
-        ]
+        if cat == "auth" and ("login" in et):
+            who = str(detail_map.get("login_user") or target or actor or "-")
+            lines = [
+                f"[{lvl.upper()}] auth/login",
+                f"user: {who}",
+                f"actor: {actor}",
+                f"target: {target}",
+            ]
+        elif cat == "alarm":
+            lines = [
+                f"[{lvl.upper()}] alarm",
+                f"event: {et}",
+                f"device: {device_id}",
+                f"actor: {actor}",
+                f"target: {target}",
+            ]
+        else:
+            lines = [
+                f"[{lvl.upper()}] {cat}/{et}",
+                f"device: {device_id}",
+                f"actor: {actor}",
+                f"target: {target}",
+            ]
+        if summary:
+            lines.insert(1, summary)
         if dev_name:
             lines.insert(3, f"device_name: {dev_name}")
         if trigger:
             lines.append(f"trigger: {trigger}")
-        for k in ("ip", "platform", "device_type", "mac_hint", "geo", "reason", "error", "result", "state", "duration_ms", "fanout_count"):
+        for k in ("ip", "geo", "platform", "device_type", "mac_hint", "reason", "error", "result", "state", "duration_ms", "fanout_count"):
             if k in detail_map and detail_map.get(k) not in (None, ""):
                 lines.append(f"{k}: {detail_map.get(k)}")
         line = "\n".join(lines)

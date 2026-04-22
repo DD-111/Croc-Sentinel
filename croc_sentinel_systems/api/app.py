@@ -983,6 +983,8 @@ def _event_visible(principal: "Principal", ev: dict[str, Any]) -> bool:
         # default to avoid spamming every tenant with cross-cutting noise.
         return False
     # user
+    if str(ev.get("category") or "") == "auth":
+        return False
     my_admin = get_manager_admin(principal.username) or ""
     if my_admin and owner == my_admin and (actor == principal.username or target == principal.username or str(ev.get("level")) in ("warn", "error", "critical")):
         return True
@@ -3768,12 +3770,20 @@ def auth_login(body: LoginRequest, request: Request) -> dict[str, Any]:
         conn.close()
     if not row or not verify_password(body.password, str(row["password_hash"])):
         _record_login_failure(ip, body.username)
-        audit_event(f"ip:{ip}", "auth.login.fail", body.username, ctx)
+        fail_detail = dict(ctx)
+        fail_detail["owner_admin"] = ""
+        fail_detail["login_user"] = body.username
+        audit_event(f"ip:{ip}", "auth.login.fail", body.username, fail_detail)
         raise HTTPException(status_code=401, detail="invalid credentials")
     # Status gate: pending / awaiting_approval / disabled cannot log in.
     status = str(row["status"] if "status" in row.keys() else "active") or "active"
+    role = str(row["role"])
+    owner_admin = str(row["username"]) if role == "admin" else str(row["manager_admin"] or "")
     if status == "disabled":
-        audit_event(f"ip:{ip}", "auth.login.disabled", body.username, ctx)
+        dis_detail = dict(ctx)
+        dis_detail["owner_admin"] = owner_admin
+        dis_detail["login_user"] = str(row["username"])
+        audit_event(f"ip:{ip}", "auth.login.disabled", str(row["username"]), dis_detail)
         raise HTTPException(status_code=403, detail="account disabled")
     if status == "pending":
         raise HTTPException(status_code=403, detail="account not activated yet — please enter the verification code sent to your email")
@@ -3782,7 +3792,10 @@ def auth_login(body: LoginRequest, request: Request) -> dict[str, Any]:
     _clear_login_failures(body.username)
     zones = zones_from_json(str(row["allowed_zones_json"]))
     token = issue_jwt(str(row["username"]), str(row["role"]), zones)
-    audit_event(str(row["username"]), "auth.login.ok", "", ctx)
+    ok_detail = dict(ctx)
+    ok_detail["owner_admin"] = owner_admin
+    ok_detail["login_user"] = str(row["username"])
+    audit_event(str(row["username"]), "auth.login.ok", str(row["username"]), ok_detail)
     return {"access_token": token, "token_type": "bearer", "role": row["role"], "zones": zones}
 
 
