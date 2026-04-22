@@ -134,7 +134,24 @@
   const $ = (sel, root) => (root || document).querySelector(sel);
   const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
 
+  /**
+   * REST base URL. Production (Traefik + StripPrefix): index.html meta `croc-api-base` is `/api`.
+   * Direct access on host :8088 / :18088 always uses origin root so local/dev matches FastAPI routes.
+   */
   function apiBase() {
+    const lp = location.port || "";
+    if (lp === "8088" || lp === "18088") {
+      return location.origin;
+    }
+    const m = document.querySelector('meta[name="croc-api-base"]');
+    const raw = m && m.getAttribute("content") != null ? String(m.getAttribute("content")).trim() : "";
+    if (raw.toLowerCase().startsWith("http")) {
+      return raw.replace(/\/$/, "");
+    }
+    if (raw && raw !== "/") {
+      const p = (raw.startsWith("/") ? raw : `/${raw}`).replace(/\/$/, "");
+      return location.origin + p;
+    }
     return location.origin;
   }
 

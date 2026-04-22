@@ -44,10 +44,8 @@ services:
 
     expose:
       - "8088"
-    # Publish API+console on host :8088 so URLs like http://HOST:8088/console/ work.
-    # Traefik still fronts http://HOST/console/ on :80 (entrypoints.web) — prefer that in prod.
-    ports:
-      - "8088:8088"
+    # No public host port: use Traefik (80/443) only. For local debug see docker-compose.override.example.yml
+    # (e.g. 127.0.0.1:8088 -> 8088).
 
     # Single process only: MQTT client, mqtt_ingest queue, event_bus, and
     # api_ready_event are in-memory — multiple workers break routing and can
@@ -71,9 +69,24 @@ services:
       # ✅ FIXED: must match REAL network name
       - "traefik.docker.network=croc_net"
 
-      # Match apex + www (adjust hostnames to your real domain).
-      - "traefik.http.routers.api.rule=Host(`esasecure.com`) || Host(`www.esasecure.com`)"
-      - "traefik.http.routers.api.entrypoints=web"
+      # External API at https://HOST/api/* → StripPrefix → FastAPI /*
+      - "traefik.http.middlewares.sentinel-api-strip.stripprefix.prefixes=/api"
+      - "traefik.http.routers.sentinel-api.rule=(Host(`esasecure.com`) || Host(`www.esasecure.com`)) && PathPrefix(`/api`)"
+      - "traefik.http.routers.sentinel-api.priority=100"
+      - "traefik.http.routers.sentinel-api.middlewares=sentinel-api-strip"
+      - "traefik.http.routers.sentinel-api.entrypoints=websecure"
+      - "traefik.http.routers.sentinel-api.tls=true"
+      - "traefik.http.routers.sentinel-api.tls.certresolver=le"
+      - "traefik.http.routers.sentinel-api.service=api"
+
+      # Console + root paths (/console, /health, …) without /api prefix
+      - "traefik.http.routers.sentinel-web.rule=Host(`esasecure.com`) || Host(`www.esasecure.com`)"
+      - "traefik.http.routers.sentinel-web.priority=1"
+      - "traefik.http.routers.sentinel-web.entrypoints=websecure"
+      - "traefik.http.routers.sentinel-web.tls=true"
+      - "traefik.http.routers.sentinel-web.tls.certresolver=le"
+      - "traefik.http.routers.sentinel-web.service=api"
+
       - "traefik.http.services.api.loadbalancer.server.port=8088"
 
 
@@ -107,22 +120,33 @@ services:
     image: traefik:latest
     container_name: traefik
     restart: unless-stopped
+    env_file:
+      - .env
 
     command:
       - "--api.dashboard=true"
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
       - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--entrypoints.web.http.redirections.entrypoint.permanent=true"
+      - "--certificatesresolvers.le.acme.tlschallenge=true"
+      - "--certificatesresolvers.le.acme.email=${ACME_EMAIL}"
+      - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
       - "--log.level=INFO"
       - "--accesslog=false"
       - "--ping=true"
 
     ports:
       - "80:80"
+      - "443:443"
       - "8080:8080"
 
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/acme.json:/letsencrypt/acme.json
 
     networks:
       - croc_net

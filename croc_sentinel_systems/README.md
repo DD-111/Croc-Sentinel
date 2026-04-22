@@ -114,10 +114,11 @@ docker compose ps
    ```bash
    docker compose logs -f api
    ```
-4. **健康检查**（宿主机上，端口以 `.env` / compose 为准，默认 8088）：
+4. **健康检查**（公网经 Traefik；需 `.env` 中 `ACME_EMAIL` 与 80/443 放行）：
    ```bash
-   curl -sS http://127.0.0.1:8088/health
+   curl -sS https://esasecure.com/api/health
    ```
+   若使用 `docker-compose.override.yml` 将 API 映射到本机回环，可：`curl -sS http://127.0.0.1:8088/health`
 5. **确认容器内 Python 文件**（`*` 必须在容器里展开，否则宿主机 shell 会先展开成空并报错）：
    ```bash
    docker compose exec api sh -c 'ls -la /app/*.py'
@@ -135,7 +136,7 @@ docker compose ps
 1. After syncing files on the VPS, keep production `.env` intact.
 2. Rebuild the API image when Python or dashboard assets changed: `docker compose build api --no-cache && docker compose up -d api`, or `docker compose up -d --build` for everything.
 3. Tail logs: `docker compose logs -f api`.
-4. Smoke-test: `curl -sS http://127.0.0.1:8088/health` (adjust host/port if published differently).
+4. Smoke-test: `curl -sS https://esasecure.com/api/health` (or loopback if you publish `127.0.0.1:8088` via override).
 5. List files **inside** the container (quote so `*` is not expanded on the host):  
    `docker compose exec api sh -c 'ls -la /app/*.py'`
 6. Hard-refresh the browser on the console URL so SPA assets update.
@@ -145,9 +146,9 @@ docker compose ps
 
 - MQTT broker (TLS): `tls://<your-vps>:8883`
 - OTA file URL: `http://<your-vps>:8070/fw/<firmware>.bin?token=<OTA_TOKEN>`
-- API base: `http://<your-vps>:8088`
-- **Operations Console (SPA)**: `http://<your-vps>:8088${DASHBOARD_PATH}/`  
-  Default is `http://<your-vps>:8088/console/` — total refresh: 侧边栏 + 移动端汉堡菜单 + 浅色/暗色主题 + 单页路由。  
+- API base (HTTPS + `/api` prefix): `https://<your-domain>/api`
+- **Operations Console (SPA)**: `https://<your-domain>${DASHBOARD_PATH}/`  
+  Default is `https://<your-domain>/console/` — total refresh: 侧边栏 + 移动端汉堡菜单 + 浅色/暗色主题 + 单页路由。  
   旧路径 `/ui`、`/dashboard` 会被 301 到 `DASHBOARD_PATH`；你可以改 `.env` 里的 `DASHBOARD_PATH`（建议自选一个不常见路径用于轻度混淆，例如 `/app`、`/c`、`/ops`、`/manage`）。
 
 **Subpath UI + root API (e.g. `https://esasecure.com:8088/Croc_Sentinel_systems/`)**  
@@ -155,8 +156,8 @@ docker compose ps
 - **设计说明与 API 前缀表（简版）**：[`docs/NGINX_SUBPATH_UI.md`](docs/NGINX_SUBPATH_UI.md)  
 - **API 仅绑定回环示例**：[`docker-compose.override.example.yml`](docker-compose.override.example.yml) → 复制为同目录 `docker-compose.override.yml`  
 
-The SPA uses `location.origin` for API calls, so no extra `apiBase` prefix is needed.  
-For the factory desktop tool (`tools/factory_pack`), set **`FACTORY_UI_API_BASE=https://esasecure.com:8088`** (no trailing slash, no UI subpath) so `POST /factory/devices` hits the API root.
+The SPA reads `<meta name="croc-api-base" content="/api">` so REST calls go to `https://<host>/api/...`. On direct `:8088` access the script falls back to same-origin root.  
+For the factory desktop tool (`tools/factory_pack`), set **`FACTORY_UI_API_BASE=https://esasecure.com/api`** (no trailing slash) so `GET /factory/ping` becomes `https://esasecure.com/api/factory/ping`.
 
 Auth: legacy `Authorization: Bearer <API_TOKEN>` (superadmin) **or** `POST /auth/login` JWT.  
 RBAC + backup details: `docs/DASHBOARD_RBAC_BACKUP_SPEC.md`.

@@ -17,7 +17,8 @@ from pathlib import Path
 CROCKFORD = "ABCDEFGHJKLMNPQRSTUVWXYZ234567"
 
 # Default API root when .env does not set FACTORY_UI_API_BASE (no path suffix; /factory/* on this host).
-DEFAULT_FACTORY_UI_API_BASE = "https://esasecure.com:8088"
+# Production: API behind Traefik with PathPrefix /api (StripPrefix). Use /api — no trailing slash.
+DEFAULT_FACTORY_UI_API_BASE = "https://esasecure.com/api"
 
 DEFAULT_QR_POLICY = re.compile(
     r"^CROC\|SN-[A-Z2-7]{16}\|\d{10}\|[A-Za-z0-9_-]{20,120}$"
@@ -109,9 +110,14 @@ def generate_items(
 
 
 def build_output_dir_name(count: int, now_ts: int | None = None) -> str:
+    """Directory name under factory_serial_exports/ — epoch-based only (matches legacy CLI).
+
+    `count` is kept for call-site compatibility; output folder naming does not embed it,
+    so batch outputs stay `output_<unix_ts>/` like `output_1776861458`.
+    """
+    _ = int(count)  # unused; retained for stable API
     ts = int(now_ts if now_ts is not None else time.time())
-    dt = datetime.fromtimestamp(ts)
-    return f"output_{dt.strftime('%Y%m%d_%H%M%S')}_{int(count)}devices"
+    return f"output_{ts}"
 
 
 def write_batch_files(

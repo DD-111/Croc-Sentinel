@@ -4,5 +4,8 @@ config.h
 # Generated factory bundles (serials + QR PNGs) — copy out of repo for production use
 factory_serial_exports/output_*/
 
+# Traefik ACME account data (Let's Encrypt)
+croc_sentinel_systems/traefik/acme.json
+
 # Never commit RSA private key used for dashboard password recovery
 password_recovery_keys/private.pem

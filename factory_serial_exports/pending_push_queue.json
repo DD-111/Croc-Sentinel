@@ -1,17 +1,1 @@
-[
-  {
-    "batch": "GUI_1776878028",
-    "items": [
-      {
-        "serial": "SN-Z4QUK7ZQKP2FC4J2",
-        "mac_nocolon": null,
-        "qr_code": "CROC|SN-Z4QUK7ZQKP2FC4J2|1776878074|gWdN2Adm1FCXIiu72G9CNDO3aIYjI4ugs3QmIIUgXss",
-        "batch": "GUI_1776878028",
-        "note": ""
-      }
-    ],
-    "reason": "HTTP -1: <urlopen error [WinError 10060] A connection attempt failed because the connected party did not properly respond after a period of time, or established connection failed because connected host has failed to respond>",
-    "queued_at": "2026-04-22T17:14:55Z",
-    "retry_count": 0
-  }
-]
+[]
