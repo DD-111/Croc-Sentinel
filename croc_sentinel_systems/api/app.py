@@ -151,8 +151,11 @@ OTA_AUTO_ROLLBACK_ON_FAILURE = os.getenv("OTA_AUTO_ROLLBACK_ON_FAILURE", "1") ==
 EVENT_RING_SIZE = int(os.getenv("EVENT_RING_SIZE", "2000"))
 # Per-SSE-subscriber queue. Slow client → oldest events dropped with warning.
 EVENT_SUB_QUEUE_SIZE = int(os.getenv("EVENT_SUB_QUEUE_SIZE", "500"))
-# SSE keepalive comment frequency (browsers kill idle SSE around 30s).
-EVENT_SSE_KEEPALIVE_SECONDS = int(os.getenv("EVENT_SSE_KEEPALIVE_SECONDS", "20"))
+# SSE keepalive: comment + named `ping` event so proxies that strip `:`
+# comments still see traffic. Keep below ~50s if your proxy read_timeout is 60s.
+EVENT_SSE_KEEPALIVE_SECONDS = int(os.getenv("EVENT_SSE_KEEPALIVE_SECONDS", "15"))
+# Hint for browser EventSource automatic reconnect delay (milliseconds).
+EVENT_SSE_RETRY_MS = int(os.getenv("EVENT_SSE_RETRY_MS", "4000"))
 # Hard cap on concurrent SSE subscribers (cheap, but bound the damage).
 EVENT_MAX_SUBSCRIBERS = int(os.getenv("EVENT_MAX_SUBSCRIBERS", "128"))
 # Level-based retention days. Debug rows go first; critical stays for audits.
@@ -8906,6 +8909,8 @@ def events_stream(
             "id": 0,
         }
         yield _sse_format(hello)
+        # Hint browser EventSource backoff after dropped connections (proxies / sleep).
+        yield f"retry: {max(500, EVENT_SSE_RETRY_MS)}\n\n"
         # Replay recent backlog so the dashboard isn't empty on first load.
         if backlog:
             for ev in event_bus.backlog(principal, filters, backlog):
@@ -8923,6 +8928,9 @@ def events_stream(
             if now - last_keepalive >= EVENT_SSE_KEEPALIVE_SECONDS:
                 last_keepalive = now
                 yield f": keepalive {int(now)} dropped={sub.dropped}\n\n"
+                # Data-bearing frame — some proxies buffer until they see `data:` lines.
+                ping = json.dumps({"ts": int(now * 1000), "dropped": sub.dropped})
+                yield f"event: ping\ndata: {ping}\n\n"
 
     def close():
         event_bus.unsubscribe(sub)
@@ -8940,7 +8948,11 @@ def events_stream(
         finally:
             close()
 
-    return StreamingResponse(wrapped(), media_type="text/event-stream", headers=headers)
+    return StreamingResponse(
+        wrapped(),
+        media_type="text/event-stream; charset=utf-8",
+        headers=headers,
+    )
 
 
 # =====================================================================

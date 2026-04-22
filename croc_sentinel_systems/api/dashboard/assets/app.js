@@ -100,6 +100,34 @@
     loadHealth();
   }
 
+  /** When MQTT is down, poll faster so the green dot tracks reality (not a 30s stale snapshot). */
+  const HEALTH_POLL_SLOW_MS = 12000;
+  const HEALTH_POLL_FAST_MS = 3500;
+
+  function armHealthPoll() {
+    clearHealthPollTimer();
+    if (!state.me) return;
+    const fast = state.mqttConnected === false;
+    const ms = fast ? HEALTH_POLL_FAST_MS : HEALTH_POLL_SLOW_MS;
+    healthPollTimer = setInterval(tickHealthIfVisible, ms);
+  }
+
+  /** Events page: align Live badge with EventSource state (no reconnect). */
+  function syncEventsLiveBadge() {
+    const live = document.getElementById("evLive");
+    if (!live || !window.__evSSE) return;
+    const es = window.__evSSE;
+    if (es.readyState === EventSource.OPEN) {
+      live.textContent = "Live";
+      live.className = "badge online";
+      live.title = "Live stream connected";
+    } else if (es.readyState === EventSource.CONNECTING) {
+      live.textContent = "Reconnecting…";
+      live.className = "badge offline";
+      live.title = "SSE reconnecting";
+    }
+  }
+
   // ------------------------------------------------------------------ utils
   const $ = (sel, root) => (root || document).querySelector(sel);
   const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
@@ -535,10 +563,12 @@
     }
     renderMqttDot();
     renderHealthPills();
+    armHealthPoll();
   }
 
   // ------------------------------------------------------------------ layout
   function renderAuthState() {
+    if (!state.me) clearHealthPollTimer();
     document.body.dataset.auth = state.me ? "ok" : "none";
     const who = $("#who");
     if (state.me) {
@@ -1131,8 +1161,9 @@
           const msg = Array.isArray(det) ? det.map((x) => x.msg || JSON.stringify(x)).join("; ") : (det || r.statusText);
           throw new Error(msg);
         }
-        m2.textContent = "Password updated. You can sign in now.";
+        m2.innerHTML = `<span class="badge online">Password updated</span> Redirecting to sign in…`;
         toast("Password updated", "ok");
+        scheduleRouteRedirect(1500, "#/login");
       } catch (e) { m2.textContent = String(e.message || e); }
     });
   });
@@ -1235,7 +1266,7 @@
         const j = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(j.detail || `${r.status}`);
         m2.innerHTML = `<span class="badge online">OK</span> Redirecting to sign in…`;
-        scheduleRouteRedirect(3000, "#/login");
+        scheduleRouteRedirect(1500, "#/login");
       } catch (e) { m2.textContent = cleanSignupMessage(e.message || e); }
     });
     $("#r_back_step").addEventListener("click", () => {
@@ -1299,7 +1330,7 @@
         const j = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(j.detail || `${r.status}`);
         msg.innerHTML = `<span class="badge online">Activated</span> Redirecting to sign in…`;
-        scheduleRouteRedirect(3000, "#/login");
+        scheduleRouteRedirect(1500, "#/login");
       } catch (e) { msg.textContent = String(e.message || e); }
     });
     $("#a_resend").addEventListener("click", async () => {
@@ -1357,10 +1388,12 @@
             new_password_confirm: ($("#acc_new2", view).value || ""),
           },
         });
-        toast("Password updated", "ok");
-        $("#acc_old", view).value = "";
-        $("#acc_new1", view).value = "";
-        $("#acc_new2", view).value = "";
+        toast("Password updated — please sign in again.", "ok");
+        setToken("");
+        state.me = null;
+        clearHealthPollTimer();
+        renderAuthState();
+        location.hash = "#/login";
       } catch (e) { toast(e.message || e, "err"); }
     });
     $("#accDeleteSelf", view).addEventListener("click", async () => {
@@ -1374,7 +1407,11 @@
           },
         });
         toast("Account deleted", "ok");
-        setToken(""); state.me = null; location.hash = "#/login"; renderAuthState();
+        setToken("");
+        state.me = null;
+        clearHealthPollTimer();
+        location.hash = "#/login";
+        renderAuthState();
       } catch (e) { toast(e.message || e, "err"); }
     });
   });
@@ -3199,7 +3236,7 @@
     const BUFFER_MAX = 220;
     const RENDER_LIMIT = 180;
     let evRenderTimer = 0;
-    let evReconnectBackoffMs = 1200;
+    let evReconnectBackoffMs = 800;
 
     function badgeClass(lvl) {
       return ({
@@ -3318,11 +3355,18 @@
       const url = apiBase() + "/events/stream?" + p.toString();
       const es = new EventSource(url);
       window.__evSSE = es;
+      es.addEventListener("ping", () => {
+        /* Server keepalive — keeps proxies from treating the stream as idle. */
+      });
       es.onopen = () => {
         if (!isRouteCurrent(routeSeq)) return;
-        evReconnectBackoffMs = 1200;
+        evReconnectBackoffMs = 800;
         const live = $("#evLive");
-        if (live) { live.textContent = "Live"; live.className = "badge online"; }
+        if (live) {
+          live.textContent = "Live";
+          live.className = "badge online";
+          live.title = "Live stream connected";
+        }
       };
       es.onerror = () => {
         if (!isRouteCurrent(routeSeq)) return;
@@ -3337,7 +3381,7 @@
             if (!isRouteCurrent(routeSeq) || paused) return;
             openStream();
           }, wait);
-          evReconnectBackoffMs = Math.min(15000, Math.floor(evReconnectBackoffMs * 1.8));
+          evReconnectBackoffMs = Math.min(12000, Math.floor(evReconnectBackoffMs * 1.75));
         }
       };
       es.onmessage = (m) => {
@@ -4506,7 +4550,11 @@
       setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
     });
     $("#logoutBtn").addEventListener("click", () => {
-      setToken(""); state.me = null; location.hash = "#/login"; renderAuthState();
+      setToken("");
+      state.me = null;
+      clearHealthPollTimer();
+      location.hash = "#/login";
+      renderAuthState();
     });
     $("#refreshBtn").addEventListener("click", () => renderRoute());
 
@@ -4522,34 +4570,40 @@
     await (getToken() ? loadMe() : Promise.resolve());
     if (!location.hash) location.hash = state.me ? "#/overview" : "#/login";
     else renderRoute();
-    // Do not block first render on health probes.
-    loadHealth().catch(() => {});
-    clearHealthPollTimer();
-    healthPollTimer = setInterval(tickHealthIfVisible, 30000);
+    await loadHealth().catch(() => {});
     window.addEventListener("online", () => {
       loadHealth().catch(() => {});
       tickHealthIfVisible();
       if (typeof window.__eventsStreamResume === "function") {
-        try { window.__eventsStreamResume(); } catch (_) {}
+        try {
+          if (!window.__evSSE || window.__evSSE.readyState === EventSource.CLOSED) {
+            window.__eventsStreamResume();
+          } else {
+            syncEventsLiveBadge();
+          }
+        } catch (_) {}
       }
     });
     document.addEventListener("visibilitychange", () => {
       document.documentElement.classList.toggle("tab-hidden", document.visibilityState === "hidden");
       if (document.visibilityState === "hidden") {
-        if (window.__evSSE) {
-          try { window.__evSSE.close(); } catch (_) {}
-          window.__evSSE = null;
-          const live = document.getElementById("evLive");
-          if (live) {
-            live.textContent = "Paused";
-            live.className = "badge offline";
-          }
+        /* Keep SSE open through tab switches — closing forced reconnect storms through proxies. */
+        const live = document.getElementById("evLive");
+        if (live && window.__evSSE && window.__evSSE.readyState === EventSource.OPEN) {
+          live.textContent = "Background";
+          live.className = "badge neutral";
+          live.title = "Stream stays connected in background";
         }
         return;
       }
       tickHealthIfVisible();
+      syncEventsLiveBadge();
       if (typeof window.__eventsStreamResume === "function") {
-        try { window.__eventsStreamResume(); } catch (_) {}
+        try {
+          if (!window.__evSSE || window.__evSSE.readyState === EventSource.CLOSED) {
+            window.__eventsStreamResume();
+          }
+        } catch (_) {}
       }
     });
     document.documentElement.classList.toggle("tab-hidden", document.visibilityState === "hidden");
