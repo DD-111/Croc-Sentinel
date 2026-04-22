@@ -10,7 +10,7 @@
 python tools/factory_pack/gen_factory_secrets.py
 ```
 
-把输出的 **`QR_SIGN_SECRET`**、**`FACTORY_API_TOKEN`** 复制到 **`croc_sentinel_systems/.env`**，自行补一行 **`FACTORY_UI_API_BASE=https://...:8088`**，然后 **`docker compose restart api`**。
+把输出的 **`QR_SIGN_SECRET`**、**`FACTORY_API_TOKEN`** 复制到 **`croc_sentinel_systems/.env`**，自行补一行 **`FACTORY_UI_API_BASE`**（公网经 Traefik 时用 **`https://你的域名/api`**，不要写 **`https://域名:8088`**），然后 **`docker compose restart api`**。仅本机直连容器时用例如 **`http://127.0.0.1:8088`**。
 
 ## 生成
 
@@ -62,7 +62,7 @@ python tools/factory_pack/generate_serial_qr.py --count 20 --batch LINE02
 
 ```bash
 python tools/factory_pack/generate_serial_qr.py --ping
-# 或指定 VPS：  --api-base https://YOUR_HOST:8088
+# 或指定 API 根（生产 Traefik）：  --api-base https://YOUR_HOST/api
 ```
 
 部署新版 API 后，可用 **`GET /factory/ping`** + 头 **`X-Factory-Token`** 验证 Token 是否生效（**`factory_ui`「测试 API+Token」** 即调用此接口）。
@@ -77,7 +77,7 @@ python tools/factory_pack/generate_serial_qr.py --ping
 2. **补登一条**（示例，把 `API`、`TOKEN`、MAC、整段 `qr_code` 换成你的）：
 
 ```bash
-curl -sS -X POST "https://YOUR_API:8088/factory/devices" \
+curl -sS -X POST "https://YOUR_HOST/api/factory/devices" \
   -H "Content-Type: application/json" \
   -H "X-Factory-Token: YOUR_FACTORY_API_TOKEN" \
   -d "{\"items\":[{\"serial\":\"SN-653BSYV4WP6YAEJB\",\"mac_nocolon\":\"AABBCCDDEEFF\",\"qr_code\":\"CROC|SN-653BSYV4WP6YAEJB|1776514219|....\",\"batch\":\"manual1\"}]}"
@@ -100,7 +100,7 @@ Arduino IDE 打开：**`tools/factory_pack/BurnSentinelSerial/BurnSentinelSerial
 python tools/factory_pack/factory_ui.py
 ```
 
-填写 **API 根地址**（如 `https://IP:8088`）、确认 **Factory Token** 与 **`.env` 路径**，勾选 **「生成后自动登记」**，即可：**本地 PNG+JSON** 与 **`factory_devices` 表** 一步完成；之后在 Dashboard **激活设备**里扫码/输序列号做 **`/provision/identify`** 验证即可。
+填写 **API 根地址**（公网 Traefik：**`https://域名/api`**；本机直连：**`http://127.0.0.1:8088`**）、确认 **Factory Token** 与 **`.env` 路径**，勾选 **「生成后自动登记」**，即可：**本地 PNG+JSON** 与 **`factory_devices` 表** 一步完成；之后在 Dashboard **激活设备**里扫码/输序列号做 **`/provision/identify`** 验证即可。
 
 ## 导入服务器
 

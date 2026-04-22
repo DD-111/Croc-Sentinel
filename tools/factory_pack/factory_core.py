@@ -340,9 +340,9 @@ def _format_factory_ping_transport_error(exc: BaseException, *, url: str, timeou
 
     if winerr == 10060:
         lines.append(
-            "hint[10060]: TCP timed out — host:port did not respond in time. Check: (1) server is up and listening on "
-            "this port; (2) firewall / ISP / VPN allows outbound HTTPS; (3) FACTORY_UI_API_BASE scheme+port match the API "
-            f'(default {DEFAULT_FACTORY_UI_API_BASE}); (4) from this PC run: curl -vk "{url}"'
+            "hint[10060]: TCP timed out — host:port did not respond in time. Check: (1) server up; (2) firewall/VPN; "
+            "(3) FACTORY_UI_API_BASE is the public API root (Traefik: https://host/api; direct: http://127.0.0.1:8088) "
+            f'(default {DEFAULT_FACTORY_UI_API_BASE}); (4) curl -vk "{url}"'
         )
     elif winerr == 10061:
         lines.append(

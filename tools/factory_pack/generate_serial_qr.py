@@ -59,7 +59,7 @@ def main() -> None:
     ap.add_argument(
         "--api-base",
         default="",
-        help="API root e.g. https://host:8088 (else FACTORY_UI_API_BASE from .env)",
+        help="API root: e.g. https://esasecure.com/api (Traefik) or http://127.0.0.1:8088 (direct); else .env FACTORY_UI_API_BASE",
     )
     ap.add_argument(
         "--insecure-ssl",

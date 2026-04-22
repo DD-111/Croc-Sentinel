@@ -4,8 +4,9 @@ This file consolidates both:
 - Backend API routes (`api/app.py`)
 - Frontend-in-use API calls (`api/dashboard/assets/app.js`)
 
-Base URL:
-- `https://<host>:8088`
+Base URL (pick what matches deployment):
+- Production (Traefik): `https://<host>/api` — StripPrefix leaves FastAPI routes as `/health`, `/factory/...`, etc.
+- Direct Uvicorn publish: `http://127.0.0.1:8088` or `https://<host>:8088` only if you actually expose that port (avoid public `:8088` when using Traefik on 443).
 
 Auth:
 - Most routes require `Authorization: Bearer <JWT>`

@@ -49,13 +49,15 @@ location /Croc_Sentinel_systems/ {
 
 ## Factory desktop app (`tools/factory_pack`)
 
-Set in `croc_sentinel_systems/.env` (or the app’s “API root” field):
+Set in `croc_sentinel_systems/.env` (or the app’s “API root” field). **Traefik** (443, `PathPrefix /api` + StripPrefix): public base is **`/api`**, not **`:8088`** on the domain:
 
 ```env
-FACTORY_UI_API_BASE=https://esasecure.com:8088
+FACTORY_UI_API_BASE=https://esasecure.com/api
 ```
 
-No trailing slash, **no** `/Croc_Sentinel_systems` — factory endpoints are `/factory/ping` and `/factory/devices`.
+If instead you terminate TLS on **Nginx :8088** with API at site root (this doc’s layout), then `FACTORY_UI_API_BASE=https://esasecure.com:8088` can be correct — it is the **browser-reachable origin** for `/factory/*`, not the Docker internal port.
+
+No trailing slash, **no** `/Croc_Sentinel_systems` — factory endpoints are **`/factory/ping`** and **`/factory/devices`** relative to that API base (e.g. `https://esasecure.com/api/factory/ping` under Traefik).
 
 ## Related
 
