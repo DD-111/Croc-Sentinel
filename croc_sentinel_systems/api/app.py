@@ -3370,6 +3370,30 @@ def _issue_verification(
     return OTP_TTL_SECONDS
 
 
+def _verification_resend_wait_seconds(username: str, channel: str, purpose: str) -> int:
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT created_at FROM verifications
+               WHERE username = ? AND channel = ? AND purpose = ? AND used = 0
+               ORDER BY id DESC LIMIT 1""",
+            (username, channel, purpose),
+        )
+        row = cur.fetchone()
+        conn.close()
+    if not row:
+        return 0
+    try:
+        last_ts = int(datetime.fromisoformat(str(row["created_at"])).timestamp())
+    except Exception:
+        return 0
+    delta = int(time.time()) - last_ts
+    if delta >= OTP_RESEND_COOLDOWN_SECONDS:
+        return 0
+    return max(1, OTP_RESEND_COOLDOWN_SECONDS - delta)
+
+
 def _consume_verification(username: str, channel: str, purpose: str, code: str) -> bool:
     """Check code; mark used if it matches. Return True/False."""
     code_hash = _hash_otp(code or "")
@@ -3822,6 +3846,35 @@ def auth_forgot_email_enabled() -> dict[str, Any]:
     return {"enabled": bool(notifier.enabled())}
 
 
+@app.post("/auth/forgot/email/check")
+def auth_forgot_email_check(body: ForgotEmailStartRequest, request: Request) -> dict[str, Any]:
+    ip = _client_ip(request)
+    _check_forgot_ip_rate(ip)
+    username = body.username.strip()
+    email = body.email.strip().lower()
+    if not _looks_like_email(email):
+        raise HTTPException(status_code=400, detail="email format invalid")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT status, email FROM dashboard_users WHERE username = ?",
+            (username,),
+        )
+        row = cur.fetchone()
+        conn.close()
+    if not row:
+        return {"ok": True, "matched": False, "can_send": False, "resend_after_seconds": 0}
+    if str(row["status"] or "active") == "disabled":
+        return {"ok": True, "matched": False, "can_send": False, "resend_after_seconds": 0}
+    reg_email = str(row["email"] or "").strip().lower()
+    matched = bool(reg_email) and reg_email == email
+    if not matched:
+        return {"ok": True, "matched": False, "can_send": False, "resend_after_seconds": 0}
+    wait = _verification_resend_wait_seconds(username, "email", "reset")
+    return {"ok": True, "matched": True, "can_send": wait <= 0, "resend_after_seconds": wait}
+
+
 @app.post("/auth/forgot/email/start")
 def auth_forgot_email_start(body: ForgotEmailStartRequest, request: Request) -> dict[str, Any]:
     ip = _client_ip(request)
@@ -3841,12 +3894,12 @@ def auth_forgot_email_start(body: ForgotEmailStartRequest, request: Request) -> 
         conn.close()
     # Keep error response generic to avoid account probing.
     if not row:
-        return {"ok": True, "ttl_seconds": OTP_TTL_SECONDS}
+        return {"ok": True, "ttl_seconds": OTP_TTL_SECONDS, "resend_after_seconds": OTP_RESEND_COOLDOWN_SECONDS}
     if str(row["status"] or "active") == "disabled":
-        return {"ok": True, "ttl_seconds": OTP_TTL_SECONDS}
+        return {"ok": True, "ttl_seconds": OTP_TTL_SECONDS, "resend_after_seconds": OTP_RESEND_COOLDOWN_SECONDS}
     reg_email = str(row["email"] or "").strip().lower()
     if not reg_email or reg_email != email:
-        return {"ok": True, "ttl_seconds": OTP_TTL_SECONDS}
+        return {"ok": True, "ttl_seconds": OTP_TTL_SECONDS, "resend_after_seconds": OTP_RESEND_COOLDOWN_SECONDS}
     if not notifier.enabled():
         raise HTTPException(status_code=503, detail="email sender is not configured")
     sha_code = _generate_sha_code()
@@ -3861,7 +3914,7 @@ def auth_forgot_email_start(body: ForgotEmailStartRequest, request: Request) -> 
         owner_admin=username if str(row["role"] or "") == "admin" else get_manager_admin(username),
         detail={"email": email},
     )
-    return {"ok": True, "ttl_seconds": ttl}
+    return {"ok": True, "ttl_seconds": ttl, "resend_after_seconds": OTP_RESEND_COOLDOWN_SECONDS}
 
 
 @app.post("/auth/forgot/email/complete")
@@ -4695,6 +4748,8 @@ def revoke_device(
         )
         conn.commit()
         conn.close()
+    cache_invalidate("devices")
+    cache_invalidate("overview")
     audit_event(principal.username, "device.revoke", device_id, {"reason": req.reason})
     return {"ok": True, "device_id": device_id}
 
@@ -4711,6 +4766,8 @@ def unrevoke_device(device_id: str, principal: Principal = Depends(require_princ
         cur.execute("DELETE FROM revoked_devices WHERE device_id = ?", (device_id,))
         conn.commit()
         conn.close()
+    cache_invalidate("devices")
+    cache_invalidate("overview")
     audit_event(principal.username, "device.unrevoke", device_id, {})
     return {"ok": True, "device_id": device_id}
 
@@ -4728,7 +4785,9 @@ def _device_delete_reset_impl(
     if principal.role == "admin":
         require_capability(principal, "can_send_command")
     if super_unclaim:
-        assert_min_role(principal, "superadmin")
+        # Superadmin: any device. Admin: only own (non-shared) devices — same factory rollback as superadmin.
+        if not principal.is_superadmin():
+            assert_device_owner(principal, device_id)
     else:
         assert_device_owner(principal, device_id)
     with db_lock:
@@ -4762,6 +4821,8 @@ def _device_delete_reset_impl(
                 )
         conn.commit()
         conn.close()
+    cache_invalidate("devices")
+    cache_invalidate("overview")
     action = "device.factory_unclaim" if super_unclaim else "device.delete_reset"
     audit_event(
         principal.username,
@@ -4802,7 +4863,7 @@ def device_factory_unregister(
     req: DeviceDeleteRequest,
     principal: Principal = Depends(require_principal),
 ) -> dict[str, Any]:
-    """Superadmin only: rollback to unregistered while keeping factory serial row."""
+    """Rollback to unregistered while keeping factory serial: superadmin (any device) or owning admin."""
     return _device_delete_reset_impl(device_id, principal, req, super_unclaim=True)
 
 
@@ -5124,24 +5185,27 @@ def get_device(device_id: str, principal: Principal = Depends(require_principal)
         str(out.get("updated_at") or ""),
         now_s,
     )
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT o.owner_admin, o.assigned_by, o.assigned_at, IFNULL(u.email, '') AS owner_email
+            FROM device_ownership o
+            LEFT JOIN dashboard_users u ON u.username = o.owner_admin
+            WHERE o.device_id = ?
+            """,
+            (device_id,),
+        )
+        ow = cur.fetchone()
+        conn.close()
+    owner_admin = str(ow["owner_admin"]) if ow and ow["owner_admin"] is not None else ""
+    out["owner_admin"] = owner_admin
+    out["owner_email"] = str(ow["owner_email"]) if ow and ow["owner_email"] is not None else ""
     if principal.role == "superadmin":
-        with db_lock:
-            conn = get_conn()
-            cur = conn.cursor()
-            cur.execute("SELECT owner_admin, assigned_by, assigned_at FROM device_ownership WHERE device_id = ?", (device_id,))
-            ow = cur.fetchone()
-            conn.close()
-        out["owner_admin"] = str(ow["owner_admin"]) if ow else ""
         out["registered_by"] = str(ow["assigned_by"]) if ow else ""
         out["registered_at"] = str(ow["assigned_at"]) if ow else ""
     else:
-        with db_lock:
-            conn = get_conn()
-            cur = conn.cursor()
-            cur.execute("SELECT owner_admin FROM device_ownership WHERE device_id = ?", (device_id,))
-            ow = cur.fetchone()
-            conn.close()
-        owner_admin = str(ow["owner_admin"]) if ow and ow["owner_admin"] is not None else ""
         viewer_admin = principal.username if principal.role == "admin" else (get_manager_admin(principal.username) or "")
         is_shared = bool(owner_admin) and bool(viewer_admin) and owner_admin != viewer_admin
         out["is_shared"] = bool(is_shared)

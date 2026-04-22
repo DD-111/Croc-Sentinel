@@ -64,6 +64,7 @@
     navDevicesLoading: false,
     navDevicesError: "",
     navDevicesAt: 0,
+    navDeviceQuery: "",
   };
 
   /** Route redirect timer (signup / activate → login); cleared on navigation. */
@@ -154,6 +155,23 @@
   function escapeHtml(v) {
     return String(v == null ? "" : v)
       .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+  const _lastHtmlByEl = new WeakMap();
+  function setHtmlIfChanged(el, html) {
+    if (!el) return false;
+    const next = String(html == null ? "" : html);
+    const prev = _lastHtmlByEl.has(el) ? _lastHtmlByEl.get(el) : null;
+    if (prev === next) return false;
+    el.innerHTML = next;
+    _lastHtmlByEl.set(el, next);
+    return true;
+  }
+  function setTextIfChanged(el, txt) {
+    if (!el) return false;
+    const next = String(txt == null ? "" : txt);
+    if (el.textContent === next) return false;
+    el.textContent = next;
+    return true;
   }
 
   const MY_TZ = "Asia/Kuala_Lumpur";
@@ -461,6 +479,18 @@
     return data;
   }
 
+  /** Clear short-lived GET cache entries (server also invalidates on write). */
+  function bustApiGetCachedPrefix(prefix) {
+    const p = String(prefix || "");
+    for (const k of _apiGetCache.keys()) {
+      if (!p || k.startsWith(p)) _apiGetCache.delete(k);
+    }
+  }
+  function bustDeviceListCaches() {
+    bustApiGetCachedPrefix("/devices");
+    bustApiGetCachedPrefix("/dashboard/overview");
+  }
+
   async function login(username, password) {
     const r = await fetchWithDeadline(
       apiBase() + "/auth/login",
@@ -525,7 +555,7 @@
   function renderNav() {
     const nav = $("#nav");
     if (!nav) return;
-    if (!state.me) { nav.innerHTML = ""; return; }
+    if (!state.me) { setHtmlIfChanged(nav, ""); return; }
     const hash = location.hash || "#/overview";
     const parts = [];
     for (const g of NAV_GROUPS) {
@@ -540,13 +570,25 @@
       }
     }
     const rowsAll = Array.isArray(state.navDevices) ? state.navDevices : [];
+    const q = String(state.navDeviceQuery || "").trim().toLowerCase();
     const rows = rowsAll.filter((d) => {
       if (!state.me) return false;
       if (state.me.role === "superadmin") return true;
       if (state.me.role === "admin") return !d.is_shared;
       return true;
+    }).filter((d) => {
+      if (!q) return true;
+      const did = String(d.device_id || "").toLowerCase();
+      const nm = String(d.display_label || "").toLowerCase();
+      return did.includes(q) || nm.includes(q);
     });
     parts.push(`<div class="nav-section">Devices</div>`);
+    parts.push(
+      `<label class="field compact nav-device-search">` +
+      `<span>Search</span>` +
+      `<input id="navDeviceQuery" type="search" placeholder="device id / name" value="${escapeHtml(state.navDeviceQuery || "")}" autocomplete="off" />` +
+      `</label>`,
+    );
     if (state.navDevicesLoading && rows.length === 0) {
       parts.push(`<div class="nav-device-empty">Loading devices...</div>`);
     } else if (state.navDevicesError && rows.length === 0) {
@@ -575,7 +617,14 @@
       if (rows.length > 80) parts.push(`<div class="nav-device-empty">+${rows.length - 80} more</div>`);
       parts.push(`</div>`);
     }
-    nav.innerHTML = parts.join("");
+    setHtmlIfChanged(nav, parts.join(""));
+    const navQ = $("#navDeviceQuery", nav);
+    if (navQ) {
+      navQ.addEventListener("input", () => {
+        state.navDeviceQuery = String(navQ.value || "");
+        renderNav();
+      });
+    }
     const stale = (Date.now() - Number(state.navDevicesAt || 0)) > 10000;
     if (stale && !state.navDevicesLoading) void refreshNavDevices();
   }
@@ -610,7 +659,7 @@
     const el = $("#healthPills");
     if (!el) return;
     if (!state.me || !state.health) {
-      el.innerHTML = "";
+      setHtmlIfChanged(el, "");
       return;
     }
     const sm = state.health.smtp || {};
@@ -638,10 +687,10 @@
         ? `MQTT connected, but ingest dropped ${mqDrop} message(s); queue depth=${mqQ}. last_up=${mqLastUp || "—"}`
         : `MQTT connected; ingest queue depth=${mqQ}. last_up=${mqLastUp || "—"}`)
       : `MQTT disconnected — check broker/TLS/network. last_down=${mqLastDown || "—"} reason=${mqLastReason || "—"}`;
-    el.innerHTML = `
+    setHtmlIfChanged(el, `
       <span class="health-pill ${mqConn ? (mqDrop > 0 ? "warn" : "ok") : "off"}" title="${escapeHtml(mqttTitle)}">MQTT</span>
       <span class="health-pill ${mailOk ? "ok" : sm.configured ? "warn" : "off"}" title="${escapeHtml(mailTitle)}">MAIL</span>
-      <span class="health-pill ${tgOk ? "ok" : tgOn ? "warn" : "off"}" title="${escapeHtml(tgTitle)}">TG</span>`;
+      <span class="health-pill ${tgOk ? "ok" : tgOn ? "warn" : "off"}" title="${escapeHtml(tgTitle)}">TG</span>`);
   }
 
   function renderMqttDot() {
@@ -809,22 +858,32 @@
       return s.replace(/^error:\s*/i, "");
     };
     view.innerHTML = `
-      <div class="auth-page" role="main">
-        <div class="auth-card" data-auth-card>
+      <div class="auth-page auth-page-pro" role="main">
+        <section class="auth-hero">
+          <div class="auth-hero__tag">ESA Secure Platform</div>
+          <h2>Unified fleet security console</h2>
+          <p>Real-time monitoring, role-based control, and protected device operations in one place.</p>
+          <ul class="auth-hero__bullets">
+            <li>Live device visibility by role scope</li>
+            <li>Secure command and trigger orchestration</li>
+            <li>Audit-ready operations and recovery flow</li>
+          </ul>
+        </section>
+        <div class="auth-card auth-card--pro" data-auth-card>
           <header class="auth-card__head">
             <div class="auth-rev">${AUTH_UI_REV}</div>
             <div class="auth-card__logo" aria-hidden="true"></div>
             <h1 class="auth-card__title">Sign in</h1>
-            <p class="auth-card__lead">Welcome back. Sign in to continue.</p>
+            <p class="auth-card__lead">Welcome back. Continue to dashboard.</p>
           </header>
           <form class="auth-card__body" id="loginForm" autocomplete="on">
             <label class="field">
               <span>Username</span>
-              <input name="username" autocomplete="username" required placeholder="Enter username" />
+              <input name="username" autocomplete="username" required placeholder="your username" />
             </label>
             <label class="field field--spaced">
               <span>Password</span>
-              <input name="password" type="password" autocomplete="current-password" required placeholder="Enter password" />
+              <input name="password" type="password" autocomplete="current-password" required placeholder="your password" />
             </label>
             <div class="auth-card__submit">
               <button class="btn btn-tap btn-block" type="submit" id="loginSubmit">Sign in</button>
@@ -915,6 +974,7 @@
             <label class="field field--spaced"><span>Confirm password</span><input id="fp_p2" type="password" autocomplete="new-password" /></label>
             <div class="auth-card__submit">
               <button class="btn btn-tap btn-block" type="button" id="fp_done">Update password</button>
+              <button class="btn secondary btn-tap btn-block" type="button" id="fp_resend">Resend SHA code</button>
               <button class="btn secondary btn-tap btn-block" type="button" id="fp_back">Back</button>
             </div>
             <p class="auth-card__msg muted" id="fp_msg2" aria-live="polite"></p>
@@ -923,28 +983,101 @@
         </div>
       </div>`;
     const m1 = $("#fp_msg1"), m2 = $("#fp_msg2");
-    $("#fp_go").addEventListener("click", async () => {
+    let fpCooldown = 0;
+    let fpCooldownTimer = 0;
+    const fpGoBtn = $("#fp_go");
+    const fpResendBtn = $("#fp_resend");
+    const applyFpCooldownUi = () => {
+      const left = Math.max(0, Number(fpCooldown || 0));
+      if (fpGoBtn) {
+        fpGoBtn.disabled = !enabled || left > 0;
+        fpGoBtn.textContent = left > 0 ? `Resend in ${left}s` : "Send SHA code";
+      }
+      if (fpResendBtn) {
+        fpResendBtn.disabled = left > 0;
+        fpResendBtn.textContent = left > 0 ? `Resend in ${left}s` : "Resend SHA code";
+      }
+    };
+    const startFpCooldown = (seconds) => {
+      fpCooldown = Math.max(0, Number(seconds || 0));
+      applyFpCooldownUi();
+      if (fpCooldownTimer) clearInterval(fpCooldownTimer);
+      if (fpCooldown <= 0) return;
+      fpCooldownTimer = setInterval(() => {
+        fpCooldown = Math.max(0, fpCooldown - 1);
+        applyFpCooldownUi();
+        if (fpCooldown <= 0) {
+          clearInterval(fpCooldownTimer);
+          fpCooldownTimer = 0;
+        }
+      }, 1000);
+    };
+    const parseCooldownFromMessage = (msg) => {
+      const m = String(msg || "").match(/wait\s+(\d+)s/i);
+      return m ? Math.max(1, Number(m[1])) : 0;
+    };
+    const doForgotSend = async () => {
       m1.textContent = "";
       const username = $("#fp_user").value.trim();
       const email = ($("#fp_email").value || "").trim().toLowerCase();
-      if (!username || !email) { m1.textContent = "Enter username and email"; return; }
+      if (!username || !email) { m1.textContent = "Enter username and email"; return false; }
+      if (fpCooldown > 0) { m1.textContent = `Please wait ${fpCooldown}s before resending.`; return false; }
+      const check = await fetch(apiBase() + "/auth/forgot/email/check", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, email }),
+      });
+      const cj = await check.json().catch(() => ({}));
+      if (!check.ok) {
+        const det = cj.detail;
+        const msg = Array.isArray(det) ? det.map((x) => x.msg || JSON.stringify(x)).join("; ") : (det || check.statusText);
+        throw new Error(msg);
+      }
+      if (!cj.matched) {
+        m1.textContent = "Username and registered email do not match.";
+        return false;
+      }
+      const preWait = Number(cj.resend_after_seconds || 0);
+      if (preWait > 0) {
+        startFpCooldown(preWait);
+        m1.textContent = `Please wait ${preWait}s before sending again.`;
+        return false;
+      }
+      const r = await fetch(apiBase() + "/auth/forgot/email/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, email }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        const det = d.detail;
+        const msg = Array.isArray(det) ? det.map((x) => x.msg || JSON.stringify(x)).join("; ") : (det || r.statusText);
+        const wait = parseCooldownFromMessage(msg);
+        if (wait > 0) startFpCooldown(wait);
+        throw new Error(msg);
+      }
+      const cd = Number(d.resend_after_seconds || 60);
+      startFpCooldown(cd);
+      m1.textContent = `Code sent. TTL ${(Number(d.ttl_seconds || 0) / 60).toFixed(0)} min.`;
+      return true;
+    };
+    applyFpCooldownUi();
+    $("#fp_go").addEventListener("click", async () => {
       try {
-        const r = await fetch(apiBase() + "/auth/forgot/email/start", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ username, email }),
-        });
-        const d = await r.json().catch(() => ({}));
-        if (!r.ok) {
-          const det = d.detail;
-          const msg = Array.isArray(det) ? det.map((x) => x.msg || JSON.stringify(x)).join("; ") : (det || r.statusText);
-          throw new Error(msg);
-        }
-        m1.textContent = `Code sent if account/email matched. TTL ${(Number(d.ttl_seconds || 0) / 60).toFixed(0)} min.`;
+        const ok = await doForgotSend();
+        if (!ok) return;
         $("#fpStep1").style.display = "none";
         $("#fpStep2").style.display = "block";
       } catch (e) { m1.textContent = String(e.message || e); }
     });
+    if (fpResendBtn) {
+      fpResendBtn.addEventListener("click", async () => {
+        try {
+          const ok = await doForgotSend();
+          if (ok) m2.textContent = `Code resent. Wait ${fpCooldown}s before next resend.`;
+        } catch (e) { m2.textContent = String(e.message || e); }
+      });
+    }
     $("#fp_back").addEventListener("click", () => {
       $("#fpStep2").style.display = "none";
       $("#fpStep1").style.display = "block";
@@ -992,16 +1125,26 @@
       return s.replace(/^error:\s*/i, "");
     };
     view.innerHTML = `
-      <div class="auth-page" role="main">
-        <div class="auth-card auth-card--wide" data-auth-card>
+      <div class="auth-page auth-page-pro" role="main">
+        <section class="auth-hero">
+          <div class="auth-hero__tag">Admin Onboarding</div>
+          <h2>Professional setup, immediate access</h2>
+          <p>Register once, verify by email, then manage your own device fleet directly.</p>
+          <ul class="auth-hero__bullets">
+            <li>No superadmin approval required</li>
+            <li>Email verification with cooldown protection</li>
+            <li>Tenant-isolated admin workspace</li>
+          </ul>
+        </section>
+        <div class="auth-card auth-card--wide auth-card--pro" data-auth-card>
           <header class="auth-card__head">
             <div class="auth-rev">${AUTH_UI_REV}</div>
             <div class="auth-card__logo" aria-hidden="true"></div>
             <h1 class="auth-card__title">Create admin</h1>
-            <p class="auth-card__lead">Create your admin account with email verification.</p>
+            <p class="auth-card__lead">Create your account with email verification.</p>
           </header>
           <div class="auth-card__body">
-            <p class="auth-card__note muted">No manual approval needed. After code verification, you can sign in immediately.</p>
+            <p class="auth-card__note muted">After verification, you can sign in immediately.</p>
             <ol class="auth-steps" aria-label="Steps">
               <li id="r_step_ind1" class="is-active"><span class="auth-steps__n">1</span><span class="auth-steps__t">Your details</span></li>
               <li id="r_step_ind2"><span class="auth-steps__n">2</span><span class="auth-steps__t">Email code</span></li>
@@ -2196,16 +2339,20 @@
       return { on, s, reason, outV, rssi, wifiSsidDd, wifiChDd };
     };
     const dm = deviceLiveModel(d);
-    const rawCommandPanel = (state.me && state.me.role === "superadmin") ? `
-        <div class="card">
-          <h3>Raw command</h3>
+    const rawCommandDrawer = (state.me && state.me.role === "superadmin") ? `
+      <details class="card device-drawer">
+        <summary class="device-drawer__summary">
+          <span class="device-drawer__title">Raw command</span>
+          <span class="device-drawer__hint muted">Superadmin · manual MQTT cmd</span>
+        </summary>
+        <div class="device-drawer__body">
           <label class="field"><span>cmd</span><input id="cmdName" placeholder="get_info / ota" ${can("can_send_command") ? "" : "disabled"} /></label>
           <label class="field" style="margin-top:8px"><span>params (JSON)</span><textarea id="cmdParams" placeholder='{"key":"value"}' ${can("can_send_command") ? "" : "disabled"}></textarea></label>
           <div class="row" style="margin-top:8px;justify-content:flex-end">
             <button class="btn" id="sendCmd" ${can("can_send_command") ? "" : "disabled"}>Send</button>
           </div>
         </div>
-      ` : "";
+      </details>` : "";
     const canUseSharePanel = !!(
       state.me
       && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_manage_users")))
@@ -2268,50 +2415,68 @@
         </details>
       </div>` : "";
     view.innerHTML = `
-      <div class="card">
-        <div class="row" style="align-items:flex-start;flex-wrap:wrap;gap:10px">
-          <div class="device-page-head" style="flex:1;min-width:0">
-            <div class="device-primary-name">${escapeHtml(d.display_label || id)}</div>
-            ${d.display_label ? `<div class="device-id-sub mono">${escapeHtml(id)}</div>` : ""}
+      <div class="card device-focus-layout">
+        <div class="device-focus-left">
+          <div class="row" style="align-items:flex-start;flex-wrap:wrap;gap:10px">
+            <div class="device-page-head" style="flex:1;min-width:0">
+              <div class="device-primary-name">${escapeHtml(d.display_label || id)}</div>
+              ${d.display_label ? `<div class="device-id-sub mono">${escapeHtml(id)}</div>` : ""}
+            </div>
+            <span class="badge ${dm.on ? "online" : "offline"}" id="devOnlineBadge">${dm.on ? "online" : "offline"}</span>
+            <span class="chip" id="devReasonChip">${escapeHtml(reasonEn[dm.reason] || dm.reason)}</span>
+            ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
+            <a href="#/overview" class="btn ghost right">← Overview</a>
           </div>
-          <span class="badge ${dm.on ? "online" : "offline"}" id="devOnlineBadge">${dm.on ? "online" : "offline"}</span>
-          <span class="chip" id="devReasonChip">${escapeHtml(reasonEn[dm.reason] || dm.reason)}</span>
-          ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
-          <a href="#/overview" class="btn ghost right">← Overview</a>
-        </div>
-        <div class="divider"></div>
-        <div style="margin-bottom:12px;padding:12px 14px;border:1px dashed var(--border-strong);border-radius:var(--radius-sm);background:var(--bg-muted)">
-          <h3 style="margin:0 0 8px;font-size:13px;color:var(--text-muted)">Notifications</h3>
-          <p class="muted" style="margin:0 0 10px">Used as the prefix for emails, Telegram, and in-app summaries for this device.</p>
-          <div class="row" style="gap:10px;align-items:flex-end;flex-wrap:wrap">
-            <label class="field grow"><span>Display name</span>
-              <input id="dispLabel" value="${escapeHtml(d.display_label || "")}" maxlength="80" />
-            </label>
-            <label class="field grow"><span>Notification group</span>
-              <input id="notifGroup" value="${escapeHtml(d.notification_group || "")}" maxlength="80" placeholder="e.g. Warehouse A" />
-            </label>
-            <button class="btn secondary btn-tap" type="button" id="saveProfile">Save</button>
+          <div class="device-hero-card">
+            <div class="device-thumb">${escapeHtml((d.display_label || id || "?").slice(0, 1).toUpperCase())}</div>
+            <div class="device-hero-meta">
+              <div class="device-hero-line"><span class="muted">Firmware</span><span class="mono">${escapeHtml(d.fw || "—")}</span></div>
+              <div class="device-hero-line"><span class="muted">Platform</span><span class="mono">${escapeHtml(maskPlatform(`${d.chip_target || ""}/${d.board_profile || ""}`))}</span></div>
+              <div class="device-hero-line"><span class="muted">Network</span><span class="mono" id="devNetRow">${escapeHtml(d.net_type || "—")} · ${escapeHtml(dm.s.ip || "—")}</span></div>
+              <div class="device-hero-line"><span class="muted">Wi‑Fi</span><span id="devWifiSsid">${dm.wifiSsidDd}</span></div>
+              <div class="device-hero-line"><span class="muted">Output V</span><span class="mono" id="devOutV">${escapeHtml(dm.outV)}</span></div>
+              <div class="device-hero-line"><span class="muted">Tx / Rx</span><span class="mono" id="devTxRx">${escapeHtml(bps(dm.s.tx_bps))} / ${escapeHtml(bps(dm.s.rx_bps))}</span></div>
+              <div class="device-hero-line"><span class="muted">RSSI</span><span class="mono" id="devRssi">${escapeHtml(dm.rssi)}</span></div>
+              <div class="device-hero-line"><span class="muted">Wi‑Fi CH</span><span class="mono" id="devWifiCh">${dm.wifiChDd}</span></div>
+              <div class="device-hero-line"><span class="muted">Uptime</span><span class="mono" id="devUptime">${escapeHtml((dm.s.uptime_s ? `${Math.floor(dm.s.uptime_s / 3600)}h ${Math.floor((dm.s.uptime_s % 3600) / 60)}m` : "—"))}</span></div>
+              <div class="device-hero-line"><span class="muted">Heap</span><span class="mono" id="devHeap">${escapeHtml(dm.s.free_heap ? `${dm.s.free_heap} B (min ${dm.s.min_free_heap || "?"} B)` : "—")}</span></div>
+              <div class="device-hero-line"><span class="muted">Disconnect</span><span class="mono" id="devDisconnect">${escapeHtml(dm.reason)}</span></div>
+              <div class="device-hero-line"><span class="muted">Updated</span><span id="devUpdated">${escapeHtml(fmtTs(d.updated_at))} (${escapeHtml(fmtRel(d.updated_at))})</span></div>
+            </div>
           </div>
         </div>
-        <dl class="kv">
-          <dt>Firmware</dt><dd class="mono">${escapeHtml(d.fw || "—")}</dd>
-          <dt>Platform</dt><dd class="mono">${escapeHtml(maskPlatform(`${d.chip_target || ""}/${d.board_profile || ""}`))}</dd>
-          <dt>Manufacturer</dt><dd class="mono">ESA Sibu</dd>
-          <dt>Network</dt><dd class="mono" id="devNetRow">${escapeHtml(d.net_type || "—")} · ${escapeHtml(dm.s.ip || "—")}</dd>
-          <dt>Wi‑Fi SSID</dt><dd id="devWifiSsid">${dm.wifiSsidDd}</dd>
-          <dt>Wi‑Fi channel</dt><dd id="devWifiCh">${dm.wifiChDd}</dd>
-          <dt>RSSI</dt><dd class="mono" id="devRssi">${escapeHtml(dm.rssi)}</dd>
-          <dt>Output V</dt><dd class="mono" id="devOutV">${escapeHtml(dm.outV)}</dd>
-          <dt>Tx / Rx</dt><dd class="mono" id="devTxRx">${escapeHtml(bps(dm.s.tx_bps))} / ${escapeHtml(bps(dm.s.rx_bps))}</dd>
-          <dt>Disconnect</dt><dd class="mono" id="devDisconnect">${escapeHtml(dm.reason)}</dd>
-          <dt>Provisioned</dt><dd>${d.provisioned ? "yes" : "no"}</dd>
-          <dt>Uptime</dt><dd class="mono" id="devUptime">${escapeHtml((dm.s.uptime_s ? `${Math.floor(dm.s.uptime_s / 3600)}h ${Math.floor((dm.s.uptime_s % 3600) / 60)}m` : "—"))}</dd>
-          <dt>Free heap</dt><dd class="mono" id="devHeap">${escapeHtml(dm.s.free_heap ? `${dm.s.free_heap} B (min ${dm.s.min_free_heap || "?"} B)` : "—")}</dd>
-          <dt>Updated</dt><dd id="devUpdated">${escapeHtml(fmtTs(d.updated_at))} (${escapeHtml(fmtRel(d.updated_at))})</dd>
-        </dl>
+        <aside class="device-focus-right">
+          <div class="card" style="margin:0">
+            <h3 style="margin:0 0 8px">Ownership</h3>
+            <p class="muted" style="margin:0 0 8px">Current account binding for this device.</p>
+            <div class="device-owner-kv">
+              <div><span class="muted">Account</span><span class="mono">${escapeHtml(d.owner_admin || d.shared_by || "—")}</span></div>
+              <div><span class="muted">Email</span><span class="mono">${escapeHtml(d.owner_email || "—")}</span></div>
+              <div><span class="muted">Shared</span><span class="mono">${d.is_shared ? `yes · by ${escapeHtml(d.shared_by || "?")}` : "no"}</span></div>
+            </div>
+            <div class="row" style="margin-top:12px;gap:8px;flex-wrap:wrap">
+              <button class="btn danger" id="deleteReset" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Unbind (delete & reset)</button>
+              ${(state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_send_command"))))
+                ? `<button class="btn danger" id="factoryUnregister" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Rollback to unregistered</button>`
+                : ""}
+            </div>
+          </div>
+          <div class="card" style="margin:12px 0 0">
+            <h3 style="margin:0 0 8px;font-size:13px;color:var(--text-muted)">Notifications</h3>
+            <div class="row" style="gap:10px;align-items:flex-end;flex-wrap:wrap">
+              <label class="field grow"><span>Display name</span>
+                <input id="dispLabel" value="${escapeHtml(d.display_label || "")}" maxlength="80" />
+              </label>
+              <label class="field grow"><span>Notification group</span>
+                <input id="notifGroup" value="${escapeHtml(d.notification_group || "")}" maxlength="80" placeholder="e.g. Warehouse A" />
+              </label>
+              <button class="btn secondary btn-tap" type="button" id="saveProfile">Save</button>
+            </div>
+          </div>
+        </aside>
       </div>
 
-      <div class="split">
+      <div class="split device-quick-split">
         <div class="card">
           <h3>Quick actions</h3>
           ${d.is_shared ? `<p class="muted" style="margin:0 0 8px">Shared by <span class="mono">${escapeHtml(d.shared_by || "?")}</span>. Delete/Revoke actions are disabled for shared devices.</p>` : ""}
@@ -2327,51 +2492,58 @@
           <div class="row" style="margin-top:14px">
             <button class="btn danger" id="revoke" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Revoke</button>
             <button class="btn secondary" id="unrevoke" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Unrevoke</button>
-            <button class="btn danger" id="deleteReset" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Delete & reset</button>
-            ${(state.me && state.me.role === "superadmin")
-              ? `<button class="btn danger" id="factoryUnregister" ${!d.is_shared ? "" : "disabled"}>Unregister (keep serial)</button>`
-              : ""}
           </div>
         </div>
-        ${rawCommandPanel}
       </div>
       ${sharePanel}
 
-      <div class="card" id="wifiCtlCard">
-        <h3>Wi‑Fi (device)</h3>
-        <p class="muted">Online/offline unified provisioning: create a Wi‑Fi task, then poll task progress until success/fail. Credentials are saved to device NVS and device reboots.</p>
-        ${can("can_send_command") ? `
-        <div class="inline-form" style="margin-top:10px">
-          <label class="field grow"><span>New SSID</span><input id="wifiNewSsid" maxlength="32" autocomplete="off" placeholder="2.4 GHz network name" /></label>
-          <label class="field grow"><span>Password</span><input id="wifiNewPass" type="password" maxlength="64" autocomplete="new-password" placeholder="empty if open network" /></label>
-          <div class="row wide" style="justify-content:flex-end;flex-wrap:wrap;gap:8px">
-            <button class="btn btn-tap" type="button" id="wifiApplyBtn">Start provision task</button>
-            <button class="btn danger btn-tap" type="button" id="wifiClearBtn">Clear saved Wi‑Fi & reboot</button>
+      <details class="card device-drawer" id="wifiCtlCard">
+        <summary class="device-drawer__summary">
+          <span class="device-drawer__title">Wi‑Fi (device)</span>
+          <span class="device-drawer__hint muted">Provision · NVS · expand</span>
+        </summary>
+        <div class="device-drawer__body">
+          <p class="muted" style="margin:0 0 10px">Online/offline unified provisioning: create a Wi‑Fi task, then poll until success/fail. Credentials are saved to device NVS and device reboots.</p>
+          ${can("can_send_command") ? `
+          <div class="inline-form" style="margin-top:4px">
+            <label class="field grow"><span>New SSID</span><input id="wifiNewSsid" maxlength="32" autocomplete="off" placeholder="2.4 GHz network name" /></label>
+            <label class="field grow"><span>Password</span><input id="wifiNewPass" type="password" maxlength="64" autocomplete="new-password" placeholder="empty if open network" /></label>
+            <div class="row wide" style="justify-content:flex-end;flex-wrap:wrap;gap:8px">
+              <button class="btn btn-tap" type="button" id="wifiApplyBtn">Start provision task</button>
+              <button class="btn danger btn-tap" type="button" id="wifiClearBtn">Clear saved Wi‑Fi & reboot</button>
+            </div>
           </div>
+          <div style="margin-top:8px">
+            <progress id="wifiTaskProgress" value="0" max="100" style="width:100%;height:12px"></progress>
+          </div>
+          <p class="muted" id="wifiScanStatus" style="margin-top:8px;min-height:1.3em"></p>` : `<p class="muted">Requires <span class="mono">can_send_command</span>.</p>`}
         </div>
-        <div style="margin-top:8px">
-          <progress id="wifiTaskProgress" value="0" max="100" style="width:100%;height:12px"></progress>
-        </div>
-        <p class="muted" id="wifiScanStatus" style="margin-top:8px;min-height:1.3em"></p>` : `<p class="muted">Requires <span class="mono">can_send_command</span>.</p>`}
-      </div>
+      </details>
 
-      <div class="card" id="triggerPolicyCard">
-        <h3>Trigger policy (server persisted)</h3>
-        <p class="muted">Scope: owner account + group <span class="mono">${escapeHtml(d.notification_group || "(default)")}</span>. Controls remote linkage behavior.</p>
-        ${can("can_send_command") ? `
-        <div class="inline-form" style="margin-top:8px;gap:12px;flex-wrap:wrap">
-          <label class="field"><span>Panic local siren</span><input type="checkbox" id="tpPanicLocal" /></label>
-          <label class="field"><span>Remote silent link</span><input type="checkbox" id="tpSilentLink" /></label>
-          <label class="field"><span>Remote loud link</span><input type="checkbox" id="tpLoudLink" /></label>
-          <label class="field"><span>Exclude self</span><input type="checkbox" id="tpExcludeSelf" /></label>
-          <label class="field"><span>Loud duration (ms)</span><input id="tpLoudDur" type="number" min="500" max="120000" value="10000" /></label>
-          <div class="row wide" style="justify-content:flex-end">
-            <button class="btn secondary btn-tap" type="button" id="tpRefresh">Refresh policy</button>
-            <button class="btn btn-tap" type="button" id="tpSave">Save policy</button>
+      <details class="card device-drawer" id="triggerPolicyCard">
+        <summary class="device-drawer__summary">
+          <span class="device-drawer__title">Trigger policy</span>
+          <span class="device-drawer__hint muted">Server · group scope · expand</span>
+        </summary>
+        <div class="device-drawer__body">
+          <p class="muted" style="margin:0 0 10px">Scope: owner account + group <span class="mono">${escapeHtml(d.notification_group || "(default)")}</span>. Controls remote linkage behavior.</p>
+          ${can("can_send_command") ? `
+          <div class="inline-form" style="margin-top:4px;gap:12px;flex-wrap:wrap">
+            <label class="field"><span>Panic local siren</span><input type="checkbox" id="tpPanicLocal" /></label>
+            <label class="field"><span>Remote silent link</span><input type="checkbox" id="tpSilentLink" /></label>
+            <label class="field"><span>Remote loud link</span><input type="checkbox" id="tpLoudLink" /></label>
+            <label class="field"><span>Exclude self</span><input type="checkbox" id="tpExcludeSelf" /></label>
+            <label class="field"><span>Loud duration (ms)</span><input id="tpLoudDur" type="number" min="500" max="120000" value="10000" /></label>
+            <div class="row wide" style="justify-content:flex-end">
+              <button class="btn secondary btn-tap" type="button" id="tpRefresh">Refresh policy</button>
+              <button class="btn btn-tap" type="button" id="tpSave">Save policy</button>
+            </div>
           </div>
+          <p class="muted" id="tpStatus" style="margin-top:8px;min-height:1.3em"></p>` : `<p class="muted">Requires <span class="mono">can_send_command</span>.</p>`}
         </div>
-        <p class="muted" id="tpStatus" style="margin-top:8px;min-height:1.3em"></p>` : `<p class="muted">Requires <span class="mono">can_send_command</span>.</p>`}
-      </div>
+      </details>
+
+      ${rawCommandDrawer}
 
       ${mqttMsgPanel}`;
     const patchDeviceLive = (dev) => {
@@ -2458,11 +2630,14 @@
       if (!confirm("Revoke this device?")) return;
       try {
         await api(`/devices/${encodeURIComponent(id)}/revoke`, { method: "POST", body: { reason: "console manual" } });
+        bustDeviceListCaches();
         toast("Revoked", "ok");
       } catch (e) { toast(e.message || e, "err"); }
     });
-    $("#unrevoke").addEventListener("click", withDev(() =>
-      api(`/devices/${encodeURIComponent(id)}/unrevoke`, { method: "POST" })));
+    $("#unrevoke").addEventListener("click", withDev(async () => {
+      await api(`/devices/${encodeURIComponent(id)}/unrevoke`, { method: "POST" });
+      bustDeviceListCaches();
+    }));
     const deleteResetBtn = $("#deleteReset", view);
     if (deleteResetBtn) {
       deleteResetBtn.addEventListener("click", async () => {
@@ -2474,6 +2649,7 @@
             method: "POST",
             body: { confirm_text: typed },
           });
+          bustDeviceListCaches();
           toast("Device deleted/reset. Re-add from Activate flow.", "ok");
           location.hash = "#/overview";
         } catch (e) { toast(e.message || e, "err"); }
@@ -2482,7 +2658,11 @@
     const factoryUnregisterBtn = $("#factoryUnregister", view);
     if (factoryUnregisterBtn) {
       factoryUnregisterBtn.addEventListener("click", async () => {
-        if (!confirm("Superadmin action: rollback to UNREGISTERED while keeping factory serial. Continue?")) return;
+        const isSa = !!(state.me && state.me.role === "superadmin");
+        const msg = isSa
+          ? "Superadmin: rollback this device to UNREGISTERED (factory serial kept). Continue?"
+          : "Rollback YOUR device to UNREGISTERED (factory serial kept). You can claim again later. Continue?";
+        if (!confirm(msg)) return;
         const typed = String(prompt(`Type device ID to confirm factory-unregister:\n${id}`) || "").trim();
         if (typed.toUpperCase() !== String(id).toUpperCase()) { toast("Confirmation mismatch", "err"); return; }
         try {
@@ -2490,6 +2670,7 @@
             method: "POST",
             body: { confirm_text: typed },
           });
+          bustDeviceListCaches();
           toast("Device rolled back to unregistered (serial preserved).", "ok");
           location.hash = "#/overview";
         } catch (e) { toast(e.message || e, "err"); }
@@ -3050,11 +3231,11 @@
       const listEl = document.getElementById("evList");
       if (!listEl) return;
       if (buffer.length === 0) {
-        listEl.innerHTML = `<p class="muted audit-empty">No events.</p>`;
+        setHtmlIfChanged(listEl, `<p class="muted audit-empty">No events.</p>`);
         return;
       }
       const visible = buffer.slice(0, RENDER_LIMIT);
-      listEl.innerHTML = `<div class="audit-feed">${visible.map(rowHtml).join("")}</div>`;
+      setHtmlIfChanged(listEl, `<div class="audit-feed">${visible.map(rowHtml).join("")}</div>`);
     }
     function scheduleEvRender() {
       if (evRenderTimer) return;
@@ -3374,14 +3555,14 @@
       const auditListEl = $("#auditList", view);
       const countEl = $("#auditCount", view);
       if (!auditListEl) return;
-      if (countEl) countEl.textContent = String(items.length);
+      if (countEl) setTextIfChanged(countEl, String(items.length));
 
       if (items.length === 0) {
-        auditListEl.innerHTML = `<p class="muted audit-empty">No matching entries.</p>`;
+        setHtmlIfChanged(auditListEl, `<p class="muted audit-empty">No matching entries.</p>`);
         return;
       }
 
-      auditListEl.innerHTML = `<div class="audit-feed">${items.map((e) => {
+      setHtmlIfChanged(auditListEl, `<div class="audit-feed">${items.map((e) => {
         const actor = e.actor || "";
         const tgt = e.target || "";
         const action = e.action || "";
@@ -3410,7 +3591,7 @@
             </div>
             ${extrasHtml}
           </article>`;
-      }).join("")}</div>`;
+      }).join("")}</div>`);
     };
 
     const onFilterKey = (ev) => {
@@ -4005,18 +4186,18 @@
         const sigSummaryEl = $("#sigSummary", view);
         const sigListEl = $("#sigList", view);
         if (!sigSummaryEl || !sigListEl) return;
-        sigSummaryEl.innerHTML = [
+        setHtmlIfChanged(sigSummaryEl, [
           ["Alarms 24h", sumR.last_24h || 0, "device-side alarm rows"],
           ["Alarms 7d", sumR.last_7d || 0, "same scope"],
           ["Top source 7d", (sumR.top_sources_7d || []).slice(0, 1).map((x) => `${x.source_id} × ${x.c}`).join("") || "—", "by count"],
-        ].map(([k, v, s]) => `<div class="stat"><div class="k">${escapeHtml(k)}</div><div class="v">${escapeHtml(v)}</div><div class="sub">${escapeHtml(s)}</div></div>`).join("");
+        ].map(([k, v, s]) => `<div class="stat"><div class="k">${escapeHtml(k)}</div><div class="v">${escapeHtml(v)}</div><div class="sub">${escapeHtml(s)}</div></div>`).join(""));
         const items = d.items || [];
         const whoLbl = (w) => ({
           remote_button: "GPIO / local button",
           network: "MQTT / network",
           api: "API / automation",
         }[w] || w);
-        sigListEl.innerHTML = items.length === 0
+        setHtmlIfChanged(sigListEl, items.length === 0
           ? `<p class="muted audit-empty">No rows in this window.</p>`
           : `<div class="audit-feed">${items.map((a) => {
             const dev = a.device_id === "*" ? "(bulk)" : a.device_id;
@@ -4043,7 +4224,7 @@
               </div>
               <div class="audit-item-line muted" style="font-size:12.5px">Who: ${escapeHtml(String(whoS))} · Fan-out: ${escapeHtml(fo)} · Email: ${escapeHtml(em)}</div>
             </article>`;
-          }).join("")}</div>`;
+          }).join("")}</div>`);
       } catch (e) {
         if (!isRouteCurrent(routeSeq)) return;
         toast(e.message || e, "err");
@@ -4318,6 +4499,13 @@
     loadHealth().catch(() => {});
     clearHealthPollTimer();
     healthPollTimer = setInterval(tickHealthIfVisible, 30000);
+    window.addEventListener("online", () => {
+      loadHealth().catch(() => {});
+      tickHealthIfVisible();
+      if (typeof window.__eventsStreamResume === "function") {
+        try { window.__eventsStreamResume(); } catch (_) {}
+      }
+    });
     document.addEventListener("visibilitychange", () => {
       document.documentElement.classList.toggle("tab-hidden", document.visibilityState === "hidden");
       if (document.visibilityState === "hidden") {
