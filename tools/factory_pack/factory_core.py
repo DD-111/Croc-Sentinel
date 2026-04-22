@@ -314,11 +314,46 @@ def write_push_status_file(
     return p
 
 
+def _format_factory_ping_transport_error(exc: BaseException, *, url: str, timeout_s: float) -> str:
+    """Turn urllib/socket errors into actionable text (WinError 10060 etc.)."""
+    lines = [
+        f"URL: {url}",
+        f"client timeout={timeout_s}s (connect+read, single urllib timeout)",
+        f"raw: {str(exc).strip()}",
+    ]
+    winerr: int | None = None
+    cur: BaseException | None = exc
+    for _ in range(12):
+        if isinstance(cur, OSError):
+            we = getattr(cur, "winerror", None)
+            if we is not None:
+                winerr = int(we)
+                break
+        nxt = getattr(cur, "reason", None)
+        cur = nxt if isinstance(nxt, BaseException) else None
+
+    if winerr == 10060:
+        lines.append(
+            "hint[10060]: TCP timed out — host:port did not respond in time. Check: (1) server is up and listening on "
+            "this port; (2) firewall / ISP / VPN allows outbound HTTPS; (3) FACTORY_UI_API_BASE scheme+port match the API "
+            f'(default {DEFAULT_FACTORY_UI_API_BASE}); (4) from this PC run: curl -vk "{url}"'
+        )
+    elif winerr == 10061:
+        lines.append(
+            "hint[10061]: connection refused — nothing accepts TCP on this host:port (wrong port or service stopped)."
+        )
+    elif isinstance(exc, urllib.error.URLError) and "timed out" in str(exc).lower():
+        lines.append(
+            "hint: request timed out before TCP/TLS completed — network slow or server overloaded; try larger timeout or fix routing."
+        )
+    return "\n".join(lines)
+
+
 def get_factory_ping(
     api_base: str,
     factory_token: str,
     insecure_ssl: bool = False,
-    timeout_s: float = 30.0,
+    timeout_s: float = 45.0,
 ) -> tuple[int, str]:
     """GET /factory/ping — verify X-Factory-Token before bulk upload."""
     factory_token = (factory_token or "").strip()
@@ -338,4 +373,4 @@ def get_factory_ping(
         err_body = e.read().decode("utf-8", errors="replace")
         return e.code, err_body or str(e)
     except Exception as e:
-        return -1, str(e)
+        return -1, _format_factory_ping_transport_error(e, url=url, timeout_s=timeout_s)

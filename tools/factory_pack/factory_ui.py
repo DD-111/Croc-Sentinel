@@ -109,6 +109,8 @@ class FactoryApp(tk.Tk):
         self._log = tk.Text(self, height=16, wrap=tk.WORD, font=("Consolas", 10))
         self._log.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
 
+        self._ping_lock = threading.Lock()
+
         self._load_env()
 
     def _browse_dotenv(self) -> None:
@@ -147,19 +149,26 @@ class FactoryApp(tk.Tk):
         def ui(fn, *a, **kw):
             self.after(0, lambda: fn(*a, **kw))
 
-        dot = Path(self._dotenv_path.get())
-        env = read_dotenv_keys(dot, ("FACTORY_API_TOKEN", "FACTORY_UI_API_BASE"))
-        api = self._api_base.get().strip().rstrip("/") or env.get("FACTORY_UI_API_BASE", "").strip().rstrip("/")
-        tok = self._factory_token.get().strip() or env.get("FACTORY_API_TOKEN", "").strip()
-        if not api or not tok:
-            ui(messagebox.showwarning, "缺少配置", "请填写 API 根地址与 Factory Token（或写入 .env）。")
+        if not self._ping_lock.acquire(blocking=False):
+            ui(self._append, "[ping] skipped — test already running")
             return
-        code, body = get_factory_ping(api, tok, insecure_ssl=self._insecure.get())
-        ui(self._append, f"[ping] GET /factory/ping -> HTTP {code}\n{body}")
-        if code in (200, 201):
-            ui(messagebox.showinfo, "连接正常", "FACTORY_API_TOKEN 已被服务器接受。")
-        else:
-            ui(messagebox.showerror, "失败", f"HTTP {code}\n{body[:600]}")
+        try:
+            dot = Path(self._dotenv_path.get())
+            env = read_dotenv_keys(dot, ("FACTORY_API_TOKEN", "FACTORY_UI_API_BASE"))
+            api = self._api_base.get().strip().rstrip("/") or env.get("FACTORY_UI_API_BASE", "").strip().rstrip("/")
+            tok = self._factory_token.get().strip() or env.get("FACTORY_API_TOKEN", "").strip()
+            if not api or not tok:
+                ui(messagebox.showwarning, "缺少配置", "请填写 API 根地址与 Factory Token（或写入 .env）。")
+                return
+            ui(self._append, f"[ping] trying {api}/factory/ping …")
+            code, body = get_factory_ping(api, tok, insecure_ssl=self._insecure.get())
+            ui(self._append, f"[ping] GET /factory/ping -> HTTP {code}\n{body}")
+            if code in (200, 201):
+                ui(messagebox.showinfo, "连接正常", "FACTORY_API_TOKEN 已被服务器接受。")
+            else:
+                ui(messagebox.showerror, "失败", f"HTTP {code}\n{body[:900]}")
+        finally:
+            self._ping_lock.release()
 
     def _run_job(self) -> None:
         def ui(fn, *a, **kw):

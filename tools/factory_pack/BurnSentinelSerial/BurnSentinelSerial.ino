@@ -7,6 +7,7 @@
  * 切勿把主工程 Croc Sentinel.ino 粘贴进本文件。
  */
 #include <Arduino.h>
+#include <cstring>
 #include <Preferences.h>
 #include "config.h"
 
@@ -17,19 +18,16 @@
 static const char *kNvsKey = "serial";
 static const unsigned long kPasteTimeoutMs = 90000UL;
 
-// Must match API / factory_core: exactly SN- + 16 chars from [A-Z2-7] minus I,O,0,1
-// (same alphabet as tools/factory_pack/factory_core.py CROCKFORD).
+// Exact same 32-char alphabet as tools/factory_pack/factory_core.py CROCKFORD (single source for factory SN).
+static const char kSerialAlphabet[] = "ABCDEFGHJKLMNPQRSTUVWXYZ234567";
+
 static bool validSerial(const String &s) {
   if (s.length() != 19)
     return false;
   if (!s.startsWith("SN-"))
     return false;
   for (unsigned i = 3; i < s.length(); i++) {
-    char c = s[i];
-    bool ok = (c >= '2' && c <= '7') || (c >= 'A' && c <= 'Z');
-    if (c == 'I' || c == 'O' || c == '0' || c == '1')
-      ok = false;
-    if (!ok)
+    if (strchr(kSerialAlphabet, s[i]) == nullptr)
       return false;
   }
   return true;

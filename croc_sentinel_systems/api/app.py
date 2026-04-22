@@ -9053,7 +9053,10 @@ def _principal_from_sse_headers_or_query(authorization: Optional[str], token: Op
 def events_stream(
     request: Request,
     authorization: Optional[str] = Header(default=None),
-    token: Optional[str] = Query(default=None, description="Fallback auth for EventSource which cannot set headers"),
+    token: Optional[str] = Query(
+        default=None,
+        description="Optional: auth for clients that cannot set Authorization (legacy). Prefer Authorization header.",
+    ),
     min_level: Optional[str] = Query(default=None, pattern="^(debug|info|warn|error|critical)$"),
     category: Optional[str] = Query(default=None, max_length=32),
     device_id: Optional[str] = Query(default=None, min_length=2, max_length=64),
@@ -9115,8 +9118,10 @@ def events_stream(
         event_bus.unsubscribe(sub)
 
     headers = {
-        "Cache-Control": "no-cache, no-store, no-transform",
-        "X-Accel-Buffering": "no",  # Nginx: disable proxy buffering
+        "Cache-Control": "no-cache, no-store, no-transform, max-age=0",
+        "Pragma": "no-cache",
+        "CDN-Cache-Control": "no-store",
+        "X-Accel-Buffering": "no",  # Nginx: disable proxy buffering (requires proxy_request_buffering off)
         "Connection": "keep-alive",
     }
     # Wrap generator so we unsubscribe on client disconnect.

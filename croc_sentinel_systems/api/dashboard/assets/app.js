@@ -1,4 +1,6 @@
-/* Croc Sentinel Console - SPA */
+/* Croc Sentinel Console - SPA
+ * Markup safety: escapeHtml(str) or hx`...${str}...` for any API/user text; mountView(el, html) for route shells.
+ * Live stream: Events use fetch()+stream+Authorization (not EventSource URL+?token=) for reverse-proxy reliability. */
 (function () {
   "use strict";
 
@@ -137,9 +139,9 @@
   }
 
   /** Default ceiling so a stuck reverse-proxy / API cannot leave the SPA on “Loading…” forever. */
-  const DEFAULT_API_TIMEOUT_MS = 20000;
-  /** Route-level async guard: any page render taking too long fails fast. */
-  const ROUTE_RENDER_TIMEOUT_MS = 15000;
+  const DEFAULT_API_TIMEOUT_MS = 45000;
+  /** Route-level async guard: full page handlers may await several API calls (slow links / cold DB). */
+  const ROUTE_RENDER_TIMEOUT_MS = 90000;
 
   /**
    * fetch() with AbortController timeout. opts.timeoutMs: number ms, false = no limit.
@@ -153,7 +155,10 @@
       return await fetch(url, Object.assign({}, init || {}, { signal: ac.signal }));
     } catch (e) {
       if (e && e.name === "AbortError") {
-        throw new Error("Request timed out — check API reachability, Nginx proxy, and browser Network tab.");
+        throw new Error(
+          `Request timed out after ${limit} ms — API slow or unreachable. Check browser Network tab, ` +
+            "Nginx `proxy_connect_timeout` / `proxy_read_timeout`, and upstream service.",
+        );
       }
       throw e;
     } finally {
@@ -200,6 +205,71 @@
     if (el.textContent === next) return false;
     el.textContent = next;
     return true;
+  }
+
+  /**
+   * Tagged template: escapes every interpolation (use for any server/user-facing string).
+   * Static HTML in template literals stays literal; only ${values} are escaped.
+   */
+  function hx(strings, ...values) {
+    let out = "";
+    for (let i = 0; i < strings.length; i++) {
+      out += strings[i];
+      if (i < values.length) out += escapeHtml(values[i]);
+    }
+    return out;
+  }
+
+  /** Replace a route container’s markup; caller must escape dynamic parts (escapeHtml / hx). */
+  function mountView(el, html) {
+    if (!el) return;
+    el.innerHTML = String(html == null ? "" : html);
+  }
+
+  /** Parse one SSE block (RFC 8895-style, LF / CRLF). */
+  function parseSseFields(block) {
+    let eventName = "message";
+    const dataLines = [];
+    const lines = String(block || "").split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (line === "" || line.startsWith(":")) continue;
+      const ci = line.indexOf(":");
+      const field = ci === -1 ? line : line.slice(0, ci);
+      let value = ci === -1 ? "" : line.slice(ci + 1);
+      if (value.startsWith(" ")) value = value.slice(1);
+      if (field === "event") eventName = value;
+      else if (field === "data") dataLines.push(value);
+    }
+    return { event: eventName, data: dataLines.join("\n") };
+  }
+
+  /** Read chunked text/event-stream; invokes onFrame(type, payload) where type is "message"|"ping". */
+  async function pumpSseBody(reader, signal, onFrame) {
+    const dec = new TextDecoder();
+    let buf = "";
+    while (!signal.aborted) {
+      let chunk;
+      try {
+        chunk = await reader.read();
+      } catch (_) {
+        break;
+      }
+      const { done, value } = chunk || {};
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      for (;;) {
+        const m = buf.match(/\r?\n\r?\n/);
+        if (!m) break;
+        const idx = m.index || 0;
+        const raw = buf.slice(0, idx);
+        buf = buf.slice(idx + m[0].length);
+        if (!String(raw || "").trim()) continue;
+        const fields = parseSseFields(raw);
+        if (fields.event === "ping") onFrame("ping", fields.data);
+        else onFrame("message", fields.data);
+      }
+    }
   }
 
   const MY_TZ = "Asia/Kuala_Lumpur";
@@ -536,7 +606,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username, password }),
       },
-      25000,
+      DEFAULT_API_TIMEOUT_MS,
     );
     if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
     const j = await r.json();
@@ -549,8 +619,8 @@
 
   async function loadMe() {
     try {
-      // Keep bootstrap snappy when API is degraded; fail fast and render login.
-      state.me = await api("/auth/me", { timeoutMs: 8000 });
+      // Uses default API ceiling; slow Nginx/upstream still yields login page on failure.
+      state.me = await api("/auth/me");
     } catch (e) {
       state.me = null;
     }
@@ -561,7 +631,7 @@
     try {
       // Public endpoint — do not use api() (no Authorization) so bad/expired JWT
       // never affects probes and we never trip the global 401 handler here.
-      const r = await fetchWithDeadline(apiBase() + "/health", { method: "GET" }, 5000);
+      const r = await fetchWithDeadline(apiBase() + "/health", { method: "GET" }, 12000);
       if (!r.ok) throw new Error(String(r.status));
       const h = await r.json();
       state.mqttConnected = !!h.mqtt_connected;
@@ -701,7 +771,7 @@
     state.navDevicesLoading = true;
     if (force) state.navDevicesError = "";
     try {
-      const r = await apiGetCached("/devices", { timeoutMs: 8000 }, force ? 0 : 7000);
+      const r = await apiGetCached("/devices", { timeoutMs: 16000 }, force ? 0 : 7000);
       state.navDevices = Array.isArray(r && r.items) ? r.items : [];
       state.navDevicesError = "";
       state.navDevicesAt = Date.now();
@@ -859,6 +929,10 @@
       try { clearTimeout(window.__evReconnectTimer); } catch (_) {}
       window.__evReconnectTimer = 0;
     }
+    if (window.__evFetchAbort) {
+      try { window.__evFetchAbort.abort(); } catch (_) {}
+      window.__evFetchAbort = null;
+    }
     window.__eventsStreamResume = null;
     toggleNav(false);
     if (window.__evSSE) { try { window.__evSSE.close(); } catch {} window.__evSSE = null; }
@@ -876,7 +950,7 @@
     document.body.dataset.layout = publicRoutes.has(routeId) ? "auth" : "app";
     const handler = routes[routeId] || routes["overview"];
     try {
-      view.innerHTML = `<div class="route-loading card" aria-busy="true" role="status">
+      mountView(view, `<div class="route-loading card" aria-busy="true" role="status">
         <span class="sr-only">Loading page</span>
         <div class="route-loading__head"></div>
         <div class="route-loading__lines">
@@ -884,7 +958,7 @@
           <span class="route-loading__bar route-loading__bar--72"></span>
           <span class="route-loading__bar route-loading__bar--84"></span>
         </div>
-      </div>`;
+      </div>`);
       const swap = async () => {
         await handler(view, args, routeSeq);
       };
@@ -901,7 +975,7 @@
       renderNav();
       renderHealthPills();
     } catch (e) {
-      view.innerHTML = `<div class="card"><h2>Load failed</h2><p class="muted">${escapeHtml(e.message || e)}</p></div>`;
+      mountView(view, hx`<div class="card"><h2>Load failed</h2><p class="muted">${e.message || e}</p></div>`);
     }
   }
 
@@ -923,7 +997,7 @@
       if (l.includes("networkerror") || l.includes("failed to fetch")) return "Network error. Please check server/API.";
       return s.replace(/^error:\s*/i, "");
     };
-    view.innerHTML = `
+    mountView(view, `
       <div class="auth-page auth-page-pro" role="main">
         <section class="auth-hero">
           <div class="auth-hero__tag">ESA Secure Platform</div>
@@ -962,7 +1036,7 @@
             </nav>
           </form>
         </div>
-      </div>`;
+      </div>`);
     const form = $("#loginForm", view);
     const card = view.querySelector("[data-auth-card]");
     form.addEventListener("submit", async (ev) => {
@@ -1008,7 +1082,7 @@
       const j = await r.json();
       enabled = !!j.enabled;
     } catch { enabled = false; }
-    view.innerHTML = `
+    mountView(view, `
       <div class="auth-page" role="main">
         <div class="auth-card auth-card--wide auth-card--prose" data-auth-card>
           <header class="auth-card__head">
@@ -1047,7 +1121,7 @@
           </div>
           </div>
         </div>
-      </div>`;
+      </div>`);
     const m1 = $("#fp_msg1"), m2 = $("#fp_msg2");
     let fpCooldown = 0;
     let fpCooldownTimer = 0;
@@ -1191,7 +1265,7 @@
       if (l.includes("networkerror") || l.includes("failed to fetch")) return "Network error. Please check server/API.";
       return s.replace(/^error:\s*/i, "");
     };
-    view.innerHTML = `
+    mountView(view, `
       <div class="auth-page auth-page-pro" role="main">
         <section class="auth-hero">
           <div class="auth-hero__tag">Admin Onboarding</div>
@@ -1238,7 +1312,7 @@
             </div>
           </div>
         </div>
-      </div>`;
+      </div>`);
     const m1 = $("#r_msg1"), m2 = $("#r_msg2");
     $("#r_start").addEventListener("click", async () => {
       m1.textContent = "";
@@ -1304,7 +1378,7 @@
   registerRoute("account-activate", async (view) => {
     setCrumb("Activate account");
     document.body.dataset.auth = "none";
-    view.innerHTML = `
+    mountView(view, `
       <div class="auth-page" role="main">
         <div class="auth-card auth-card--wide" data-auth-card>
           <header class="auth-card__head">
@@ -1324,7 +1398,7 @@
             <p class="auth-card__msg muted" id="a_msg" aria-live="polite"></p>
           </div>
         </div>
-      </div>`;
+      </div>`);
     const msg = $("#a_msg");
     $("#a_submit").addEventListener("click", async () => {
       const body = {
@@ -1361,7 +1435,7 @@
 
   registerRoute("account", async (view) => {
     setCrumb("Account");
-    if (!hasRole("user")) { view.innerHTML = `<div class="card"><p class="muted">Sign in required.</p></div>`; return; }
+    if (!hasRole("user")) { mountView(view, `<div class="card"><p class="muted">Sign in required.</p></div>`); return; }
     const me = state.me || { username: "", role: "" };
     const roleNorm = String(me.role || "").trim().toLowerCase();
     const deleteSection = (() => {
@@ -1405,7 +1479,7 @@
         </div>
       </div>`;
     })();
-    view.innerHTML = `
+    mountView(view, `
       <div class="card">
         <h2>My account</h2>
         <p class="muted">User: <span class="mono">${escapeHtml(me.username)}</span> · Role: <span class="mono">${escapeHtml(me.role)}</span></p>
@@ -1420,7 +1494,7 @@
         </div>
       </div>
       ${deleteSection}
-    `;
+    `);
     $("#accChangePw", view).addEventListener("click", async () => {
       try {
         await api("/auth/me/password", {
@@ -1520,7 +1594,7 @@
     const loadGroupSettingsCompat = async () => {
       if (!groupApiCaps.settings) return { items: [] };
       try {
-        return await tryGroupApiCall("/settings", { timeoutMs: 6000, retries: 1 });
+        return await tryGroupApiCall("/settings", { timeoutMs: 12000, retries: 1 });
       } catch (e) {
         const msg = String((e && e.message) || e || "");
         if (msg.includes("404") || msg.includes("405") || msg.includes("501")) {
@@ -1532,8 +1606,8 @@
       }
     };
     const [ovRes, listRes, grpSetRes] = await Promise.allSettled([
-      apiGetCached("/dashboard/overview", { timeoutMs: 8000 }, 4000),
-      apiGetCached("/devices", { timeoutMs: 8000 }, 4000),
+      apiGetCached("/dashboard/overview", { timeoutMs: 16000 }, 4000),
+      apiGetCached("/devices", { timeoutMs: 16000 }, 4000),
       loadGroupSettingsCompat(),
     ]);
     let ov = (ovRes.status === "fulfilled" && ovRes.value) ? ovRes.value : null;
@@ -1635,7 +1709,7 @@
       }
     };
 
-    view.innerHTML = `
+    mountView(view, `
       <section class="stats">
         <div class="stat"><div class="k">Server</div><div class="v" id="ovServerV">—</div><div class="sub">MQTT broker link</div></div>
         <div class="stat"><div class="k">Devices</div><div class="v" id="ovDevicesV">—</div><div class="sub">total in scope</div></div>
@@ -1726,7 +1800,7 @@
             <button class="btn sm" id="gmSave" type="button">Save</button>
           </div>
         </div>
-      </div>`;
+      </div>`);
     patchOverviewHeader({
       server: mqConnected ? "Connected" : "Disconnected",
       devices: totalDevices,
@@ -2040,7 +2114,7 @@
         .join("") || `<p class="muted">No own devices available.</p>`;
       userListEl.innerHTML = `<p class="muted">Loading users…</p>`;
       try {
-        const u = await api("/auth/users", { timeoutMs: 8000 });
+        const u = await api("/auth/users", { timeoutMs: 16000 });
         const users = (u.items || []).filter((x) => {
           const role = String(x.role || "");
           const st = String(x.status || "active");
@@ -2233,7 +2307,7 @@
     const meta = loadGroupMeta();
     const gsMap = loadGroupSettings();
     const groupApiCaps = loadGroupApiCaps();
-    const [listRes] = await Promise.allSettled([apiGetCached("/devices", { timeoutMs: 8000 }, 3000)]);
+    const [listRes] = await Promise.allSettled([apiGetCached("/devices", { timeoutMs: 16000 }, 3000)]);
     let list = (listRes.status === "fulfilled" && listRes.value) ? listRes.value : { items: [] };
     let byId = new Map((list.items || []).map((d) => [String(d.device_id), d]));
     const gm = meta[g] || { display_name: g, owner_name: "", phone: "", email: "", device_ids: [] };
@@ -2243,7 +2317,7 @@
     const online = rows.filter((d) => isOnline(d)).length;
     const offline = Math.max(0, rows.length - online);
     setCrumb(`Group · ${gm.display_name || g}`);
-    view.innerHTML = `
+    mountView(view, `
       <section class="card">
         <div class="row">
           <h2 style="margin:0">${escapeHtml(gm.display_name || g)}</h2>
@@ -2268,7 +2342,7 @@
         <div class="divider"></div>
         <div class="device-grid" id="groupPageDevices"></div>
       </section>
-    `;
+    `);
     const devGrid = $("#groupPageDevices", view);
     const renderGroupDevices = () => {
       if (!devGrid) return;
@@ -2392,7 +2466,7 @@
     }
     const refreshGroupLive = async () => {
       if (!isRouteCurrent(routeSeq)) return;
-      const latest = await apiGetCached("/devices", { timeoutMs: 8000 }, 2000);
+      const latest = await apiGetCached("/devices", { timeoutMs: 16000 }, 2000);
       if (!isRouteCurrent(routeSeq)) return;
       list = latest || { items: [] };
       byId = new Map((list.items || []).map((d) => [String(d.device_id), d]));
@@ -2531,7 +2605,7 @@
           <div class="audit-feed-wrap" id="devMsgsList"><p class="muted">Expand to load…</p></div>
         </details>
       </div>` : "";
-    view.innerHTML = `
+    mountView(view, `
       <div class="card device-focus-layout">
         <div class="device-focus-left">
           <div class="row" style="align-items:flex-start;flex-wrap:wrap;gap:10px">
@@ -2662,7 +2736,7 @@
 
       ${rawCommandDrawer}
 
-      ${mqttMsgPanel}`;
+      ${mqttMsgPanel}`);
     const patchDeviceLive = (dev) => {
       const m = deviceLiveModel(dev);
       const onlineBadge = $("#devOnlineBadge", view);
@@ -2687,7 +2761,7 @@
     };
     scheduleRouteTicker(routeSeq, `device-live-${id}`, async () => {
       if (!isRouteCurrent(routeSeq)) return;
-      const latest = await apiGetCached(`/devices/${encodeURIComponent(id)}`, { timeoutMs: 8000 }, 2000);
+      const latest = await apiGetCached(`/devices/${encodeURIComponent(id)}`, { timeoutMs: 16000 }, 2000);
       if (!isRouteCurrent(routeSeq) || !latest) return;
       d = latest;
       patchDeviceLive(latest);
@@ -2701,7 +2775,7 @@
         loaded = true;
         box.innerHTML = `<p class="muted">Loading…</p>`;
         try {
-          const msgs = await api(`/devices/${encodeURIComponent(id)}/messages?limit=25`, { timeoutMs: 8000 });
+          const msgs = await api(`/devices/${encodeURIComponent(id)}/messages?limit=25`, { timeoutMs: 16000 });
           box.innerHTML = renderMsgFeed(msgs.items || []);
         } catch (e) {
           box.innerHTML = `<p class="badge offline">${escapeHtml(e.message || e)}</p>`;
@@ -2835,7 +2909,7 @@
       for (let i = 0; i < 120; i++) {
         await new Promise((r) => setTimeout(r, 1000));
         try {
-          const t = await api(`/devices/${encodeURIComponent(id)}/provision/wifi-task/${encodeURIComponent(taskId)}`, { timeoutMs: 8000 });
+          const t = await api(`/devices/${encodeURIComponent(id)}/provision/wifi-task/${encodeURIComponent(taskId)}`, { timeoutMs: 16000 });
           setWifiProgress(t.progress || 0);
           if (st) st.textContent = String(t.message || t.status || "");
           if (t.status === "success") {
@@ -2906,7 +2980,7 @@
       if (!tpPanicLocal || !tpSilentLink || !tpLoudLink || !tpExcludeSelf || !tpLoudDur) return;
       try {
         if (tpStatus) tpStatus.textContent = "Loading policy…";
-        const r = await api(`/devices/${encodeURIComponent(id)}/trigger-policy`, { timeoutMs: 8000 });
+        const r = await api(`/devices/${encodeURIComponent(id)}/trigger-policy`, { timeoutMs: 16000 });
         const p = r.policy || {};
         tpPanicLocal.checked = !!p.panic_local_siren;
         tpSilentLink.checked = !!p.remote_silent_link_enabled;
@@ -2954,7 +3028,7 @@
       if (!shareListEl) return;
       shareListEl.innerHTML = `<p class="muted">Loading shares…</p>`;
       try {
-        const r = await api(`/admin/devices/${encodeURIComponent(id)}/shares`, { timeoutMs: 8000 });
+        const r = await api(`/admin/devices/${encodeURIComponent(id)}/shares`, { timeoutMs: 16000 });
         const items = r.items || [];
         shareListEl.innerHTML = `
           <div class="table-wrap"><table class="t">
@@ -3025,14 +3099,14 @@
     let devicesLoadErr = "";
     let list;
     try {
-      list = await apiGetCached("/devices", { timeoutMs: 8000 }, 4000);
+      list = await apiGetCached("/devices", { timeoutMs: 16000 }, 4000);
     } catch (e) {
       devicesLoadErr = String((e && e.message) || e || "load failed");
       list = { items: [] };
     }
     const devices = list.items || [];
 
-    view.innerHTML = `
+    mountView(view, `
       <div class="card">
         <h2>Bulk siren</h2>
         <p class="muted">MQTT <span class="mono">siren_on</span> / <span class="mono">siren_off</span>. Requires <span class="mono">can_alert</span>.</p>
@@ -3052,7 +3126,7 @@
             <button class="btn danger" id="fire" ${enabled ? "" : "disabled"}>Run</button>
           </div>
         </div>
-      </div>`;
+      </div>`);
 
     const sel = $("#targets");
     sel.innerHTML = devices.map((d) => {
@@ -3078,10 +3152,10 @@
   // Activate
   registerRoute("activate", async (view) => {
     setCrumb("Activate device");
-    if (!hasRole("admin")) { view.innerHTML = `<div class="card"><p class="muted">Admins only.</p></div>`; return; }
+    if (!hasRole("admin")) { mountView(view, `<div class="card"><p class="muted">Admins only.</p></div>`); return; }
     const canClaim = can("can_claim_device");
 
-    view.innerHTML = `
+    mountView(view, `
       <div class="card">
         <h2 style="margin-top:0">Claim a device</h2>
         <p class="muted">
@@ -3109,7 +3183,7 @@
         </div>
         <div class="divider"></div>
         <div id="pendList"></div>
-      </div>`;
+      </div>`);
 
     const resultBox = $("#idnResult");
     const drawBadge = (kind, label) =>
@@ -3201,7 +3275,7 @@
     const data = await apiOr("/provision/pending", (e) => {
       pendingErr = String((e && e.message) || e || "load failed");
       return { items: [] };
-    }, { timeoutMs: 8000 });
+    }, { timeoutMs: 16000 });
     const items = data.items || [];
     const pendListEl = view.querySelector("#pendList");
     if (!pendListEl) return;
@@ -3220,15 +3294,14 @@
   });
 
   // Event Center — global live + historical log stream
-  // NOTE: SSE isn't automatically torn down on route change, so we stash the
-  // active EventSource on window so leaving the page closes it.
+  // NOTE: Active stream lives on window.__evSSE (fetch shim); renderRoute closes it on navigation.
   registerRoute("events", async (view, _args, routeSeq) => {
     setCrumb("Events");
     const me = state.me || { username: "", role: "" };
     const isSuper = me.role === "superadmin";
     const scopeLabel = isSuper ? "System-wide" : (me.role === "admin" ? "Your tenant" : "Your account");
 
-    view.innerHTML = `
+    mountView(view, `
       <div class="ui-shell card audit-page" style="margin:0">
         <div class="row between" style="flex-wrap:wrap;gap:10px">
           <div>
@@ -3282,7 +3355,7 @@
       </div>
       <div class="ui-shell card audit-page" style="margin-top:12px">
         <div id="evList" class="audit-feed-wrap muted">Connecting…</div>
-      </div>`;
+      </div>`);
 
     let paused = false;
     let buffer = [];  // newest first
@@ -3377,7 +3450,7 @@
       try {
         if (!isRouteCurrent(routeSeq)) return;
         const p = currentFilters(); p.set("limit", "200");
-        const r = await api("/events?" + p.toString(), { timeoutMs: 8000 });
+        const r = await api("/events?" + p.toString(), { timeoutMs: 16000 });
         if (!isRouteCurrent(routeSeq)) return;
         buffer = (r.items || []).slice();
         if (evRenderTimer) { clearTimeout(evRenderTimer); evRenderTimer = 0; }
@@ -3385,7 +3458,7 @@
       } catch (e) {
         if (!isRouteCurrent(routeSeq)) return;
         const listEl = document.getElementById("evList");
-        if (listEl) listEl.innerHTML = `<p class="badge offline">${escapeHtml(e.message || e)}</p>`;
+        if (listEl) mountView(listEl, hx`<p class="badge offline">${e.message || e}</p>`);
         toast(e.message || e, "err");
       }
     }
@@ -3395,56 +3468,122 @@
         try { clearTimeout(window.__evReconnectTimer); } catch (_) {}
         window.__evReconnectTimer = 0;
       }
-      if (window.__evSSE) { try { window.__evSSE.close(); } catch {} window.__evSSE = null; }
+      if (window.__evSSE) {
+        try { window.__evSSE.close(); } catch (_) {}
+        window.__evSSE = null;
+      }
+      if (window.__evFetchAbort) {
+        try { window.__evFetchAbort.abort(); } catch (_) {}
+        window.__evFetchAbort = null;
+      }
       const live = $("#evLive");
       if (live) { live.textContent = "Offline"; live.className = "badge offline"; }
     }
+    /**
+     * Live events: use fetch() + ReadableStream instead of EventSource so we can send
+     * Authorization (JWT never appears in URL query — fewer proxy/logging issues).
+     * Server still emits ping keepalives for buffered proxies.
+     */
     function openStream() {
       if (!isRouteCurrent(routeSeq)) return;
       closeStream();
       const p = currentFilters();
-      p.set("token", getToken());
       p.set("backlog", String(Math.min(100, BUFFER_MAX - buffer.length)));
-      const url = apiBase() + "/events/stream?" + p.toString();
-      const es = new EventSource(url);
-      window.__evSSE = es;
-      es.addEventListener("ping", () => {
-        /* Server keepalive — keeps proxies from treating the stream as idle. */
-      });
-      es.onopen = () => {
-        if (!isRouteCurrent(routeSeq)) return;
-        evReconnectBackoffMs = 800;
-        const live = $("#evLive");
-        if (live) {
-          live.textContent = "Live";
-          live.className = "badge online";
-          live.title = "Live stream connected";
-        }
+      const qs = p.toString();
+      const tok = getToken();
+      const ac = new AbortController();
+      window.__evFetchAbort = ac;
+      const shim = {
+        readyState: EventSource.CONNECTING,
+        close() {
+          try { ac.abort(); } catch (_) {}
+          window.__evFetchAbort = null;
+          this.readyState = EventSource.CLOSED;
+        },
       };
-      es.onerror = () => {
-        if (!isRouteCurrent(routeSeq)) return;
-        const live = $("#evLive");
-        if (!live) return;
-        live.textContent = es.readyState === EventSource.CONNECTING ? "Reconnecting…" : "Offline";
-        live.className = "badge offline";
-        if (es.readyState === EventSource.CLOSED && !window.__evReconnectTimer) {
-          const wait = evReconnectBackoffMs;
-          window.__evReconnectTimer = setTimeout(() => {
-            window.__evReconnectTimer = 0;
-            if (!isRouteCurrent(routeSeq) || paused) return;
-            openStream();
-          }, wait);
-          evReconnectBackoffMs = Math.min(12000, Math.floor(evReconnectBackoffMs * 1.75));
-        }
+      window.__evSSE = shim;
+
+      const scheduleReconnect = () => {
+        if (!isRouteCurrent(routeSeq) || paused || window.__evReconnectTimer) return;
+        const wait = evReconnectBackoffMs + Math.floor(Math.random() * 480);
+        window.__evReconnectTimer = setTimeout(() => {
+          window.__evReconnectTimer = 0;
+          if (!isRouteCurrent(routeSeq) || paused) return;
+          openStream();
+        }, wait);
+        evReconnectBackoffMs = Math.min(12000, Math.floor(evReconnectBackoffMs * 1.75));
       };
-      es.onmessage = (m) => {
-        if (!isRouteCurrent(routeSeq)) return;
+
+      const run = async () => {
+        if (!tok) {
+          shim.readyState = EventSource.CLOSED;
+          const live = $("#evLive");
+          if (live && isRouteCurrent(routeSeq)) {
+            live.textContent = "Offline";
+            live.className = "badge offline";
+          }
+          return;
+        }
+        const url = apiBase() + "/events/stream" + (qs ? "?" + qs : "");
         try {
-          const ev = JSON.parse(m.data);
-          if (ev.event_type === "stream.hello") return;
-          pushEvent(ev);
-        } catch {}
+          const r = await fetch(url, {
+            method: "GET",
+            headers: {
+              Authorization: "Bearer " + tok,
+              Accept: "text/event-stream",
+              "Cache-Control": "no-store",
+            },
+            signal: ac.signal,
+          });
+          if (!isRouteCurrent(routeSeq)) return;
+          if (!r.ok) {
+            const errText = await r.text().catch(() => "");
+            throw new Error(errText || String(r.status));
+          }
+          if (!r.body || typeof r.body.getReader !== "function") {
+            throw new Error("Event stream unsupported in this browser");
+          }
+          evReconnectBackoffMs = 800;
+          shim.readyState = EventSource.OPEN;
+          const liveOn = $("#evLive");
+          if (liveOn) {
+            liveOn.textContent = "Live";
+            liveOn.className = "badge online";
+            liveOn.title = "Live stream connected";
+          }
+          await pumpSseBody(r.body.getReader(), ac.signal, (kind, payload) => {
+            if (kind === "ping") return;
+            if (!isRouteCurrent(routeSeq)) return;
+            try {
+              const ev = JSON.parse(payload);
+              if (ev.event_type === "stream.hello") return;
+              pushEvent(ev);
+            } catch (_) {}
+          });
+          if (ac.signal.aborted || !isRouteCurrent(routeSeq)) return;
+          shim.readyState = EventSource.CLOSED;
+          if (!paused && isRouteCurrent(routeSeq)) {
+            evReconnectBackoffMs = 800;
+            const live = $("#evLive");
+            if (live) {
+              live.textContent = "Reconnecting…";
+              live.className = "badge offline";
+            }
+            scheduleReconnect();
+          }
+        } catch (e) {
+          if (e && e.name === "AbortError") return;
+          if (!isRouteCurrent(routeSeq)) return;
+          shim.readyState = EventSource.CLOSED;
+          const live = $("#evLive");
+          if (live && isRouteCurrent(routeSeq)) {
+            live.textContent = "Reconnecting…";
+            live.className = "badge offline";
+          }
+          if (!paused && isRouteCurrent(routeSeq)) scheduleReconnect();
+        }
       };
+      void run();
     }
 
     $("#evPause").addEventListener("click", () => {
@@ -3461,7 +3600,7 @@
     $("#evStats").addEventListener("click", async () => {
       try {
         if (!isRouteCurrent(routeSeq)) return;
-        const r = await api("/events/stats/by-device?hours=168&limit=200", { timeoutMs: 8000 });
+        const r = await api("/events/stats/by-device?hours=168&limit=200", { timeoutMs: 16000 });
         const items = r.items || [];
         const evStatsBoxEl = $("#evStatsBox", view);
         const evStatsInnerEl = $("#evStatsInner", view);
@@ -3508,8 +3647,8 @@
   // Telegram self-service (user/admin/superadmin)
   registerRoute("telegram", async (view) => {
     setCrumb("Telegram");
-    if (!hasRole("user")) { view.innerHTML = `<div class="card"><p class="muted">Sign in required.</p></div>`; return; }
-    view.innerHTML = `
+    if (!hasRole("user")) { mountView(view, `<div class="card"><p class="muted">Sign in required.</p></div>`); return; }
+    mountView(view, `
       <div class="ui-shell telegram-shell">
       <div class="card">
         <div class="ui-section-head">
@@ -3547,14 +3686,14 @@
         </div>
       </div>
       </div>
-    `;
+    `);
     const mineEl = $("#tgMineList", view);
     const linkEl = $("#tgLinkBox", view);
     const loadMine = async () => {
       if (!mineEl) return;
       mineEl.innerHTML = `<p class="muted">Loading…</p>`;
       try {
-        const d = await api("/admin/telegram/bindings", { timeoutMs: 8000 });
+        const d = await api("/admin/telegram/bindings", { timeoutMs: 16000 });
         const items = d.items || [];
         mineEl.innerHTML = items.length === 0
           ? `<p class="muted">No bindings yet.</p>`
@@ -3632,8 +3771,8 @@
   // Audit
   registerRoute("audit", async (view, _args, routeSeq) => {
     setCrumb("Audit");
-    if (!hasRole("admin")) { view.innerHTML = `<div class="card"><p class="muted">Admins only.</p></div>`; return; }
-    view.innerHTML = `
+    if (!hasRole("admin")) { mountView(view, `<div class="card"><p class="muted">Admins only.</p></div>`); return; }
+    mountView(view, `
       <div class="ui-shell card audit-page">
         <div class="ui-section-head">
           <div>
@@ -3653,7 +3792,7 @@
         </div>
         <div class="divider"></div>
         <div id="auditList" class="audit-feed-wrap"></div>
-      </div>`;
+      </div>`);
 
     const reload = async () => {
       const qs = new URLSearchParams();
@@ -3669,7 +3808,7 @@
       qs.set("limit", "200");
       let d;
       try {
-        d = await api("/audit?" + qs.toString(), { timeoutMs: 12000 });
+        d = await api("/audit?" + qs.toString(), { timeoutMs: 24000 });
       } catch (e) {
         toast(e.message || e, "err");
         return;
@@ -3735,14 +3874,14 @@
   // Admin
   registerRoute("admin", async (view) => {
     setCrumb("Admin");
-    if (!hasRole("admin")) { view.innerHTML = `<div class="card"><p class="muted">Admins only.</p></div>`; return; }
+    if (!hasRole("admin")) { mountView(view, `<div class="card"><p class="muted">Admins only.</p></div>`); return; }
     const isSuper = state.me.role === "superadmin";
     let admins = [];
     if (isSuper) {
-      try { admins = (await api("/auth/admins", { timeoutMs: 8000 })).items || []; } catch { admins = []; }
+      try { admins = (await api("/auth/admins", { timeoutMs: 16000 })).items || []; } catch { admins = []; }
     }
 
-    view.innerHTML = `
+    mountView(view, `
       <div class="card">
         <h2>Users</h2>
         <p class="muted">${isSuper
@@ -3856,14 +3995,14 @@
           <input type="file" id="bk_file" accept=".enc,application/octet-stream" />
           <button class="btn secondary" id="bk_import">Upload & decrypt</button>
         </div>
-      </div>` : ""}`;
+      </div>` : ""}`);
 
     const $v = (sel) => $(sel, view);
 
     // users
     const loadUsers = async () => {
       try {
-        const d = await api("/auth/users", { timeoutMs: 8000 });
+        const d = await api("/auth/users", { timeoutMs: 16000 });
         const users = d.items || [];
         const userTableEl = $v("#userTable");
         if (!userTableEl) return;
@@ -3910,7 +4049,7 @@
       qs.set("limit", "500");
       listEl.innerHTML = `<p class="muted">Loading shares…</p>`;
       try {
-        const d = await api("/admin/shares?" + qs.toString(), { timeoutMs: 8000 });
+        const d = await api("/admin/shares?" + qs.toString(), { timeoutMs: 16000 });
         const items = d.items || [];
         listEl.innerHTML = items.length === 0
           ? `<p class="muted">No matching shares.</p>`
@@ -4000,7 +4139,7 @@
       cell.innerHTML = `<span class="muted">Loading…</span>`;
       trRow.style.display = "";
       try {
-          const p = await api(`/auth/users/${encodeURIComponent(username)}/policy`, { timeoutMs: 8000 });
+          const p = await api(`/auth/users/${encodeURIComponent(username)}/policy`, { timeoutMs: 16000 });
         cell.innerHTML = renderPolicyPanel(username, p);
         cell.querySelector(".js-save").addEventListener("click", async () => {
           const body = {};
@@ -4102,7 +4241,7 @@
     // SMTP status + recipients
     const loadSmtpStatus = async () => {
       try {
-        const s = await api("/admin/smtp/status", { timeoutMs: 8000 });
+        const s = await api("/admin/smtp/status", { timeoutMs: 16000 });
         const smtpEl = $v("#smtpStatus");
         if (!smtpEl) return;
         const okBadge = s.enabled
@@ -4124,7 +4263,7 @@
     };
     const loadRecipients = async () => {
       try {
-        const d = await api("/admin/alert-recipients", { timeoutMs: 8000 });
+        const d = await api("/admin/alert-recipients", { timeoutMs: 16000 });
         const items = d.items || [];
         const listEl = $v("#recipientList");
         if (!listEl) return;
@@ -4171,7 +4310,7 @@
     });
     const loadTgStatus = async () => {
       try {
-        const t = await api("/admin/telegram/status", { timeoutMs: 8000 });
+        const t = await api("/admin/telegram/status", { timeoutMs: 16000 });
         const tgEl = $v("#tgStatus");
         if (!tgEl) return;
         const badge = t.enabled
@@ -4202,7 +4341,7 @@
       if (!el) return;
       el.innerHTML = `<p class="muted">Loading bindings…</p>`;
       try {
-        const d = await api("/admin/telegram/bindings", { timeoutMs: 8000 });
+        const d = await api("/admin/telegram/bindings", { timeoutMs: 16000 });
         const items = d.items || [];
         el.innerHTML = items.length === 0
           ? `<p class="muted">No bindings yet.</p>`
@@ -4273,7 +4412,7 @@
     const loadPendAdmins = async () => {
       if (!isSuper) return;
       try {
-        const d = await api("/auth/signup/pending", { timeoutMs: 8000 });
+        const d = await api("/auth/signup/pending", { timeoutMs: 16000 });
         const items = d.items || [];
         const pendEl = $v("#pendAdmins");
         if (!pendEl) return;
@@ -4319,7 +4458,7 @@
   // Unified: device alarms + dashboard/API remote siren (who / what / when / where / fan-out)
   async function renderSignalsPage(view, _args, routeSeq) {
     setCrumb("Signals");
-    view.innerHTML = `
+    mountView(view, `
       <div class="card">
         <div class="row" style="flex-wrap:wrap;align-items:flex-end;gap:12px">
           <div style="flex:1;min-width:200px">
@@ -4333,15 +4472,15 @@
         <div class="stats" id="sigSummary"></div>
         <div class="divider"></div>
         <div id="sigList"></div>
-      </div>`;
+      </div>`);
     const reload = async () => {
       const hours = parseInt($("#sig_hours").value, 10) || 168;
       const qs = new URLSearchParams({ limit: "200", since_hours: String(hours) });
       try {
         if (!isRouteCurrent(routeSeq)) return;
         const [d, sumR] = await Promise.all([
-          api("/activity/signals?" + qs.toString(), { timeoutMs: 12000 }),
-          api("/alarms/summary", { timeoutMs: 8000 }).catch(() => ({ last_24h: 0, last_7d: 0, top_sources_7d: [] })),
+          api("/activity/signals?" + qs.toString(), { timeoutMs: 24000 }),
+          api("/alarms/summary", { timeoutMs: 16000 }).catch(() => ({ last_24h: 0, last_7d: 0, top_sources_7d: [] })),
         ]);
         if (!isRouteCurrent(routeSeq)) return;
         const sigSummaryEl = $("#sigSummary", view);
@@ -4433,10 +4572,10 @@
   registerRoute("ota", async (view, _args, routeSeq) => {
     setCrumb("OTA");
     const me = state.me || { username: "", role: "" };
-    if (!hasRole("admin")) { view.innerHTML = `<div class="card"><p class="muted">OTA is available to admin and above.</p></div>`; return; }
+    if (!hasRole("admin")) { mountView(view, `<div class="card"><p class="muted">OTA is available to admin and above.</p></div>`); return; }
     const isSuper = me.role === "superadmin";
 
-    view.innerHTML = `
+    mountView(view, `
       ${isSuper ? `
       <div class="card">
         <h2>New OTA campaign</h2>
@@ -4467,12 +4606,12 @@
         </div>
         <div id="campList" class="muted" style="margin-top:8px">Loading…</div>
       </div>
-      <div id="campDetail"></div>`;
+      <div id="campDetail"></div>`);
 
     async function loadCampaigns() {
       try {
         if (!isRouteCurrent(routeSeq)) return;
-        const r = await api("/ota/campaigns", { timeoutMs: 10000 });
+        const r = await api("/ota/campaigns", { timeoutMs: 30000 });
         if (!isRouteCurrent(routeSeq)) return;
         const list = r.items || [];
         const campListEl = $("#campList", view);
@@ -4544,7 +4683,7 @@
 
     if (isSuper) {
       try {
-        const fw = await api("/ota/firmwares", { timeoutMs: 10000 });
+        const fw = await api("/ota/firmwares", { timeoutMs: 30000 });
         if (!isRouteCurrent(routeSeq)) return;
         const fwListEl = $("#fwList", view);
         if (!fwListEl) return;
