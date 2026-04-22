@@ -121,6 +121,11 @@ class _TelegramQueue:
                 for k in ("reason", "error", "result", "state", "duration_ms", "fanout_count"):
                     if k in d and d.get(k) not in (None, ""):
                         keep[k] = d.get(k)
+                # Rich login/device context is kept only for superadmin actor events.
+                if bool(ev.get("_actor_superadmin")):
+                    for k in ("ip", "platform", "device_type", "mac_hint"):
+                        if k in d and d.get(k) not in (None, ""):
+                            keep[k] = d.get(k)
                 if keep:
                     detail_short = " · " + ", ".join([f"{k}={keep[k]}" for k in keep.keys()])
         except Exception:

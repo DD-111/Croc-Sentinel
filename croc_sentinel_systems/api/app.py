@@ -1117,6 +1117,7 @@ def emit_event(
         "ref_table": ref_table,
         "ref_id": ref_id,
     }
+    ev["_actor_superadmin"] = _is_superadmin_username(str(ev.get("actor") or ""))
     rid = _insert_event_row(ev)
     ev["id"] = rid
     event_bus.publish(ev)
@@ -2840,6 +2841,45 @@ def _client_ip(request: Request) -> str:
     return "?"
 
 
+def _client_context(request: Request) -> dict[str, str]:
+    """Best-effort client context for auth logs (IP + UA-derived platform).
+
+    Browser and HTTP clients do not expose endpoint MAC reliably; if an upstream
+    proxy/device gateway sets one, we accept it via x-client-mac/x-device-mac.
+    """
+    ip = _client_ip(request)
+    ua = str(request.headers.get("user-agent") or "").strip()
+    ua_l = ua.lower()
+    if "iphone" in ua_l or "ipad" in ua_l or "ios" in ua_l:
+        platform = "iPhone/iOS"
+    elif "android" in ua_l:
+        platform = "Android"
+    elif "windows" in ua_l:
+        platform = "Windows"
+    elif "mac os" in ua_l or "macintosh" in ua_l:
+        platform = "macOS"
+    elif "linux" in ua_l:
+        platform = "Linux"
+    else:
+        platform = "Unknown"
+    if "mobile" in ua_l:
+        device_type = "mobile"
+    elif "tablet" in ua_l or "ipad" in ua_l:
+        device_type = "tablet"
+    else:
+        device_type = "desktop"
+    mac_hint = str(request.headers.get("x-client-mac") or request.headers.get("x-device-mac") or "").strip()
+    out = {
+        "ip": ip,
+        "platform": platform,
+        "device_type": device_type,
+        "ua": ua[:220],
+    }
+    if mac_hint:
+        out["mac_hint"] = mac_hint[:64]
+    return out
+
+
 def _check_login_rate(ip: str, username: str) -> None:
     """Raise 429 if the ip OR username has too many recent failures."""
     cutoff = int(time.time()) - LOGIN_RATE_WINDOW_SECONDS
@@ -3666,7 +3706,8 @@ def auth_forgot_complete(body: ForgotCompleteRequest, request: Request) -> dict[
 
 @app.post("/auth/login")
 def auth_login(body: LoginRequest, request: Request) -> dict[str, Any]:
-    ip = _client_ip(request)
+    ctx = _client_context(request)
+    ip = ctx["ip"]
     _check_login_rate(ip, body.username)
     with db_lock:
         conn = get_conn()
@@ -3676,12 +3717,12 @@ def auth_login(body: LoginRequest, request: Request) -> dict[str, Any]:
         conn.close()
     if not row or not verify_password(body.password, str(row["password_hash"])):
         _record_login_failure(ip, body.username)
-        audit_event(f"ip:{ip}", "auth.login.fail", body.username, {})
+        audit_event(f"ip:{ip}", "auth.login.fail", body.username, ctx)
         raise HTTPException(status_code=401, detail="invalid credentials")
     # Status gate: pending / awaiting_approval / disabled cannot log in.
     status = str(row["status"] if "status" in row.keys() else "active") or "active"
     if status == "disabled":
-        audit_event(f"ip:{ip}", "auth.login.disabled", body.username, {})
+        audit_event(f"ip:{ip}", "auth.login.disabled", body.username, ctx)
         raise HTTPException(status_code=403, detail="account disabled")
     if status == "pending":
         raise HTTPException(status_code=403, detail="account not activated yet — please enter the verification code sent to your email")
@@ -3690,7 +3731,7 @@ def auth_login(body: LoginRequest, request: Request) -> dict[str, Any]:
     _clear_login_failures(body.username)
     zones = zones_from_json(str(row["allowed_zones_json"]))
     token = issue_jwt(str(row["username"]), str(row["role"]), zones)
-    audit_event(str(row["username"]), "auth.login.ok", "", {"ip": ip})
+    audit_event(str(row["username"]), "auth.login.ok", "", ctx)
     return {"access_token": token, "token_type": "bearer", "role": row["role"], "zones": zones}
 
 
