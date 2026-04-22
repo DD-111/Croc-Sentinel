@@ -1192,11 +1192,43 @@
       <section class="card">
         <div class="row">
           <h2 style="margin:0">Group cards</h2>
+          ${state.me && state.me.role === "superadmin" ? `<button class="btn sm secondary right" id="grpShareOpen">Sharing</button>` : ""}
           <button class="btn sm secondary right" id="grpNew">New group</button>
         </div>
         <div class="divider"></div>
         <div id="groupCards" class="device-grid"></div>
       </section>
+      <div id="shareModal" class="grp-modal" style="display:none">
+        <div class="grp-modal-card" style="max-width:760px;width:min(760px,96vw)">
+          <h3 style="margin:0 0 8px">Share devices / group</h3>
+          <p class="muted" id="shareTargetHint" style="margin:0 0 10px">Select devices, users, and permissions.</p>
+          <div class="row" style="gap:10px;align-items:flex-start;flex-wrap:wrap">
+            <div style="flex:1;min-width:280px">
+              <div class="row" style="justify-content:space-between;align-items:center">
+                <strong>Devices</strong>
+                <label class="muted"><input type="checkbox" id="shareSelAllDevices" /> Select all</label>
+              </div>
+              <div id="shareDeviceList" class="grp-pick-list" style="max-height:260px;overflow:auto"></div>
+            </div>
+            <div style="flex:1;min-width:280px">
+              <div class="row" style="justify-content:space-between;align-items:center">
+                <strong>Users</strong>
+                <label class="muted"><input type="checkbox" id="shareSelAllUsers" /> Select all</label>
+              </div>
+              <div id="shareUserList" class="grp-pick-list" style="max-height:260px;overflow:auto"></div>
+            </div>
+          </div>
+          <div class="row" style="margin-top:10px;gap:14px">
+            <label><input type="checkbox" id="sharePermView" checked /> can_view</label>
+            <label><input type="checkbox" id="sharePermOperate" /> can_operate</label>
+          </div>
+          <p class="muted" id="shareBatchStat" style="min-height:1.2em;margin:8px 0 0"></p>
+          <div class="row" style="justify-content:flex-end;gap:8px;margin-top:10px">
+            <button class="btn sm secondary" id="shareModalCancel" type="button">Cancel</button>
+            <button class="btn sm" id="shareModalApply" type="button">Apply sharing</button>
+          </div>
+        </div>
+      </div>
       <div id="grpSetModal" class="grp-modal" style="display:none">
         <div class="grp-modal-card">
           <h3 style="margin:0 0 8px">Group trigger settings</h3>
@@ -1236,6 +1268,7 @@
     const groupCardsEl = $("#groupCards", view);
     const grpModalEl = $("#grpModal", view);
     const grpSetModalEl = $("#grpSetModal", view);
+    const shareModalEl = $("#shareModal", view);
     if (!groupCardsEl || !grpModalEl || !grpSetModalEl) return;
 
     let editingGroup = "";
@@ -1291,7 +1324,11 @@
         const modeLabel = String(gs.trigger_mode || "continuous") === "delay"
           ? `delay ${Number(gs.delay_seconds || 0)}s`
           : "continuous";
+        const shareBtn = state.me && state.me.role === "superadmin"
+          ? `<button class="group-del-ico js-share-group" data-group="${escapeHtml(g)}" type="button" title="Share group" style="right:32px">⇪</button>`
+          : "";
         return `<article class="device-card js-group-card ${selectedGroup === g ? "is-selected" : ""}" data-group="${escapeHtml(g)}" style="cursor:pointer;position:relative">
+          ${shareBtn}
           <button class="group-del-ico js-del-group" data-group="${escapeHtml(g)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group cannot be deleted\"" : "title=\"Delete group\""} aria-label="Delete group">✕</button>
           <h3><div class="device-primary-name">${escapeHtml(m.display_name || g)}</div><div class="device-id-sub mono">${escapeHtml(g)}</div></h3>
           <div class="meta" style="margin-bottom:8px">
@@ -1518,8 +1555,99 @@
       grpModalEl.style.display = "flex";
     };
     const closeGroupModal = () => { grpModalEl.style.display = "none"; };
+    let sharePrefillGroup = "";
+    const openShareModal = async (prefillGroup) => {
+      if (!shareModalEl) return;
+      sharePrefillGroup = String(prefillGroup || "").trim();
+      const devListEl = $("#shareDeviceList", view);
+      const userListEl = $("#shareUserList", view);
+      const hintEl = $("#shareTargetHint", view);
+      const statEl = $("#shareBatchStat", view);
+      if (!devListEl || !userListEl || !hintEl || !statEl) return;
+      statEl.textContent = "";
+      hintEl.textContent = sharePrefillGroup
+        ? `Group: ${sharePrefillGroup} (you can still adjust selections).`
+        : "Select devices, users, and permissions.";
+      const picked = new Set(sharePrefillGroup ? groupDeviceIds(sharePrefillGroup).map(String) : []);
+      devListEl.innerHTML = devices
+        .filter((d) => !d.is_shared)
+        .map((d) => `<label class="grp-pick-item"><input type="checkbox" value="${escapeHtml(d.device_id)}" ${picked.has(String(d.device_id)) ? "checked" : ""}/> <span>${escapeHtml(d.display_label || d.device_id)} <span class="mono">(${escapeHtml(d.device_id)})</span></span></label>`)
+        .join("") || `<p class="muted">No own devices available.</p>`;
+      userListEl.innerHTML = `<p class="muted">Loading users…</p>`;
+      try {
+        const u = await api("/auth/users", { timeoutMs: 8000 });
+        const users = (u.items || [])
+          .filter((x) => {
+            const role = String(x.role || "");
+            const st = String(x.status || "active");
+            return (role === "admin" || role === "user") && (st === "active" || st === "");
+          });
+        userListEl.innerHTML = users.map((x) =>
+          `<label class="grp-pick-item"><input type="checkbox" value="${escapeHtml(x.username)}"/> <span>${escapeHtml(x.username)} <span class="mono">(${escapeHtml(x.role || "user")})</span></span></label>`,
+        ).join("") || `<p class="muted">No active admin/user accounts.</p>`;
+      } catch (e) {
+        userListEl.innerHTML = `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`;
+      }
+      const allDev = $("#shareSelAllDevices", view);
+      const allUsr = $("#shareSelAllUsers", view);
+      if (allDev) {
+        allDev.checked = false;
+        allDev.onchange = () => {
+          $$("#shareDeviceList input[type='checkbox']", view).forEach((x) => { x.checked = !!allDev.checked; });
+        };
+      }
+      if (allUsr) {
+        allUsr.checked = false;
+        allUsr.onchange = () => {
+          $$("#shareUserList input[type='checkbox']", view).forEach((x) => { x.checked = !!allUsr.checked; });
+        };
+      }
+      shareModalEl.style.display = "flex";
+    };
+    const closeShareModal = () => { if (shareModalEl) shareModalEl.style.display = "none"; };
     $("#grpNew", view).addEventListener("click", () => openGroupModal(""));
     $("#gmCancel", view).addEventListener("click", closeGroupModal);
+    const grpShareOpenBtn = $("#grpShareOpen", view);
+    if (grpShareOpenBtn) grpShareOpenBtn.addEventListener("click", () => openShareModal(""));
+    const shareCancelBtn = $("#shareModalCancel", view);
+    if (shareCancelBtn) shareCancelBtn.addEventListener("click", closeShareModal);
+    const shareApplyBtn = $("#shareModalApply", view);
+    if (shareApplyBtn) {
+      shareApplyBtn.addEventListener("click", async () => {
+        const statEl = $("#shareBatchStat", view);
+        const deviceIds = $$("#shareDeviceList input[type='checkbox']", view).filter((x) => x.checked).map((x) => String(x.value || "").trim()).filter(Boolean);
+        const usernames = $$("#shareUserList input[type='checkbox']", view).filter((x) => x.checked).map((x) => String(x.value || "").trim()).filter(Boolean);
+        const canView = !!$("#sharePermView", view)?.checked;
+        const canOperate = !!$("#sharePermOperate", view)?.checked;
+        if (!deviceIds.length) { toast("Select at least one device", "err"); return; }
+        if (!usernames.length) { toast("Select at least one user", "err"); return; }
+        if (!canView && !canOperate) { toast("Select at least one permission", "err"); return; }
+        const total = deviceIds.length * usernames.length;
+        let ok = 0;
+        let fail = 0;
+        if (statEl) statEl.textContent = `Applying ${total} share grants…`;
+        for (const did of deviceIds) {
+          for (const user of usernames) {
+            try {
+              await api(`/admin/devices/${encodeURIComponent(did)}/share`, {
+                method: "POST",
+                body: { grantee_username: user, can_view: canView, can_operate: canOperate },
+              });
+              ok += 1;
+            } catch {
+              fail += 1;
+            }
+            if (statEl) statEl.textContent = `Applied ${ok + fail}/${total} · ok ${ok} · failed ${fail}`;
+          }
+        }
+        if (fail === 0) {
+          toast(`Sharing applied (${ok}/${total})`, "ok");
+          closeShareModal();
+        } else {
+          toast(`Sharing done with failures (${ok} ok, ${fail} failed)`, "warn");
+        }
+      });
+    }
     $("#gmSave", view).addEventListener("click", () => {
       const key = String($("#gmKey", view).value || "").trim();
       if (!key) { toast("Group key required", "err"); return; }
@@ -1545,6 +1673,11 @@
         }
         if (btn.classList.contains("js-group-settings")) {
           openSettingsModal(g);
+          return;
+        }
+        if (btn.classList.contains("js-share-group")) {
+          if (!(state.me && state.me.role === "superadmin")) { toast("Superadmin only", "err"); return; }
+          openShareModal(g);
           return;
         }
         if (btn.classList.contains("js-del-group")) {
@@ -1751,6 +1884,16 @@
     const wifiChDd = (netT === "wifi" && s.wifi_channel != null && Number(s.wifi_channel) > 0)
       ? escapeHtml(String(s.wifi_channel))
       : "—";
+    const rawCommandPanel = (state.me && state.me.role === "superadmin") ? `
+        <div class="card">
+          <h3>Raw command</h3>
+          <label class="field"><span>cmd</span><input id="cmdName" placeholder="get_info / ota" ${can("can_send_command") ? "" : "disabled"} /></label>
+          <label class="field" style="margin-top:8px"><span>params (JSON)</span><textarea id="cmdParams" placeholder='{"key":"value"}' ${can("can_send_command") ? "" : "disabled"}></textarea></label>
+          <div class="row" style="margin-top:8px;justify-content:flex-end">
+            <button class="btn" id="sendCmd" ${can("can_send_command") ? "" : "disabled"}>Send</button>
+          </div>
+        </div>
+      ` : "";
     const sharePanel = state.me && state.me.role === "superadmin" ? `
       <div class="card" id="sharePanel">
         <div class="row">
