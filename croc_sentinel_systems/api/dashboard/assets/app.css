@@ -135,6 +135,43 @@ body {
   padding-top: 6px;
   border-top: none;
 }
+.nav-device-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.nav a.nav-device-link {
+  align-items: flex-start;
+  gap: 8px;
+  padding-top: 7px;
+  padding-bottom: 7px;
+}
+.nav-device-txt {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.nav-device-title {
+  font-size: 12.5px;
+  color: var(--text);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  overflow: hidden;
+  max-width: 180px;
+}
+.nav-device-sub {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  overflow: hidden;
+  max-width: 180px;
+}
+.nav-device-empty {
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 6px 10px 4px;
+}
 
 .health-pills {
   display: none;

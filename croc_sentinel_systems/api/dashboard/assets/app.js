@@ -60,6 +60,10 @@
     health: null,
     overviewCache: null,
     routeSeq: 0,
+    navDevices: [],
+    navDevicesLoading: false,
+    navDevicesError: "",
+    navDevicesAt: 0,
   };
 
   /** Route redirect timer (signup / activate → login); cleared on navigation. */
@@ -535,7 +539,71 @@
         );
       }
     }
+    const rowsAll = Array.isArray(state.navDevices) ? state.navDevices : [];
+    const rows = rowsAll.filter((d) => {
+      if (!state.me) return false;
+      if (state.me.role === "superadmin") return true;
+      if (state.me.role === "admin") return !d.is_shared;
+      return true;
+    });
+    parts.push(`<div class="nav-section">Devices</div>`);
+    if (state.navDevicesLoading && rows.length === 0) {
+      parts.push(`<div class="nav-device-empty">Loading devices...</div>`);
+    } else if (state.navDevicesError && rows.length === 0) {
+      parts.push(`<div class="nav-device-empty">${escapeHtml(state.navDevicesError)}</div>`);
+    } else if (rows.length === 0) {
+      parts.push(`<div class="nav-device-empty">No devices in scope.</div>`);
+    } else {
+      parts.push(`<div class="nav-device-list">`);
+      for (const d of rows.slice(0, 80)) {
+        const did = String(d.device_id || "").trim();
+        if (!did) continue;
+        const nm = String(d.display_label || "").trim();
+        const title = nm || did;
+        const sub = (state.me.role === "superadmin")
+          ? (d.owner_admin ? `owner: ${String(d.owner_admin)}` : "owner: unassigned")
+          : (d.is_shared ? `sharing by ${String(d.shared_by || "?")}` : "owned");
+        const active = hash.startsWith(`#/devices/${encodeURIComponent(did)}`) ? ` aria-current="page"` : "";
+        parts.push(
+          `<a href="#/devices/${encodeURIComponent(did)}"${active} class="nav-device-link" title="${escapeHtml(did)}">` +
+          `<span class="nav-ico">${isOnline(d) ? "●" : "○"}</span>` +
+          `<span class="nav-device-txt"><span class="nav-device-title">${escapeHtml(title)}</span>` +
+          `<span class="nav-device-sub">${escapeHtml(sub)}</span></span>` +
+          `</a>`,
+        );
+      }
+      if (rows.length > 80) parts.push(`<div class="nav-device-empty">+${rows.length - 80} more</div>`);
+      parts.push(`</div>`);
+    }
     nav.innerHTML = parts.join("");
+    const stale = (Date.now() - Number(state.navDevicesAt || 0)) > 10000;
+    if (stale && !state.navDevicesLoading) void refreshNavDevices();
+  }
+
+  async function refreshNavDevices(force) {
+    if (!state.me) return;
+    if (state.navDevicesLoading) return;
+    state.navDevicesLoading = true;
+    if (force) state.navDevicesError = "";
+    try {
+      const r = await apiGetCached("/devices", { timeoutMs: 8000 }, force ? 0 : 7000);
+      state.navDevices = Array.isArray(r && r.items) ? r.items : [];
+      state.navDevicesError = "";
+      state.navDevicesAt = Date.now();
+    } catch (e) {
+      state.navDevicesError = String((e && e.message) || e || "Device list unavailable");
+    } finally {
+      state.navDevicesLoading = false;
+      const nav = $("#nav");
+      if (nav && state.me) {
+        const currentHash = location.hash || "#/overview";
+        const onAuthRoute = currentHash.startsWith("#/login")
+          || currentHash.startsWith("#/signup")
+          || currentHash.startsWith("#/activate")
+          || currentHash.startsWith("#/forgot-password");
+        if (!onAuthRoute) renderNav();
+      }
+    }
   }
 
   function renderHealthPills() {
@@ -2400,7 +2468,7 @@
       deleteResetBtn.addEventListener("click", async () => {
         if (!confirm("Delete this device from current account records? You can re-add and reconfigure later.")) return;
         const typed = String(prompt(`Type device ID to confirm delete/reset:\n${id}`) || "").trim();
-        if (typed !== id) { toast("Confirmation mismatch", "err"); return; }
+        if (typed.toUpperCase() !== String(id).toUpperCase()) { toast("Confirmation mismatch", "err"); return; }
         try {
           await api(`/devices/${encodeURIComponent(id)}/delete-reset`, {
             method: "POST",
@@ -2416,7 +2484,7 @@
       factoryUnregisterBtn.addEventListener("click", async () => {
         if (!confirm("Superadmin action: rollback to UNREGISTERED while keeping factory serial. Continue?")) return;
         const typed = String(prompt(`Type device ID to confirm factory-unregister:\n${id}`) || "").trim();
-        if (typed !== id) { toast("Confirmation mismatch", "err"); return; }
+        if (typed.toUpperCase() !== String(id).toUpperCase()) { toast("Confirmation mismatch", "err"); return; }
         try {
           await api(`/devices/${encodeURIComponent(id)}/factory-unregister`, {
             method: "POST",
