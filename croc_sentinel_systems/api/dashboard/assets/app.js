@@ -1512,7 +1512,9 @@
       </div>
       ${deleteSection}
     `);
-    $("#accChangePw", view).addEventListener("click", async () => {
+    const accChangePwBtn = $("#accChangePw", view);
+    if (accChangePwBtn) {
+      accChangePwBtn.addEventListener("click", async () => {
       try {
         await api("/auth/me/password", {
           method: "PATCH",
@@ -1529,8 +1531,11 @@
         renderAuthState();
         location.hash = "#/login";
       } catch (e) { toast(e.message || e, "err"); }
-    });
-    $("#accDeleteSelf", view).addEventListener("click", async () => {
+      });
+    }
+    const accDeleteSelfBtn = $("#accDeleteSelf", view);
+    if (accDeleteSelfBtn) {
+      accDeleteSelfBtn.addEventListener("click", async () => {
       if (roleNorm === "superadmin") return;
       const msg = roleNorm === "admin"
         ? "Close this admin tenant permanently? All owned devices will be factory-unclaimed and sub-users deleted."
@@ -1557,7 +1562,8 @@
         location.hash = "#/login";
         renderAuthState();
       } catch (e) { toast(e.message || e, "err"); }
-    });
+      });
+    }
   });
 
   // Overview
