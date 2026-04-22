@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Simple Tk GUI: generate signed serials + QR PNGs, optionally auto-register on API."""
+"""Tk GUI: factory serials + QR PNGs; optional POST /factory/devices."""
 from __future__ import annotations
 
 import os
@@ -12,7 +12,6 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-# Allow `python tools/factory_pack/factory_ui.py` from repo root.
 _PACK = Path(__file__).resolve().parent
 if str(_PACK) not in sys.path:
     sys.path.insert(0, str(_PACK))
@@ -50,13 +49,10 @@ def _open_path_in_os(path: Path) -> None:
 class FactoryApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Croc Sentinel — 出厂序列号 / 二维码")
-        self.geometry("880x620")
-        self.minsize(720, 520)
+        self.title("Croc Sentinel · 出厂工具")
+        self.geometry("920x700")
+        self.minsize(760, 560)
 
-        self._apply_style()
-
-        root = repo_root()
         self._dotenv_path = tk.StringVar(value=str(default_dotenv_path()))
         self._api_base = tk.StringVar(value=DEFAULT_FACTORY_UI_API_BASE)
         self._factory_token = tk.StringVar()
@@ -65,12 +61,23 @@ class FactoryApp(tk.Tk):
         self._auto_push = tk.BooleanVar(value=True)
         self._insecure = tk.BooleanVar(value=False)
         self._last_out: Path | None = None
+        self._conn_status = tk.StringVar(value="未检测 · 请点击「测试连接」")
+
+        self._apply_style()
 
         outer = ttk.Frame(self, padding=12)
         outer.pack(fill=tk.BOTH, expand=True)
 
-        cfg = ttk.LabelFrame(outer, text="配置（.env：QR_SIGN_SECRET / FACTORY_*）", padding=10)
-        cfg.pack(fill=tk.X, pady=(0, 10))
+        # —— 连接状态（与服务器是否通）——
+        stat_fr = ttk.LabelFrame(outer, text="服务器连接", padding=10)
+        stat_fr.pack(fill=tk.X, pady=(0, 8))
+        row_s = ttk.Frame(stat_fr)
+        row_s.pack(fill=tk.X)
+        self._lbl_status = ttk.Label(row_s, textvariable=self._conn_status, font=("Segoe UI", 10))
+        self._lbl_status.pack(side=tk.LEFT, anchor=tk.W)
+
+        cfg = ttk.LabelFrame(outer, text="密钥与 API（与 croc_sentinel_systems/.env 一致）", padding=10)
+        cfg.pack(fill=tk.X, pady=(0, 8))
 
         r0 = ttk.Frame(cfg)
         r0.pack(fill=tk.X, pady=2)
@@ -82,13 +89,14 @@ class FactoryApp(tk.Tk):
         r1.pack(fill=tk.X, pady=2)
         ttk.Label(r1, text="API 根地址", width=14).pack(side=tk.LEFT)
         ttk.Entry(r1, textvariable=self._api_base).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
-        ttk.Label(
-            cfg,
-            text="默认指向部署的 /api（Traefik StripPrefix）；不要拼接 /factory；可用 .env 的 FACTORY_UI_API_BASE 覆盖",
-            foreground="#5a5a5a",
-            wraplength=820,
-            justify=tk.LEFT,
-        ).pack(anchor=tk.W, pady=(4, 0))
+
+        hint_api = (
+            "示例（直连容器映射）: http://你的域名:18999 — 不要多写 /factory。"
+            " 若用 HTTPS+Traefik 则为 https://域名/api"
+        )
+        ttk.Label(cfg, text=hint_api, foreground="#555", wraplength=860, justify=tk.LEFT).pack(
+            anchor=tk.W, pady=(4, 0)
+        )
 
         r2 = ttk.Frame(cfg)
         r2.pack(fill=tk.X, pady=6)
@@ -97,8 +105,8 @@ class FactoryApp(tk.Tk):
             side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0)
         )
 
-        batch_fr = ttk.LabelFrame(outer, text="批次与生成", padding=10)
-        batch_fr.pack(fill=tk.X, pady=(0, 10))
+        batch_fr = ttk.LabelFrame(outer, text="批次生成", padding=10)
+        batch_fr.pack(fill=tk.X, pady=(0, 8))
 
         r3 = ttk.Frame(batch_fr)
         r3.pack(fill=tk.X, pady=2)
@@ -108,57 +116,63 @@ class FactoryApp(tk.Tk):
         ttk.Spinbox(r3, from_=1, to=2000, textvariable=self._count, width=10).pack(side=tk.LEFT, padx=(8, 0))
 
         r4 = ttk.Frame(batch_fr)
-        r4.pack(fill=tk.X, pady=(8, 2))
-        ttk.Checkbutton(r4, text="生成后自动 POST /factory/devices", variable=self._auto_push).pack(side=tk.LEFT)
-        ttk.Checkbutton(r4, text="跳过 HTTPS 证书校验（内网/自签）", variable=self._insecure).pack(
-            side=tk.LEFT, padx=(16, 0)
+        r4.pack(fill=tk.X, pady=(6, 2))
+        ttk.Checkbutton(r4, text="生成后登记到服务器（POST /factory/devices）", variable=self._auto_push).pack(
+            side=tk.LEFT
         )
+        ttk.Checkbutton(r4, text="跳过 HTTPS 证书校验", variable=self._insecure).pack(side=tk.LEFT, padx=(16, 0))
 
-        hint = ttk.Label(
+        ttk.Label(
             batch_fr,
-            text="导出目录：仓库根下 factory_serial_exports/output_<Unix时间戳>/，内含 manifest.csv、factory_devices_bulk.json、png/、README_BATCH.txt、BATCH_ID.txt",
-            foreground="#5a5a5a",
-            wraplength=820,
+            text="导出: 仓库 factory_serial_exports/output_<时间戳>/ · manifest.csv · png/ · factory_devices_bulk.json · BATCH_ID.txt",
+            foreground="#555",
+            wraplength=860,
             justify=tk.LEFT,
-        )
-        hint.pack(anchor=tk.W, pady=(6, 0))
+        ).pack(anchor=tk.W, pady=(6, 0))
 
         btn_row = ttk.Frame(outer)
-        btn_row.pack(fill=tk.X, pady=(0, 8))
+        btn_row.pack(fill=tk.X, pady=(0, 6))
         for text, cmd, pad in (
-            ("重新加载 .env", self._load_env, (0, 6)),
-            ("测试 API + Token", self._ping_async, (0, 6)),
-            ("生成（可选登记）", self._run_async, (0, 6)),
+            ("加载 .env", self._load_env, (0, 6)),
+            ("测试连接", self._ping_async, (0, 6)),
+            ("生成", self._run_async, (0, 6)),
             ("验证二维码…", self._verify_dialog, (0, 6)),
-            ("打开上次导出文件夹", self._open_last_export, (0, 6)),
-            ("复制上次路径", self._copy_last_path, (0, 0)),
+            ("打开导出目录", self._open_last_export, (0, 6)),
+            ("复制导出路径", self._copy_last_path, (0, 6)),
+            ("清空日志", self._clear_log, (0, 0)),
         ):
             ttk.Button(btn_row, text=text, command=cmd).pack(side=tk.LEFT, padx=pad)
 
-        log_fr = ttk.LabelFrame(outer, text="日志", padding=(8, 6))
+        log_fr = ttk.LabelFrame(outer, text="运行日志（一行一条）", padding=(8, 6))
         log_fr.pack(fill=tk.BOTH, expand=True)
 
         log_wrap = ttk.Frame(log_fr)
         log_wrap.pack(fill=tk.BOTH, expand=True)
-        scroll = ttk.Scrollbar(log_wrap)
-        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        log_wrap.grid_columnconfigure(0, weight=1)
+        log_wrap.grid_rowconfigure(0, weight=1)
+        xscroll = ttk.Scrollbar(log_wrap, orient=tk.HORIZONTAL)
+        yscroll = ttk.Scrollbar(log_wrap)
         self._log = tk.Text(
             log_wrap,
-            height=14,
-            wrap=tk.WORD,
-            font=("Consolas", 10),
-            yscrollcommand=scroll.set,
+            height=18,
+            wrap=tk.NONE,
+            font=("Consolas", 9),
+            yscrollcommand=yscroll.set,
+            xscrollcommand=xscroll.set,
             undo=False,
         )
-        self._log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scroll.config(command=self._log.yview)
+        self._log.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        yscroll.config(command=self._log.yview)
+        xscroll.config(command=self._log.xview)
 
         self._ping_lock = threading.Lock()
         self._load_env()
 
     def _apply_style(self) -> None:
         try:
-            self.call("tk", "scaling", 1.1)
+            self.call("tk", "scaling", 1.08)
         except tk.TclError:
             pass
         style = ttk.Style(self)
@@ -167,26 +181,62 @@ class FactoryApp(tk.Tk):
         else:
             style.theme_use("clam")
         style.configure("TLabelframe", padding=(10, 8))
-        style.configure("TButton", padding=(10, 6))
+        style.configure("TButton", padding=(8, 5))
 
     def _browse_dotenv(self) -> None:
-        p = filedialog.askopenfilename(
-            title="选择 .env",
-            filetypes=[("env", "*.env"), ("All", "*.*")],
-        )
+        p = filedialog.askopenfilename(title="选择 .env", filetypes=[("env", "*.env"), ("All", "*.*")])
         if p:
             self._dotenv_path.set(p)
 
-    def _append(self, s: str) -> None:
-        self._log.insert(tk.END, s + "\n")
+    def _clear_log(self) -> None:
+        self._log.delete("1.0", tk.END)
+
+    def _line(self, msg: str) -> None:
+        """One logical line (no embedded newlines — split caller side)."""
+        self._log.insert(tk.END, msg.rstrip("\r\n") + "\n")
         self._log.see(tk.END)
+
+    def _lines(self, prefix: str, text: str, *, max_lines: int = 80) -> None:
+        """Split server body into one log line each."""
+        parts = text.replace("\r\n", "\n").split("\n")
+        for i, ln in enumerate(parts[:max_lines]):
+            s = ln.strip()
+            if not s and i > 0:
+                continue
+            self._line(f"{prefix}{s}")
+        if len(parts) > max_lines:
+            self._line(f"{prefix}… ({len(parts) - max_lines} more lines omitted)")
+
+    def _set_status(self, text: str) -> None:
+        self._conn_status.set(text)
+
+    def _browse_dotenv_path_display(self, dot: Path) -> None:
+        env = read_dotenv_keys(dot, ("QR_SIGN_SECRET", "FACTORY_API_TOKEN", "FACTORY_UI_API_BASE"))
+        if env.get("FACTORY_UI_API_BASE", "").strip():
+            self._api_base.set(env["FACTORY_UI_API_BASE"].strip())
+        if env.get("FACTORY_API_TOKEN") and not self._factory_token.get().strip():
+            self._factory_token.set(env["FACTORY_API_TOKEN"].strip())
+        qs = "yes" if env.get("QR_SIGN_SECRET") else "NO"
+        ft = env.get("FACTORY_API_TOKEN") or ""
+        fs = "yes" if ft.strip() else "NO"
+        flen = len(ft.strip())
+        ab = "yes" if (env.get("FACTORY_UI_API_BASE") or "").strip() else "NO"
+        self._line(f"[env] path={dot}")
+        self._line(f"[env] QR_SIGN_SECRET={qs}")
+        self._line(f"[env] FACTORY_API_TOKEN={fs} len={flen}")
+        self._line(f"[env] FACTORY_UI_API_BASE={ab}")
+
+    def _load_env(self) -> None:
+        dot = Path(self._dotenv_path.get())
+        self._browse_dotenv_path_display(dot)
+        self._set_status("已从 .env 加载 · 请点击「测试连接」确认服务器")
 
     def _set_last_out(self, p: Path) -> None:
         self._last_out = p
 
     def _open_last_export(self) -> None:
         if not self._last_out or not self._last_out.is_dir():
-            messagebox.showinfo("提示", "尚无本次会话内的导出目录；请先生成一批。")
+            messagebox.showinfo("提示", "尚无导出目录；请先生成一批。")
             return
         _open_path_in_os(self._last_out)
 
@@ -196,21 +246,7 @@ class FactoryApp(tk.Tk):
             return
         self.clipboard_clear()
         self.clipboard_append(str(self._last_out.resolve()))
-        self._append(f"[clipboard] {self._last_out}")
-
-    def _load_env(self) -> None:
-        dot = Path(self._dotenv_path.get())
-        env = read_dotenv_keys(dot, ("QR_SIGN_SECRET", "FACTORY_API_TOKEN", "FACTORY_UI_API_BASE"))
-        if env.get("FACTORY_UI_API_BASE", "").strip():
-            self._api_base.set(env["FACTORY_UI_API_BASE"].strip())
-        if env.get("FACTORY_API_TOKEN") and not self._factory_token.get().strip():
-            self._factory_token.set(env["FACTORY_API_TOKEN"].strip())
-        ft = env.get("FACTORY_API_TOKEN") or ""
-        self._append(
-            f"[load] {dot}  QR_SECRET={'yes' if env.get('QR_SIGN_SECRET') else 'NO'}  "
-            f"FACTORY_TOKEN={'yes' if ft.strip() else 'NO'}(len={len(ft.strip())})  "
-            f"API_BASE={'set' if (env.get('FACTORY_UI_API_BASE') or '').strip() else 'NO'}"
-        )
+        self._line(f"[clipboard] {self._last_out}")
 
     def _run_async(self) -> None:
         threading.Thread(target=self._run_job, daemon=True).start()
@@ -223,7 +259,7 @@ class FactoryApp(tk.Tk):
             self.after(0, lambda: fn(*a, **kw))
 
         if not self._ping_lock.acquire(blocking=False):
-            ui(self._append, "[ping] skipped — test already running")
+            self._line("[ping] skipped (already running)")
             return
         try:
             dot = Path(self._dotenv_path.get())
@@ -232,14 +268,20 @@ class FactoryApp(tk.Tk):
             tok = self._factory_token.get().strip() or env.get("FACTORY_API_TOKEN", "").strip()
             if not api or not tok:
                 ui(messagebox.showwarning, "缺少配置", "请填写 API 根地址与 Factory Token（或写入 .env）。")
+                ui(self._set_status, "失败 · 缺少 API 或 Token")
                 return
-            ui(self._append, f"[ping] trying {api}/factory/ping …")
+            ui(self._set_status, f"检测中… {api}")
+            ui(self._line, f"[ping] GET {api}/factory/ping")
+            ui(self._line, f"[ping] token_len={len(tok)}")
             code, body = get_factory_ping(api, tok, insecure_ssl=self._insecure.get())
-            ui(self._append, f"[ping] GET /factory/ping -> HTTP {code}\n{body}")
+            ui(self._line, f"[ping] http_status={code}")
+            ui(self._lines, "[ping] body | ", body)
             if code in (200, 201):
-                ui(messagebox.showinfo, "连接正常", "FACTORY_API_TOKEN 已被服务器接受。")
+                ui(self._set_status, f"已连接 · {api}")
+                ui(messagebox.showinfo, "连接正常", "服务器已接受 FACTORY_API_TOKEN。")
             else:
-                ui(messagebox.showerror, "失败", f"HTTP {code}\n{body[:900]}")
+                ui(self._set_status, f"失败 · HTTP {code}")
+                ui(messagebox.showerror, "连接失败", f"HTTP {code}\n{body[:1200]}")
         finally:
             self._ping_lock.release()
 
@@ -257,23 +299,26 @@ class FactoryApp(tk.Tk):
 
             n = int(self._count.get())
             batch = self._batch.get().strip() or f"GUI_{int(time.time())}"
-            ui(self._append, f"[gen] count={n} batch={batch}")
+            ui(self._line, "[gen] start")
+            ui(self._line, f"[gen] count={n}")
+            ui(self._line, f"[gen] batch={batch}")
             items = generate_items(n, secret, batch)
             out = repo_root() / "factory_serial_exports" / build_output_dir_name(len(items))
             write_batch_files(out, items, batch, qr_secret=secret)
             (out / "BATCH_ID.txt").write_text(batch + "\n", encoding="utf-8")
             ui(self._set_last_out, out)
-            ui(self._append, f"[ok] 已写入: {out}")
-            ui(self._append, "[qr] policy+signature verification passed for all generated items")
+            ui(self._line, f"[gen] output_dir={out}")
+            ui(self._line, "[gen] qr_verify=all_ok")
 
             if self._auto_push.get():
                 api = self._api_base.get().strip().rstrip("/")
                 tok = self._factory_token.get().strip() or env.get("FACTORY_API_TOKEN", "").strip()
                 if not api:
-                    ui(messagebox.showwarning, "未登记", "未填写 API 根地址，已只生成本地文件。")
+                    ui(messagebox.showwarning, "未登记", "未填写 API 根地址，仅生成本地文件。")
+                    ui(self._set_status, "仅本地导出（未推送）")
                     return
                 if not tok:
-                    ui(messagebox.showerror, "错误", "需要 FACTORY_API_TOKEN（界面或 .env）才能登记。")
+                    ui(messagebox.showerror, "错误", "登记需要 FACTORY_API_TOKEN。")
                     return
                 queue_path = repo_root() / "factory_serial_exports" / "pending_push_queue.json"
                 queued_before = len(load_pending_push_queue(queue_path))
@@ -285,47 +330,53 @@ class FactoryApp(tk.Tk):
                         insecure_ssl=self._insecure.get(),
                         max_batches=20,
                     )
-                    ui(
-                        self._append,
-                        f"[retry] queue_before={queued_before} drained={drained} remain={len(load_pending_push_queue(queue_path))}",
-                    )
+                    ui(self._line, f"[retry] queue_before={queued_before}")
+                    ui(self._line, f"[retry] drained={drained}")
+                    ui(self._line, f"[retry] remain={len(load_pending_push_queue(queue_path))}")
                     for a in attempts:
-                        ui(self._append, f"[retry] batch={a.get('batch')} code={a.get('code')} ok={a.get('ok')}")
-                ui(self._append, f"[push] POST {api}/factory/devices  token_len={len(tok)}")
+                        ui(self._line, f"[retry] batch={a.get('batch')} code={a.get('code')} ok={a.get('ok')}")
+                ui(self._line, f"[push] url={api}/factory/devices")
+                ui(self._line, f"[push] token_len={len(tok)}")
                 code, body = post_factory_devices(api, tok, items, insecure_ssl=self._insecure.get())
-                ui(self._append, f"[push] HTTP {code}\n{body}")
+                ui(self._line, f"[push] http_status={code}")
+                ui(self._lines, "[push] body | ", body)
                 ok = code in (200, 201)
                 status_file = write_push_status_file(out, batch, items, code, body, pushed_ok=ok, retry_attempt=0)
-                ui(self._append, f"[push] status file: {status_file}")
+                ui(self._line, f"[push] status_json={status_file}")
                 if ok:
                     first = str(items[0].get("serial") or "")
                     qr0 = str(items[0].get("qr_code") or "")
                     base = api.rstrip("/")
                     qparam = urllib.parse.quote(qr0 if qr0 else first, safe="")
                     dash = f"{base}/dashboard/#/activate?q={qparam}"
-                    ui(self._append, f"[link] 登录 Dashboard 后打开（预填激活框）:\n{dash}")
+                    ui(self._line, "[push] ok=1")
+                    ui(self._line, f"[link] activate_url={dash}")
+                    ui(self._set_status, f"已登记 · {api}")
                     ui(
                         messagebox.showinfo,
                         "完成",
-                        f"已登记 {len(items)} 条。\n\n下一步：浏览器登录控制台后打开「激活设备」，或复制日志里的 link 整行。\n\n{out}",
+                        f"已登记 {len(items)} 条。\n导出目录:\n{out}",
                     )
                 else:
                     qlen = append_pending_push_queue(
                         queue_path, batch, items, reason=f"HTTP {code}: {body[:500]}"
                     )
-                    ui(self._append, f"[queue] pushed to retry queue: {queue_path} (size={qlen})")
+                    ui(self._line, f"[queue] path={queue_path}")
+                    ui(self._line, f"[queue] size={qlen}")
+                    ui(self._set_status, f"登记失败 · HTTP {code}")
                     hint = ""
                     if code == 403:
                         hint = (
-                            "\n\n403 常见原因：\n"
-                            "1) 服务器 croc_sentinel_systems/.env 里未设置 FACTORY_API_TOKEN，或改后未执行 docker compose restart api；\n"
-                            "2) 本界面 / 本机 .env 里的 Token 与服务器那一行不完全一致（空格、换行、引号）。"
+                            "\n\n403: 核对服务器 FACTORY_API_TOKEN；改 .env 后 docker compose restart api。"
                         )
                     ui(messagebox.showerror, "登记失败", f"HTTP {code}\n{body[:800]}{hint}")
             else:
+                ui(self._line, "[push] skipped auto_push=0")
+                ui(self._set_status, "仅本地导出")
                 ui(messagebox.showinfo, "完成", f"已生成 {len(items)} 条（未推送）。\n{out}")
         except Exception as e:
-            ui(self._append, f"[err] {e!r}")
+            ui(self._line, f"[err] {e!r}")
+            ui(self._set_status, "出错")
             ui(messagebox.showerror, "错误", str(e))
 
     def _verify_dialog(self) -> None:
@@ -337,7 +388,7 @@ class FactoryApp(tk.Tk):
             return
         d = tk.Toplevel(self)
         d.title("验证二维码")
-        d.geometry("640x240")
+        d.geometry("640x260")
         d.minsize(480, 200)
         ttk.Label(d, text="粘贴整行 CROC|…").pack(anchor=tk.W, padx=12, pady=(10, 4))
         txt = tk.Text(d, height=5, wrap=tk.NONE, font=("Consolas", 10))

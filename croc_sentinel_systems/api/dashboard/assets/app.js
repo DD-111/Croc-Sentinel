@@ -262,6 +262,7 @@
   }
 
   /** Read chunked text/event-stream; invokes onFrame(type, payload) where type is "message"|"ping". */
+  const SSE_PARSE_BUF_MAX = 262144;
   async function pumpSseBody(reader, signal, onFrame) {
     const dec = new TextDecoder();
     let buf = "";
@@ -275,6 +276,10 @@
       const { done, value } = chunk || {};
       if (done) break;
       buf += dec.decode(value, { stream: true });
+      if (buf.length > SSE_PARSE_BUF_MAX) {
+        const cut = buf.lastIndexOf("\n\n", buf.length - 65536);
+        buf = cut > 0 ? buf.slice(cut + 2) : "";
+      }
       for (;;) {
         const m = buf.match(/\r?\n\r?\n/);
         if (!m) break;
@@ -582,6 +587,23 @@
   /** Short-lived GET cache to avoid duplicate round-trips when navigating (server still uses CACHE_TTL). */
   const _apiGetCache = new Map();
   const _apiGetInflight = new Map();
+  const _API_GET_CACHE_MAX_KEYS = 48;
+  function _apiGetCacheSet(path, data) {
+    const p = String(path || "");
+    _apiGetCache.set(p, { t: Date.now(), data });
+    while (_apiGetCache.size > _API_GET_CACHE_MAX_KEYS) {
+      let oldestK = null;
+      let oldestT = Infinity;
+      for (const [k, v] of _apiGetCache.entries()) {
+        if (v && v.t < oldestT) {
+          oldestT = v.t;
+          oldestK = k;
+        }
+      }
+      if (oldestK != null) _apiGetCache.delete(oldestK);
+      else break;
+    }
+  }
   async function apiGetCached(path, opts, ttlMs) {
     const ttl = ttlMs != null ? ttlMs : 4500;
     const ent = _apiGetCache.get(path);
@@ -590,7 +612,7 @@
     if (_apiGetInflight.has(path)) return _apiGetInflight.get(path);
     const p = (async () => {
       const data = await api(path, opts);
-      _apiGetCache.set(path, { t: Date.now(), data });
+      _apiGetCacheSet(path, data);
       return data;
     })();
     _apiGetInflight.set(path, p);
@@ -1649,8 +1671,8 @@
     const groupSettingsItems = (grpSetRes.status === "fulfilled" && grpSetRes.value && Array.isArray(grpSetRes.value.items))
       ? grpSetRes.value.items
       : [];
-    const devices = list.items || [];
-    const byId = new Map(devices.map((d) => [String(d.device_id), d]));
+    let devices = list.items || [];
+    let byId = new Map(devices.map((d) => [String(d.device_id), d]));
 
     const GROUP_META_LS_KEY = `croc.group.meta.v2.${groupScope}`;
     const GROUP_SETTINGS_LS_KEY = `croc.group.settings.v1.${groupScope}`;
@@ -2288,6 +2310,56 @@
       if (!g) return;
       location.hash = `#/group/${encodeURIComponent(g)}`;
     });
+    const OVERVIEW_LIVE_MS = 7500;
+    const refreshOverviewLive = async () => {
+      if (!isRouteCurrent(routeSeq)) return;
+      try {
+        bustApiGetCachedPrefix("/dashboard/overview");
+        bustApiGetCachedPrefix("/devices");
+        const [ovN, listN] = await Promise.all([
+          api("/dashboard/overview", { timeoutMs: 14000 }),
+          api("/devices", { timeoutMs: 14000 }),
+        ]);
+        if (!isRouteCurrent(routeSeq)) return;
+        ov = ovN || ov;
+        list = listN || list;
+        state.overviewCache = { ov, list, ts: Date.now() };
+        devices = Array.isArray(list.items) ? list.items.slice() : [];
+        byId = new Map(devices.map((d) => [String(d.device_id), d]));
+        const hh = state.health || {};
+        const mqConnected = !!(hh.mqtt_connected ?? ov.mqtt_connected);
+        const mqQDepth = Number(hh.mqtt_ingest_queue_depth || 0);
+        const mqDropped = Number(hh.mqtt_ingest_dropped || 0);
+        const totalDevices = Number(ov.total_devices != null ? ov.total_devices : devices.length);
+        const onlineDevices = Number((ov.presence && ov.presence.online != null) ? ov.presence.online : devices.filter(isOnline).length);
+        const offlineDevices = Math.max(0, totalDevices - onlineDevices);
+        const txBps = Number((ov.throughput && ov.throughput.tx_bps_total) || 0);
+        const rxBps = Number((ov.throughput && ov.throughput.rx_bps_total) || 0);
+        const bps = (v) => {
+          v = Number(v || 0);
+          if (v < 1024) return `${v.toFixed(0)} B/s`;
+          if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)} KB/s`;
+          return `${(v / 1024 / 1024).toFixed(2)} MB/s`;
+        };
+        const mqStatus = !mqConnected ? "Disconnected" : (mqDropped > 0 || mqQDepth >= 300 ? "Warning" : "Healthy");
+        const mqClass = !mqConnected ? "revoked" : (mqStatus === "Warning" ? "offline" : "online");
+        patchOverviewHeader({
+          server: mqConnected ? "Connected" : "Disconnected",
+          devices: totalDevices,
+          online: onlineDevices,
+          offline: offlineDevices,
+          tx: bps(txBps),
+          rx: bps(rxBps),
+          queue: mqQDepth,
+          dropped: mqDropped,
+          risk: mqStatus,
+          riskClass: mqClass,
+        });
+        renderGroups();
+        void refreshNavDevices(true);
+      } catch (_) {}
+    };
+    scheduleRouteTicker(routeSeq, "overview-live", refreshOverviewLive, OVERVIEW_LIVE_MS);
     renderGroups();
   });
 
@@ -3382,8 +3454,8 @@
 
     let paused = false;
     let buffer = [];  // newest first
-    const BUFFER_MAX = 220;
-    const RENDER_LIMIT = 180;
+    const BUFFER_MAX = 180;
+    const RENDER_LIMIT = 150;
     let evRenderTimer = 0;
     let evReconnectBackoffMs = 800;
 
@@ -3456,7 +3528,18 @@
     }
     function pushEvent(ev) {
       if (paused) return;
-      buffer.unshift(ev);
+      let row = ev;
+      try {
+        if (ev && ev.detail != null && typeof ev.detail === "object") {
+          const sj = JSON.stringify(ev.detail);
+          if (sj.length > 12000) {
+            row = Object.assign({}, ev, {
+              detail: { _truncated: true, _approx_bytes: sj.length },
+            });
+          }
+        }
+      } catch (_) {}
+      buffer.unshift(row);
       if (buffer.length > BUFFER_MAX) buffer.length = BUFFER_MAX;
       scheduleEvRender();
     }
