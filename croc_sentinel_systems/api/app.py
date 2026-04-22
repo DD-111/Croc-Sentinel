@@ -620,6 +620,24 @@ def init_db() -> None:
         )
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS group_card_settings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_admin TEXT NOT NULL,
+                group_key TEXT NOT NULL,
+                trigger_mode TEXT NOT NULL DEFAULT 'continuous',
+                trigger_duration_ms INTEGER NOT NULL DEFAULT 10000,
+                delay_seconds INTEGER NOT NULL DEFAULT 0,
+                reboot_self_check INTEGER NOT NULL DEFAULT 0,
+                updated_by TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(owner_admin, group_key)
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_group_card_settings_owner ON group_card_settings(owner_admin)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_group_card_settings_group ON group_card_settings(group_key)")
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS login_failures (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ip TEXT NOT NULL,
@@ -4747,6 +4765,13 @@ class DeviceProfileBody(BaseModel):
     notification_group: Optional[str] = Field(default=None, max_length=80)
 
 
+class GroupCardSettingsBody(BaseModel):
+    trigger_mode: str = Field(default="continuous", pattern="^(continuous|delay)$")
+    trigger_duration_ms: int = Field(default=10000, ge=500, le=120000)
+    delay_seconds: int = Field(default=0, ge=0, le=3600)
+    reboot_self_check: bool = False
+
+
 class DeviceShareRequest(BaseModel):
     grantee_username: str = Field(min_length=2, max_length=64)
     can_view: bool = True
@@ -4804,6 +4829,16 @@ def _delete_group_card_impl(group_key: str, principal: Principal) -> dict[str, A
         conn.close()
     cache_invalidate("devices")
     cache_invalidate("overview")
+    owner_scope = principal.username if principal.role == "admin" else (get_manager_admin(principal.username) or principal.username)
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM group_card_settings WHERE owner_admin = ? AND group_key = ?",
+            (owner_scope, g),
+        )
+        conn.commit()
+        conn.close()
     audit_event(principal.username, "group.delete", g, {"device_count": len(ids), "changed": changed})
     return {"ok": True, "group_key": g, "device_count": len(ids), "changed": changed}
 
@@ -4817,6 +4852,309 @@ def delete_group_card(group_key: str, principal: Principal = Depends(require_pri
 def delete_group_card_post(group_key: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     """Proxy-friendly delete route for environments that block HTTP DELETE."""
     return _delete_group_card_impl(group_key, principal)
+
+
+def _group_owner_scope(principal: Principal) -> str:
+    if principal.role == "admin":
+        return principal.username
+    if principal.role == "user":
+        return get_manager_admin(principal.username) or principal.username
+    return principal.username
+
+
+def _group_settings_defaults(group_key: str) -> dict[str, Any]:
+    return {
+        "group_key": group_key,
+        "trigger_mode": "continuous",
+        "trigger_duration_ms": 10000,
+        "delay_seconds": 0,
+        "reboot_self_check": False,
+        "updated_by": "",
+        "updated_at": "",
+    }
+
+
+@app.get("/group-cards/settings")
+def list_group_card_settings(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "user")
+    owner_scope = _group_owner_scope(principal)
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT group_key, trigger_mode, trigger_duration_ms, delay_seconds, reboot_self_check, updated_by, updated_at
+            FROM group_card_settings
+            WHERE owner_admin = ?
+            ORDER BY group_key ASC
+            """,
+            (owner_scope,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+    out = []
+    for r in rows:
+        out.append(
+            {
+                "group_key": str(r.get("group_key") or ""),
+                "trigger_mode": str(r.get("trigger_mode") or "continuous"),
+                "trigger_duration_ms": int(r.get("trigger_duration_ms") or 10000),
+                "delay_seconds": int(r.get("delay_seconds") or 0),
+                "reboot_self_check": bool(int(r.get("reboot_self_check") or 0)),
+                "updated_by": str(r.get("updated_by") or ""),
+                "updated_at": str(r.get("updated_at") or ""),
+            }
+        )
+    return {"items": out}
+
+
+@app.get("/group-cards/{group_key}/settings")
+def get_group_card_settings(group_key: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "user")
+    g = (group_key or "").strip()
+    if not g:
+        raise HTTPException(status_code=400, detail="group_key required")
+    owner_scope = _group_owner_scope(principal)
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT group_key, trigger_mode, trigger_duration_ms, delay_seconds, reboot_self_check, updated_by, updated_at
+            FROM group_card_settings
+            WHERE owner_admin = ? AND group_key = ?
+            """,
+            (owner_scope, g),
+        )
+        row = cur.fetchone()
+        conn.close()
+    if not row:
+        return _group_settings_defaults(g)
+    r = dict(row)
+    return {
+        "group_key": g,
+        "trigger_mode": str(r.get("trigger_mode") or "continuous"),
+        "trigger_duration_ms": int(r.get("trigger_duration_ms") or 10000),
+        "delay_seconds": int(r.get("delay_seconds") or 0),
+        "reboot_self_check": bool(int(r.get("reboot_self_check") or 0)),
+        "updated_by": str(r.get("updated_by") or ""),
+        "updated_at": str(r.get("updated_at") or ""),
+    }
+
+
+@app.put("/group-cards/{group_key}/settings")
+def save_group_card_settings(
+    group_key: str,
+    body: GroupCardSettingsBody,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    assert_min_role(principal, "user")
+    g = (group_key or "").strip()
+    if not g:
+        raise HTTPException(status_code=400, detail="group_key required")
+    owner_scope = _group_owner_scope(principal)
+    now = utc_now_iso()
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO group_card_settings (
+                owner_admin, group_key, trigger_mode, trigger_duration_ms, delay_seconds,
+                reboot_self_check, updated_by, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(owner_admin, group_key) DO UPDATE SET
+                trigger_mode=excluded.trigger_mode,
+                trigger_duration_ms=excluded.trigger_duration_ms,
+                delay_seconds=excluded.delay_seconds,
+                reboot_self_check=excluded.reboot_self_check,
+                updated_by=excluded.updated_by,
+                updated_at=excluded.updated_at
+            """,
+            (
+                owner_scope,
+                g,
+                body.trigger_mode,
+                int(body.trigger_duration_ms),
+                int(body.delay_seconds),
+                1 if body.reboot_self_check else 0,
+                principal.username,
+                now,
+            ),
+        )
+        conn.commit()
+        conn.close()
+    audit_event(
+        principal.username,
+        "group.settings.save",
+        g,
+        {
+            "trigger_mode": body.trigger_mode,
+            "trigger_duration_ms": int(body.trigger_duration_ms),
+            "delay_seconds": int(body.delay_seconds),
+            "reboot_self_check": bool(body.reboot_self_check),
+        },
+    )
+    return {
+        "ok": True,
+        "group_key": g,
+        "trigger_mode": body.trigger_mode,
+        "trigger_duration_ms": int(body.trigger_duration_ms),
+        "delay_seconds": int(body.delay_seconds),
+        "reboot_self_check": bool(body.reboot_self_check),
+        "updated_by": principal.username,
+        "updated_at": now,
+    }
+
+
+@app.post("/group-cards/{group_key}/apply")
+def apply_group_card_settings(
+    group_key: str,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    assert_min_role(principal, "user")
+    g = (group_key or "").strip()
+    if not g:
+        raise HTTPException(status_code=400, detail="group_key required")
+    owner_scope = _group_owner_scope(principal)
+    zs, za = zone_sql_suffix(principal, "d.zone")
+    osf, osa = owner_scope_clause_for_device_state(principal, "d")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT d.device_id
+            FROM device_state d
+            WHERE IFNULL(d.notification_group,'') = ? {zs} {osf}
+            ORDER BY d.device_id ASC
+            """,
+            tuple([g] + za + osa),
+        )
+        targets = [str(r["device_id"]) for r in cur.fetchall()]
+        cur.execute(
+            """
+            SELECT trigger_mode, trigger_duration_ms, delay_seconds, reboot_self_check
+            FROM group_card_settings
+            WHERE owner_admin = ? AND group_key = ?
+            """,
+            (owner_scope, g),
+        )
+        st = cur.fetchone()
+        conn.close()
+    if not targets:
+        raise HTTPException(status_code=404, detail="group has no devices in your scope")
+    cfg = dict(st) if st else _group_settings_defaults(g)
+    mode = str(cfg.get("trigger_mode") or "continuous")
+    dur_ms = int(cfg.get("trigger_duration_ms") or 10000)
+    delay_seconds = int(cfg.get("delay_seconds") or 0)
+    reboot_self_check = bool(int(cfg.get("reboot_self_check") or 0)) if st else bool(cfg.get("reboot_self_check"))
+
+    now_ts = int(time.time())
+    siren_sent = 0
+    siren_scheduled = 0
+    reboot_jobs = 0
+    self_tests = 0
+    for did in targets:
+        ensure_not_revoked(did)
+        if mode == "delay" and delay_seconds > 0:
+            enqueue_scheduled_command(
+                device_id=did,
+                cmd="siren_on",
+                params={"duration_ms": dur_ms},
+                target_id=did,
+                proto=CMD_PROTO,
+                execute_at_ts=now_ts + delay_seconds,
+            )
+            siren_scheduled += 1
+        else:
+            publish_command(
+                topic=f"{TOPIC_ROOT}/{did}/cmd",
+                cmd="siren_on",
+                params={"duration_ms": dur_ms},
+                target_id=did,
+                proto=CMD_PROTO,
+                cmd_key=get_cmd_key_for_device(did),
+            )
+            siren_sent += 1
+
+        if reboot_self_check:
+            assert_min_role(principal, "admin")
+            require_capability(principal, "can_send_command")
+            publish_command(
+                topic=f"{TOPIC_ROOT}/{did}/cmd",
+                cmd="self_test",
+                params={},
+                target_id=did,
+                proto=CMD_PROTO,
+                cmd_key=get_cmd_key_for_device(did),
+            )
+            self_tests += 1
+            enqueue_scheduled_command(
+                device_id=did,
+                cmd="reboot",
+                params={},
+                target_id=did,
+                proto=CMD_PROTO,
+                execute_at_ts=now_ts + max(5, delay_seconds + 5),
+            )
+            reboot_jobs += 1
+
+    owner = _lookup_owner_admin(targets[0]) if targets else ""
+    _log_signal_trigger(
+        "group_card_apply",
+        "*",
+        "",
+        principal.username,
+        owner,
+        duration_ms=dur_ms,
+        target_count=len(targets),
+        detail={
+            "group_key": g,
+            "trigger_mode": mode,
+            "delay_seconds": delay_seconds,
+            "reboot_self_check": reboot_self_check,
+            "sent_now": siren_sent,
+            "scheduled": siren_scheduled,
+            "self_tests": self_tests,
+            "reboot_jobs": reboot_jobs,
+        },
+    )
+    emit_event(
+        level="warn",
+        category="alarm",
+        event_type="group.trigger.apply",
+        summary=f"group settings applied for {g} ({len(targets)} devices) by {principal.username}",
+        actor=principal.username,
+        target=g,
+        owner_admin=owner or "",
+        detail={
+            "group_key": g,
+            "mode": mode,
+            "duration_ms": dur_ms,
+            "delay_seconds": delay_seconds,
+            "reboot_self_check": reboot_self_check,
+            "device_count": len(targets),
+            "sent_now": siren_sent,
+            "scheduled": siren_scheduled,
+            "self_tests": self_tests,
+            "reboot_jobs": reboot_jobs,
+        },
+    )
+    return {
+        "ok": True,
+        "group_key": g,
+        "device_count": len(targets),
+        "mode": mode,
+        "trigger_duration_ms": dur_ms,
+        "delay_seconds": delay_seconds,
+        "reboot_self_check": reboot_self_check,
+        "sent_now": siren_sent,
+        "scheduled": siren_scheduled,
+        "self_tests": self_tests,
+        "reboot_jobs": reboot_jobs,
+    }
 
 
 def _apply_device_profile_update(

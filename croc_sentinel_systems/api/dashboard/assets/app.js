@@ -983,9 +983,10 @@
   // Overview
   registerRoute("overview", async (view) => {
     setCrumb("Overview");
-    const [ovRes, listRes] = await Promise.allSettled([
+    const [ovRes, listRes, grpSetRes] = await Promise.allSettled([
       apiGetCached("/dashboard/overview", { timeoutMs: 8000 }, 4000),
       apiGetCached("/devices", { timeoutMs: 8000 }, 4000),
+      apiOr("/group-cards/settings", { items: [] }, { timeoutMs: 6000 }),
     ]);
     let ov = (ovRes.status === "fulfilled" && ovRes.value) ? ovRes.value : null;
     let list = (listRes.status === "fulfilled" && listRes.value) ? listRes.value : null;
@@ -1000,8 +1001,12 @@
     if (!ov) ov = { mqtt_connected: false };
     if (!list) list = { items: [] };
     state.overviewCache = { ov, list, ts: Date.now() };
+    const groupSettingsItems = (grpSetRes.status === "fulfilled" && grpSetRes.value && Array.isArray(grpSetRes.value.items))
+      ? grpSetRes.value.items
+      : [];
     const devices = list.items || [];
     const byId = new Map(devices.map((d) => [String(d.device_id), d]));
+    const groupSettingsMap = new Map(groupSettingsItems.map((x) => [String(x.group_key || ""), x]));
 
     const groupScope = (state.me && state.me.username) ? state.me.username : "anon";
     const GROUP_META_LS_KEY = `croc.group.meta.v2.${groupScope}`;
@@ -1071,6 +1076,26 @@
         <div class="divider"></div>
         <div id="groupCards" class="device-grid"></div>
       </section>
+      <div id="grpSetModal" class="grp-modal" style="display:none">
+        <div class="grp-modal-card">
+          <h3 style="margin:0 0 8px">Group trigger settings</h3>
+          <p class="muted" id="gsKeyLabel" style="margin:0 0 10px"></p>
+          <label class="field"><span>Trigger duration (ms)</span><input id="gsDuration" type="number" min="500" max="120000" step="100" /></label>
+          <label class="field field--spaced"><span>Trigger mode</span>
+            <select id="gsMode">
+              <option value="continuous">Continuous trigger</option>
+              <option value="delay">Delay trigger</option>
+            </select>
+          </label>
+          <label class="field field--spaced"><span>Delay seconds</span><input id="gsDelay" type="number" min="0" max="3600" step="1" /></label>
+          <label class="field field--spaced"><span><input id="gsReboot" type="checkbox" /> Reboot + self-check this group after trigger</span></label>
+          <div class="row" style="justify-content:flex-end;gap:8px;margin-top:10px">
+            <button class="btn sm secondary" id="gsCancel" type="button">Cancel</button>
+            <button class="btn sm secondary" id="gsApply" type="button">Apply now</button>
+            <button class="btn sm" id="gsSave" type="button">Save</button>
+          </div>
+        </div>
+      </div>
       <div id="grpModal" class="grp-modal" style="display:none">
         <div class="grp-modal-card">
           <h3 style="margin:0 0 8px">Edit group card</h3>
@@ -1089,7 +1114,8 @@
 
     const groupCardsEl = $("#groupCards", view);
     const grpModalEl = $("#grpModal", view);
-    if (!groupCardsEl || !grpModalEl) return;
+    const grpSetModalEl = $("#grpSetModal", view);
+    if (!groupCardsEl || !grpModalEl || !grpSetModalEl) return;
 
     let editingGroup = "";
     const groupKeys = () => Object.keys(meta).sort((a, b) => a.localeCompare(b));
@@ -1133,11 +1159,25 @@
         const on = rows.filter((d) => isOnline(d)).length;
         const off = Math.max(0, total - on);
         const m = meta[g] || {};
+        const gs = groupSettingsMap.get(g) || {
+          trigger_mode: "continuous",
+          trigger_duration_ms: 10000,
+          delay_seconds: 0,
+          reboot_self_check: false,
+        };
         const sharedBy = groupSharedBy(g);
         const isSharedGroup = sharedBy.length > 0;
+        const modeLabel = String(gs.trigger_mode || "continuous") === "delay"
+          ? `delay ${Number(gs.delay_seconds || 0)}s`
+          : "continuous";
         return `<article class="device-card js-group-card ${selectedGroup === g ? "is-selected" : ""}" data-group="${escapeHtml(g)}" style="cursor:pointer;position:relative">
           <button class="group-del-ico js-del-group" data-group="${escapeHtml(g)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group cannot be deleted\"" : "title=\"Delete group\""} aria-label="Delete group">✕</button>
           <h3><div class="device-primary-name">${escapeHtml(m.display_name || g)}</div><div class="device-id-sub mono">${escapeHtml(g)}</div></h3>
+          <div class="meta" style="margin-bottom:8px">
+            Trigger: <span class="mono">${escapeHtml(modeLabel)}</span> ·
+            Duration: <span class="mono">${escapeHtml(String(gs.trigger_duration_ms || 10000))}ms</span> ·
+            Reboot+self-check: <span class="mono">${gs.reboot_self_check ? "yes" : "no"}</span>
+          </div>
           <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
             <span class="badge neutral">total ${total}</span>
             <span class="badge online">online ${on}</span>
@@ -1146,6 +1186,7 @@
           </div>
           <div class="meta">Owner: ${escapeHtml(m.owner_name || "—")} · ${escapeHtml(m.phone || "—")} · ${escapeHtml(m.email || "—")}</div>
           <div class="row" style="margin-top:8px;gap:6px;flex-wrap:wrap">
+            <button class="btn sm secondary js-group-settings" data-group="${escapeHtml(g)}" type="button">Settings</button>
             <button class="btn sm secondary js-edit-group" data-group="${escapeHtml(g)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group: device membership is read-only\"" : ""}>Edit</button>
             <button class="btn sm danger js-alert-on" data-group="${escapeHtml(g)}" type="button">Alarm ON</button>
             <button class="btn sm secondary js-alert-off" data-group="${escapeHtml(g)}" type="button">Alarm OFF</button>
@@ -1153,6 +1194,79 @@
         </article>`;
       }).join("");
     };
+    let editingSettingsGroup = "";
+    const openSettingsModal = (g) => {
+      editingSettingsGroup = g || "";
+      if (!editingSettingsGroup) return;
+      const gs = groupSettingsMap.get(editingSettingsGroup) || {
+        trigger_mode: "continuous",
+        trigger_duration_ms: 10000,
+        delay_seconds: 0,
+        reboot_self_check: false,
+      };
+      $("#gsKeyLabel", view).textContent = `Group: ${editingSettingsGroup}`;
+      $("#gsDuration", view).value = String(Number(gs.trigger_duration_ms || 10000));
+      $("#gsMode", view).value = String(gs.trigger_mode || "continuous");
+      $("#gsDelay", view).value = String(Number(gs.delay_seconds || 0));
+      $("#gsReboot", view).checked = !!gs.reboot_self_check;
+      grpSetModalEl.style.display = "flex";
+    };
+    const closeSettingsModal = () => { grpSetModalEl.style.display = "none"; };
+    const collectSettingsPayload = () => {
+      const mode = String($("#gsMode", view).value || "continuous");
+      const duration = parseInt($("#gsDuration", view).value, 10);
+      const delay = parseInt($("#gsDelay", view).value, 10);
+      const reboot = !!$("#gsReboot", view).checked;
+      if (!Number.isFinite(duration) || duration < 500 || duration > 120000) {
+        throw new Error("Trigger duration must be 500-120000 ms");
+      }
+      if (!Number.isFinite(delay) || delay < 0 || delay > 3600) {
+        throw new Error("Delay seconds must be 0-3600");
+      }
+      if (mode !== "continuous" && mode !== "delay") {
+        throw new Error("Trigger mode invalid");
+      }
+      return {
+        trigger_mode: mode,
+        trigger_duration_ms: duration,
+        delay_seconds: delay,
+        reboot_self_check: reboot,
+      };
+    };
+    $("#gsCancel", view).addEventListener("click", closeSettingsModal);
+    $("#gsSave", view).addEventListener("click", async () => {
+      try {
+        if (!editingSettingsGroup) throw new Error("No group selected");
+        const payload = collectSettingsPayload();
+        const r = await api(`/group-cards/${encodeURIComponent(editingSettingsGroup)}/settings`, {
+          method: "PUT",
+          body: payload,
+        });
+        groupSettingsMap.set(editingSettingsGroup, r || payload);
+        renderGroups();
+        closeSettingsModal();
+        toast("Group settings saved", "ok");
+      } catch (e) {
+        toast(e.message || e, "err");
+      }
+    });
+    $("#gsApply", view).addEventListener("click", async () => {
+      try {
+        if (!editingSettingsGroup) throw new Error("No group selected");
+        const payload = collectSettingsPayload();
+        await api(`/group-cards/${encodeURIComponent(editingSettingsGroup)}/settings`, {
+          method: "PUT",
+          body: payload,
+        });
+        groupSettingsMap.set(editingSettingsGroup, payload);
+        const r = await api(`/group-cards/${encodeURIComponent(editingSettingsGroup)}/apply`, { method: "POST" });
+        renderGroups();
+        closeSettingsModal();
+        toast(`Applied to ${Number(r.device_count || 0)} devices`, "ok");
+      } catch (e) {
+        toast(e.message || e, "err");
+      }
+    });
     const clearGroupByDevicePatch = async (groupKey) => {
       const ids = groupDeviceIds(groupKey);
       if (!ids.length) return { ok: true, changed: 0 };
@@ -1232,6 +1346,10 @@
           openGroupModal(g);
           return;
         }
+        if (btn.classList.contains("js-group-settings")) {
+          openSettingsModal(g);
+          return;
+        }
         if (btn.classList.contains("js-del-group")) {
           if (groupSharedBy(g).length > 0) { toast("Shared group cannot be deleted", "err"); return; }
           if (!confirm(`Delete group card "${g}"?`)) return;
@@ -1252,7 +1370,9 @@
         const action = btn.classList.contains("js-alert-on") ? "on" : "off";
         if (!confirm(`${action === "on" ? "Open" : "Close"} alarm for ${ids.length} devices in ${g}?`)) return;
         try {
-          await api("/alerts", { method: "POST", body: { action, duration_ms: 10000, device_ids: ids } });
+          const gs = groupSettingsMap.get(g) || {};
+          const durationMs = Number(gs.trigger_duration_ms || 10000);
+          await api("/alerts", { method: "POST", body: { action, duration_ms: durationMs, device_ids: ids } });
           toast(`${action === "on" ? "Alarm ON" : "Alarm OFF"} · ${ids.length}`, "ok");
         } catch (e) {
           toast(e.message || e, "err");
