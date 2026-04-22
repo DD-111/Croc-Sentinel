@@ -557,56 +557,65 @@
     if (!nav) return;
     if (!state.me) { setHtmlIfChanged(nav, ""); return; }
     const hash = location.hash || "#/overview";
-    const parts = [];
+    const coreParts = [];
     for (const g of NAV_GROUPS) {
       const items = g.items.filter((n) => hasRole(n.min));
       if (items.length === 0) continue;
-      parts.push(`<div class="nav-section">${escapeHtml(g.title)}</div>`);
+      coreParts.push(`<div class="nav-section">${escapeHtml(g.title)}</div>`);
       for (const n of items) {
         const active = hash.startsWith(n.path) ? ` aria-current="page"` : "";
-        parts.push(
+        coreParts.push(
           `<a href="${n.path}"${active}><span class="nav-ico">${n.ico}</span>${escapeHtml(n.label)}</a>`,
         );
       }
     }
+    /* Device list: server already scopes /devices by role (superadmin=all, admin=own+ACL, user=manager+ACL). */
     const rowsAll = Array.isArray(state.navDevices) ? state.navDevices : [];
     const q = String(state.navDeviceQuery || "").trim().toLowerCase();
     const rows = rowsAll.filter((d) => {
-      if (!state.me) return false;
-      if (state.me.role === "superadmin") return true;
-      if (state.me.role === "admin") return !d.is_shared;
-      return true;
-    }).filter((d) => {
       if (!q) return true;
       const did = String(d.device_id || "").toLowerCase();
       const nm = String(d.display_label || "").toLowerCase();
-      return did.includes(q) || nm.includes(q);
+      const grp = String(d.notification_group || "").toLowerCase();
+      return did.includes(q) || nm.includes(q) || grp.includes(q);
     });
-    parts.push(`<div class="nav-section">Devices</div>`);
-    parts.push(
+    const onDeviceRoute = hash.startsWith("#/devices/");
+    let drawerOpen = onDeviceRoute;
+    try {
+      if (sessionStorage.getItem("navDevicesOpen") === "1") drawerOpen = true;
+    } catch (_) {}
+    const openAttr = drawerOpen ? " open" : "";
+
+    const listParts = [];
+    listParts.push(
       `<label class="field compact nav-device-search">` +
       `<span>Search</span>` +
-      `<input id="navDeviceQuery" type="search" placeholder="device id / name" value="${escapeHtml(state.navDeviceQuery || "")}" autocomplete="off" />` +
+      `<input id="navDeviceQuery" type="search" placeholder="id / name / group" value="${escapeHtml(state.navDeviceQuery || "")}" autocomplete="off" />` +
       `</label>`,
     );
     if (state.navDevicesLoading && rows.length === 0) {
-      parts.push(`<div class="nav-device-empty">Loading devices...</div>`);
+      listParts.push(`<div class="nav-device-empty">Loading devices...</div>`);
     } else if (state.navDevicesError && rows.length === 0) {
-      parts.push(`<div class="nav-device-empty">${escapeHtml(state.navDevicesError)}</div>`);
+      listParts.push(`<div class="nav-device-empty">${escapeHtml(state.navDevicesError)}</div>`);
     } else if (rows.length === 0) {
-      parts.push(`<div class="nav-device-empty">No devices in scope.</div>`);
+      listParts.push(`<div class="nav-device-empty">No devices in scope.</div>`);
     } else {
-      parts.push(`<div class="nav-device-list">`);
-      for (const d of rows.slice(0, 80)) {
+      listParts.push(`<div class="nav-device-list">`);
+      for (const d of rows) {
         const did = String(d.device_id || "").trim();
         if (!did) continue;
         const nm = String(d.display_label || "").trim();
         const title = nm || did;
-        const sub = (state.me.role === "superadmin")
-          ? (d.owner_admin ? `owner: ${String(d.owner_admin)}` : "owner: unassigned")
-          : (d.is_shared ? `sharing by ${String(d.shared_by || "?")}` : "owned");
+        let sub = "";
+        if (state.me.role === "superadmin") {
+          sub = d.owner_admin ? `owner: ${String(d.owner_admin)}` : "owner: unassigned";
+        } else if (d.is_shared) {
+          sub = `shared · ${String(d.shared_by || "?")}`;
+        } else {
+          sub = "owned";
+        }
         const active = hash.startsWith(`#/devices/${encodeURIComponent(did)}`) ? ` aria-current="page"` : "";
-        parts.push(
+        listParts.push(
           `<a href="#/devices/${encodeURIComponent(did)}"${active} class="nav-device-link" title="${escapeHtml(did)}">` +
           `<span class="nav-ico">${isOnline(d) ? "●" : "○"}</span>` +
           `<span class="nav-device-txt"><span class="nav-device-title">${escapeHtml(title)}</span>` +
@@ -614,15 +623,33 @@
           `</a>`,
         );
       }
-      if (rows.length > 80) parts.push(`<div class="nav-device-empty">+${rows.length - 80} more</div>`);
-      parts.push(`</div>`);
+      listParts.push(`</div>`);
     }
-    setHtmlIfChanged(nav, parts.join(""));
+
+    const html =
+      `<div class="nav-core">${coreParts.join("")}</div>` +
+      `<details class="sidebar-device-panel" id="navDeviceDrawer"${openAttr}>` +
+      `<summary><span class="sidebar-device-panel__title"><span>Devices</span>` +
+      `<span class="nav-dev-count">${rows.length}</span></span>` +
+      `<span class="sidebar-device-chev" aria-hidden="true">▼</span></summary>` +
+      `<div class="sidebar-device-panel__body">` +
+      `<div class="sidebar-device-panel__scroll">${listParts.join("")}</div>` +
+      `</div></details>`;
+
+    setHtmlIfChanged(nav, html);
     const navQ = $("#navDeviceQuery", nav);
     if (navQ) {
       navQ.addEventListener("input", () => {
         state.navDeviceQuery = String(navQ.value || "");
         renderNav();
+      });
+    }
+    const drawerEl = $("#navDeviceDrawer", nav);
+    if (drawerEl) {
+      drawerEl.addEventListener("toggle", () => {
+        try {
+          sessionStorage.setItem("navDevicesOpen", drawerEl.open ? "1" : "0");
+        } catch (_) {}
       });
     }
     const stale = (Date.now() - Number(state.navDevicesAt || 0)) > 10000;

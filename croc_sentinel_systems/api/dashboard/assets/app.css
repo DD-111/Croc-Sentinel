@@ -77,6 +77,19 @@ body {
   min-height: 100dvh;
 }
 
+/* Logged-in shell: lock page height so only main scrolls — sidebar stays visible */
+body[data-layout="app"].app-shell {
+  height: 100vh;
+  height: 100dvh;
+  max-height: 100dvh;
+  overflow: hidden;
+  grid-template-rows: 1fr;
+}
+body[data-layout="app"].app-shell > .sidebar,
+body[data-layout="app"].app-shell > .main {
+  min-height: 0;
+}
+
 /* Sidebar */
 .sidebar {
   background: var(--bg-elev);
@@ -85,12 +98,13 @@ body {
   flex-direction: column;
   padding: 16px 12px;
   gap: 10px;
-  position: sticky;
-  top: 0;
-  align-self: start;
-  height: 100vh;
-  height: 100dvh;
+  position: relative;
+  min-height: 0;
+  height: 100%;
+  max-height: 100dvh;
   overflow: hidden;
+  /* isolate paint to reduce scroll-linked jitter with motion-ui transforms */
+  contain: paint;
 }
 
 .brand {
@@ -113,7 +127,23 @@ body {
   box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.15);
 }
 
-.nav { display: flex; flex-direction: column; gap: 2px; margin-top: 6px; flex: 1; overflow-y: auto; }
+.nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 6px;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+.nav-core {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-height: 0;
+  overflow-y: auto;
+}
 .nav a {
   display: flex; align-items: center; gap: 10px;
   padding: 9px 10px; border-radius: var(--radius-sm);
@@ -182,6 +212,77 @@ body {
   padding: 6px 10px 4px;
 }
 
+/* Collapsible device list (sidebar) */
+.sidebar-device-panel {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin-top: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--bg-muted) 45%, var(--bg-elev));
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.sidebar-device-panel > summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 10px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  user-select: none;
+  flex: 0 0 auto;
+}
+.sidebar-device-panel > summary::-webkit-details-marker { display: none; }
+.sidebar-device-panel > summary .sidebar-device-chev {
+  font-size: 9px;
+  opacity: 0.75;
+  transition: transform var(--transition);
+  flex-shrink: 0;
+}
+.sidebar-device-panel[open] > summary .sidebar-device-chev {
+  transform: rotate(-180deg);
+}
+.sidebar-device-panel > summary .sidebar-device-panel__title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.sidebar-device-panel > summary .nav-dev-count {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--bg-muted);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+}
+.sidebar-device-panel__body {
+  padding: 0 0 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+.sidebar-device-panel__scroll {
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 0 4px 4px;
+  max-height: min(52vh, 520px);
+}
+
 @media (max-width: 1100px) {
   .auth-page.auth-page-pro {
     grid-template-columns: 1fr;
@@ -244,8 +345,20 @@ body[data-auth="ok"] .health-pills {
   backdrop-filter: blur(2px); z-index: 40;
 }
 
-/* Main */
-.main { display: flex; flex-direction: column; min-width: 0; min-height: 100vh; min-height: 100dvh; }
+/* Main — scrolls independently from sidebar when layout=app */
+.main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+}
+body[data-layout="app"] .main {
+  height: 100%;
+}
 
 /* Public auth routes — hide chrome, full-bleed #view */
 body[data-layout="auth"].app-shell {
@@ -256,9 +369,15 @@ body[data-layout="auth"] .sidebar-backdrop,
 body[data-layout="auth"] .topbar {
   display: none !important;
 }
+body[data-layout="auth"].app-shell {
+  height: auto;
+  max-height: none;
+  overflow: auto;
+}
 body[data-layout="auth"] .main {
   min-height: 100vh;
   min-height: 100dvh;
+  overflow: visible;
 }
 body[data-layout="auth"] .view {
   max-width: none;
@@ -1418,7 +1537,10 @@ body.motion-ui.app-shell {
 
 body.motion-ui .main {
   position: relative;
+}
+body[data-layout="auth"].motion-ui .main {
   min-height: 100vh;
+  min-height: 100dvh;
 }
 
 body.motion-ui .sidebar {
@@ -1530,6 +1652,10 @@ body.motion-ui .nav a {
 body.motion-ui .nav a:hover {
   transform: translateX(4px);
 }
+/* Avoid horizontal nudge while sidebar is fixed — reduces scroll/layout jitter */
+body[data-layout="app"].motion-ui .nav a:hover {
+  transform: none;
+}
 
 body.motion-ui .icon-btn {
   transition: transform 0.2s ease, background 0.2s ease, border-color 0.2s ease;
@@ -1584,14 +1710,14 @@ body.motion-ui #view > *:nth-child(10) { animation-delay: 0.48s; }
 body.motion-ui #view > *:nth-child(11) { animation-delay: 0.53s; }
 body.motion-ui #view > *:nth-child(12) { animation-delay: 0.58s; }
 
-/* Sidebar: nav-section label then links */
-body.motion-ui .nav > .nav-section {
+/* Sidebar: nav-section label then links (inside .nav-core) */
+body.motion-ui .nav-core > .nav-section {
   animation: motion-fade-in 0.4s ease backwards;
   animation-delay: 0.02s;
 }
 
-/* Links sit after section headers — animate all anchors uniformly */
-body.motion-ui .nav > a {
+/* Primary nav links — device links animate via .nav a below */
+body.motion-ui .nav-core > a {
   animation: motion-fade-up 0.4s cubic-bezier(0.22, 1, 0.36, 1) backwards;
   animation-delay: 0.06s;
 }
@@ -1649,8 +1775,8 @@ html.tab-hidden body.motion-ui .auth-page {
 }
 
 html.tab-hidden body.motion-ui #view > *,
-html.tab-hidden body.motion-ui .nav > .nav-section,
-html.tab-hidden body.motion-ui .nav > a,
+html.tab-hidden body.motion-ui .nav-core > .nav-section,
+html.tab-hidden body.motion-ui .nav-core > a,
 html.tab-hidden body.motion-ui .login-card,
 html.tab-hidden body.motion-ui .auth-card,
 html.tab-hidden body.motion-ui .toast.show {
@@ -1665,7 +1791,7 @@ html.tab-hidden body.motion-ui .toast.show {
   }
 
   body.motion-ui #view > *,
-  body.motion-ui .nav > .nav-section,
+  body.motion-ui .nav-core > .nav-section,
   body.motion-ui .nav a,
   body.motion-ui .login-card,
   body.motion-ui .auth-card,
