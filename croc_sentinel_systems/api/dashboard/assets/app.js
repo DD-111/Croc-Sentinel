@@ -916,10 +916,6 @@
     }
     state.overviewCache = { ov, list, ts: Date.now() };
     const devices = list.items || [];
-    const online = (ov.presence && ov.presence.online != null) ? ov.presence.online : devices.filter(isOnline).length;
-    const offline = (ov.presence && ov.presence.offline_total != null) ? ov.presence.offline_total : Math.max(0, devices.length - online);
-    const pr = ov.presence || {};
-    const tp = ov.throughput || {};
     const hh = state.health || {};
     const mqConnected = !!(hh.mqtt_connected ?? ov.mqtt_connected);
     const mqQDepth = Number(hh.mqtt_ingest_queue_depth || 0);
@@ -945,112 +941,202 @@
     } else {
       mqRiskDetail = `queue=${mqQDepth} · dropped=${mqDropped} · last_up=${mqLastUp || "—"}`;
     }
-    const bps = (v) => {
-      v = Number(v || 0);
-      if (v < 1024) return v.toFixed(0) + " B/s";
-      if (v < 1024 * 1024) return (v / 1024).toFixed(1) + " KB/s";
-      return (v / 1024 / 1024).toFixed(2) + " MB/s";
+
+    // Group metadata: browser-side profile card (name/owner/phone/email).
+    const GROUP_META_LS_KEY = "croc.group.meta.v1";
+    const loadGroupMeta = () => {
+      try {
+        const raw = localStorage.getItem(GROUP_META_LS_KEY);
+        const obj = raw ? JSON.parse(raw) : {};
+        return (obj && typeof obj === "object") ? obj : {};
+      } catch {
+        return {};
+      }
     };
-    const stats = [
-      ["Devices", ov.total_devices ?? devices.length, "in your scope"],
-      ["Online", online, "recent MQTT + online (status / heartbeat / ack / event ts)"],
-      ["Offline", offline, ">90s no traffic or last status says offline"],
-      ["Alarms 24h", ov.alarms_24h ?? 0, "device alarm count"],
-      ["MQTT", ov.mqtt_connected ? "up" : "down", "broker"],
-      ["Throughput", `${bps(tp.tx_bps_total)} / ${bps(tp.rx_bps_total)}`, "Tx / Rx sum"],
-    ].map(([k, v, s]) => `<div class="stat"><div class="k">${escapeHtml(k)}</div><div class="v">${escapeHtml(v)}</div><div class="sub">${escapeHtml(s)}</div></div>`).join("");
-    const presenceCards = `
-      <div class="stat"><div class="k">Power low</div><div class="v">${pr.reason_power_low || 0}</div><div class="sub">Output V</div></div>
-      <div class="stat"><div class="k">Network lost</div><div class="v">${pr.reason_network_lost || 0}</div><div class="sub">link / timeout</div></div>
-      <div class="stat"><div class="k">Weak signal</div><div class="v">${pr.reason_signal_weak || 0}</div><div class="sub">RSSI</div></div>
-      <div class="stat"><div class="k">Unknown</div><div class="v">${pr.reason_unknown || 0}</div><div class="sub">no reason yet</div></div>`;
+    const saveGroupMeta = (obj) => {
+      localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(obj || {}));
+    };
+    const groupMetaMap = loadGroupMeta();
+    const normalizeGroup = (s) => {
+      const t = String(s || "").trim();
+      return t || "Ungrouped";
+    };
+    const groups = new Map();
+    for (const d of devices) {
+      const g = normalizeGroup(d.notification_group);
+      if (!groups.has(g)) groups.set(g, []);
+      groups.get(g).push(d);
+    }
+    const groupNames = Array.from(groups.keys()).sort((a, b) => a.localeCompare(b));
+    let selectedGroup = groupNames[0] || "";
+
+    const renderDeviceCard = (d) => {
+      const on = isOnline(d);
+      const primary = escapeHtml(d.display_label || d.device_id || "unknown");
+      const subId = d.display_label ? `<div class="device-id-sub mono">${escapeHtml(d.device_id || "")}</div>` : "";
+      const platform = `${d.chip_target || "—"} / ${d.board_profile || "—"}`;
+      return `<a class="device-card" href="#/devices/${encodeURIComponent(d.device_id)}" style="text-decoration:none;color:inherit">
+        <h3><div class="device-primary-name">${primary}</div>${subId}</h3>
+        <div><span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>
+          ${d.notification_group ? `<span class="chip">${escapeHtml(d.notification_group)}</span>` : ""}
+          ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
+          ${d.fw ? `<span class="chip">v${escapeHtml(d.fw)}</span>` : ""}
+        </div>
+        <div class="meta">
+          Platform: ${escapeHtml(platform)}<br/>
+          Net: ${escapeHtml(d.net_type || "—")}<br/>
+          Manufacturer: ESA Sibu<br/>
+          Updated: ${escapeHtml(fmtRel(d.updated_at))}
+        </div>
+      </a>`;
+    };
 
     view.innerHTML = `
-      <section class="stats">${stats}</section>
       <section class="card">
         <div class="row">
           <h3 style="margin:0">MQTT risk</h3>
           <span class="badge ${mqRiskClass}">${mqRiskLabel}</span>
         </div>
         <div class="divider"></div>
-        <section class="stats">
-          <div class="stat">
-            <div class="k">Broker link</div>
-            <div class="v">${mqConnected ? "up" : "down"}</div>
-            <div class="sub">${escapeHtml(mqConnected ? `last_up=${mqLastUp || "—"}` : `last_down=${mqLastDown || "—"}`)}</div>
-          </div>
-          <div class="stat">
-            <div class="k">Ingest queue depth</div>
-            <div class="v">${mqQDepth}</div>
-            <div class="sub">>=300 warn, >=700 high</div>
-          </div>
-          <div class="stat">
-            <div class="k">Dropped messages</div>
-            <div class="v">${mqDropped}</div>
-            <div class="sub">${escapeHtml(mqReason || "0 is ideal")}</div>
-          </div>
-          <div class="stat">
-            <div class="k">Assessment</div>
-            <div class="v">${escapeHtml(mqRiskLabel)}</div>
-            <div class="sub">${escapeHtml(mqRiskDetail)}</div>
-          </div>
-        </section>
+        <div class="muted">${escapeHtml(mqRiskDetail)}</div>
       </section>
-      <section class="card">
-        <div class="row">
-          <h3 style="margin:0">Offline breakdown</h3>
-          <span class="muted">disconnect_reason from devices</span>
-        </div>
-        <div class="divider"></div>
-        <section class="stats">${presenceCards}</section>
-      </section>
-      <section class="card">
-        <div class="row" style="align-items:center">
-          <h2 style="margin:0">Devices</h2>
-          <span class="muted">${devices.length} total</span>
-          <input id="q" placeholder="Filter id / name / group / zone / fw" class="grow right" />
-        </div>
-        <div class="divider"></div>
-        <div class="device-grid" id="devGrid"></div>
-      </section>`;
 
-    const renderList = () => {
-      const grid = document.getElementById("devGrid");
-      if (!grid) return;
-      const q = ($("#q").value || "").toLowerCase().trim();
-      const rows = devices.filter((d) => !q || [d.device_id, d.display_label, d.notification_group, d.zone, d.fw, d.board_profile, d.chip_target].join(" ").toLowerCase().includes(q));
-      grid.innerHTML = rows.length === 0
-        ? `<p class="muted">No matching devices.</p>`
-        : rows.map((d) => {
-          const on = isOnline(d);
-          const primary = escapeHtml(d.display_label || d.device_id || "unknown");
-          const subId = d.display_label
-            ? `<div class="device-id-sub mono">${escapeHtml(d.device_id || "")}</div>`
-            : "";
-          return `<a class="device-card" href="#/devices/${encodeURIComponent(d.device_id)}" style="text-decoration:none;color:inherit">
-            <h3><div class="device-primary-name">${primary}</div>${subId}</h3>
-            <div><span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>
-              ${d.notification_group ? `<span class="chip">${escapeHtml(d.notification_group)}</span>` : ""}
-              ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
-              ${d.fw ? `<span class="chip">v${escapeHtml(d.fw)}</span>` : ""}
-            </div>
-            <div class="meta">
-              Chip: ${escapeHtml(d.chip_target || "—")}<br/>
-              Board: ${escapeHtml(d.board_profile || "—")}<br/>
-              Net: ${escapeHtml(d.net_type || "—")}<br/>
-              Updated: ${escapeHtml(fmtRel(d.updated_at))}
-            </div>
-          </a>`;
-        }).join("");
+      <section class="card">
+        <div class="row" style="align-items:center;gap:8px;flex-wrap:wrap">
+          <h2 style="margin:0">Groups</h2>
+          <span class="muted">${groupNames.length} groups</span>
+        </div>
+        <div class="divider"></div>
+        <div id="groupCards" class="device-grid"></div>
+      </section>
+
+      <section class="card">
+        <div class="row" style="align-items:center;gap:8px;flex-wrap:wrap">
+          <h2 style="margin:0">Group devices</h2>
+          <span class="chip" id="groupNowChip">—</span>
+        </div>
+        <div class="divider"></div>
+        <div id="groupDevices" class="device-grid"></div>
+      </section>
+    `;
+
+    const groupCardsEl = $("#groupCards", view);
+    const groupDevicesEl = $("#groupDevices", view);
+    const groupNowChipEl = $("#groupNowChip", view);
+    if (!groupCardsEl || !groupDevicesEl || !groupNowChipEl) return;
+
+    const runGroupAlert = async (groupName, action) => {
+      const rows = groups.get(groupName) || [];
+      const ids = rows.map((x) => x.device_id).filter(Boolean);
+      if (ids.length === 0) {
+        toast("No devices in this group", "warn");
+        return;
+      }
+      if (!can("can_alert")) {
+        toast("No can_alert capability", "err");
+        return;
+      }
+      const ok = confirm(`${action === "on" ? "Open alarm" : "Close alarm"} for group "${groupName}" on ${ids.length} devices?`);
+      if (!ok) return;
+      await api("/alerts", { method: "POST", body: { action, duration_ms: 10000, device_ids: ids } });
+      toast(`${action === "on" ? "Alarm ON" : "Alarm OFF"} · ${ids.length} devices`, "ok");
     };
-    $("#q").addEventListener("input", () => {
-      clearTimeout(overviewFilterDebounce);
-      overviewFilterDebounce = setTimeout(() => {
-        overviewFilterDebounce = null;
-        renderList();
-      }, 140);
+
+    const renderGroupDevices = () => {
+      const rows = groups.get(selectedGroup) || [];
+      groupNowChipEl.textContent = selectedGroup || "—";
+      if (rows.length === 0) {
+        groupDevicesEl.innerHTML = `<p class="muted">No devices in selected group.</p>`;
+        return;
+      }
+      groupDevicesEl.innerHTML = rows.map(renderDeviceCard).join("");
+    };
+
+    const renderGroupCards = () => {
+      if (groupNames.length === 0) {
+        groupCardsEl.innerHTML = `<p class="muted">No groups.</p>`;
+        groupDevicesEl.innerHTML = `<p class="muted">No devices.</p>`;
+        return;
+      }
+      groupCardsEl.innerHTML = groupNames.map((g) => {
+        const rows = groups.get(g) || [];
+        const total = rows.length;
+        const online = rows.filter((d) => isOnline(d)).length;
+        const offline = Math.max(0, total - online);
+        const meta = groupMetaMap[g] || {};
+        const groupLabel = String(meta.display_name || g);
+        const owner = String(meta.owner_name || "—");
+        const phone = String(meta.phone || "—");
+        const email = String(meta.email || "—");
+        return `<article class="device-card js-group-card ${selectedGroup === g ? "is-selected" : ""}" data-group="${escapeHtml(g)}" style="cursor:pointer">
+          <h3>
+            <div class="device-primary-name">${escapeHtml(groupLabel)}</div>
+            <div class="device-id-sub mono">${escapeHtml(g)}</div>
+          </h3>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
+            <span class="badge neutral">Total ${total}</span>
+            <span class="badge online">Online ${online}</span>
+            <span class="badge offline">Offline ${offline}</span>
+          </div>
+          <div class="meta">
+            Owner: ${escapeHtml(owner)}<br/>
+            Phone: ${escapeHtml(phone)}<br/>
+            Email: ${escapeHtml(email)}
+          </div>
+          <div class="row" style="margin-top:10px;gap:6px;flex-wrap:wrap">
+            <button class="btn sm secondary js-edit-group" data-group="${escapeHtml(g)}" type="button">Edit</button>
+            <button class="btn sm danger js-alert-on" data-group="${escapeHtml(g)}" type="button">Alarm ON</button>
+            <button class="btn sm secondary js-alert-off" data-group="${escapeHtml(g)}" type="button">Alarm OFF</button>
+          </div>
+        </article>`;
+      }).join("");
+    };
+
+    groupCardsEl.addEventListener("click", async (ev) => {
+      const b = ev.target.closest("button");
+      if (b) {
+        const g = b.dataset.group || "";
+        if (!g) return;
+        try {
+          if (b.classList.contains("js-alert-on")) {
+            await runGroupAlert(g, "on");
+          } else if (b.classList.contains("js-alert-off")) {
+            await runGroupAlert(g, "off");
+          } else if (b.classList.contains("js-edit-group")) {
+            const old = groupMetaMap[g] || {};
+            const display_name = prompt("Group display name", old.display_name || g);
+            if (display_name == null) return;
+            const owner_name = prompt("Owner name", old.owner_name || "");
+            if (owner_name == null) return;
+            const phone = prompt("Phone", old.phone || "");
+            if (phone == null) return;
+            const email = prompt("Email", old.email || "");
+            if (email == null) return;
+            groupMetaMap[g] = {
+              display_name: String(display_name || "").trim(),
+              owner_name: String(owner_name || "").trim(),
+              phone: String(phone || "").trim(),
+              email: String(email || "").trim(),
+            };
+            saveGroupMeta(groupMetaMap);
+            renderGroupCards();
+          }
+        } catch (e) {
+          toast(e.message || e, "err");
+        }
+        return;
+      }
+      const card = ev.target.closest(".js-group-card");
+      if (!card) return;
+      const g = card.dataset.group || "";
+      if (!g) return;
+      selectedGroup = g;
+      renderGroupCards();
+      renderGroupDevices();
     });
-    renderList();
+
+    renderGroupCards();
+    renderGroupDevices();
   });
 
   // Device detail
@@ -1171,8 +1257,8 @@
         </div>
         <dl class="kv">
           <dt>Firmware</dt><dd class="mono">${escapeHtml(d.fw || "—")}</dd>
-          <dt>Chip</dt><dd class="mono">${escapeHtml(d.chip_target || "—")}</dd>
-          <dt>Board</dt><dd class="mono">${escapeHtml(d.board_profile || "—")}</dd>
+          <dt>Platform</dt><dd class="mono">${escapeHtml(`${d.chip_target || "—"} / ${d.board_profile || "—"}`)}</dd>
+          <dt>Manufacturer</dt><dd class="mono">ESA Sibu</dd>
           <dt>Network</dt><dd class="mono">${escapeHtml(d.net_type || "—")} · ${escapeHtml(s.ip || "—")}</dd>
           <dt>Wi‑Fi SSID</dt><dd>${wifiSsidDd}</dd>
           <dt>Wi‑Fi channel</dt><dd>${wifiChDd}</dd>
