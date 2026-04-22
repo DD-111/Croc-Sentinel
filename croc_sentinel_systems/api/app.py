@@ -3293,11 +3293,9 @@ def _send_email_otp(to: str, code: str, purpose: str) -> None:
         "</table>"
         "</td></tr></table></div>"
     )
-    ok = notifier.enqueue(to=[to], subject=subject, body_text=body, body_html=body_html)
-    if not ok:
-        raise RuntimeError(
-            "Email sender is not configured or the mail queue rejected the job"
-        )
+    # Use synchronous SMTP for OTP mail: async queue would return 200 before delivery,
+    # so authentication flows could claim success while the worker silently failed.
+    notifier.send_sync([to], subject, body, body_html)
 
 
 def _send_sms_otp(phone: str, code: str, purpose: str) -> None:
@@ -3658,7 +3656,13 @@ def auth_code_resend(body: ResendCodeRequest) -> dict[str, Any]:
     target = str(u["email"] or "") if body.channel == "email" else str(u["phone"] or "")
     if not target:
         raise HTTPException(status_code=400, detail=f"{body.channel} not on file")
-    _issue_verification(username, body.channel, target, purpose=body.purpose)
+    try:
+        _issue_verification(username, body.channel, target, purpose=body.purpose)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("resend verification failed for %s %s: %s", username, body.channel, exc)
+        raise HTTPException(status_code=502, detail=f"failed to send code: {exc}") from exc
     return {"ok": True, "ttl_seconds": OTP_TTL_SECONDS}
 
 
@@ -3903,7 +3907,16 @@ def auth_forgot_email_start(body: ForgotEmailStartRequest, request: Request) -> 
     if not notifier.enabled():
         raise HTTPException(status_code=503, detail="email sender is not configured")
     sha_code = _generate_sha_code()
-    ttl = _issue_verification(username, "email", email, "reset", explicit_code=sha_code)
+    try:
+        ttl = _issue_verification(username, "email", email, "reset", explicit_code=sha_code)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("password reset email send failed for %s: %s", username, exc)
+        raise HTTPException(
+            status_code=502,
+            detail=f"failed to send recovery email: {exc}",
+        ) from exc
     emit_event(
         level="info",
         category="auth",
