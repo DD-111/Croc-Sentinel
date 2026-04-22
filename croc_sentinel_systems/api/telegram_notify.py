@@ -113,7 +113,10 @@ class _TelegramQueue:
         # Keep Telegram signal clean: debug/info system chatter is skipped unless alarm/auth/ota.
         if lvl in ("debug", "info") and cat not in ("alarm", "auth", "ota"):
             return
-        detail_short = ""
+        # Device alarm raw echoes are noisy; the normalized alarm/* event follows.
+        if cat == "device" and "alarm.trigger" in et:
+            return
+        detail_map: dict[str, Any] = {}
         try:
             d = ev.get("detail") or {}
             if isinstance(d, dict) and d:
@@ -123,18 +126,41 @@ class _TelegramQueue:
                         keep[k] = d.get(k)
                 # Rich login/device context is kept only for superadmin actor events.
                 if bool(ev.get("_actor_superadmin")):
-                    for k in ("ip", "platform", "device_type", "mac_hint"):
+                    for k in ("ip", "platform", "device_type", "mac_hint", "geo"):
                         if k in d and d.get(k) not in (None, ""):
                             keep[k] = d.get(k)
-                if keep:
-                    detail_short = " · " + ", ".join([f"{k}={keep[k]}" for k in keep.keys()])
+                # Trigger source is always important for alarm actions.
+                for k in ("trigger_kind", "client_kind"):
+                    if k in d and d.get(k) not in (None, ""):
+                        keep[k] = d.get(k)
+                detail_map = keep
         except Exception:
             pass
-        line = (
-            f"[{lvl.upper()}] {cat}/{et}\n"
-            f"{summary}\n"
-            f"device={device_id} actor={actor} target={target}{detail_short}"
-        )
+        trigger = str(detail_map.get("trigger_kind") or detail_map.get("client_kind") or "")
+        if trigger == "remote_button":
+            trigger = "push_button"
+        elif trigger == "api":
+            trigger = "web/app"
+        dev_name = ""
+        if "·" in summary:
+            dev_name = summary.split("·", 1)[0].strip()
+            if dev_name.startswith("[") and "]" in dev_name:
+                dev_name = dev_name.split("]", 1)[1].strip() or dev_name
+        lines = [
+            f"[{lvl.upper()}] {cat}/{et}",
+            summary,
+            f"device: {device_id}",
+            f"actor: {actor}",
+            f"target: {target}",
+        ]
+        if dev_name:
+            lines.insert(3, f"device_name: {dev_name}")
+        if trigger:
+            lines.append(f"trigger: {trigger}")
+        for k in ("ip", "platform", "device_type", "mac_hint", "geo", "reason", "error", "result", "state", "duration_ms", "fanout_count"):
+            if k in detail_map and detail_map.get(k) not in (None, ""):
+                lines.append(f"{k}: {detail_map.get(k)}")
+        line = "\n".join(lines)
         fp = f"{lvl}|{cat}|{et}|{device_id}|{summary}"
         now = time.time()
         prev = float(self._recent_fingerprint_ts.get(fp, 0.0))

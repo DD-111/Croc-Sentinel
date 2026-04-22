@@ -9,6 +9,7 @@ import secrets
 import sqlite3
 import threading
 import time
+import urllib.request
 from contextlib import asynccontextmanager
 import base64
 import hashlib
@@ -2852,6 +2853,40 @@ def _client_ip(request: Request) -> str:
     return "?"
 
 
+_ip_geo_cache: dict[str, tuple[float, str]] = {}
+
+
+def _ip_geo_text(ip: str) -> str:
+    """Best-effort geo text for a public IP. Returns '' when unavailable."""
+    ip = str(ip or "").strip()
+    if not ip or ip in ("?", "127.0.0.1", "::1"):
+        return ""
+    now = time.time()
+    ent = _ip_geo_cache.get(ip)
+    if ent and (now - ent[0]) < 1800:
+        return ent[1]
+    try:
+        req = urllib.request.Request(
+            f"http://ip-api.com/json/{ip}?fields=status,country,regionName,city,query",
+            headers={"User-Agent": "CrocSentinel-Geo/1.0"},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        j = json.loads(raw)
+        if str(j.get("status")) == "success":
+            city = str(j.get("city") or "").strip()
+            region = str(j.get("regionName") or "").strip()
+            country = str(j.get("country") or "").strip()
+            txt = ", ".join([x for x in (city, region, country) if x]) or ""
+            _ip_geo_cache[ip] = (now, txt)
+            return txt
+    except Exception:
+        pass
+    _ip_geo_cache[ip] = (now, "")
+    return ""
+
+
 def _client_context(request: Request) -> dict[str, str]:
     """Best-effort client context for auth logs (IP + UA-derived platform).
 
@@ -2880,12 +2915,17 @@ def _client_context(request: Request) -> dict[str, str]:
     else:
         device_type = "desktop"
     mac_hint = str(request.headers.get("x-client-mac") or request.headers.get("x-device-mac") or "").strip()
+    client_kind = "app" if any(x in ua_l for x in ("okhttp", "dalvik", "cfnetwork", "flutter", "reactnative")) else "web"
+    geo = _ip_geo_text(ip)
     out = {
         "ip": ip,
         "platform": platform,
         "device_type": device_type,
+        "client_kind": client_kind,
         "ua": ua[:220],
     }
+    if geo:
+        out["geo"] = geo
     if mac_hint:
         out["mac_hint"] = mac_hint[:64]
     return out
@@ -5569,7 +5609,12 @@ def get_log_file_tail(
 
 
 @app.post("/devices/{device_id}/commands")
-def send_device_command(device_id: str, req: CommandRequest, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+def send_device_command(
+    device_id: str,
+    req: CommandRequest,
+    request: Request,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
     assert_min_role(principal, "admin")
     require_capability(principal, "can_send_command")
     ensure_not_revoked(device_id)
@@ -5586,6 +5631,27 @@ def send_device_command(device_id: str, req: CommandRequest, principal: Principa
     target = req.target_id or device_id
     topic = f"{TOPIC_ROOT}/{device_id}/cmd"
     publish_command(topic, req.cmd, req.params, target, req.proto, get_cmd_key_for_device(device_id))
+    ctx = _client_context(request)
+    emit_event(
+        level="info",
+        category="device",
+        event_type="device.command.send",
+        summary=f"command {req.cmd} to {device_id} by {principal.username}",
+        actor=principal.username,
+        target=device_id,
+        owner_admin=_lookup_owner_admin(device_id) or "",
+        device_id=device_id,
+        detail={
+            "cmd": req.cmd,
+            "target_id": target,
+            "trigger_kind": ctx.get("client_kind", "web"),
+            "ip": ctx.get("ip", ""),
+            "platform": ctx.get("platform", ""),
+            "device_type": ctx.get("device_type", ""),
+            "mac_hint": ctx.get("mac_hint", ""),
+            "geo": ctx.get("geo", ""),
+        },
+    )
     return {"ok": True, "topic": topic, "target_id": target}
 
 
@@ -5593,6 +5659,7 @@ def send_device_command(device_id: str, req: CommandRequest, principal: Principa
 def device_alert_on(
     device_id: str,
     duration_ms: int = Query(default=8000, ge=500, le=120000),
+    request: Request = None,
     principal: Principal = Depends(require_principal),
 ) -> dict[str, Any]:
     assert_min_role(principal, "user")
@@ -5619,6 +5686,7 @@ def device_alert_on(
     )
     z = str(zr["zone"] if zr["zone"] is not None else "")
     owner = _lookup_owner_admin(device_id)
+    ctx = _client_context(request) if request else {}
     _log_signal_trigger(
         "remote_siren_on",
         device_id,
@@ -5627,6 +5695,7 @@ def device_alert_on(
         owner,
         duration_ms=duration_ms,
         target_count=1,
+        detail=ctx,
     )
     _remote_siren_notify_email(
         action="ON",
@@ -5645,13 +5714,13 @@ def device_alert_on(
         target=device_id,
         owner_admin=owner or "",
         device_id=device_id,
-        detail={"duration_ms": duration_ms, "zone": z},
+        detail={"duration_ms": duration_ms, "zone": z, **ctx},
     )
     return {"ok": True}
 
 
 @app.post("/devices/{device_id}/alert/off")
-def device_alert_off(device_id: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+def device_alert_off(device_id: str, request: Request, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     assert_min_role(principal, "user")
     require_capability(principal, "can_alert")
     ensure_not_revoked(device_id)
@@ -5684,6 +5753,7 @@ def device_alert_off(device_id: str, principal: Principal = Depends(require_prin
         owner,
         duration_ms=None,
         target_count=1,
+        detail=_client_context(request),
     )
     _remote_siren_notify_email(
         action="OFF",
@@ -5702,13 +5772,13 @@ def device_alert_off(device_id: str, principal: Principal = Depends(require_prin
         target=device_id,
         owner_admin=owner or "",
         device_id=device_id,
-        detail={"zone": z},
+        detail={"zone": z, **_client_context(request)},
     )
     return {"ok": True}
 
 
 @app.post("/alerts")
-def bulk_alert(req: BulkAlertRequest, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+def bulk_alert(req: BulkAlertRequest, request: Request, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     assert_min_role(principal, "user")
     require_capability(principal, "can_alert")
     targets = resolve_target_devices(req.device_ids, principal)
@@ -5748,7 +5818,7 @@ def bulk_alert(req: BulkAlertRequest, principal: Principal = Depends(require_pri
             own,
             duration_ms=req.duration_ms if req.action == "on" else None,
             target_count=sent,
-            detail={"device_ids": targets},
+            detail={"device_ids": targets, **_client_context(request)},
         )
         if notifier.enabled() and own:
             rec = _recipients_for_admin(own)
