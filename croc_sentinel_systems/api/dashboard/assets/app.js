@@ -561,22 +561,32 @@
   registerRoute("login", async (view) => {
     setCrumb("Sign in");
     document.body.dataset.auth = "none";
+    const cleanAuthMessage = (raw) => {
+      const s = String(raw || "").trim();
+      if (!s) return "Request failed. Please try again.";
+      const l = s.toLowerCase();
+      if (l.includes("401")) return "Username or password is incorrect.";
+      if (l.includes("invalid credentials")) return "Username or password is incorrect.";
+      if (l.includes("session expired")) return "Session expired. Please sign in again.";
+      if (l.includes("networkerror") || l.includes("failed to fetch")) return "Network error. Please check server/API.";
+      return s.replace(/^error:\s*/i, "");
+    };
     view.innerHTML = `
       <div class="auth-page" role="main">
         <div class="auth-card" data-auth-card>
           <header class="auth-card__head">
             <div class="auth-card__logo" aria-hidden="true"></div>
             <h1 class="auth-card__title">Sign in</h1>
-            <p class="auth-card__lead">Croc Sentinel — fleet alarms, devices &amp; OTA</p>
+            <p class="auth-card__lead">Welcome back. Sign in to continue.</p>
           </header>
           <form class="auth-card__body" id="loginForm" autocomplete="on">
             <label class="field">
               <span>Username</span>
-              <input name="username" autocomplete="username" required placeholder="e.g. admin" />
+              <input name="username" autocomplete="username" required placeholder="Enter username" />
             </label>
             <label class="field field--spaced">
               <span>Password</span>
-              <input name="password" type="password" autocomplete="current-password" required placeholder="••••••••" />
+              <input name="password" type="password" autocomplete="current-password" required placeholder="Enter password" />
             </label>
             <div class="auth-card__submit">
               <button class="btn btn-tap btn-block" type="submit" id="loginSubmit">Sign in</button>
@@ -585,7 +595,7 @@
             <nav class="auth-card__links" aria-label="Other sign-in options">
               <a class="auth-link" href="#/register">Create admin account</a>
               <a class="auth-link" href="#/account-activate">Activate with email code</a>
-              <a class="auth-link" href="#/forgot-password">Forgot password <span class="auth-link__hint">(offline RSA)</span></a>
+              <a class="auth-link" href="#/forgot-password">Forgot password</a>
             </nav>
           </form>
         </div>
@@ -609,7 +619,7 @@
         await loadHealth();
         location.hash = "#/overview";
       } catch (e) {
-        msg.textContent = String(e.message || e);
+        msg.textContent = cleanAuthMessage(e.message || e);
         if (card) {
           card.classList.remove("auth-shake");
           void card.offsetWidth;
@@ -744,16 +754,25 @@
   registerRoute("register", async (view) => {
     setCrumb("Register admin");
     document.body.dataset.auth = "none";
+    const cleanSignupMessage = (raw) => {
+      const s = String(raw || "").trim();
+      if (!s) return "Request failed. Please try again.";
+      const l = s.toLowerCase();
+      if (l.includes("already exists")) return "Username or email already exists.";
+      if (l.includes("invalid") && l.includes("email")) return "Email format is invalid.";
+      if (l.includes("networkerror") || l.includes("failed to fetch")) return "Network error. Please check server/API.";
+      return s.replace(/^error:\s*/i, "");
+    };
     view.innerHTML = `
       <div class="auth-page" role="main">
         <div class="auth-card auth-card--wide" data-auth-card>
           <header class="auth-card__head">
             <div class="auth-card__logo" aria-hidden="true"></div>
             <h1 class="auth-card__title">Create admin</h1>
-            <p class="auth-card__lead">Email verification · creates an <strong>admin</strong> account</p>
+            <p class="auth-card__lead">Create your admin account with email verification.</p>
           </header>
           <div class="auth-card__body">
-            <p class="auth-card__note muted">After email verification your account is ready to sign in.</p>
+            <p class="auth-card__note muted">No manual approval needed. After code verification, you can sign in immediately.</p>
             <ol class="auth-steps" aria-label="Steps">
               <li id="r_step_ind1" class="is-active"><span class="auth-steps__n">1</span><span class="auth-steps__t">Your details</span></li>
               <li id="r_step_ind2"><span class="auth-steps__n">2</span><span class="auth-steps__t">Email code</span></li>
@@ -802,7 +821,7 @@
         $("#r_step_ind2").classList.add("is-active");
         $("#rStep1").style.display = "none";
         $("#rStep2").style.display = "";
-      } catch (e) { m1.textContent = String(e.message || e); }
+      } catch (e) { m1.textContent = cleanSignupMessage(e.message || e); }
     });
     $("#r_verify").addEventListener("click", async () => {
       m2.textContent = "";
@@ -818,7 +837,7 @@
         if (!r.ok) throw new Error(j.detail || `${r.status}`);
         m2.innerHTML = `<span class="badge online">OK</span> Redirecting to sign in…`;
         scheduleRouteRedirect(3000, "#/login");
-      } catch (e) { m2.textContent = String(e.message || e); }
+      } catch (e) { m2.textContent = cleanSignupMessage(e.message || e); }
     });
     $("#r_back_step").addEventListener("click", () => {
       m2.textContent = "";
@@ -838,7 +857,7 @@
         const j = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(j.detail || `${r.status}`);
         m2.textContent = "Code resent";
-      } catch (e) { m2.textContent = String(e.message || e); }
+      } catch (e) { m2.textContent = cleanSignupMessage(e.message || e); }
     });
   });
 
@@ -994,11 +1013,12 @@
       } catch { return {}; }
     };
     const saveGroupMeta = (obj) => localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(obj || {}));
-    const normalizeGroup = (s) => String(s || "").trim() || "Ungrouped";
+    const normalizeGroup = (s) => String(s || "").trim();
     const meta = loadGroupMeta();
     const notifMap = new Map();
     for (const d of devices) {
       const g = normalizeGroup(d.notification_group);
+      if (!g) continue;
       if (!notifMap.has(g)) notifMap.set(g, []);
       notifMap.get(g).push(String(d.device_id));
     }
@@ -1133,6 +1153,19 @@
         </article>`;
       }).join("");
     };
+    const clearGroupByDevicePatch = async (groupKey) => {
+      const ids = groupDeviceIds(groupKey);
+      if (!ids.length) return { ok: true, changed: 0 };
+      let changed = 0;
+      for (const id of ids) {
+        await api(`/devices/${encodeURIComponent(id)}/profile`, {
+          method: "PATCH",
+          body: { notification_group: "" },
+        });
+        changed += 1;
+      }
+      return { ok: true, changed };
+    };
     const deleteGroupCard = async (groupKey) => {
       // Prefer POST /delete for proxy compatibility; fallback to DELETE.
       try {
@@ -1140,7 +1173,16 @@
       } catch (e) {
         const msg = String((e && e.message) || e || "");
         if (msg.includes("404") || msg.includes("405") || msg.includes("501")) {
-          return await api(`/group-cards/${encodeURIComponent(groupKey)}`, { method: "DELETE" });
+          try {
+            return await api(`/group-cards/${encodeURIComponent(groupKey)}`, { method: "DELETE" });
+          } catch (e2) {
+            const msg2 = String((e2 && e2.message) || e2 || "");
+            // Backward-compatible fallback: clear group assignment per device.
+            if (msg2.includes("404") || msg2.includes("405") || msg2.includes("501")) {
+              return await clearGroupByDevicePatch(groupKey);
+            }
+            throw e2;
+          }
         }
         throw e;
       }
