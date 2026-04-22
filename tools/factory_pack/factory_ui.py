@@ -22,9 +22,11 @@ from factory_core import (  # noqa: E402
     DEFAULT_FACTORY_UI_API_BASE,
     default_dotenv_path,
     drain_pending_push_queue,
+    FACTORY_PUBLIC_HTTP_PORT,
     generate_items,
     get_factory_ping,
     load_pending_push_queue,
+    normalize_factory_api_base,
     post_factory_devices,
     read_dotenv_keys,
     repo_root,
@@ -50,8 +52,8 @@ class FactoryApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Croc Sentinel · 出厂工具")
-        self.geometry("920x700")
-        self.minsize(760, 560)
+        self.geometry("960x780")
+        self.minsize(800, 620)
 
         self._dotenv_path = tk.StringVar(value=str(default_dotenv_path()))
         self._api_base = tk.StringVar(value=DEFAULT_FACTORY_UI_API_BASE)
@@ -62,6 +64,7 @@ class FactoryApp(tk.Tk):
         self._insecure = tk.BooleanVar(value=False)
         self._last_out: Path | None = None
         self._conn_status = tk.StringVar(value="未检测 · 请点击「测试连接」")
+        self._resolved_ping = tk.StringVar(value="")
 
         self._apply_style()
 
@@ -75,6 +78,29 @@ class FactoryApp(tk.Tk):
         row_s.pack(fill=tk.X)
         self._lbl_status = ttk.Label(row_s, textvariable=self._conn_status, font=("Segoe UI", 10))
         self._lbl_status.pack(side=tk.LEFT, anchor=tk.W)
+        ttk.Label(
+            stat_fr,
+            textvariable=self._resolved_ping,
+            foreground="#1565c0",
+            font=("Consolas", 9),
+            wraplength=900,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, fill=tk.X, pady=(6, 0))
+
+        deploy = ttk.LabelFrame(outer, text="端口说明（必读）", padding=(10, 8))
+        deploy.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(
+            deploy,
+            text=(
+                f"• 本仓库 docker-compose 把容器内 8088 映射到宿主机端口 {FACTORY_PUBLIC_HTTP_PORT}（不是把 8088 暴露到公网）。\n"
+                "• FACTORY_UI_API_BASE 填「API 根」，不要带 /factory；Traefik 示例：https://域名/api\n"
+                "• 若 ping 超时 (WinError 10060)：多为防火墙、错端口（常见误用 :8088）、或 VPS 未映射 18999。\n"
+                "• 控制台 SPA 与出厂工具都应指向同一可达的 API 根（浏览器 Network 里成功的 origin）。"
+            ),
+            foreground="#444",
+            justify=tk.LEFT,
+            wraplength=900,
+        ).pack(anchor=tk.W)
 
         cfg = ttk.LabelFrame(outer, text="密钥与 API（与 croc_sentinel_systems/.env 一致）", padding=10)
         cfg.pack(fill=tk.X, pady=(0, 8))
@@ -85,14 +111,31 @@ class FactoryApp(tk.Tk):
         ttk.Entry(r0, textvariable=self._dotenv_path).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 8))
         ttk.Button(r0, text="浏览…", command=self._browse_dotenv, width=10).pack(side=tk.LEFT)
 
+        self._api_presets = (
+            DEFAULT_FACTORY_UI_API_BASE,
+            f"http://127.0.0.1:{FACTORY_PUBLIC_HTTP_PORT}",
+            "https://esasecure.com/api",
+        )
         r1 = ttk.Frame(cfg)
         r1.pack(fill=tk.X, pady=2)
         ttk.Label(r1, text="API 根地址", width=14).pack(side=tk.LEFT)
-        ttk.Entry(r1, textvariable=self._api_base).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+        self._api_combo = ttk.Combobox(
+            r1,
+            textvariable=self._api_base,
+            values=self._api_presets,
+            width=52,
+        )
+        self._api_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 6))
+        ttk.Button(
+            r1,
+            text=f":8088 → :{FACTORY_PUBLIC_HTTP_PORT}",
+            command=self._swap_compose_port,
+            width=18,
+        ).pack(side=tk.LEFT)
 
         hint_api = (
-            "示例（直连容器映射）: http://你的域名:18999 — 不要多写 /factory。"
-            " 若用 HTTPS+Traefik 则为 https://域名/api"
+            "下拉可选预设；若手动填 IP，请与服务器实际放行端口一致（compose 默认 "
+            f"{FACTORY_PUBLIC_HTTP_PORT}）。误填 :8088 会导致连接超时。"
         )
         ttk.Label(cfg, text=hint_api, foreground="#555", wraplength=860, justify=tk.LEFT).pack(
             anchor=tk.W, pady=(4, 0)
@@ -168,7 +211,37 @@ class FactoryApp(tk.Tk):
         xscroll.config(command=self._log.xview)
 
         self._ping_lock = threading.Lock()
+        self._api_base.trace_add("write", lambda *_: self.after(60, self._refresh_resolved_ping_label))
         self._load_env()
+
+    def _effective_api_base(self, dot: Path) -> str:
+        raw_ui = self._api_base.get().strip()
+        env = read_dotenv_keys(dot, ("FACTORY_UI_API_BASE",))
+        env_b = (env.get("FACTORY_UI_API_BASE") or "").strip()
+        merged = raw_ui or env_b
+        return normalize_factory_api_base(merged)
+
+    def _refresh_resolved_ping_label(self) -> None:
+        dot = Path(self._dotenv_path.get())
+        api = self._effective_api_base(dot)
+        if api:
+            mis = ":8088" in api and "127.0.0.1" not in api and "localhost" not in api.lower()
+            warn = "  [!] 常见误配：compose 对外是 :18999 而非 :8088" if mis else ""
+            self._resolved_ping.set(f"实际请求: GET {api}/factory/ping{warn}")
+        else:
+            self._resolved_ping.set("实际请求: （填写 API 根或 .env 中 FACTORY_UI_API_BASE）")
+
+    def _swap_compose_port(self) -> None:
+        raw = self._api_base.get()
+        if ":8088" not in raw:
+            messagebox.showinfo(
+                "提示",
+                f"当前地址里没有 :8088。\n若连接超时，请改为宿主机映射端口 :{FACTORY_PUBLIC_HTTP_PORT}（见上方说明）。",
+            )
+            return
+        self._api_base.set(raw.replace(":8088", f":{FACTORY_PUBLIC_HTTP_PORT}", 1))
+        self._refresh_resolved_ping_label()
+        self._line(f"[ui] replaced :8088 → :{FACTORY_PUBLIC_HTTP_PORT} in API base")
 
     def _apply_style(self) -> None:
         try:
@@ -213,7 +286,7 @@ class FactoryApp(tk.Tk):
     def _browse_dotenv_path_display(self, dot: Path) -> None:
         env = read_dotenv_keys(dot, ("QR_SIGN_SECRET", "FACTORY_API_TOKEN", "FACTORY_UI_API_BASE"))
         if env.get("FACTORY_UI_API_BASE", "").strip():
-            self._api_base.set(env["FACTORY_UI_API_BASE"].strip())
+            self._api_base.set(normalize_factory_api_base(env["FACTORY_UI_API_BASE"].strip()))
         if env.get("FACTORY_API_TOKEN") and not self._factory_token.get().strip():
             self._factory_token.set(env["FACTORY_API_TOKEN"].strip())
         qs = "yes" if env.get("QR_SIGN_SECRET") else "NO"
@@ -230,6 +303,7 @@ class FactoryApp(tk.Tk):
         dot = Path(self._dotenv_path.get())
         self._browse_dotenv_path_display(dot)
         self._set_status("已从 .env 加载 · 请点击「测试连接」确认服务器")
+        self._refresh_resolved_ping_label()
 
     def _set_last_out(self, p: Path) -> None:
         self._last_out = p
@@ -264,12 +338,13 @@ class FactoryApp(tk.Tk):
         try:
             dot = Path(self._dotenv_path.get())
             env = read_dotenv_keys(dot, ("FACTORY_API_TOKEN", "FACTORY_UI_API_BASE"))
-            api = self._api_base.get().strip().rstrip("/") or env.get("FACTORY_UI_API_BASE", "").strip().rstrip("/")
+            api = self._effective_api_base(dot)
             tok = self._factory_token.get().strip() or env.get("FACTORY_API_TOKEN", "").strip()
             if not api or not tok:
                 ui(messagebox.showwarning, "缺少配置", "请填写 API 根地址与 Factory Token（或写入 .env）。")
                 ui(self._set_status, "失败 · 缺少 API 或 Token")
                 return
+            ui(self._refresh_resolved_ping_label)
             ui(self._set_status, f"检测中… {api}")
             ui(self._line, f"[ping] GET {api}/factory/ping")
             ui(self._line, f"[ping] token_len={len(tok)}")
@@ -311,7 +386,7 @@ class FactoryApp(tk.Tk):
             ui(self._line, "[gen] qr_verify=all_ok")
 
             if self._auto_push.get():
-                api = self._api_base.get().strip().rstrip("/")
+                api = self._effective_api_base(dot)
                 tok = self._factory_token.get().strip() or env.get("FACTORY_API_TOKEN", "").strip()
                 if not api:
                     ui(messagebox.showwarning, "未登记", "未填写 API 根地址，仅生成本地文件。")

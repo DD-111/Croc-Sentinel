@@ -1,5 +1,5 @@
 /* Croc Sentinel Console - SPA
- * Markup safety: escapeHtml(str) or hx`...${str}...` for any API/user text; mountView(el, html) for route shells.
+ * Markup safety: escapeHtml(str) or hx`...${str}...` for any API/user text; mountView(el, html) for route shells (DOMParser + replaceChildren, no innerHTML).
  * Live stream: Events use fetch()+stream+Authorization (not EventSource URL+?token=) for reverse-proxy reliability. */
 (function () {
   "use strict";
@@ -207,12 +207,41 @@
       .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
   }
   const _lastHtmlByEl = new WeakMap();
+
+  /** Parsed HTML fragment (no assignment to Element.innerHTML). */
+  function parseHtmlToFragment(html) {
+    const src = String(html ?? "");
+    const frag = document.createDocumentFragment();
+    if (!src.trim()) return frag;
+    const doc = new DOMParser().parseFromString("<!DOCTYPE html><body>" + src + "</body>", "text/html");
+    const b = doc.body;
+    while (b.firstChild) frag.appendChild(b.firstChild);
+    return frag;
+  }
+
+  function setChildMarkup(el, html) {
+    if (!el) return;
+    el.replaceChildren(parseHtmlToFragment(String(html ?? "")));
+  }
+
+  function prependChildMarkup(el, html) {
+    if (!el) return;
+    const frag = parseHtmlToFragment(html);
+    const ref = el.firstChild;
+    while (frag.firstChild) el.insertBefore(frag.firstChild, ref);
+  }
+
+  function appendChildMarkup(el, html) {
+    if (!el) return;
+    el.append(parseHtmlToFragment(html));
+  }
+
   function setHtmlIfChanged(el, html) {
     if (!el) return false;
     const next = String(html == null ? "" : html);
     const prev = _lastHtmlByEl.has(el) ? _lastHtmlByEl.get(el) : null;
     if (prev === next) return false;
-    el.innerHTML = next;
+    el.replaceChildren(parseHtmlToFragment(next));
     _lastHtmlByEl.set(el, next);
     return true;
   }
@@ -240,7 +269,7 @@
   /** Replace a route container’s markup; caller must escape dynamic parts (escapeHtml / hx). */
   function mountView(el, html) {
     if (!el) return;
-    el.innerHTML = String(html == null ? "" : html);
+    el.replaceChildren(parseHtmlToFragment(String(html == null ? "" : html)));
   }
 
   /** Parse one SSE block (RFC 8895-style, LF / CRLF). */
@@ -690,9 +719,11 @@
     document.body.dataset.auth = state.me ? "ok" : "none";
     const who = $("#who");
     if (state.me) {
-      who.innerHTML =
+      setChildMarkup(
+        who,
         `<div><strong>${escapeHtml(state.me.username)}</strong></div>` +
-        `<div class="muted">${escapeHtml(state.me.role)} · ${escapeHtml((state.me.zones || []).join(", ") || "—")}</div>`;
+          `<div class="muted">${escapeHtml(state.me.role)} · ${escapeHtml((state.me.zones || []).join(", ") || "—")}</div>`,
+      );
     } else {
       who.textContent = "Signed out";
     }
@@ -1283,7 +1314,7 @@
           const msg = Array.isArray(det) ? det.map((x) => x.msg || JSON.stringify(x)).join("; ") : (det || r.statusText);
           throw new Error(msg);
         }
-        m2.innerHTML = `<span class="badge online">Password updated</span> Redirecting to sign in…`;
+        setChildMarkup(m2, `<span class="badge online">Password updated</span> Redirecting to sign in…`);
         toast("Password updated", "ok");
         scheduleRouteRedirect(1500, "#/login");
       } catch (e) { m2.textContent = String(e.message || e); }
@@ -1387,7 +1418,7 @@
         });
         const j = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(j.detail || `${r.status}`);
-        m2.innerHTML = `<span class="badge online">OK</span> Redirecting to sign in…`;
+        setChildMarkup(m2, `<span class="badge online">OK</span> Redirecting to sign in…`);
         scheduleRouteRedirect(1500, "#/login");
       } catch (e) { m2.textContent = cleanSignupMessage(e.message || e); }
     });
@@ -1451,7 +1482,7 @@
         });
         const j = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(j.detail || `${r.status}`);
-        msg.innerHTML = `<span class="badge online">Activated</span> Redirecting to sign in…`;
+        setChildMarkup(msg, `<span class="badge online">Activated</span> Redirecting to sign in…`);
         scheduleRouteRedirect(1500, "#/login");
       } catch (e) { msg.textContent = String(e.message || e); }
     });
@@ -1589,7 +1620,7 @@
   });
 
   // Overview
-  registerRoute("overview", async (view) => {
+  registerRoute("overview", async (view, _args, routeSeq) => {
     setCrumb("Overview");
     const groupScope = (state.me && state.me.username) ? state.me.username : "anon";
     const GROUP_API_CAPS_LS_KEY = `croc.group.api.caps.v2.${groupScope}`;
@@ -1942,7 +1973,7 @@
     const renderGroups = () => {
       const keys = groupKeys();
       if (keys.length === 0) {
-        groupCardsEl.innerHTML = `<p class="muted">No groups yet.</p>`;
+        setChildMarkup(groupCardsEl, `<p class="muted">No groups yet.</p>`);
         return;
       }
       const existing = new Map(
@@ -1953,9 +1984,8 @@
         const html = buildGroupCardHtml(g);
         let node = existing.get(g) || null;
         if (!node || node.outerHTML !== html) {
-          const t = document.createElement("template");
-          t.innerHTML = html.trim();
-          node = t.content.firstElementChild;
+          const frag = parseHtmlToFragment(html.trim());
+          node = frag.firstElementChild;
         }
         if (node) frag.appendChild(node);
       }
@@ -2131,9 +2161,12 @@
       const pick = $("#gmDevices", view);
       const isSharedGroup = groupSharedBy(g || "").length > 0;
       if (pick) {
-        pick.innerHTML = devices.map((d) => `<label class="grp-pick-item"><input type="checkbox" value="${escapeHtml(d.device_id)}" ${sel.has(String(d.device_id)) ? "checked" : ""} ${isSharedGroup ? "disabled" : ""}/> <span>${escapeHtml(d.display_label || d.device_id)} <span class="mono">(${escapeHtml(d.device_id)})</span></span></label>`).join("");
+        setChildMarkup(
+          pick,
+          devices.map((d) => `<label class="grp-pick-item"><input type="checkbox" value="${escapeHtml(d.device_id)}" ${sel.has(String(d.device_id)) ? "checked" : ""} ${isSharedGroup ? "disabled" : ""}/> <span>${escapeHtml(d.display_label || d.device_id)} <span class="mono">(${escapeHtml(d.device_id)})</span></span></label>`).join(""),
+        );
         if (isSharedGroup) {
-          pick.insertAdjacentHTML("afterbegin", `<p class="muted" style="margin:0 0 6px">Shared group: device membership is read-only.</p>`);
+          prependChildMarkup(pick, `<p class="muted" style="margin:0 0 6px">Shared group: device membership is read-only.</p>`);
         }
       }
       grpModalEl.style.display = "flex";
@@ -2153,11 +2186,14 @@
         ? `Group: ${sharePrefillGroup} (you can still adjust selections).`
         : "Select devices, users, and permissions.";
       const picked = new Set(sharePrefillGroup ? groupDeviceIds(sharePrefillGroup).map(String) : []);
-      devListEl.innerHTML = devices
-        .filter((d) => !d.is_shared)
-        .map((d) => `<label class="grp-pick-item"><input type="checkbox" value="${escapeHtml(d.device_id)}" ${picked.has(String(d.device_id)) ? "checked" : ""}/> <span>${escapeHtml(d.display_label || d.device_id)} <span class="mono">(${escapeHtml(d.device_id)})</span></span></label>`)
-        .join("") || `<p class="muted">No own devices available.</p>`;
-      userListEl.innerHTML = `<p class="muted">Loading users…</p>`;
+      setChildMarkup(
+        devListEl,
+        devices
+          .filter((d) => !d.is_shared)
+          .map((d) => `<label class="grp-pick-item"><input type="checkbox" value="${escapeHtml(d.device_id)}" ${picked.has(String(d.device_id)) ? "checked" : ""}/> <span>${escapeHtml(d.display_label || d.device_id)} <span class="mono">(${escapeHtml(d.device_id)})</span></span></label>`)
+          .join("") || `<p class="muted">No own devices available.</p>`,
+      );
+      setChildMarkup(userListEl, `<p class="muted">Loading users…</p>`);
       try {
         const u = await api("/auth/users", { timeoutMs: 16000 });
         const users = (u.items || []).filter((x) => {
@@ -2167,11 +2203,14 @@
           if (state.me && state.me.role === "admin") return role === "user";
           return role === "admin" || role === "user";
         });
-        userListEl.innerHTML = users.map((x) =>
-          `<label class="grp-pick-item"><input type="checkbox" value="${escapeHtml(x.username)}"/> <span>${escapeHtml(x.username)} <span class="mono">(${escapeHtml(x.role || "user")})</span></span></label>`,
-        ).join("") || `<p class="muted">No active admin/user accounts.</p>`;
+        setChildMarkup(
+          userListEl,
+          users.map((x) =>
+            `<label class="grp-pick-item"><input type="checkbox" value="${escapeHtml(x.username)}"/> <span>${escapeHtml(x.username)} <span class="mono">(${escapeHtml(x.role || "user")})</span></span></label>`,
+          ).join("") || `<p class="muted">No active admin/user accounts.</p>`,
+        );
       } catch (e) {
-        userListEl.innerHTML = `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`;
+        setChildMarkup(userListEl, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
       }
       const allDev = $("#shareSelAllDevices", view);
       const allUsr = $("#shareSelAllUsers", view);
@@ -2441,11 +2480,13 @@
     const devGrid = $("#groupPageDevices", view);
     const renderGroupDevices = () => {
       if (!devGrid) return;
-      devGrid.innerHTML = rows.length ? rows.map((d) => {
-        const on = isOnline(d);
-        const primary = escapeHtml(d.display_label || d.device_id || "unknown");
-        const subId = d.display_label ? `<div class="device-id-sub mono">${escapeHtml(d.device_id || "")}</div>` : "";
-        return `<a class="device-card" href="#/devices/${encodeURIComponent(d.device_id)}" style="text-decoration:none;color:inherit">
+      setChildMarkup(
+        devGrid,
+        rows.length ? rows.map((d) => {
+          const on = isOnline(d);
+          const primary = escapeHtml(d.display_label || d.device_id || "unknown");
+          const subId = d.display_label ? `<div class="device-id-sub mono">${escapeHtml(d.device_id || "")}</div>` : "";
+          return `<a class="device-card" href="#/devices/${encodeURIComponent(d.device_id)}" style="text-decoration:none;color:inherit">
           <h3><div class="device-primary-name">${primary}</div>${subId}</h3>
           <div><span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>
             ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
@@ -2454,7 +2495,8 @@
           </div>
           <div class="meta">Platform: ${escapeHtml(maskPlatform(`${d.chip_target || ""}/${d.board_profile || ""}`))}<br/>Manufacturer: ESA Sibu</div>
         </a>`;
-      }).join("") : `<p class="muted">No devices in this group.</p>`;
+        }).join("") : `<p class="muted">No devices in this group.</p>`,
+      );
       const onNow = rows.filter((d) => isOnline(d)).length;
       const offNow = Math.max(0, rows.length - onNow);
       const tEl = $("#grpTotal", view);
@@ -2842,7 +2884,7 @@
       const reasonChip = $("#devReasonChip", view);
       if (reasonChip) reasonChip.textContent = String(reasonEn[m.reason] || m.reason);
       const setText = (idSel, txt) => { const el = $(idSel, view); if (el) el.textContent = String(txt); };
-      const setHtml = (idSel, txt) => { const el = $(idSel, view); if (el) el.innerHTML = String(txt); };
+      const setHtml = (idSel, txt) => { const el = $(idSel, view); if (el) setChildMarkup(el, String(txt)); };
       setText("#devNetRow", `${dev.net_type || "—"} · ${m.s.ip || "—"}`);
       setHtml("#devWifiSsid", m.wifiSsidDd);
       setHtml("#devWifiCh", m.wifiChDd);
@@ -2868,12 +2910,12 @@
       const loadDebugMsgs = async () => {
         if (loaded || !box) return;
         loaded = true;
-        box.innerHTML = `<p class="muted">Loading…</p>`;
+        setChildMarkup(box, `<p class="muted">Loading…</p>`);
         try {
           const msgs = await api(`/devices/${encodeURIComponent(id)}/messages?limit=25`, { timeoutMs: 16000 });
-          box.innerHTML = renderMsgFeed(msgs.items || []);
+          setChildMarkup(box, renderMsgFeed(msgs.items || []));
         } catch (e) {
-          box.innerHTML = `<p class="badge offline">${escapeHtml(e.message || e)}</p>`;
+          setChildMarkup(box, `<p class="badge offline">${escapeHtml(e.message || e)}</p>`);
         }
       };
       if (det) {
@@ -3121,11 +3163,13 @@
     const shareListEl = $("#shareList");
     const renderShares = async () => {
       if (!shareListEl) return;
-      shareListEl.innerHTML = `<p class="muted">Loading shares…</p>`;
+      setChildMarkup(shareListEl, `<p class="muted">Loading shares…</p>`);
       try {
         const r = await api(`/admin/devices/${encodeURIComponent(id)}/shares`, { timeoutMs: 16000 });
         const items = r.items || [];
-        shareListEl.innerHTML = `
+        setChildMarkup(
+          shareListEl,
+          `
           <div class="table-wrap"><table class="t">
             <thead><tr><th>User</th><th>Role</th><th>View</th><th>Operate</th><th>Granted by</th><th>Granted at</th><th>Status</th><th></th></tr></thead>
             <tbody>${
@@ -3145,7 +3189,8 @@
                 `).join("")
             }</tbody>
           </table></div>
-        `;
+        `,
+        );
         $$(".shareRevokeBtn", shareListEl).forEach((btn) => {
           btn.addEventListener("click", async () => {
             const u = btn.getAttribute("data-user") || "";
@@ -3159,7 +3204,7 @@
           });
         });
       } catch (e) {
-        shareListEl.innerHTML = `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`;
+        setChildMarkup(shareListEl, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
       }
     };
     const shareGrantBtn = $("#shareGrant");
@@ -3224,13 +3269,13 @@
       </div>`);
 
     const sel = $("#targets");
-    sel.innerHTML = devices.map((d) => {
+    setChildMarkup(sel, devices.map((d) => {
       const lab = d.display_label ? `${escapeHtml(d.display_label)}` : escapeHtml(d.device_id);
       const serial = d.display_label ? ` · ${escapeHtml(d.device_id)}` : "";
       const grp = d.notification_group ? `[${escapeHtml(d.notification_group)}] ` : "";
       const z = d.zone ? ` · ${escapeHtml(d.zone)}` : "";
       return `<option value="${escapeHtml(d.device_id)}">${grp}${lab}${serial}${z}</option>`;
-    }).join("");
+    }).join(""));
 
     $("#fire").addEventListener("click", async () => {
       const action = $("#action").value;
@@ -3285,7 +3330,9 @@
       `<span class="badge ${kind === "ok" ? "online" : (kind === "err" ? "offline" : "")}">${escapeHtml(label)}</span>`;
 
     const showClaimForm = (serial, mac, qr) => {
-      resultBox.insertAdjacentHTML("beforeend", `
+      appendChildMarkup(
+        resultBox,
+        `
         <div class="card" style="margin-top:10px">
           <h4 style="margin-top:0">Confirm claim</h4>
           <div class="inline-form">
@@ -3297,7 +3344,8 @@
               <button class="btn btn-tap" id="c_submit">Claim device</button>
             </div>
           </div>
-        </div>`);
+        </div>`,
+      );
       $("#c_submit").addEventListener("click", async () => {
         const body = {
           mac_nocolon: ($("#c_mac").value || "").trim().toUpperCase(),
@@ -3315,44 +3363,53 @@
     };
 
     $("#idn_go").addEventListener("click", async () => {
-      resultBox.innerHTML = `<p class="muted">Identifying…</p>`;
+      setChildMarkup(resultBox, `<p class="muted">Identifying…</p>`);
       const raw = ($("#idn_input").value || "").trim();
-      if (!raw) { resultBox.innerHTML = `<p class="muted">Enter serial or QR payload</p>`; return; }
+      if (!raw) { setChildMarkup(resultBox, `<p class="muted">Enter serial or QR payload</p>`); return; }
       const body = raw.startsWith("CROC|") ? { qr_code: raw } : { serial: raw.toUpperCase() };
       try {
         const r = await api("/provision/identify", { method: "POST", body });
         const kv = (k, v) => `<dt>${escapeHtml(k)}</dt><dd class="mono">${escapeHtml(v)}</dd>`;
         switch (r.status) {
           case "ready":
-            resultBox.innerHTML = `${drawBadge("ok", "Ready to claim")}
+            setChildMarkup(
+              resultBox,
+              `${drawBadge("ok", "Ready to claim")}
               <dl class="kv">${kv("Serial", r.serial)}${kv("MAC", r.mac_nocolon)}${kv("Firmware", r.fw || "—")}${kv("Last seen", r.last_seen_at || "—")}</dl>
-              <p>${escapeHtml(r.message)}</p>`;
+              <p>${escapeHtml(r.message)}</p>`,
+            );
             showClaimForm(r.serial, r.mac_nocolon, raw.startsWith("CROC|") ? raw : "");
             break;
           case "already_registered":
             const canSeeOwner = !!(state.me && state.me.role === "superadmin");
             const ownerKv = canSeeOwner ? kv("Owner admin", r.owner_admin || "—") : "";
             const byYou = !!r.by_you;
-            resultBox.innerHTML = `${drawBadge("err", byYou ? "Already yours" : "Already registered")}
+            setChildMarkup(
+              resultBox,
+              `${drawBadge("err", byYou ? "Already yours" : "Already registered")}
               <dl class="kv">${kv("Serial", r.serial)}${kv("device_id", r.device_id)}${ownerKv}${kv("Claimed at", r.claimed_at)}</dl>
               <p class="muted">${escapeHtml(r.message)}</p>
-              ${byYou ? `<a class="btn secondary" href="#/devices/${encodeURIComponent(r.device_id)}">Open device</a>` : ""}`;
+              ${byYou ? `<a class="btn secondary" href="#/devices/${encodeURIComponent(r.device_id)}">Open device</a>` : ""}`,
+            );
             break;
           case "offline":
-            resultBox.innerHTML = `${drawBadge("", "Waiting for device")}
+            setChildMarkup(
+              resultBox,
+              `${drawBadge("", "Waiting for device")}
               <dl class="kv">${kv("Serial", r.serial)}${r.mac_hint ? kv("Factory MAC", r.mac_hint) : ""}</dl>
-              <p>${escapeHtml(r.message)}</p>`;
+              <p>${escapeHtml(r.message)}</p>`,
+            );
             break;
           case "blocked":
-            resultBox.innerHTML = `${drawBadge("err", "Factory blocked")}<p>${escapeHtml(r.message)}</p>`;
+            setChildMarkup(resultBox, `${drawBadge("err", "Factory blocked")}<p>${escapeHtml(r.message)}</p>`);
             break;
           case "unknown_serial":
-            resultBox.innerHTML = `${drawBadge("err", "Unknown serial")}<p>${escapeHtml(r.message)}</p>`;
+            setChildMarkup(resultBox, `${drawBadge("err", "Unknown serial")}<p>${escapeHtml(r.message)}</p>`);
             break;
           default:
-            resultBox.innerHTML = `<p class="muted">Unknown status: ${escapeHtml(r.status)}</p>`;
+            setChildMarkup(resultBox, `<p class="muted">Unknown status: ${escapeHtml(r.status)}</p>`);
         }
-      } catch (e) { resultBox.innerHTML = `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`; }
+      } catch (e) { setChildMarkup(resultBox, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`); }
     });
 
     $("#reload").addEventListener("click", () => renderRoute());
@@ -3374,7 +3431,9 @@
     const items = data.items || [];
     const pendListEl = view.querySelector("#pendList");
     if (!pendListEl) return;
-    pendListEl.innerHTML = `
+    setChildMarkup(
+      pendListEl,
+      `
       <div class="table-wrap"><table class="t">
         <thead><tr><th>MAC</th><th>Serial / proposed ID</th><th>QR</th><th>Firmware</th><th>Last seen</th></tr></thead>
         <tbody>${items.length === 0 ? `<tr><td colspan="5" class="muted">${pendingErr ? "Load failed (retry with Refresh)." : "None"}</td></tr>` :
@@ -3385,7 +3444,8 @@
             <td>${escapeHtml(p.fw || "—")}</td>
             <td>${escapeHtml(fmtTs(p.last_seen_at))}</td>
           </tr>`).join("")}</tbody>
-      </table></div>`;
+      </table></div>`,
+    );
   });
 
   // Event Center — global live + historical log stream
@@ -3713,12 +3773,15 @@
         if (!evStatsBoxEl || !evStatsInnerEl || !isRouteCurrent(routeSeq)) return;
         evStatsBoxEl.style.display = "block";
         if (items.length === 0) {
-          evStatsInnerEl.innerHTML = "<p class='muted'>No rows with device_id.</p>";
+          setChildMarkup(evStatsInnerEl, "<p class='muted'>No rows with device_id.</p>");
           return;
         }
-        evStatsInnerEl.innerHTML = `<div class="table-wrap"><table class="t"><thead><tr><th>Device</th><th>Count</th></tr></thead><tbody>${
-          items.map((x) => `<tr><td class="mono">${escapeHtml(x.device_id)}</td><td>${x.count}</td></tr>`).join("")
-        }</tbody></table></div>`;
+        setChildMarkup(
+          evStatsInnerEl,
+          `<div class="table-wrap"><table class="t"><thead><tr><th>Device</th><th>Count</th></tr></thead><tbody>${
+            items.map((x) => `<tr><td class="mono">${escapeHtml(x.device_id)}</td><td>${x.count}</td></tr>`).join("")
+          }</tbody></table></div>`,
+        );
       } catch (e) { toast(e.message || e, "err"); }
     });
     $("#evCsv").addEventListener("click", async () => {
@@ -3797,13 +3860,15 @@
     const linkEl = $("#tgLinkBox", view);
     const loadMine = async () => {
       if (!mineEl) return;
-      mineEl.innerHTML = `<p class="muted">Loading…</p>`;
+      setChildMarkup(mineEl, `<p class="muted">Loading…</p>`);
       try {
         const d = await api("/admin/telegram/bindings", { timeoutMs: 16000 });
         const items = d.items || [];
-        mineEl.innerHTML = items.length === 0
-          ? `<p class="muted">No bindings yet.</p>`
-          : `<div class="table-wrap"><table class="t">
+        setChildMarkup(
+          mineEl,
+          items.length === 0
+            ? `<p class="muted">No bindings yet.</p>`
+            : `<div class="table-wrap"><table class="t">
               <thead><tr><th>chat_id</th><th>enabled</th><th>updated</th><th></th><th></th></tr></thead>
               <tbody>${items.map((it) => `
                 <tr>
@@ -3813,9 +3878,10 @@
                   <td><button class="btn sm secondary js-tg-toggle" data-chat="${escapeHtml(String(it.chat_id || ""))}" data-en="${it.enabled ? "1" : "0"}">${it.enabled ? "Disable" : "Enable"}</button></td>
                   <td><button class="btn sm danger js-tg-unbind" data-chat="${escapeHtml(String(it.chat_id || ""))}">Unbind</button></td>
                 </tr>`).join("")}</tbody>
-            </table></div>`;
+            </table></div>`,
+        );
       } catch (e) {
-        mineEl.innerHTML = `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`;
+        setChildMarkup(mineEl, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
       }
     };
     $("#tgGenLink", view).addEventListener("click", async () => {
@@ -3825,15 +3891,18 @@
         const deep = r.deep_link || "";
         const openChat = r.open_chat_url || "";
         const payload = r.start_payload || "";
-        linkEl.innerHTML = deep
-          ? `<div class="ui-status-strip">
+        setChildMarkup(
+          linkEl,
+          deep
+            ? `<div class="ui-status-strip">
                <div class="ui-status-item"><div class="k">Step 1</div><div class="v"><a class="btn" href="${escapeHtml(openChat || deep)}" target="_blank" rel="noopener">Open bot chat</a></div></div>
                <div class="ui-status-item"><div class="k">Step 2</div><div class="v"><a class="btn secondary" href="${escapeHtml(deep)}" target="_blank" rel="noopener">Run one-click bind</a></div></div>
              </div>
              <p class="muted mono" style="margin-top:8px">${escapeHtml(deep)}</p>`
-          : `<p class="muted">Set <span class="mono">TELEGRAM_BOT_USERNAME</span> on server, then retry.<br/>Fallback: send <span class="mono">/start ${escapeHtml(payload)}</span> in your bot chat.</p>`;
+            : `<p class="muted">Set <span class="mono">TELEGRAM_BOT_USERNAME</span> on server, then retry.<br/>Fallback: send <span class="mono">/start ${escapeHtml(payload)}</span> in your bot chat.</p>`,
+        );
       } catch (e) {
-        linkEl.innerHTML = `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`;
+        setChildMarkup(linkEl, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
       }
     });
     $("#tgManualBind", view).addEventListener("click", async () => {
@@ -4112,9 +4181,11 @@
         const users = d.items || [];
         const userTableEl = $v("#userTable");
         if (!userTableEl) return;
-        userTableEl.innerHTML = users.length === 0
-          ? `<p class="muted">No users.</p>`
-          : `<div class="table-wrap"><table class="t">
+        setChildMarkup(
+          userTableEl,
+          users.length === 0
+            ? `<p class="muted">No users.</p>`
+            : `<div class="table-wrap"><table class="t">
               <thead><tr><th>User</th><th>Role</th><th>manager</th><th>tenant</th><th>Created</th><th></th></tr></thead>
               <tbody>${users.map((u) => {
                 const isUser = u.role === "user";
@@ -4135,10 +4206,11 @@
                     ${self ? "" : (isAdminRow ? "" : `<button type="button" class="btn sm danger js-del" data-u="${escapeHtml(u.username)}">Delete</button>`)}
                   </td>
                 </tr><tr class="sub" style="display:none" data-pol-row="${escapeHtml(u.username)}"><td colspan="6"></td></tr>`;
-              }).join("")}</tbody></table></div>`;
+              }).join("")}</tbody></table></div>`,
+        );
       } catch (e) {
         const userTableEl = $v("#userTable");
-        if (userTableEl) userTableEl.innerHTML = `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`;
+        if (userTableEl) setChildMarkup(userTableEl, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
       }
     };
 
@@ -4153,13 +4225,15 @@
       if (user) qs.set("grantee_username", user);
       if ($v("#gs_inc_rev") && $v("#gs_inc_rev").checked) qs.set("include_revoked", "true");
       qs.set("limit", "500");
-      listEl.innerHTML = `<p class="muted">Loading shares…</p>`;
+      setChildMarkup(listEl, `<p class="muted">Loading shares…</p>`);
       try {
         const d = await api("/admin/shares?" + qs.toString(), { timeoutMs: 16000 });
         const items = d.items || [];
-        listEl.innerHTML = items.length === 0
-          ? `<p class="muted">No matching shares.</p>`
-          : `<div class="table-wrap"><table class="t">
+        setChildMarkup(
+          listEl,
+          items.length === 0
+            ? `<p class="muted">No matching shares.</p>`
+            : `<div class="table-wrap"><table class="t">
               <thead><tr><th>Device</th><th>Owner</th><th>Grantee</th><th>Role</th><th>View</th><th>Operate</th><th>Granted by</th><th>Status</th><th></th></tr></thead>
               <tbody>${items.map((it) => `
                 <tr>
@@ -4172,9 +4246,10 @@
                   <td class="mono">${escapeHtml(it.granted_by || "")}</td>
                   <td>${it.revoked_at ? `<span class="badge offline">revoked</span>` : `<span class="badge online">active</span>`}</td>
                   <td>${it.revoked_at ? "" : `<button class="btn sm danger js-gs-revoke" data-device="${escapeHtml(it.device_id || "")}" data-user="${escapeHtml(it.grantee_username || "")}">Revoke</button>`}</td>
-                </tr>`).join("")}</tbody></table></div>`;
+                </tr>`).join("")}</tbody></table></div>`,
+        );
       } catch (e) {
-        listEl.innerHTML = `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`;
+        setChildMarkup(listEl, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
       }
     };
 
@@ -4242,22 +4317,22 @@
 
     const openPolicy = async (username, trRow) => {
       const cell = trRow.querySelector("td");
-      cell.innerHTML = `<span class="muted">Loading…</span>`;
+      setChildMarkup(cell, `<span class="muted">Loading…</span>`);
       trRow.style.display = "";
       try {
           const p = await api(`/auth/users/${encodeURIComponent(username)}/policy`, { timeoutMs: 16000 });
-        cell.innerHTML = renderPolicyPanel(username, p);
+        setChildMarkup(cell, renderPolicyPanel(username, p));
         cell.querySelector(".js-save").addEventListener("click", async () => {
           const body = {};
           cell.querySelectorAll("input[type=checkbox][data-k]").forEach((i) => body[i.dataset.k] = !!i.checked);
           try {
             const r = await api(`/auth/users/${encodeURIComponent(username)}/policy`, { method: "PUT", body });
             toast(`Policy updated for ${username}`, "ok");
-            cell.innerHTML = renderPolicyPanel(username, r.policy || r);
+            setChildMarkup(cell, renderPolicyPanel(username, r.policy || r));
             cell.querySelector(".js-save").addEventListener("click", () => openPolicy(username, trRow));
           } catch (e) { toast(e.message || e, "err"); }
         });
-      } catch (e) { cell.innerHTML = `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`; }
+      } catch (e) { setChildMarkup(cell, `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`); }
     };
 
     $v("#userTable").addEventListener("click", async (ev) => {
@@ -4354,17 +4429,20 @@
           ? `<span class="badge online">Mail on</span>`
           : `<span class="badge offline">Mail off</span>`;
         const last = s.last_error ? `<span class="chip" title="last error">${escapeHtml(s.last_error)}</span>` : "";
-        smtpEl.innerHTML = `${okBadge}
+        setChildMarkup(
+          smtpEl,
+          `${okBadge}
           <span class="chip">host: ${escapeHtml(s.host || "—")}:${escapeHtml(String(s.port || "—"))}</span>
           <span class="chip">mode: ${escapeHtml(s.mode || "—")}</span>
           <span class="chip">from: ${escapeHtml(s.sender || "—")}</span>
           <span class="chip">sent: ${s.sent_count || 0}</span>
           <span class="chip">failed: ${s.failed_count || 0}</span>
-          <span class="chip">queue: ${s.queue_size ?? 0}/${s.queue_max ?? ""}</span>${last}`;
+          <span class="chip">queue: ${s.queue_size ?? 0}/${s.queue_max ?? ""}</span>${last}`,
+        );
       } catch (e) {
         const smtpEl = $v("#smtpStatus");
         if (!smtpEl) return;
-        smtpEl.innerHTML = `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`;
+        setChildMarkup(smtpEl, `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`);
       }
     };
     const loadRecipients = async () => {
@@ -4373,9 +4451,11 @@
         const items = d.items || [];
         const listEl = $v("#recipientList");
         if (!listEl) return;
-        listEl.innerHTML = items.length === 0
-          ? `<p class="muted">No recipients yet.</p>`
-          : `<div class="table-wrap"><table class="t">
+        setChildMarkup(
+          listEl,
+          items.length === 0
+            ? `<p class="muted">No recipients yet.</p>`
+            : `<div class="table-wrap"><table class="t">
               <thead><tr><th>Email</th><th>Label</th><th>Enabled</th><th>Tenant</th><th></th></tr></thead>
               <tbody>${items.map((r) => `
                 <tr>
@@ -4387,11 +4467,12 @@
                     <button class="btn sm secondary js-rtoggle" data-id="${r.id}" data-en="${r.enabled ? 1 : 0}">${r.enabled ? "Disable" : "Enable"}</button>
                     <button class="btn sm danger js-rdel" data-id="${r.id}">Delete</button>
                   </td>
-                </tr>`).join("")}</tbody></table></div>`;
+                </tr>`).join("")}</tbody></table></div>`,
+        );
       } catch (e) {
         const listEl = $v("#recipientList");
         if (!listEl) return;
-        listEl.innerHTML = `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`;
+        setChildMarkup(listEl, `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`);
       }
     };
     $v("#r_add").addEventListener("click", async () => {
@@ -4430,28 +4511,33 @@
         const le = (t.last_error || "").trim()
           ? `<p class="muted" style="margin-top:8px;word-break:break-word"><strong>Last error:</strong> ${escapeHtml(t.last_error)}</p>`
           : "";
-        tgEl.innerHTML = `${badge}
+        setChildMarkup(
+          tgEl,
+          `${badge}
           ${th}
           <span class="chip">worker: ${wk}</span>
           <span class="chip">chats: ${t.chats ?? 0}</span>
           <span class="chip">min_level: ${escapeHtml(t.min_level || "")}</span>
-          <span class="chip">queue: ${t.queue_size ?? 0}</span>${modErr}${le}`;
+          <span class="chip">queue: ${t.queue_size ?? 0}</span>${modErr}${le}`,
+        );
       } catch (e) {
         const tgEl = $v("#tgStatus");
         if (!tgEl) return;
-        tgEl.innerHTML = `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`;
+        setChildMarkup(tgEl, `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`);
       }
     };
     const loadTgBindings = async () => {
       const el = $v("#tgBindings");
       if (!el) return;
-      el.innerHTML = `<p class="muted">Loading bindings…</p>`;
+      setChildMarkup(el, `<p class="muted">Loading bindings…</p>`);
       try {
         const d = await api("/admin/telegram/bindings", { timeoutMs: 16000 });
         const items = d.items || [];
-        el.innerHTML = items.length === 0
-          ? `<p class="muted">No bindings yet.</p>`
-          : `<div class="table-wrap"><table class="t">
+        setChildMarkup(
+          el,
+          items.length === 0
+            ? `<p class="muted">No bindings yet.</p>`
+            : `<div class="table-wrap"><table class="t">
               <thead><tr><th>chat_id</th><th>username</th><th>enabled</th><th>updated</th><th></th></tr></thead>
               <tbody>${items.map((it) => `
                 <tr>
@@ -4460,9 +4546,10 @@
                   <td>${it.enabled ? `<span class="badge online">on</span>` : `<span class="badge offline">off</span>`}</td>
                   <td>${escapeHtml(fmtTs(it.updated_at || it.created_at))}</td>
                   <td><button class="btn sm danger js-tg-unbind" data-chat="${escapeHtml(String(it.chat_id || ""))}">Unbind</button></td>
-                </tr>`).join("")}</tbody></table></div>`;
+                </tr>`).join("")}</tbody></table></div>`,
+        );
       } catch (e) {
-        el.innerHTML = `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`;
+        setChildMarkup(el, `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`);
       }
     };
     $v("#tgTest").addEventListener("click", async () => {
@@ -4522,9 +4609,11 @@
         const items = d.items || [];
         const pendEl = $v("#pendAdmins");
         if (!pendEl) return;
-        pendEl.innerHTML = items.length === 0
-          ? `<p class="muted">No pending signups.</p>`
-          : `<div class="table-wrap"><table class="t">
+        setChildMarkup(
+          pendEl,
+          items.length === 0
+            ? `<p class="muted">No pending signups.</p>`
+            : `<div class="table-wrap"><table class="t">
               <thead><tr><th>Username</th><th>Email</th><th>Submitted</th><th>Email OK</th><th></th></tr></thead>
               <tbody>${items.map((u) => `<tr>
                 <td><strong>${escapeHtml(u.username)}</strong></td>
@@ -4535,11 +4624,12 @@
                   <button class="btn sm js-ok" data-u="${escapeHtml(u.username)}">Approve</button>
                   <button class="btn sm danger js-reject" data-u="${escapeHtml(u.username)}">Reject</button>
                 </td>
-              </tr>`).join("")}</tbody></table></div>`;
+              </tr>`).join("")}</tbody></table></div>`,
+        );
       } catch (e) {
         const pendEl = $v("#pendAdmins");
         if (!pendEl) return;
-        pendEl.innerHTML = `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`;
+        setChildMarkup(pendEl, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
       }
     };
     if (isSuper) {
@@ -4723,13 +4813,16 @@
         const campListEl = $("#campList", view);
         if (!campListEl) return;
         if (list.length === 0) {
-          campListEl.innerHTML = `<p class="muted">No OTA campaigns.</p>`;
+          setChildMarkup(campListEl, `<p class="muted">No OTA campaigns.</p>`);
           return;
         }
-        campListEl.innerHTML = `<div class="table-wrap"><table class="t">
+        setChildMarkup(
+          campListEl,
+          `<div class="table-wrap"><table class="t">
           <thead><tr><th>ID</th><th>Version</th><th>URL</th><th>State</th><th>Progress</th><th>My decision</th><th>Created</th><th></th></tr></thead>
           <tbody>${list.map((c) => renderOtaCampaignRow(c, me)).join("")}</tbody>
-        </table></div>`;
+        </table></div>`,
+        );
 
         view.querySelectorAll(".js-accept").forEach((b) => b.addEventListener("click", async () => {
           if (!confirm("Accept upgrade? The server will verify the URL then push to all devices you own.")) return;
@@ -4755,7 +4848,9 @@
             if (!isRouteCurrent(routeSeq)) return;
             const campDetailEl = $("#campDetail", view);
             if (!campDetailEl) return;
-            campDetailEl.innerHTML = `<div class="card">
+            setChildMarkup(
+              campDetailEl,
+              `<div class="card">
               <h3>Campaign ${escapeHtml(c.id)}</h3>
               <p class="muted">FW ${escapeHtml(c.fw_version)} · ${escapeHtml(c.state)} · created ${escapeHtml(c.created_at)}</p>
               <p class="mono" style="word-break:break-all">${escapeHtml(c.url)}</p>
@@ -4773,7 +4868,8 @@
                     <td>${escapeHtml(r.finished_at || "")}</td>
                   </tr>`).join("")}</tbody>
               </table></div>
-            </div>`;
+            </div>`,
+            );
           } catch (e) {
             if (!isRouteCurrent(routeSeq)) return;
             toast(e.message || e, "err");
@@ -4783,7 +4879,7 @@
         if (!isRouteCurrent(routeSeq)) return;
         const campListEl = $("#campList", view);
         if (!campListEl) return;
-        campListEl.innerHTML = `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`;
+        setChildMarkup(campListEl, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
       }
     }
 
@@ -4793,9 +4889,11 @@
         if (!isRouteCurrent(routeSeq)) return;
         const fwListEl = $("#fwList", view);
         if (!fwListEl) return;
-        fwListEl.innerHTML = (fw.items || []).length === 0
-          ? `<p class="muted">No .bin files under ${escapeHtml(fw.dir || "/opt/sentinel/firmware")}.</p>`
-          : `<div class="table-wrap"><table class="t">
+        setChildMarkup(
+          fwListEl,
+          (fw.items || []).length === 0
+            ? `<p class="muted">No .bin files under ${escapeHtml(fw.dir || "/opt/sentinel/firmware")}.</p>`
+            : `<div class="table-wrap"><table class="t">
               <thead><tr><th>File</th><th>Size</th><th>SHA-256</th><th>Modified</th><th></th></tr></thead>
               <tbody>${fw.items.map((it) => `
                 <tr>
@@ -4804,7 +4902,8 @@
                   <td class="mono" style="max-width:280px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(it.sha256 || "—")}</td>
                   <td>${escapeHtml(fmtTs(it.mtime))}</td>
                   <td>${it.download_url ? `<button class="btn sm secondary js-use" data-url="${escapeHtml(it.download_url)}" data-fw="${escapeHtml(it.name.replace(/\\.bin$/i, ""))}" data-sha="${escapeHtml(it.sha256 || "")}">Use in form</button>` : ""}</td>
-                </tr>`).join("")}</tbody></table></div>`;
+                </tr>`).join("")}</tbody></table></div>`,
+        );
         view.querySelectorAll(".js-use").forEach((b) => {
           b.addEventListener("click", () => {
             const cUrl = $("#c_url", view);
@@ -4818,7 +4917,7 @@
       } catch (e) {
         if (!isRouteCurrent(routeSeq)) return;
         const fwListEl = $("#fwList", view);
-        if (fwListEl) fwListEl.innerHTML = `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`;
+        if (fwListEl) setChildMarkup(fwListEl, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
       }
 
       const cSend = $("#c_send", view);

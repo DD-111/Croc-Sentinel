@@ -21,6 +21,22 @@ CROCKFORD = "ABCDEFGHJKLMNPQRSTUVWXYZ234567"
 # Plain HTTP API publish (docker-compose maps host 18999 → container 8088). Restore https://…/api when Traefik+TLS is enabled.
 DEFAULT_FACTORY_UI_API_BASE = "http://esasecure.com:18999"
 
+# Host port published by croc_sentinel_systems/docker-compose.yml (`18999:8088`). Container listens on 8088 internally.
+FACTORY_PUBLIC_HTTP_PORT = 18999
+
+
+def normalize_factory_api_base(raw: str) -> str:
+    """Strip whitespace, trailing slashes, and accidental `/factory` path suffix."""
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    s = s.rstrip("/")
+    low = s.lower()
+    if low.endswith("/factory"):
+        s = s[: -len("/factory")].rstrip("/")
+    return s
+
+
 DEFAULT_QR_POLICY = re.compile(
     r"^CROC\|SN-[A-Z2-7]{16}\|\d{10}\|[A-Za-z0-9_-]{20,120}$"
 )
@@ -174,7 +190,7 @@ def post_factory_devices(
 ) -> tuple[int, str]:
     """POST /factory/devices in chunks (API max 2000 items). Returns (http_code, body)."""
     factory_token = (factory_token or "").strip()
-    base = api_base.rstrip("/")
+    base = normalize_factory_api_base(api_base)
     url = f"{base}/factory/devices"
     ctx = ssl._create_unverified_context() if insecure_ssl else None
     last_code = 200
@@ -341,10 +357,23 @@ def _format_factory_ping_transport_error(exc: BaseException, *, url: str, timeou
 
     if winerr == 10060:
         lines.append(
-            "hint[10060]: TCP timed out — host:port did not respond in time. Check: (1) server up; (2) firewall/VPN; "
-            "(3) FACTORY_UI_API_BASE is the public API root (Traefik: https://host/api; direct: http://127.0.0.1:8088) "
-            f'(default {DEFAULT_FACTORY_UI_API_BASE}); (4) curl -vk "{url}"'
+            "hint[10060]: TCP timed out — nothing answered on this host:port in time."
         )
+        lines.append(
+            f"hint[compose]: This repo maps the API to host port **{FACTORY_PUBLIC_HTTP_PORT}** "
+            f"(`{FACTORY_PUBLIC_HTTP_PORT}:8088` in docker-compose). Use http://HOST:{FACTORY_PUBLIC_HTTP_PORT} "
+            "unless Nginx/Traefik listens on another port."
+        )
+        lines.append(
+            "hint[path]: FACTORY_UI_API_BASE is the API root only — no /factory suffix. "
+            "Traefik: https://host/api ; plain direct: http://HOST:18999"
+        )
+        if ":8088" in url:
+            alt_u = url.replace(":8088", f":{FACTORY_PUBLIC_HTTP_PORT}", 1)
+            lines.append(
+                f"hint[port]: Stock compose publishes API on host :{FACTORY_PUBLIC_HTTP_PORT}, not :8088. Try: curl -vk {alt_u!r}"
+            )
+        lines.append(f'hint[curl]: curl -vk "{url}"')
     elif winerr == 10061:
         lines.append(
             "hint[10061]: connection refused — nothing accepts TCP on this host:port (wrong port or service stopped)."
@@ -364,7 +393,7 @@ def get_factory_ping(
 ) -> tuple[int, str]:
     """GET /factory/ping — verify X-Factory-Token before bulk upload."""
     factory_token = (factory_token or "").strip()
-    base = api_base.rstrip("/")
+    base = normalize_factory_api_base(api_base)
     url = f"{base}/factory/ping"
     ctx = ssl._create_unverified_context() if insecure_ssl else None
     req = urllib.request.Request(
