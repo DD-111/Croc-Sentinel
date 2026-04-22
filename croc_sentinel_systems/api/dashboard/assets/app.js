@@ -103,7 +103,7 @@
   }
 
   /** Default ceiling so a stuck reverse-proxy / API cannot leave the SPA on “Loading…” forever. */
-  const DEFAULT_API_TIMEOUT_MS = 30000;
+  const DEFAULT_API_TIMEOUT_MS = 20000;
   /** Route-level async guard: any page render taking too long fails fast. */
   const ROUTE_RENDER_TIMEOUT_MS = 15000;
 
@@ -176,6 +176,44 @@
       if (t && str === t && /^(target|device_id|deviceId|source_id)$/i.test(k)) continue;
       let display = str;
       if (display.length > 220) display = `${display.slice(0, 217)}…`;
+      rows.push({ k, v: display });
+    }
+    return rows;
+  }
+
+  /** Event detail: skip keys that duplicate the row (actor, target, device, owner). */
+  function eventDetailDedupedRows(detail, e) {
+    if (!detail || typeof detail !== "object" || Array.isArray(detail)) return [];
+    const actor = String((e && e.actor) || "").trim();
+    const target = String((e && e.target) || "").trim();
+    const dev = String((e && e.device_id) || "").trim();
+    const owner = String((e && e.owner_admin) || "").trim();
+    const rows = [];
+    for (const [k, raw] of Object.entries(detail)) {
+      if (raw == null || raw === "") continue;
+      const str = typeof raw === "object" ? JSON.stringify(raw) : String(raw);
+      if (!str.trim()) continue;
+      if (str === actor && /^(actor|username|user|owner_admin|created_by)$/i.test(k)) continue;
+      if (target && str === target && /^(target)$/i.test(k)) continue;
+      if (dev && str === dev && /^(device_id|deviceId|source_id|device)$/i.test(k)) continue;
+      if (owner && str === owner && /^(owner_admin|owner)$/i.test(k)) continue;
+      if (str === target && /^(target|device_id|deviceId)$/i.test(k)) continue;
+      let display = str;
+      if (display.length > 220) display = `${display.slice(0, 217)}…`;
+      rows.push({ k, v: display });
+    }
+    return rows;
+  }
+
+  function messagePayloadRows(payload) {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) return [];
+    const rows = [];
+    for (const [k, raw] of Object.entries(payload)) {
+      if (raw == null || raw === "") continue;
+      const str = typeof raw === "object" ? JSON.stringify(raw) : String(raw);
+      if (!str.trim()) continue;
+      let display = str;
+      if (display.length > 200) display = `${display.slice(0, 197)}…`;
       rows.push({ k, v: display });
     }
     return rows;
@@ -263,6 +301,18 @@
     } catch (e) {
       return (typeof fallback === "function") ? fallback(e) : fallback;
     }
+  }
+
+  /** Short-lived GET cache to avoid duplicate round-trips when navigating (server still uses CACHE_TTL). */
+  const _apiGetCache = new Map();
+  async function apiGetCached(path, opts, ttlMs) {
+    const ttl = ttlMs != null ? ttlMs : 4500;
+    const ent = _apiGetCache.get(path);
+    const now = Date.now();
+    if (ent && (now - ent.t) < ttl) return ent.data;
+    const data = await api(path, opts);
+    _apiGetCache.set(path, { t: now, data });
+    return data;
   }
 
   async function login(username, password) {
@@ -675,7 +725,7 @@
             <p class="auth-card__lead">Email verification · creates an <strong>admin</strong> account</p>
           </header>
           <div class="auth-card__body">
-            <p class="auth-card__note muted">Superadmin is created on the server. If signup approval is on, a superadmin must activate you before login.</p>
+            <p class="auth-card__note muted">Server seed superadmin is separate. By default you can use the account right after email verification; the server can require superadmin approval via <span class="mono">ADMIN_SIGNUP_REQUIRE_APPROVAL=1</span>.</p>
             <ol class="auth-steps" aria-label="Steps">
               <li id="r_step_ind1" class="is-active"><span class="auth-steps__n">1</span><span class="auth-steps__t">Your details</span></li>
               <li id="r_step_ind2"><span class="auth-steps__n">2</span><span class="auth-steps__t">Email code</span></li>
@@ -831,8 +881,8 @@
   registerRoute("overview", async (view) => {
     setCrumb("Overview");
     const [ovRes, listRes] = await Promise.allSettled([
-      api("/dashboard/overview", { timeoutMs: 8000 }),
-      api("/devices", { timeoutMs: 8000 }),
+      apiGetCached("/dashboard/overview", { timeoutMs: 8000 }, 4000),
+      apiGetCached("/devices", { timeoutMs: 8000 }, 4000),
     ]);
     let ov = (ovRes.status === "fulfilled" && ovRes.value) ? ovRes.value : null;
     let list = (listRes.status === "fulfilled" && listRes.value) ? listRes.value : null;
@@ -871,7 +921,7 @@
       ["Throughput", `${bps(tp.tx_bps_total)} / ${bps(tp.rx_bps_total)}`, "Tx / Rx sum"],
     ].map(([k, v, s]) => `<div class="stat"><div class="k">${escapeHtml(k)}</div><div class="v">${escapeHtml(v)}</div><div class="sub">${escapeHtml(s)}</div></div>`).join("");
     const presenceCards = `
-      <div class="stat"><div class="k">Power low</div><div class="v">${pr.reason_power_low || 0}</div><div class="sub">vbat</div></div>
+      <div class="stat"><div class="k">Power low</div><div class="v">${pr.reason_power_low || 0}</div><div class="sub">Output V</div></div>
       <div class="stat"><div class="k">Network lost</div><div class="v">${pr.reason_network_lost || 0}</div><div class="sub">link / timeout</div></div>
       <div class="stat"><div class="k">Weak signal</div><div class="v">${pr.reason_signal_weak || 0}</div><div class="sub">RSSI</div></div>
       <div class="stat"><div class="k">Unknown</div><div class="v">${pr.reason_unknown || 0}</div><div class="sub">no reason yet</div></div>`;
@@ -960,7 +1010,7 @@
       signal_weak: "Weak signal",
     };
     const reason = s.disconnect_reason || (on ? "none" : "network_lost");
-    const vbat = (s.vbat == null || s.vbat < 0) ? "—" : `${Number(s.vbat).toFixed(2)} V`;
+    const outV = (s.vbat == null || s.vbat < 0) ? "—" : `${Number(s.vbat).toFixed(2)} V`;
     const rssi = (s.rssi == null || s.rssi === -127) ? "—" : `${s.rssi} dBm`;
     const netT = String(s.net_type || d.net_type || "");
     const wifiSsidDd = netT === "wifi"
@@ -996,6 +1046,27 @@
         <div id="shareList" style="margin-top:12px"></div>
       </div>
     ` : "";
+    const msgItems = msgs.items || [];
+    const msgFeedHtml = msgItems.length === 0
+      ? `<p class="muted audit-empty">No messages.</p>`
+      : `<div class="audit-feed">${msgItems.map((m) => {
+        const plRows = messagePayloadRows(m.payload || {});
+        const extra = plRows.length
+          ? `<div class="audit-extra">${plRows.map((row) =>
+              `<div class="audit-extra-row"><span class="audit-k">${escapeHtml(row.k)}</span><span class="audit-v mono">${escapeHtml(row.v)}</span></div>`,
+          ).join("")}</div>`
+          : "";
+        return `<article class="audit-item">
+        <div class="audit-item-top">
+          <div class="audit-time">
+            <span class="audit-ts mono">${escapeHtml((m.ts_received || "").replace("T", " ").replace(/\..*/, ""))}</span>
+            <span class="muted audit-rel">${escapeHtml(fmtRel(m.ts_received))}</span>
+          </div>
+          <span class="chip">${escapeHtml(m.channel || "—")}</span>
+        </div>
+        ${extra}
+      </article>`;
+      }).join("")}</div>`;
     view.innerHTML = `
       <div class="card">
         <div class="row" style="align-items:flex-start;flex-wrap:wrap;gap:10px">
@@ -1030,7 +1101,7 @@
           <dt>Wi‑Fi SSID</dt><dd>${wifiSsidDd}</dd>
           <dt>Wi‑Fi channel</dt><dd>${wifiChDd}</dd>
           <dt>RSSI</dt><dd class="mono">${escapeHtml(rssi)}</dd>
-          <dt>Battery</dt><dd class="mono">${escapeHtml(vbat)}</dd>
+          <dt>Output V</dt><dd class="mono">${escapeHtml(outV)}</dd>
           <dt>Tx / Rx</dt><dd class="mono">${escapeHtml(bps(s.tx_bps))} / ${escapeHtml(bps(s.rx_bps))}</dd>
           <dt>Disconnect</dt><dd class="mono">${escapeHtml(reason)}</dd>
           <dt>Provisioned</dt><dd>${d.provisioned ? "yes" : "no"}</dd>
@@ -1085,23 +1156,11 @@
 
       <div class="card">
         <div class="row">
-          <h3 style="margin:0">Recent messages</h3>
+          <h3 style="margin:0">Recent MQTT messages</h3>
           <span class="muted">last 25</span>
         </div>
         <div class="divider"></div>
-        <div class="table-wrap">
-          <table class="t">
-            <thead><tr><th>Time</th><th>Channel</th><th>Payload</th></tr></thead>
-            <tbody>
-              ${(msgs.items || []).map((m) => `
-                <tr>
-                  <td>${escapeHtml(fmtTs(m.ts_received))}</td>
-                  <td><span class="chip">${escapeHtml(m.channel || "")}</span></td>
-                  <td><pre class="code">${escapeHtml(JSON.stringify(m.payload || {}))}</pre></td>
-                </tr>`).join("") || `<tr><td colspan="3" class="muted">No messages</td></tr>`}
-            </tbody>
-          </table>
-        </div>
+        <div class="audit-feed-wrap" id="devMsgsList">${msgFeedHtml}</div>
       </div>`;
 
     $("#saveProfile").addEventListener("click", async () => {
@@ -1287,10 +1346,13 @@
     setCrumb("Siren");
     const enabled = can("can_alert");
     let devicesLoadErr = "";
-    const list = await apiOr("/devices", (e) => {
+    let list;
+    try {
+      list = await apiGetCached("/devices", { timeoutMs: 8000 }, 4000);
+    } catch (e) {
       devicesLoadErr = String((e && e.message) || e || "load failed");
-      return { items: [] };
-    }, { timeoutMs: 8000 });
+      list = { items: [] };
+    }
     const devices = list.items || [];
 
     view.innerHTML = `
@@ -1487,14 +1549,14 @@
     setCrumb("Events");
     const me = state.me || { username: "", role: "" };
     const isSuper = me.role === "superadmin";
-    const scopeLabel = isSuper ? "Global (superadmin)" : (me.role === "admin" ? `My tenant · ${escapeHtml(me.username)}` : "Parent tenant");
+    const scopeLabel = isSuper ? "System-wide" : (me.role === "admin" ? "Your tenant" : "Your account");
 
     view.innerHTML = `
-      <div class="card">
+      <div class="ui-shell card audit-page" style="margin:0">
         <div class="row between" style="flex-wrap:wrap;gap:10px">
           <div>
-            <h2 style="margin:0">Event center</h2>
-            <p class="muted" style="margin:4px 0 0">Scope: ${scopeLabel} · Superadmin sees all; admin sees tenant; users see related + warn+.</p>
+            <h2 class="ui-section-title" style="margin:0">Event center</h2>
+            <p class="muted" style="margin:4px 0 0">Visibility: ${scopeLabel}.</p>
           </div>
           <div class="row" style="gap:8px;align-items:center">
             <span id="evLive" class="badge offline" title="Live stream">Offline</span>
@@ -1541,8 +1603,8 @@
         <h3 style="margin:0 0 8px">Events per device (7 days)</h3>
         <div id="evStatsInner" class="muted">—</div>
       </div>
-      <div class="card" style="margin-top:12px">
-        <div id="evList" class="events-list muted">Connecting…</div>
+      <div class="ui-shell card audit-page" style="margin-top:12px">
+        <div id="evList" class="audit-feed-wrap muted">Connecting…</div>
       </div>`;
 
     let paused = false;
@@ -1563,30 +1625,52 @@
       })[cat] || "neutral";
     }
     function rowHtml(e) {
-      const summary = e.summary || e.event_type || "";
+      const primary = (e.summary && String(e.summary).trim()) || (e.event_type || "—");
       const tsShort = (e.ts || "").replace("T", " ").replace(/\..*/, "");
-      const dev = e.device_id ? `<span class="chip mono">${escapeHtml(e.device_id)}</span>` : "";
-      const owner = e.owner_admin ? `<span class="chip">@${escapeHtml(e.owner_admin)}</span>` : "";
-      const detailTxt = (e.detail && Object.keys(e.detail).length) ? JSON.stringify(e.detail) : "";
-      return `<div class="ev-row" data-level="${escapeHtml(e.level || "")}">
-        <span class="ev-ts mono">${escapeHtml(tsShort)}</span>
-        <span class="badge ${badgeClass(e.level)}">${escapeHtml(e.level || "")}</span>
-        <span class="badge ${catClass(e.category)}">${escapeHtml(e.category || "")}</span>
-        <span class="ev-type mono">${escapeHtml(e.event_type || "")}</span>
-        <span class="ev-actor">${escapeHtml(e.actor || "")}</span>
-        <span class="ev-summary">${escapeHtml(summary)}</span>
-        ${dev} ${owner}
-        ${detailTxt ? `<details class="ev-detail"><summary class="muted">Details</summary><pre class="code">${escapeHtml(detailTxt)}</pre></details>` : ""}
-      </div>`;
+      const typeDiffers = e.event_type && String(e.event_type) !== String(primary);
+      const extras = eventDetailDedupedRows(
+        (e.detail && typeof e.detail === "object" && !Array.isArray(e.detail)) ? e.detail : {},
+        e,
+      );
+      const devLink = e.device_id
+        ? `<a class="mono audit-target" href="#/devices/${encodeURIComponent(e.device_id)}">${escapeHtml(e.device_id)}</a>`
+        : "";
+      const targetStr = (e.target && e.target !== e.device_id) ? String(e.target) : "";
+      const typeTag = typeDiffers
+        ? ` · <span class="mono" style="font-size:12px;opacity:0.88">${escapeHtml(e.event_type)}</span>`
+        : "";
+      const extraBlock = extras.length
+        ? `<div class="audit-extra">${extras.map((row) =>
+            `<div class="audit-extra-row"><span class="audit-k">${escapeHtml(row.k)}</span><span class="audit-v mono">${escapeHtml(row.v)}</span></div>`,
+        ).join("")}</div>`
+        : "";
+      return `<article class="audit-item" data-level="${escapeHtml(e.level || "")}">
+        <div class="audit-item-top">
+          <div class="audit-time">
+            <span class="audit-ts mono">${escapeHtml(tsShort)}</span>
+            <span class="muted audit-rel">${escapeHtml(fmtRel(e.ts))}</span>
+          </div>
+          <span class="badge ${badgeClass(e.level)}">${escapeHtml(e.level || "")}</span>
+          <span class="badge ${catClass(e.category)}">${escapeHtml(e.category || "")}</span>
+        </div>
+        <div class="audit-item-line" style="font-weight:600">${escapeHtml(primary)}${typeTag}</div>
+        <div class="audit-item-line" style="font-size:12.5px;flex-wrap:wrap">
+          <span class="audit-actor">${e.actor ? escapeHtml(e.actor) : "—"}</span>
+          ${targetStr ? ` <span class="audit-arrow">→</span> <span class="mono audit-target">${escapeHtml(targetStr)}</span>` : ""}
+          ${devLink ? ` · ${devLink}` : ""}
+          ${e.owner_admin ? ` <span class="chip" title="owner_admin">@${escapeHtml(e.owner_admin)}</span>` : ""}
+        </div>
+        ${extraBlock}
+      </article>`;
     }
     function flushEvRender() {
       const listEl = document.getElementById("evList");
       if (!listEl) return;
       if (buffer.length === 0) {
-        listEl.innerHTML = `<p class="muted">No events.</p>`;
+        listEl.innerHTML = `<p class="muted audit-empty">No events.</p>`;
         return;
       }
-      listEl.innerHTML = buffer.map(rowHtml).join("");
+      listEl.innerHTML = `<div class="audit-feed">${buffer.map(rowHtml).join("")}</div>`;
     }
     function scheduleEvRender() {
       if (window.__pendingEvListRaf) return;
@@ -2524,8 +2608,8 @@
       try {
         if (!isRouteCurrent(routeSeq)) return;
         const [d, sumR] = await Promise.all([
-          api("/activity/signals?" + qs.toString()),
-          api("/alarms/summary").catch(() => ({ last_24h: 0, last_7d: 0, top_sources_7d: [] })),
+          api("/activity/signals?" + qs.toString(), { timeoutMs: 12000 }),
+          api("/alarms/summary", { timeoutMs: 8000 }).catch(() => ({ last_24h: 0, last_7d: 0, top_sources_7d: [] })),
         ]);
         if (!isRouteCurrent(routeSeq)) return;
         const sigSummaryEl = $("#sigSummary", view);
@@ -2543,28 +2627,33 @@
           api: "API / automation",
         }[w] || w);
         sigListEl.innerHTML = items.length === 0
-          ? `<p class="muted">No rows in this window.</p>`
-          : `<div class="table-wrap"><table class="t">
-              <thead><tr><th>When (UTC)</th><th>What</th><th>Where</th><th>Device</th><th>Group</th><th>Name</th><th>Who</th><th>Fan-out</th><th>Email</th></tr></thead>
-              <tbody>${items.map((a) => {
+          ? `<p class="muted audit-empty">No rows in this window.</p>`
+          : `<div class="audit-feed">${items.map((a) => {
             const dev = a.device_id === "*" ? "(bulk)" : a.device_id;
             const link = a.device_id && a.device_id !== "*"
-              ? `<a class="mono" href="#/devices/${encodeURIComponent(a.device_id)}">${escapeHtml(dev)}</a>`
+              ? `<a class="mono audit-target" href="#/devices/${encodeURIComponent(a.device_id)}">${escapeHtml(dev)}</a>`
               : escapeHtml(dev);
             const em = a.email_sent ? "queued" : (a.email_detail || "—");
             const fo = a.kind && a.kind.startsWith("bulk") ? String(a.fanout_count || 0) : String(a.fanout_count ?? "—");
-            return `<tr>
-                  <td>${escapeHtml(fmtTs(a.ts))}</td>
-                  <td><span class="chip">${escapeHtml(a.what || a.kind || "")}</span></td>
-                  <td><span class="chip">${escapeHtml(a.zone || "all")}</span></td>
-                  <td class="mono">${link}</td>
-                  <td>${escapeHtml(a.notification_group || "—")}</td>
-                  <td>${escapeHtml(a.display_label || "—")}</td>
-                  <td>${escapeHtml(a.kind === "device_alarm" ? whoLbl(a.who) : a.who)}</td>
-                  <td class="mono">${escapeHtml(fo)}</td>
-                  <td class="mono">${escapeHtml(em)}</td>
-                </tr>`;
-          }).join("")}</tbody></table></div>`;
+            const whoS = a.kind === "device_alarm" ? whoLbl(a.who) : (a.who || "—");
+            const tShort = (a.ts || "").replace("T", " ").replace(/\..*/, "");
+            return `<article class="audit-item">
+              <div class="audit-item-top">
+                <div class="audit-time">
+                  <span class="audit-ts mono">${escapeHtml(tShort)}</span>
+                  <span class="muted audit-rel">${escapeHtml(fmtRel(a.ts))}</span>
+                </div>
+                <span class="chip">${escapeHtml(a.what || a.kind || "")}</span>
+                <span class="chip">${escapeHtml(a.zone || "all")}</span>
+              </div>
+              <div class="audit-item-line" style="flex-wrap:wrap;align-items:center;gap:6px">
+                <span class="mono">${link}</span>
+                <span class="chip">${escapeHtml(a.display_label || "—")}</span>
+                <span class="chip">${escapeHtml(a.notification_group || "—")}</span>
+              </div>
+              <div class="audit-item-line muted" style="font-size:12.5px">Who: ${escapeHtml(String(whoS))} · Fan-out: ${escapeHtml(fo)} · Email: ${escapeHtml(em)}</div>
+            </article>`;
+          }).join("")}</div>`;
       } catch (e) {
         if (!isRouteCurrent(routeSeq)) return;
         toast(e.message || e, "err");

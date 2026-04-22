@@ -92,8 +92,8 @@ LOGIN_RATE_MAX_FAILS = int(os.getenv("LOGIN_RATE_MAX_FAILS", "5"))
 LOGIN_RATE_WINDOW_SECONDS = int(os.getenv("LOGIN_RATE_WINDOW_SECONDS", "900"))
 
 # --- Signup / user activation ---
-# If 1, a superadmin must approve each admin signup before they can log in.
-ADMIN_SIGNUP_REQUIRE_APPROVAL = os.getenv("ADMIN_SIGNUP_REQUIRE_APPROVAL", "1") == "1"
+# If 1, a superadmin must approve each admin signup before they can log in. Default 0: self-serve.
+ADMIN_SIGNUP_REQUIRE_APPROVAL = os.getenv("ADMIN_SIGNUP_REQUIRE_APPROVAL", "0") == "1"
 # If 0, new public admin signups are refused entirely (for private deployments).
 ALLOW_PUBLIC_ADMIN_SIGNUP = os.getenv("ALLOW_PUBLIC_ADMIN_SIGNUP", "1") == "1"
 REQUIRE_EMAIL_VERIFICATION = os.getenv("REQUIRE_EMAIL_VERIFICATION", "1") == "1"
@@ -3079,7 +3079,7 @@ def auth_signup_start(body: SignupStartRequest, request: Request) -> dict[str, A
 
     Creates a `dashboard_users` row in status='pending' and emails an OTP.
     The account becomes usable only after /auth/signup/verify succeeds AND,
-    when ADMIN_SIGNUP_REQUIRE_APPROVAL=1, a superadmin approves it.
+    When ADMIN_SIGNUP_REQUIRE_APPROVAL=1, a superadmin must approve after OTP.
     """
     if not ALLOW_PUBLIC_ADMIN_SIGNUP:
         raise HTTPException(status_code=403, detail="public signup disabled")
@@ -5344,6 +5344,7 @@ def get_logs_messages(
     if principal.role == "user" and not device_id:
         raise HTTPException(status_code=403, detail="device_id is required for this role")
     zs, za = zone_sql_suffix(principal, "d.zone")
+    osf, osa = owner_scope_clause_for_device_state(principal, "d")
     query = """
         SELECT m.id, m.topic, m.channel, m.device_id, m.payload_json, m.ts_device, m.ts_received
         FROM messages m
@@ -5353,6 +5354,8 @@ def get_logs_messages(
     args: list[Any] = []
     query += zs
     args.extend(za)
+    query += osf
+    args.extend(osa)
     if channel:
         query += " AND m.channel = ?"
         args.append(channel)
@@ -5740,20 +5743,45 @@ def send_broadcast_command(req: BroadcastCommandRequest, principal: Principal = 
 #  Alarms (server-side fan-out history)
 # =====================================================================
 
-def _alarm_scope_for(principal: Principal) -> tuple[str, list[Any]]:
-    """SQL fragment restricting alarms to what the principal may see."""
+def _alarm_scope_for(
+    principal: Principal,
+    *,
+    device_id_sql: str = "alarms.source_id",
+) -> tuple[str, list[Any]]:
+    """SQL fragment restricting alarms/signal_triggers to what the principal may see.
+
+    `device_id_sql` must be the device column in the current query (e.g. `alarms.source_id`, `a.source_id`, `s.device_id`)
+    for ACL checks when a non-owner has a share.
+    """
     if principal.is_superadmin():
         return "", []
+    acl = (
+        f"EXISTS (SELECT 1 FROM device_acl a2 "
+        f"WHERE a2.device_id = {device_id_sql} AND a2.grantee_username = ? AND a2.revoked_at IS NULL "
+        f"AND (a2.can_view=1 OR a2.can_operate=1))"
+    )
     if principal.role == "admin":
         if ALLOW_LEGACY_UNOWNED:
-            return " AND (owner_admin = ? OR owner_admin IS NULL) ", [principal.username]
-        return " AND owner_admin = ? ", [principal.username]
+            return (
+                f" AND (owner_admin = ? OR owner_admin IS NULL OR ({acl})) ",
+                [principal.username, principal.username],
+            )
+        return (
+            f" AND (owner_admin = ? OR ({acl})) ",
+            [principal.username, principal.username],
+        )
     manager = get_manager_admin(principal.username)
     if not manager:
         return " AND 1=0 ", []
     if ALLOW_LEGACY_UNOWNED:
-        return " AND (owner_admin = ? OR owner_admin IS NULL) ", [manager]
-    return " AND owner_admin = ? ", [manager]
+        return (
+            f" AND (owner_admin = ? OR owner_admin IS NULL OR ({acl})) ",
+            [manager, principal.username],
+        )
+    return (
+        f" AND (owner_admin = ? OR ({acl})) ",
+        [manager, principal.username],
+    )
 
 
 @app.get("/alarms")
@@ -5764,7 +5792,7 @@ def list_alarms(
     principal: Principal = Depends(require_principal),
 ) -> dict[str, Any]:
     assert_min_role(principal, "user")
-    scope_sql, scope_args = _alarm_scope_for(principal)
+    scope_sql, scope_args = _alarm_scope_for(principal, device_id_sql="alarms.source_id")
     args: list[Any] = list(scope_args)
     where_extra = ""
     if source_id:
@@ -5794,7 +5822,7 @@ def list_alarms(
 @app.get("/alarms/summary")
 def alarms_summary(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     assert_min_role(principal, "user")
-    scope_sql, scope_args = _alarm_scope_for(principal)
+    scope_sql, scope_args = _alarm_scope_for(principal, device_id_sql="alarms.source_id")
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -5832,10 +5860,13 @@ def list_activity_signals(
 ) -> dict[str, Any]:
     """Unified feed: physical device alarms + dashboard/API remote siren actions."""
     assert_min_role(principal, "user")
-    scope_sql, scope_args = _alarm_scope_for(principal)
+    al_base, scope_args = _alarm_scope_for(principal, device_id_sql="a.source_id")
     since_arg = f"-{since_hours} hours"
-    al_scope = scope_sql.replace("owner_admin", "a.owner_admin")
-    st_scope = scope_sql.replace("owner_admin", "s.owner_admin")
+    al_scope = al_base.replace("owner_admin", "a.owner_admin")
+    st_scope = (
+        al_base.replace("owner_admin", "s.owner_admin")
+        .replace("a.source_id", "s.device_id", 1)
+    )
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()

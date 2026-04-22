@@ -4,22 +4,22 @@ overview: Implement a shared Telegram bot with per-chat tenant scoping, fine-gra
 todos:
   - id: binding-model
     content: Add telegram chat binding storage and resolve Principal from chat_id in webhook flow.
-    status: pending
+    status: cancelled
   - id: command-targeting
     content: Implement single/many/all command parsing and execution via existing guarded command path.
-    status: pending
+    status: cancelled
   - id: telegram-capabilities
     content: Add tg_* capability switches and enforce per-command authorization.
-    status: pending
+    status: cancelled
   - id: admin-management-api-ui
     content: Expose superadmin management endpoints and dashboard controls for bindings and Telegram permissions.
-    status: pending
+    status: cancelled
   - id: safety-controls
     content: Add confirmation token for broad actions, per-chat rate limit, and complete audit entries.
-    status: pending
+    status: cancelled
   - id: tenant-routing-validation
     content: Validate tenant isolation for admin/user and global visibility for superadmin across logs/devices/commands.
-    status: pending
+    status: cancelled
 isProject: false
 ---
 
