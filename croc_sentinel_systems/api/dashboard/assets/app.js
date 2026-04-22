@@ -994,14 +994,6 @@
         <div class="divider"></div>
         <div id="groupCards" class="device-grid"></div>
       </section>
-      <section class="card" id="groupDevicesPanel" style="display:none">
-        <div class="row">
-          <h2 style="margin:0">Devices in group</h2>
-          <span class="chip" id="groupNowChip">—</span>
-        </div>
-        <div class="divider"></div>
-        <div id="groupDevices" class="device-grid"></div>
-      </section>
       <div id="grpModal" class="grp-modal" style="display:none">
         <div class="grp-modal-card">
           <h3 style="margin:0 0 8px">Edit group card</h3>
@@ -1019,11 +1011,8 @@
       </div>`;
 
     const groupCardsEl = $("#groupCards", view);
-    const groupDevicesEl = $("#groupDevices", view);
-    const groupNowChipEl = $("#groupNowChip", view);
-    const groupDevicesPanelEl = $("#groupDevicesPanel", view);
     const grpModalEl = $("#grpModal", view);
-    if (!groupCardsEl || !groupDevicesEl || !groupNowChipEl || !groupDevicesPanelEl || !grpModalEl) return;
+    if (!groupCardsEl || !grpModalEl) return;
 
     let editingGroup = "";
     const groupKeys = () => Object.keys(meta).sort((a, b) => a.localeCompare(b));
@@ -1077,17 +1066,6 @@
         </article>`;
       }).join("");
     };
-    const renderGroupDevices = () => {
-      if (!selectedGroup) {
-        groupDevicesPanelEl.style.display = "none";
-        return;
-      }
-      const ids = groupDeviceIds(selectedGroup);
-      const rows = ids.map((id) => byId.get(String(id))).filter(Boolean);
-      groupDevicesPanelEl.style.display = "";
-      groupNowChipEl.textContent = selectedGroup;
-      groupDevicesEl.innerHTML = rows.length ? rows.map(renderDeviceCard).join("") : `<p class="muted">No devices in this group.</p>`;
-    };
     const openGroupModal = (g) => {
       editingGroup = g || "";
       const m = meta[g] || { display_name: g || "", owner_name: "", phone: "", email: "", device_ids: [] };
@@ -1119,10 +1097,6 @@
       saveGroupMeta(meta);
       closeGroupModal();
       renderGroups();
-      if (selectedGroup === editingGroup || selectedGroup === key) {
-        selectedGroup = key;
-        renderGroupDevices();
-      }
     });
     groupCardsEl.addEventListener("click", async (ev) => {
       const btn = ev.target.closest("button");
@@ -1148,12 +1122,87 @@
       }
       const card = ev.target.closest(".js-group-card");
       if (!card) return;
-      selectedGroup = card.dataset.group || "";
-      renderGroups();
-      renderGroupDevices();
+      const g = card.dataset.group || "";
+      if (!g) return;
+      location.hash = `#/group/${encodeURIComponent(g)}`;
     });
     renderGroups();
-    renderGroupDevices();
+  });
+
+  registerRoute("group", async (view, args) => {
+    const g = decodeURIComponent(args[0] || "").trim();
+    if (!g) { location.hash = "#/overview"; return; }
+    const groupScope = (state.me && state.me.username) ? state.me.username : "anon";
+    const GROUP_META_LS_KEY = `croc.group.meta.v2.${groupScope}`;
+    const loadGroupMeta = () => {
+      try {
+        const raw = localStorage.getItem(GROUP_META_LS_KEY);
+        const obj = raw ? JSON.parse(raw) : {};
+        return (obj && typeof obj === "object") ? obj : {};
+      } catch { return {}; }
+    };
+    const meta = loadGroupMeta();
+    const [listRes] = await Promise.allSettled([apiGetCached("/devices", { timeoutMs: 8000 }, 3000)]);
+    const list = (listRes.status === "fulfilled" && listRes.value) ? listRes.value : { items: [] };
+    const byId = new Map((list.items || []).map((d) => [String(d.device_id), d]));
+    const gm = meta[g] || { display_name: g, owner_name: "", phone: "", email: "", device_ids: [] };
+    const ids = Array.isArray(gm.device_ids) ? gm.device_ids.map(String) : [];
+    const rows = ids.map((id) => byId.get(id)).filter(Boolean);
+    const online = rows.filter((d) => isOnline(d)).length;
+    const offline = Math.max(0, rows.length - online);
+    setCrumb(`Group · ${gm.display_name || g}`);
+    view.innerHTML = `
+      <section class="card">
+        <div class="row">
+          <h2 style="margin:0">${escapeHtml(gm.display_name || g)}</h2>
+          <a href="#/overview" class="btn ghost right">← Back</a>
+        </div>
+        <div class="divider"></div>
+        <div class="row" style="gap:6px;flex-wrap:wrap">
+          <span class="badge neutral">total ${rows.length}</span>
+          <span class="badge online">online ${online}</span>
+          <span class="badge offline">offline ${offline}</span>
+          <span class="chip">${escapeHtml(g)}</span>
+        </div>
+        <p class="muted" style="margin-top:8px">Owner: ${escapeHtml(gm.owner_name || "—")} · ${escapeHtml(gm.phone || "—")} · ${escapeHtml(gm.email || "—")}</p>
+        <div class="row" style="margin-top:8px;gap:8px;justify-content:flex-end">
+          <button class="btn sm danger" id="grpAlarmOn" ${can("can_alert") ? "" : "disabled"}>Alarm ON</button>
+          <button class="btn sm secondary" id="grpAlarmOff" ${can("can_alert") ? "" : "disabled"}>Alarm OFF</button>
+        </div>
+      </section>
+      <section class="card">
+        <h3 style="margin:0">Devices</h3>
+        <div class="divider"></div>
+        <div class="device-grid" id="groupPageDevices"></div>
+      </section>
+    `;
+    const devGrid = $("#groupPageDevices", view);
+    if (devGrid) {
+      devGrid.innerHTML = rows.length ? rows.map((d) => {
+        const on = isOnline(d);
+        const primary = escapeHtml(d.display_label || d.device_id || "unknown");
+        const subId = d.display_label ? `<div class="device-id-sub mono">${escapeHtml(d.device_id || "")}</div>` : "";
+        return `<a class="device-card" href="#/devices/${encodeURIComponent(d.device_id)}" style="text-decoration:none;color:inherit">
+          <h3><div class="device-primary-name">${primary}</div>${subId}</h3>
+          <div><span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>
+            ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
+            ${d.fw ? `<span class="chip">v${escapeHtml(d.fw)}</span>` : ""}
+          </div>
+          <div class="meta">Platform: ${escapeHtml(maskPlatform(`${d.chip_target || ""}/${d.board_profile || ""}`))}<br/>Manufacturer: ESA Sibu</div>
+        </a>`;
+      }).join("") : `<p class="muted">No devices in this group.</p>`;
+    }
+    const sendAlert = async (action) => {
+      if (!can("can_alert")) { toast("No can_alert capability", "err"); return; }
+      if (ids.length === 0) { toast("No devices in this group", "warn"); return; }
+      if (!confirm(`${action === "on" ? "Open" : "Close"} alarm for ${ids.length} devices in ${g}?`)) return;
+      await api("/alerts", { method: "POST", body: { action, duration_ms: 10000, device_ids: ids } });
+      toast(`${action === "on" ? "Alarm ON" : "Alarm OFF"} · ${ids.length}`, "ok");
+    };
+    const alarmOnBtn = $("#grpAlarmOn", view);
+    const alarmOffBtn = $("#grpAlarmOff", view);
+    if (alarmOnBtn) alarmOnBtn.addEventListener("click", () => sendAlert("on"));
+    if (alarmOffBtn) alarmOffBtn.addEventListener("click", () => sendAlert("off"));
   });
 
   // Device detail

@@ -1123,8 +1123,7 @@ def emit_event(
     try:
         from telegram_notify import maybe_notify_telegram
 
-        if not _is_superadmin_username(str(ev.get("actor") or "")):
-            maybe_notify_telegram(ev)
+        maybe_notify_telegram(ev)
     except Exception as exc:
         # Avoid silent failures when Telegram module/env is misconfigured (default log level INFO).
         logger.warning("telegram_notify skipped: %s", exc)
