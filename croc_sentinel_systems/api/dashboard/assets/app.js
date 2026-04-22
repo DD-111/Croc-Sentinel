@@ -435,13 +435,25 @@
 
   /** Short-lived GET cache to avoid duplicate round-trips when navigating (server still uses CACHE_TTL). */
   const _apiGetCache = new Map();
+  const _apiGetInflight = new Map();
   async function apiGetCached(path, opts, ttlMs) {
     const ttl = ttlMs != null ? ttlMs : 4500;
     const ent = _apiGetCache.get(path);
     const now = Date.now();
     if (ent && (now - ent.t) < ttl) return ent.data;
-    const data = await api(path, opts);
-    _apiGetCache.set(path, { t: now, data });
+    if (_apiGetInflight.has(path)) return _apiGetInflight.get(path);
+    const p = (async () => {
+      const data = await api(path, opts);
+      _apiGetCache.set(path, { t: Date.now(), data });
+      return data;
+    })();
+    _apiGetInflight.set(path, p);
+    let data;
+    try {
+      data = await p;
+    } finally {
+      if (_apiGetInflight.get(path) === p) _apiGetInflight.delete(path);
+    }
     return data;
   }
 
@@ -594,6 +606,43 @@
 
   function registerRoute(id, handler) { routes[id] = handler; }
   function isRouteCurrent(seq) { return seq === state.routeSeq; }
+  function clearRouteTickers() {
+    const ticks = window.__routeTickers;
+    if (!ticks) return;
+    for (const t of ticks.values()) {
+      try { clearTimeout(t); } catch (_) {}
+    }
+    ticks.clear();
+  }
+  function scheduleRouteTicker(routeSeq, key, fn, intervalMs) {
+    window.__routeTickers = window.__routeTickers || new Map();
+    const ticks = window.__routeTickers;
+    const k = String(key || "");
+    let running = false;
+    const run = async () => {
+      if (!isRouteCurrent(routeSeq)) return;
+      if (document.visibilityState !== "visible") {
+        const tid = setTimeout(run, intervalMs);
+        ticks.set(k, tid);
+        return;
+      }
+      if (running) {
+        const tid = setTimeout(run, intervalMs);
+        ticks.set(k, tid);
+        return;
+      }
+      running = true;
+      try { await fn(); } catch (_) {}
+      running = false;
+      if (!isRouteCurrent(routeSeq)) return;
+      const tid = setTimeout(run, intervalMs);
+      ticks.set(k, tid);
+    };
+    const old = ticks.get(k);
+    if (old) { try { clearTimeout(old); } catch (_) {} }
+    const first = setTimeout(run, intervalMs);
+    ticks.set(k, first);
+  }
 
   async function renderRoute() {
     const view = $("#view");
@@ -621,6 +670,11 @@
     if (window.__pendingEvListRaf) {
       try { cancelAnimationFrame(window.__pendingEvListRaf); } catch (_) {}
       window.__pendingEvListRaf = 0;
+    }
+    clearRouteTickers();
+    if (window.__evReconnectTimer) {
+      try { clearTimeout(window.__evReconnectTimer); } catch (_) {}
+      window.__evReconnectTimer = 0;
     }
     window.__eventsStreamResume = null;
     toggleNav(false);
@@ -1228,23 +1282,47 @@
     };
     const mqStatus = !mqConnected ? "Disconnected" : (mqDropped > 0 || mqQDepth >= 300 ? "Warning" : "Healthy");
     const mqClass = !mqConnected ? "revoked" : (mqStatus === "Warning" ? "offline" : "online");
+    let lastOverviewHeaderSig = "";
+    const patchOverviewHeader = (vals) => {
+      const sig = JSON.stringify(vals || {});
+      if (sig === lastOverviewHeaderSig) return;
+      lastOverviewHeaderSig = sig;
+      const setTxt = (id, v) => {
+        const el = $(`#${id}`, view);
+        if (el && el.textContent !== String(v)) el.textContent = String(v);
+      };
+      setTxt("ovServerV", vals.server);
+      setTxt("ovDevicesV", vals.devices);
+      setTxt("ovOnlineV", vals.online);
+      setTxt("ovOfflineV", vals.offline);
+      setTxt("ovTxV", vals.tx);
+      setTxt("ovRxV", vals.rx);
+      setTxt("ovMqttQueue", vals.queue);
+      setTxt("ovMqttDropped", vals.dropped);
+      const risk = $("#ovMqttRisk", view);
+      if (risk) {
+        if (risk.textContent !== String(vals.risk)) risk.textContent = String(vals.risk);
+        const want = `badge ${vals.riskClass}`;
+        if (risk.className !== want) risk.className = want;
+      }
+    };
 
     view.innerHTML = `
       <section class="stats">
-        <div class="stat"><div class="k">Server</div><div class="v">${mqConnected ? "Connected" : "Disconnected"}</div><div class="sub">MQTT broker link</div></div>
-        <div class="stat"><div class="k">Devices</div><div class="v">${totalDevices}</div><div class="sub">total in scope</div></div>
-        <div class="stat"><div class="k">Online</div><div class="v">${onlineDevices}</div><div class="sub">active now</div></div>
-        <div class="stat"><div class="k">Offline</div><div class="v">${offlineDevices}</div><div class="sub">inactive now</div></div>
-        <div class="stat"><div class="k">TX</div><div class="v">${escapeHtml(bps(txBps))}</div><div class="sub">aggregate uplink</div></div>
-        <div class="stat"><div class="k">RX</div><div class="v">${escapeHtml(bps(rxBps))}</div><div class="sub">aggregate downlink</div></div>
+        <div class="stat"><div class="k">Server</div><div class="v" id="ovServerV">—</div><div class="sub">MQTT broker link</div></div>
+        <div class="stat"><div class="k">Devices</div><div class="v" id="ovDevicesV">—</div><div class="sub">total in scope</div></div>
+        <div class="stat"><div class="k">Online</div><div class="v" id="ovOnlineV">—</div><div class="sub">active now</div></div>
+        <div class="stat"><div class="k">Offline</div><div class="v" id="ovOfflineV">—</div><div class="sub">inactive now</div></div>
+        <div class="stat"><div class="k">TX</div><div class="v" id="ovTxV">—</div><div class="sub">aggregate uplink</div></div>
+        <div class="stat"><div class="k">RX</div><div class="v" id="ovRxV">—</div><div class="sub">aggregate downlink</div></div>
       </section>
       <section class="card">
         <div class="row">
           <h3 style="margin:0">MQTT risk</h3>
-          <span class="badge ${mqClass}">${mqStatus}</span>
+          <span class="badge ${mqClass}" id="ovMqttRisk">${mqStatus}</span>
         </div>
         <div class="divider"></div>
-        <div class="muted">queue=${mqQDepth} · dropped=${mqDropped}</div>
+        <div class="muted">queue=<span class="mono" id="ovMqttQueue">0</span> · dropped=<span class="mono" id="ovMqttDropped">0</span></div>
       </section>
       <section class="card">
         <div class="row">
@@ -1321,6 +1399,18 @@
           </div>
         </div>
       </div>`;
+    patchOverviewHeader({
+      server: mqConnected ? "Connected" : "Disconnected",
+      devices: totalDevices,
+      online: onlineDevices,
+      offline: offlineDevices,
+      tx: bps(txBps),
+      rx: bps(rxBps),
+      queue: mqQDepth,
+      dropped: mqDropped,
+      risk: mqStatus,
+      riskClass: mqClass,
+    });
 
     const groupCardsEl = $("#groupCards", view);
     const grpModalEl = $("#grpModal", view);
@@ -1357,57 +1447,72 @@
         </div>
       </a>`;
     };
+    const buildGroupCardHtml = (g) => {
+      const ids = groupDeviceIds(g);
+      const rows = ids.map((id) => byId.get(String(id))).filter(Boolean);
+      const total = rows.length;
+      const on = rows.filter((d) => isOnline(d)).length;
+      const off = Math.max(0, total - on);
+      const m = meta[g] || {};
+      const gs = groupSettingsMap.get(g) || {
+        trigger_mode: "continuous",
+        trigger_duration_ms: 10000,
+        delay_seconds: 0,
+        reboot_self_check: false,
+      };
+      const sharedBy = groupSharedBy(g);
+      const isSharedGroup = sharedBy.length > 0;
+      const modeLabel = String(gs.trigger_mode || "continuous") === "delay"
+        ? `delay ${Number(gs.delay_seconds || 0)}s`
+        : "continuous";
+      const shareBtn = state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_manage_users")))
+        ? `<button class="group-del-ico js-share-group" data-group="${escapeHtml(g)}" type="button" title="Share group" style="right:32px">⇪</button>`
+        : "";
+      return `<article class="device-card js-group-card ${selectedGroup === g ? "is-selected" : ""}" data-group="${escapeHtml(g)}" style="cursor:pointer;position:relative">
+        ${shareBtn}
+        <button class="group-del-ico js-del-group" data-group="${escapeHtml(g)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group cannot be deleted\"" : "title=\"Delete group\""} aria-label="Delete group">✕</button>
+        <h3><div class="device-primary-name">${escapeHtml(m.display_name || g)}</div><div class="device-id-sub mono">${escapeHtml(g)}</div></h3>
+        <div class="meta" style="margin-bottom:8px">
+          Trigger: <span class="mono">${escapeHtml(modeLabel)}</span> ·
+          Duration: <span class="mono">${escapeHtml(String(gs.trigger_duration_ms || 10000))}ms</span> ·
+          Reboot+self-check: <span class="mono">${gs.reboot_self_check ? "yes" : "no"}</span>
+        </div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
+          <span class="badge neutral">total ${total}</span>
+          <span class="badge online">online ${on}</span>
+          <span class="badge offline">offline ${off}</span>
+          ${isSharedGroup ? `<span class="badge accent" title="shared group">shared by ${escapeHtml(sharedBy.join(", "))}</span>` : ""}
+        </div>
+        <div class="meta">Owner: ${escapeHtml(m.owner_name || "—")} · ${escapeHtml(m.phone || "—")} · ${escapeHtml(m.email || "—")}</div>
+        <div class="row" style="margin-top:8px;gap:6px;flex-wrap:wrap">
+          <button class="btn sm secondary js-group-settings" data-group="${escapeHtml(g)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group follows owner settings\"" : ""}>Settings</button>
+          <button class="btn sm secondary js-edit-group" data-group="${escapeHtml(g)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group: device membership is read-only\"" : ""}>Edit</button>
+          <button class="btn sm danger js-alert-on" data-group="${escapeHtml(g)}" type="button">Alarm ON</button>
+          <button class="btn sm secondary js-alert-off" data-group="${escapeHtml(g)}" type="button">Alarm OFF</button>
+        </div>
+      </article>`;
+    };
     const renderGroups = () => {
       const keys = groupKeys();
       if (keys.length === 0) {
         groupCardsEl.innerHTML = `<p class="muted">No groups yet.</p>`;
         return;
       }
-      groupCardsEl.innerHTML = keys.map((g) => {
-        const ids = groupDeviceIds(g);
-        const rows = ids.map((id) => byId.get(String(id))).filter(Boolean);
-        const total = rows.length;
-        const on = rows.filter((d) => isOnline(d)).length;
-        const off = Math.max(0, total - on);
-        const m = meta[g] || {};
-        const gs = groupSettingsMap.get(g) || {
-          trigger_mode: "continuous",
-          trigger_duration_ms: 10000,
-          delay_seconds: 0,
-          reboot_self_check: false,
-        };
-        const sharedBy = groupSharedBy(g);
-        const isSharedGroup = sharedBy.length > 0;
-        const modeLabel = String(gs.trigger_mode || "continuous") === "delay"
-          ? `delay ${Number(gs.delay_seconds || 0)}s`
-          : "continuous";
-        const shareBtn = state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_manage_users")))
-          ? `<button class="group-del-ico js-share-group" data-group="${escapeHtml(g)}" type="button" title="Share group" style="right:32px">⇪</button>`
-          : "";
-        return `<article class="device-card js-group-card ${selectedGroup === g ? "is-selected" : ""}" data-group="${escapeHtml(g)}" style="cursor:pointer;position:relative">
-          ${shareBtn}
-          <button class="group-del-ico js-del-group" data-group="${escapeHtml(g)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group cannot be deleted\"" : "title=\"Delete group\""} aria-label="Delete group">✕</button>
-          <h3><div class="device-primary-name">${escapeHtml(m.display_name || g)}</div><div class="device-id-sub mono">${escapeHtml(g)}</div></h3>
-          <div class="meta" style="margin-bottom:8px">
-            Trigger: <span class="mono">${escapeHtml(modeLabel)}</span> ·
-            Duration: <span class="mono">${escapeHtml(String(gs.trigger_duration_ms || 10000))}ms</span> ·
-            Reboot+self-check: <span class="mono">${gs.reboot_self_check ? "yes" : "no"}</span>
-          </div>
-          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
-            <span class="badge neutral">total ${total}</span>
-            <span class="badge online">online ${on}</span>
-            <span class="badge offline">offline ${off}</span>
-            ${isSharedGroup ? `<span class="badge accent" title="shared group">shared by ${escapeHtml(sharedBy.join(", "))}</span>` : ""}
-          </div>
-          <div class="meta">Owner: ${escapeHtml(m.owner_name || "—")} · ${escapeHtml(m.phone || "—")} · ${escapeHtml(m.email || "—")}</div>
-          <div class="row" style="margin-top:8px;gap:6px;flex-wrap:wrap">
-            <button class="btn sm secondary js-group-settings" data-group="${escapeHtml(g)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group follows owner settings\"" : ""}>Settings</button>
-            <button class="btn sm secondary js-edit-group" data-group="${escapeHtml(g)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group: device membership is read-only\"" : ""}>Edit</button>
-            <button class="btn sm danger js-alert-on" data-group="${escapeHtml(g)}" type="button">Alarm ON</button>
-            <button class="btn sm secondary js-alert-off" data-group="${escapeHtml(g)}" type="button">Alarm OFF</button>
-          </div>
-        </article>`;
-      }).join("");
+      const existing = new Map(
+        $$(".js-group-card", groupCardsEl).map((el) => [String(el.getAttribute("data-group") || ""), el]),
+      );
+      const frag = document.createDocumentFragment();
+      for (const g of keys) {
+        const html = buildGroupCardHtml(g);
+        let node = existing.get(g) || null;
+        if (!node || node.outerHTML !== html) {
+          const t = document.createElement("template");
+          t.innerHTML = html.trim();
+          node = t.content.firstElementChild;
+        }
+        if (node) frag.appendChild(node);
+      }
+      groupCardsEl.replaceChildren(frag);
     };
     let editingSettingsGroup = "";
     const openSettingsModal = (g) => {
@@ -1761,7 +1866,7 @@
     renderGroups();
   });
 
-  registerRoute("group", async (view, args) => {
+  registerRoute("group", async (view, args, routeSeq) => {
     const g = decodeURIComponent(args[0] || "").trim();
     if (!g) { location.hash = "#/overview"; return; }
     const groupScope = (state.me && state.me.username) ? state.me.username : "anon";
@@ -1801,11 +1906,11 @@
     const gsMap = loadGroupSettings();
     const groupApiCaps = loadGroupApiCaps();
     const [listRes] = await Promise.allSettled([apiGetCached("/devices", { timeoutMs: 8000 }, 3000)]);
-    const list = (listRes.status === "fulfilled" && listRes.value) ? listRes.value : { items: [] };
-    const byId = new Map((list.items || []).map((d) => [String(d.device_id), d]));
+    let list = (listRes.status === "fulfilled" && listRes.value) ? listRes.value : { items: [] };
+    let byId = new Map((list.items || []).map((d) => [String(d.device_id), d]));
     const gm = meta[g] || { display_name: g, owner_name: "", phone: "", email: "", device_ids: [] };
     const ids = Array.isArray(gm.device_ids) ? gm.device_ids.map(String) : [];
-    const rows = ids.map((id) => byId.get(id)).filter(Boolean);
+    let rows = ids.map((id) => byId.get(id)).filter(Boolean);
     const isSharedGroup = rows.some((d) => !!d.is_shared);
     const online = rows.filter((d) => isOnline(d)).length;
     const offline = Math.max(0, rows.length - online);
@@ -1819,9 +1924,9 @@
         </div>
         <div class="divider"></div>
         <div class="row" style="gap:6px;flex-wrap:wrap">
-          <span class="badge neutral">total ${rows.length}</span>
-          <span class="badge online">online ${online}</span>
-          <span class="badge offline">offline ${offline}</span>
+          <span class="badge neutral">total <span id="grpTotal">${rows.length}</span></span>
+          <span class="badge online">online <span id="grpOnline">${online}</span></span>
+          <span class="badge offline">offline <span id="grpOffline">${offline}</span></span>
           <span class="chip">${escapeHtml(g)}</span>
         </div>
         <p class="muted" style="margin-top:8px">Owner: ${escapeHtml(gm.owner_name || "—")} · ${escapeHtml(gm.phone || "—")} · ${escapeHtml(gm.email || "—")}</p>
@@ -1837,7 +1942,8 @@
       </section>
     `;
     const devGrid = $("#groupPageDevices", view);
-    if (devGrid) {
+    const renderGroupDevices = () => {
+      if (!devGrid) return;
       devGrid.innerHTML = rows.length ? rows.map((d) => {
         const on = isOnline(d);
         const primary = escapeHtml(d.display_label || d.device_id || "unknown");
@@ -1852,7 +1958,16 @@
           <div class="meta">Platform: ${escapeHtml(maskPlatform(`${d.chip_target || ""}/${d.board_profile || ""}`))}<br/>Manufacturer: ESA Sibu</div>
         </a>`;
       }).join("") : `<p class="muted">No devices in this group.</p>`;
-    }
+      const onNow = rows.filter((d) => isOnline(d)).length;
+      const offNow = Math.max(0, rows.length - onNow);
+      const tEl = $("#grpTotal", view);
+      const oEl = $("#grpOnline", view);
+      const fEl = $("#grpOffline", view);
+      if (tEl) tEl.textContent = String(rows.length);
+      if (oEl) oEl.textContent = String(onNow);
+      if (fEl) fEl.textContent = String(offNow);
+    };
+    renderGroupDevices();
     const clearGroupByDevicePatchCompat = async () => {
       let changed = 0;
       for (const id of ids) {
@@ -1947,18 +2062,42 @@
         }
       });
     }
+    const refreshGroupLive = async () => {
+      if (!isRouteCurrent(routeSeq)) return;
+      const latest = await apiGetCached("/devices", { timeoutMs: 8000 }, 2000);
+      if (!isRouteCurrent(routeSeq)) return;
+      list = latest || { items: [] };
+      byId = new Map((list.items || []).map((d) => [String(d.device_id), d]));
+      rows = ids.map((id2) => byId.get(id2)).filter(Boolean);
+      renderGroupDevices();
+    };
+    scheduleRouteTicker(routeSeq, `group-live-${g}`, refreshGroupLive, 10000);
   });
 
   // Device detail
-  registerRoute("devices", async (view, args) => {
+  registerRoute("devices", async (view, args, routeSeq) => {
     const id = decodeURIComponent(args[0] || "");
     if (!id) { location.hash = "#/overview"; return; }
     const isSuperViewer = !!(state.me && state.me.role === "superadmin");
 
-    const d = await api(`/devices/${encodeURIComponent(id)}`);
+    let d = await api(`/devices/${encodeURIComponent(id)}`);
+    window.__devicePollLocks = window.__devicePollLocks || new Map();
+    const runPollDedup = (key, worker) => {
+      const k = String(key || "");
+      if (!k) return worker();
+      const locks = window.__devicePollLocks;
+      if (locks.has(k)) return locks.get(k);
+      const p = (async () => {
+        try {
+          return await worker();
+        } finally {
+          if (locks.get(k) === p) locks.delete(k);
+        }
+      })();
+      locks.set(k, p);
+      return p;
+    };
     setCrumb(d.display_label ? `Device · ${d.display_label}` : `Device · ${id}`);
-    const on = isOnline(d);
-    const s = d.last_status_json || {};
     const bps = (v) => {
       v = Number(v || 0);
       if (v < 1024) return v.toFixed(0) + " B/s";
@@ -1971,18 +2110,24 @@
       network_lost: "Network lost",
       signal_weak: "Weak signal",
     };
-    const reason = s.disconnect_reason || (on ? "none" : "network_lost");
-    const outV = (s.vbat == null || s.vbat < 0) ? "—" : `${Number(s.vbat).toFixed(2)} V`;
-    const rssi = (s.rssi == null || s.rssi === -127) ? "—" : `${s.rssi} dBm`;
-    const netT = String(s.net_type || d.net_type || "");
-    const wifiSsidDd = netT === "wifi"
-      ? ((s.wifi_ssid != null && String(s.wifi_ssid).length > 0)
-        ? escapeHtml(String(s.wifi_ssid))
-        : `<span class="muted">Not associated</span>`)
-      : `<span class="muted">N/A (${escapeHtml(netT || "—")})</span>`;
-    const wifiChDd = (netT === "wifi" && s.wifi_channel != null && Number(s.wifi_channel) > 0)
-      ? escapeHtml(String(s.wifi_channel))
-      : "—";
+    const deviceLiveModel = (dev) => {
+      const on = isOnline(dev);
+      const s = dev.last_status_json || {};
+      const reason = s.disconnect_reason || (on ? "none" : "network_lost");
+      const outV = (s.vbat == null || s.vbat < 0) ? "—" : `${Number(s.vbat).toFixed(2)} V`;
+      const rssi = (s.rssi == null || s.rssi === -127) ? "—" : `${s.rssi} dBm`;
+      const netT = String(s.net_type || dev.net_type || "");
+      const wifiSsidDd = netT === "wifi"
+        ? ((s.wifi_ssid != null && String(s.wifi_ssid).length > 0)
+          ? escapeHtml(String(s.wifi_ssid))
+          : `<span class="muted">Not associated</span>`)
+        : `<span class="muted">N/A (${escapeHtml(netT || "—")})</span>`;
+      const wifiChDd = (netT === "wifi" && s.wifi_channel != null && Number(s.wifi_channel) > 0)
+        ? escapeHtml(String(s.wifi_channel))
+        : "—";
+      return { on, s, reason, outV, rssi, wifiSsidDd, wifiChDd };
+    };
+    const dm = deviceLiveModel(d);
     const rawCommandPanel = (state.me && state.me.role === "superadmin") ? `
         <div class="card">
           <h3>Raw command</h3>
@@ -2061,8 +2206,8 @@
             <div class="device-primary-name">${escapeHtml(d.display_label || id)}</div>
             ${d.display_label ? `<div class="device-id-sub mono">${escapeHtml(id)}</div>` : ""}
           </div>
-          <span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>
-          <span class="chip">${escapeHtml(reasonEn[reason] || reason)}</span>
+          <span class="badge ${dm.on ? "online" : "offline"}" id="devOnlineBadge">${dm.on ? "online" : "offline"}</span>
+          <span class="chip" id="devReasonChip">${escapeHtml(reasonEn[dm.reason] || dm.reason)}</span>
           ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
           <a href="#/overview" class="btn ghost right">← Overview</a>
         </div>
@@ -2084,17 +2229,17 @@
           <dt>Firmware</dt><dd class="mono">${escapeHtml(d.fw || "—")}</dd>
           <dt>Platform</dt><dd class="mono">${escapeHtml(maskPlatform(`${d.chip_target || ""}/${d.board_profile || ""}`))}</dd>
           <dt>Manufacturer</dt><dd class="mono">ESA Sibu</dd>
-          <dt>Network</dt><dd class="mono">${escapeHtml(d.net_type || "—")} · ${escapeHtml(s.ip || "—")}</dd>
-          <dt>Wi‑Fi SSID</dt><dd>${wifiSsidDd}</dd>
-          <dt>Wi‑Fi channel</dt><dd>${wifiChDd}</dd>
-          <dt>RSSI</dt><dd class="mono">${escapeHtml(rssi)}</dd>
-          <dt>Output V</dt><dd class="mono">${escapeHtml(outV)}</dd>
-          <dt>Tx / Rx</dt><dd class="mono">${escapeHtml(bps(s.tx_bps))} / ${escapeHtml(bps(s.rx_bps))}</dd>
-          <dt>Disconnect</dt><dd class="mono">${escapeHtml(reason)}</dd>
+          <dt>Network</dt><dd class="mono" id="devNetRow">${escapeHtml(d.net_type || "—")} · ${escapeHtml(dm.s.ip || "—")}</dd>
+          <dt>Wi‑Fi SSID</dt><dd id="devWifiSsid">${dm.wifiSsidDd}</dd>
+          <dt>Wi‑Fi channel</dt><dd id="devWifiCh">${dm.wifiChDd}</dd>
+          <dt>RSSI</dt><dd class="mono" id="devRssi">${escapeHtml(dm.rssi)}</dd>
+          <dt>Output V</dt><dd class="mono" id="devOutV">${escapeHtml(dm.outV)}</dd>
+          <dt>Tx / Rx</dt><dd class="mono" id="devTxRx">${escapeHtml(bps(dm.s.tx_bps))} / ${escapeHtml(bps(dm.s.rx_bps))}</dd>
+          <dt>Disconnect</dt><dd class="mono" id="devDisconnect">${escapeHtml(dm.reason)}</dd>
           <dt>Provisioned</dt><dd>${d.provisioned ? "yes" : "no"}</dd>
-          <dt>Uptime</dt><dd class="mono">${escapeHtml((s.uptime_s ? `${Math.floor(s.uptime_s / 3600)}h ${Math.floor((s.uptime_s % 3600) / 60)}m` : "—"))}</dd>
-          <dt>Free heap</dt><dd class="mono">${escapeHtml(s.free_heap ? `${s.free_heap} B (min ${s.min_free_heap || "?"} B)` : "—")}</dd>
-          <dt>Updated</dt><dd>${escapeHtml(fmtTs(d.updated_at))} (${escapeHtml(fmtRel(d.updated_at))})</dd>
+          <dt>Uptime</dt><dd class="mono" id="devUptime">${escapeHtml((dm.s.uptime_s ? `${Math.floor(dm.s.uptime_s / 3600)}h ${Math.floor((dm.s.uptime_s % 3600) / 60)}m` : "—"))}</dd>
+          <dt>Free heap</dt><dd class="mono" id="devHeap">${escapeHtml(dm.s.free_heap ? `${dm.s.free_heap} B (min ${dm.s.min_free_heap || "?"} B)` : "—")}</dd>
+          <dt>Updated</dt><dd id="devUpdated">${escapeHtml(fmtTs(d.updated_at))} (${escapeHtml(fmtRel(d.updated_at))})</dd>
         </dl>
       </div>
 
@@ -2157,6 +2302,35 @@
       </div>
 
       ${mqttMsgPanel}`;
+    const patchDeviceLive = (dev) => {
+      const m = deviceLiveModel(dev);
+      const onlineBadge = $("#devOnlineBadge", view);
+      if (onlineBadge) {
+        onlineBadge.textContent = m.on ? "online" : "offline";
+        onlineBadge.className = `badge ${m.on ? "online" : "offline"}`;
+      }
+      const reasonChip = $("#devReasonChip", view);
+      if (reasonChip) reasonChip.textContent = String(reasonEn[m.reason] || m.reason);
+      const setText = (idSel, txt) => { const el = $(idSel, view); if (el) el.textContent = String(txt); };
+      const setHtml = (idSel, txt) => { const el = $(idSel, view); if (el) el.innerHTML = String(txt); };
+      setText("#devNetRow", `${dev.net_type || "—"} · ${m.s.ip || "—"}`);
+      setHtml("#devWifiSsid", m.wifiSsidDd);
+      setHtml("#devWifiCh", m.wifiChDd);
+      setText("#devRssi", m.rssi);
+      setText("#devOutV", m.outV);
+      setText("#devTxRx", `${bps(m.s.tx_bps)} / ${bps(m.s.rx_bps)}`);
+      setText("#devDisconnect", m.reason);
+      setText("#devUptime", m.s.uptime_s ? `${Math.floor(m.s.uptime_s / 3600)}h ${Math.floor((m.s.uptime_s % 3600) / 60)}m` : "—");
+      setText("#devHeap", m.s.free_heap ? `${m.s.free_heap} B (min ${m.s.min_free_heap || "?"} B)` : "—");
+      setText("#devUpdated", `${fmtTs(dev.updated_at)} (${fmtRel(dev.updated_at)})`);
+    };
+    scheduleRouteTicker(routeSeq, `device-live-${id}`, async () => {
+      if (!isRouteCurrent(routeSeq)) return;
+      const latest = await apiGetCached(`/devices/${encodeURIComponent(id)}`, { timeoutMs: 8000 }, 2000);
+      if (!isRouteCurrent(routeSeq) || !latest) return;
+      d = latest;
+      patchDeviceLive(latest);
+    }, 8000);
     if (isSuperViewer) {
       const det = $("#mqttMsgDetails", view);
       const box = $("#devMsgsList", view);
@@ -2235,7 +2409,7 @@
       });
     }
 
-    const waitForCmdAck = async (expectedCmd) => {
+    const waitForCmdAck = async (expectedCmd) => runPollDedup(`ack:${id}:${String(expectedCmd || "")}`, async () => {
       for (let i = 0; i < 36; i++) {
         await new Promise((r) => setTimeout(r, 500));
         const d2 = await api(`/devices/${encodeURIComponent(id)}`);
@@ -2245,7 +2419,7 @@
         }
       }
       return null;
-    };
+    });
 
     const wifiApplyBtn = $("#wifiApplyBtn");
     const wifiTaskProgress = $("#wifiTaskProgress");
@@ -2254,7 +2428,7 @@
       const v = Math.max(0, Math.min(100, Number(n || 0)));
       wifiTaskProgress.value = v;
     };
-    const pollWifiTask = async (taskId) => {
+    const pollWifiTask = async (taskId) => runPollDedup(`wifi-task:${id}:${String(taskId || "")}`, async () => {
       const st = $("#wifiScanStatus");
       for (let i = 0; i < 120; i++) {
         await new Promise((r) => setTimeout(r, 1000));
@@ -2276,7 +2450,7 @@
       }
       if (st) st.textContent = "Timed out waiting task result";
       toast("Provision task timeout", "err");
-    };
+    });
     if (wifiApplyBtn) {
       wifiApplyBtn.addEventListener("click", async () => {
         const ssid = ($("#wifiNewSsid").value || "").trim();
@@ -2285,6 +2459,7 @@
         if (!ssid) { toast("Enter SSID", "err"); return; }
         if (!confirm("Save Wi‑Fi on device and reboot? You may lose contact until it joins the new network.")) return;
         try {
+          wifiApplyBtn.disabled = true;
           setWifiProgress(10);
           if (st) st.textContent = "Creating provision task…";
           const r = await api(`/devices/${encodeURIComponent(id)}/provision/wifi-task`, {
@@ -2295,6 +2470,7 @@
           if (st) st.textContent = `Task ${r.task_id} running…`;
           await pollWifiTask(r.task_id);
         } catch (e) { toast(e.message || e, "err"); if (st) st.textContent = String(e.message || e); }
+        finally { wifiApplyBtn.disabled = false; }
       });
     }
     const wifiClearBtn = $("#wifiClearBtn");
@@ -2708,7 +2884,10 @@
 
     let paused = false;
     let buffer = [];  // newest first
-    const BUFFER_MAX = 500;
+    const BUFFER_MAX = 220;
+    const RENDER_LIMIT = 180;
+    let evRenderTimer = 0;
+    let evReconnectBackoffMs = 1200;
 
     function badgeClass(lvl) {
       return ({
@@ -2763,20 +2942,19 @@
       </article>`;
     }
     function flushEvRender() {
+      evRenderTimer = 0;
       const listEl = document.getElementById("evList");
       if (!listEl) return;
       if (buffer.length === 0) {
         listEl.innerHTML = `<p class="muted audit-empty">No events.</p>`;
         return;
       }
-      listEl.innerHTML = `<div class="audit-feed">${buffer.map(rowHtml).join("")}</div>`;
+      const visible = buffer.slice(0, RENDER_LIMIT);
+      listEl.innerHTML = `<div class="audit-feed">${visible.map(rowHtml).join("")}</div>`;
     }
     function scheduleEvRender() {
-      if (window.__pendingEvListRaf) return;
-      window.__pendingEvListRaf = requestAnimationFrame(() => {
-        window.__pendingEvListRaf = 0;
-        flushEvRender();
-      });
+      if (evRenderTimer) return;
+      evRenderTimer = setTimeout(flushEvRender, 120);
     }
     function pushEvent(ev) {
       if (paused) return;
@@ -2800,10 +2978,7 @@
         const r = await api("/events?" + p.toString(), { timeoutMs: 8000 });
         if (!isRouteCurrent(routeSeq)) return;
         buffer = (r.items || []).slice();
-        if (window.__pendingEvListRaf) {
-          cancelAnimationFrame(window.__pendingEvListRaf);
-          window.__pendingEvListRaf = 0;
-        }
+        if (evRenderTimer) { clearTimeout(evRenderTimer); evRenderTimer = 0; }
         flushEvRender();
       } catch (e) {
         if (!isRouteCurrent(routeSeq)) return;
@@ -2814,6 +2989,10 @@
     }
 
     function closeStream() {
+      if (window.__evReconnectTimer) {
+        try { clearTimeout(window.__evReconnectTimer); } catch (_) {}
+        window.__evReconnectTimer = 0;
+      }
       if (window.__evSSE) { try { window.__evSSE.close(); } catch {} window.__evSSE = null; }
       const live = $("#evLive");
       if (live) { live.textContent = "Offline"; live.className = "badge offline"; }
@@ -2829,6 +3008,7 @@
       window.__evSSE = es;
       es.onopen = () => {
         if (!isRouteCurrent(routeSeq)) return;
+        evReconnectBackoffMs = 1200;
         const live = $("#evLive");
         if (live) { live.textContent = "Live"; live.className = "badge online"; }
       };
@@ -2838,6 +3018,15 @@
         if (!live) return;
         live.textContent = es.readyState === EventSource.CONNECTING ? "Reconnecting…" : "Offline";
         live.className = "badge offline";
+        if (es.readyState === EventSource.CLOSED && !window.__evReconnectTimer) {
+          const wait = evReconnectBackoffMs;
+          window.__evReconnectTimer = setTimeout(() => {
+            window.__evReconnectTimer = 0;
+            if (!isRouteCurrent(routeSeq) || paused) return;
+            openStream();
+          }, wait);
+          evReconnectBackoffMs = Math.min(15000, Math.floor(evReconnectBackoffMs * 1.8));
+        }
       };
       es.onmessage = (m) => {
         if (!isRouteCurrent(routeSeq)) return;
@@ -2855,10 +3044,7 @@
     });
     $("#evClear").addEventListener("click", () => {
       buffer = [];
-      if (window.__pendingEvListRaf) {
-        cancelAnimationFrame(window.__pendingEvListRaf);
-        window.__pendingEvListRaf = 0;
-      }
+      if (evRenderTimer) { clearTimeout(evRenderTimer); evRenderTimer = 0; }
       flushEvRender();
     });
     $("#evApply").addEventListener("click", () => { loadHistory().then(openStream); });
@@ -3134,6 +3320,7 @@
     if (fac) fac.addEventListener("keydown", onFilterKey);
     if (ft) ft.addEventListener("keydown", onFilterKey);
     reload();
+    scheduleRouteTicker(routeSeq, "audit-live-reload", reload, 12000);
   });
 
   // Admin
@@ -3760,6 +3947,7 @@
     };
     $("#sig_reload").addEventListener("click", reload);
     reload();
+    scheduleRouteTicker(routeSeq, "signals-live-reload", reload, 10000);
   }
   registerRoute("signals", renderSignalsPage);
 
