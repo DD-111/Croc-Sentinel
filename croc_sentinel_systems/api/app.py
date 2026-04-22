@@ -5353,21 +5353,39 @@ def patch_device_display_label(
 
 @app.get("/admin/devices/{device_id}/shares")
 def list_device_shares(device_id: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_min_role(principal, "superadmin")
+    assert_min_role(principal, "admin")
+    if principal.role == "admin":
+        require_capability(principal, "can_manage_users")
+        assert_device_owner(principal, device_id)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT a.device_id, a.grantee_username, u.role AS grantee_role,
-                   a.can_view, a.can_operate, a.granted_by, a.granted_at, a.revoked_at
-            FROM device_acl a
-            LEFT JOIN dashboard_users u ON u.username = a.grantee_username
-            WHERE a.device_id = ?
-            ORDER BY a.revoked_at IS NOT NULL ASC, a.granted_at DESC
-            """,
-            (device_id,),
-        )
+        if principal.role == "superadmin":
+            cur.execute(
+                """
+                SELECT a.device_id, a.grantee_username, u.role AS grantee_role,
+                       a.can_view, a.can_operate, a.granted_by, a.granted_at, a.revoked_at
+                FROM device_acl a
+                LEFT JOIN dashboard_users u ON u.username = a.grantee_username
+                WHERE a.device_id = ?
+                ORDER BY a.revoked_at IS NOT NULL ASC, a.granted_at DESC
+                """,
+                (device_id,),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT a.device_id, a.grantee_username, u.role AS grantee_role,
+                       a.can_view, a.can_operate, a.granted_by, a.granted_at, a.revoked_at
+                FROM device_acl a
+                LEFT JOIN dashboard_users u ON u.username = a.grantee_username
+                WHERE a.device_id = ?
+                  AND u.role = 'user'
+                  AND IFNULL(u.manager_admin,'') = ?
+                ORDER BY a.revoked_at IS NOT NULL ASC, a.granted_at DESC
+                """,
+                (device_id, principal.username),
+            )
         rows = [dict(r) for r in cur.fetchall()]
         conn.close()
     return {"items": rows}
@@ -5381,7 +5399,9 @@ def list_all_shares(
     include_revoked: bool = Query(default=False),
     limit: int = Query(default=500, ge=1, le=2000),
 ) -> dict[str, Any]:
-    assert_min_role(principal, "superadmin")
+    assert_min_role(principal, "admin")
+    if principal.role == "admin":
+        require_capability(principal, "can_manage_users")
     clauses = ["1=1"]
     args: list[Any] = []
     if device_id:
@@ -5392,6 +5412,12 @@ def list_all_shares(
         args.append(grantee_username.strip())
     if not include_revoked:
         clauses.append("a.revoked_at IS NULL")
+    if principal.role == "admin":
+        clauses.append("IFNULL(o.owner_admin,'') = ?")
+        args.append(principal.username)
+        clauses.append("u.role = 'user'")
+        clauses.append("IFNULL(u.manager_admin,'') = ?")
+        args.append(principal.username)
     where = " AND ".join(clauses)
     with db_lock:
         conn = get_conn()
@@ -5421,7 +5447,10 @@ def share_device(
     req: DeviceShareRequest,
     principal: Principal = Depends(require_principal),
 ) -> dict[str, Any]:
-    assert_min_role(principal, "superadmin")
+    assert_min_role(principal, "admin")
+    if principal.role == "admin":
+        require_capability(principal, "can_manage_users")
+        assert_device_owner(principal, device_id)
     grantee = req.grantee_username.strip()
     if not grantee:
         raise HTTPException(status_code=400, detail="grantee_username required")
@@ -5434,16 +5463,25 @@ def share_device(
         if not cur.fetchone():
             conn.close()
             raise HTTPException(status_code=404, detail="device not found")
-        cur.execute("SELECT role, status FROM dashboard_users WHERE username = ?", (grantee,))
+        cur.execute("SELECT role, status, manager_admin FROM dashboard_users WHERE username = ?", (grantee,))
         ur = cur.fetchone()
         if not ur:
             conn.close()
             raise HTTPException(status_code=404, detail="grantee not found")
         role = str(ur["role"] or "")
         status = str(ur["status"] or "active")
-        if role not in ("admin", "user"):
-            conn.close()
-            raise HTTPException(status_code=400, detail="only admin/user can be shared")
+        if principal.role == "superadmin":
+            if role not in ("admin", "user"):
+                conn.close()
+                raise HTTPException(status_code=400, detail="only admin/user can be shared")
+        else:
+            # Admin can only share to own managed users.
+            if role != "user":
+                conn.close()
+                raise HTTPException(status_code=400, detail="admin can only share to user")
+            if str(ur["manager_admin"] or "") != principal.username:
+                conn.close()
+                raise HTTPException(status_code=403, detail="target user is not under this admin")
         if status not in ("active", ""):
             conn.close()
             raise HTTPException(status_code=400, detail=f"grantee is not active: {status}")
@@ -5487,7 +5525,18 @@ def unshare_device(
     grantee_username: str,
     principal: Principal = Depends(require_principal),
 ) -> dict[str, Any]:
-    assert_min_role(principal, "superadmin")
+    assert_min_role(principal, "admin")
+    if principal.role == "admin":
+        require_capability(principal, "can_manage_users")
+        assert_device_owner(principal, device_id)
+        with db_lock:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute("SELECT role, manager_admin FROM dashboard_users WHERE username = ?", (grantee_username,))
+            ur = cur.fetchone()
+            conn.close()
+        if not ur or str(ur["role"] or "") != "user" or str(ur["manager_admin"] or "") != principal.username:
+            raise HTTPException(status_code=403, detail="cannot revoke share for this grantee")
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()

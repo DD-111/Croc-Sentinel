@@ -355,6 +355,36 @@
     }
   }
 
+  async function grantShareMatrix(deviceIds, usernames, perms, onProgress) {
+    const dids = (Array.isArray(deviceIds) ? deviceIds : []).map((x) => String(x || "").trim()).filter(Boolean);
+    const users = (Array.isArray(usernames) ? usernames : []).map((x) => String(x || "").trim()).filter(Boolean);
+    const canView = !!(perms && perms.can_view);
+    const canOperate = !!(perms && perms.can_operate);
+    if (!dids.length) throw new Error("No devices selected");
+    if (!users.length) throw new Error("No users selected");
+    if (!canView && !canOperate) throw new Error("No sharing permission selected");
+    const total = dids.length * users.length;
+    let ok = 0;
+    let fail = 0;
+    let idx = 0;
+    for (const did of dids) {
+      for (const user of users) {
+        idx += 1;
+        try {
+          await api(`/admin/devices/${encodeURIComponent(did)}/share`, {
+            method: "POST",
+            body: { grantee_username: user, can_view: canView, can_operate: canOperate },
+          });
+          ok += 1;
+        } catch {
+          fail += 1;
+        }
+        if (typeof onProgress === "function") onProgress({ idx, total, ok, fail, device_id: did, username: user });
+      }
+    }
+    return { total, ok, fail };
+  }
+
   /** Short-lived GET cache to avoid duplicate round-trips when navigating (server still uses CACHE_TTL). */
   const _apiGetCache = new Map();
   async function apiGetCached(path, opts, ttlMs) {
@@ -964,16 +994,6 @@
     setCrumb("Account");
     if (!hasRole("user")) { view.innerHTML = `<div class="card"><p class="muted">Sign in required.</p></div>`; return; }
     const me = state.me || { username: "", role: "" };
-    const rawCommandPanel = (state.me && state.me.role === "superadmin") ? `
-        <div class="card">
-          <h3>Raw command</h3>
-          <label class="field"><span>cmd</span><input id="cmdName" placeholder="get_info / ota" ${can("can_send_command") ? "" : "disabled"} /></label>
-          <label class="field" style="margin-top:8px"><span>params (JSON)</span><textarea id="cmdParams" placeholder='{"key":"value"}' ${can("can_send_command") ? "" : "disabled"}></textarea></label>
-          <div class="row" style="margin-top:8px;justify-content:flex-end">
-            <button class="btn" id="sendCmd" ${can("can_send_command") ? "" : "disabled"}>Send</button>
-          </div>
-        </div>
-      ` : "";
     view.innerHTML = `
       <div class="card">
         <h2>My account</h2>
@@ -1192,7 +1212,7 @@
       <section class="card">
         <div class="row">
           <h2 style="margin:0">Group cards</h2>
-          ${state.me && state.me.role === "superadmin" ? `<button class="btn sm secondary right" id="grpShareOpen">Sharing</button>` : ""}
+          ${state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_manage_users"))) ? `<button class="btn sm secondary right" id="grpShareOpen">Sharing</button>` : ""}
           <button class="btn sm secondary right" id="grpNew">New group</button>
         </div>
         <div class="divider"></div>
@@ -1324,7 +1344,7 @@
         const modeLabel = String(gs.trigger_mode || "continuous") === "delay"
           ? `delay ${Number(gs.delay_seconds || 0)}s`
           : "continuous";
-        const shareBtn = state.me && state.me.role === "superadmin"
+        const shareBtn = state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_manage_users")))
           ? `<button class="group-del-ico js-share-group" data-group="${escapeHtml(g)}" type="button" title="Share group" style="right:32px">⇪</button>`
           : "";
         return `<article class="device-card js-group-card ${selectedGroup === g ? "is-selected" : ""}" data-group="${escapeHtml(g)}" style="cursor:pointer;position:relative">
@@ -1576,12 +1596,13 @@
       userListEl.innerHTML = `<p class="muted">Loading users…</p>`;
       try {
         const u = await api("/auth/users", { timeoutMs: 8000 });
-        const users = (u.items || [])
-          .filter((x) => {
-            const role = String(x.role || "");
-            const st = String(x.status || "active");
-            return (role === "admin" || role === "user") && (st === "active" || st === "");
-          });
+        const users = (u.items || []).filter((x) => {
+          const role = String(x.role || "");
+          const st = String(x.status || "active");
+          if (!(st === "active" || st === "")) return false;
+          if (state.me && state.me.role === "admin") return role === "user";
+          return role === "admin" || role === "user";
+        });
         userListEl.innerHTML = users.map((x) =>
           `<label class="grp-pick-item"><input type="checkbox" value="${escapeHtml(x.username)}"/> <span>${escapeHtml(x.username)} <span class="mono">(${escapeHtml(x.role || "user")})</span></span></label>`,
         ).join("") || `<p class="muted">No active admin/user accounts.</p>`;
@@ -1623,23 +1644,15 @@
         if (!usernames.length) { toast("Select at least one user", "err"); return; }
         if (!canView && !canOperate) { toast("Select at least one permission", "err"); return; }
         const total = deviceIds.length * usernames.length;
-        let ok = 0;
-        let fail = 0;
         if (statEl) statEl.textContent = `Applying ${total} share grants…`;
-        for (const did of deviceIds) {
-          for (const user of usernames) {
-            try {
-              await api(`/admin/devices/${encodeURIComponent(did)}/share`, {
-                method: "POST",
-                body: { grantee_username: user, can_view: canView, can_operate: canOperate },
-              });
-              ok += 1;
-            } catch {
-              fail += 1;
-            }
-            if (statEl) statEl.textContent = `Applied ${ok + fail}/${total} · ok ${ok} · failed ${fail}`;
-          }
-        }
+        const res = await grantShareMatrix(
+          deviceIds,
+          usernames,
+          { can_view: canView, can_operate: canOperate },
+          (p) => { if (statEl) statEl.textContent = `Applied ${p.idx}/${p.total} · ok ${p.ok} · failed ${p.fail}`; },
+        );
+        const ok = Number(res.ok || 0);
+        const fail = Number(res.fail || 0);
         if (fail === 0) {
           toast(`Sharing applied (${ok}/${total})`, "ok");
           closeShareModal();
@@ -1676,7 +1689,9 @@
           return;
         }
         if (btn.classList.contains("js-share-group")) {
-          if (!(state.me && state.me.role === "superadmin")) { toast("Superadmin only", "err"); return; }
+          if (!(state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_manage_users"))))) {
+            toast("No sharing permission", "err"); return;
+          }
           openShareModal(g);
           return;
         }
@@ -1760,6 +1775,7 @@
     if (!g) { location.hash = "#/overview"; return; }
     const groupScope = (state.me && state.me.username) ? state.me.username : "anon";
     const GROUP_META_LS_KEY = `croc.group.meta.v2.${groupScope}`;
+    const GROUP_SETTINGS_LS_KEY = `croc.group.settings.v1.${groupScope}`;
     const loadGroupMeta = () => {
       try {
         const raw = localStorage.getItem(GROUP_META_LS_KEY);
@@ -1767,7 +1783,16 @@
         return (obj && typeof obj === "object") ? obj : {};
       } catch { return {}; }
     };
+    const loadGroupSettings = () => {
+      try {
+        const raw = localStorage.getItem(GROUP_SETTINGS_LS_KEY);
+        const obj = raw ? JSON.parse(raw) : {};
+        return (obj && typeof obj === "object") ? obj : {};
+      } catch { return {}; }
+    };
+    window.__groupDelayTimers = window.__groupDelayTimers || new Map();
     const meta = loadGroupMeta();
+    const gsMap = loadGroupSettings();
     const [listRes] = await Promise.allSettled([apiGetCached("/devices", { timeoutMs: 8000 }, 3000)]);
     const list = (listRes.status === "fulfilled" && listRes.value) ? listRes.value : { items: [] };
     const byId = new Map((list.items || []).map((d) => [String(d.device_id), d]));
@@ -1821,11 +1846,52 @@
         </a>`;
       }).join("") : `<p class="muted">No devices in this group.</p>`;
     }
+    const deleteGroupCardCompat = async (groupKey) => {
+      const attempt = async (path, method) => api(path, { method });
+      try { return await attempt(`/group-cards/${encodeURIComponent(groupKey)}/delete`, "POST"); } catch {}
+      try { return await attempt(`/api/group-cards/${encodeURIComponent(groupKey)}/delete`, "POST"); } catch {}
+      try { return await attempt(`/group-cards/${encodeURIComponent(groupKey)}`, "DELETE"); } catch {}
+      try { return await attempt(`/api/group-cards/${encodeURIComponent(groupKey)}`, "DELETE"); } catch {}
+      // Fallback for old backend: clear notification_group per device.
+      let changed = 0;
+      for (const id of ids) {
+        await api(`/devices/${encodeURIComponent(id)}/profile`, { method: "PATCH", body: { notification_group: "" } });
+        changed += 1;
+      }
+      return { ok: true, changed };
+    };
     const sendAlert = async (action) => {
       if (!can("can_alert")) { toast("No can_alert capability", "err"); return; }
       if (ids.length === 0) { toast("No devices in this group", "warn"); return; }
       if (!confirm(`${action === "on" ? "Open" : "Close"} alarm for ${ids.length} devices in ${g}?`)) return;
-      await api("/alerts", { method: "POST", body: { action, duration_ms: 10000, device_ids: ids } });
+      if (action === "on") {
+        const cfg = gsMap[g] || {};
+        const durationMs = Number(cfg.trigger_duration_ms || 10000);
+        const delaySeconds = Number(cfg.delay_seconds || 0);
+        const mode = String(cfg.trigger_mode || "continuous");
+        const prev = window.__groupDelayTimers.get(g);
+        if (prev) {
+          clearTimeout(prev);
+          window.__groupDelayTimers.delete(g);
+        }
+        if (mode === "delay" && delaySeconds > 0) {
+          const tid = setTimeout(async () => {
+            try {
+              await api("/alerts", { method: "POST", body: { action: "on", duration_ms: durationMs, device_ids: ids } });
+            } catch {}
+          }, delaySeconds * 1000);
+          window.__groupDelayTimers.set(g, tid);
+        } else {
+          await api("/alerts", { method: "POST", body: { action: "on", duration_ms: durationMs, device_ids: ids } });
+        }
+      } else {
+        const prev = window.__groupDelayTimers.get(g);
+        if (prev) {
+          clearTimeout(prev);
+          window.__groupDelayTimers.delete(g);
+        }
+        await api("/alerts", { method: "POST", body: { action: "off", duration_ms: 10000, device_ids: ids } });
+      }
       toast(`${action === "on" ? "Alarm ON" : "Alarm OFF"} · ${ids.length}`, "ok");
     };
     const alarmOnBtn = $("#grpAlarmOn", view);
@@ -1838,7 +1904,7 @@
         if (isSharedGroup) { toast("Shared group cannot be deleted", "err"); return; }
         if (!confirm(`Delete group card "${g}"?`)) return;
         try {
-          await deleteGroupCard(g);
+          await deleteGroupCardCompat(g);
           delete meta[g];
           localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(meta));
           toast("Group deleted", "ok");
@@ -1894,11 +1960,16 @@
           </div>
         </div>
       ` : "";
-    const sharePanel = state.me && state.me.role === "superadmin" ? `
+    const canUseSharePanel = !!(
+      state.me
+      && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_manage_users")))
+      && (!d.is_shared || state.me.role === "superadmin")
+    );
+    const sharePanel = canUseSharePanel ? `
       <div class="card" id="sharePanel">
         <div class="row">
           <h3 style="margin:0">Sharing</h3>
-          <span class="muted">Grant or revoke per-account access</span>
+          <span class="muted">Grant or revoke per-account access (admin: your users only)</span>
           <button class="btn secondary right" id="shareRefresh">Refresh</button>
         </div>
         <div class="divider"></div>

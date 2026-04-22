@@ -1,5 +1,5 @@
 :root {
-  color-scheme: light dark;
+  color-scheme: light;
   --radius: 12px;
   --radius-sm: 8px;
   --gap: 14px;
@@ -13,6 +13,7 @@
 }
 
 html[data-theme="light"] {
+  color-scheme: light;
   --bg: #f4f7fb;
   --bg-elev: #ffffff;
   --bg-muted: #eef2f7;
@@ -34,6 +35,7 @@ html[data-theme="light"] {
 }
 
 html[data-theme="dark"] {
+  color-scheme: dark;
   --bg: #0b1220;
   --bg-elev: #121a2b;
   --bg-muted: #0f1728;
@@ -415,6 +417,7 @@ body[data-layout="auth"] .view {
   border-radius: var(--radius);
   box-shadow: var(--shadow);
   padding: 16px;
+  color: var(--text);
 }
 .card + .card { margin-top: 14px; }
 .card h2 { margin: 0 0 6px; font-size: 16px; }
