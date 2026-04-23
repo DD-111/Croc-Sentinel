@@ -2494,10 +2494,12 @@ def _fan_out_alarm(device_id: str, payload: dict[str, Any]) -> None:
     Steps:
       1. Resolve ``owner_admin`` and this device's ``notification_group`` / zone (sibling scope).
       2. Apply policy: remote silent vs loud vs panic use different linkage toggles.
-      3. Build target list: **siblings only** for ``remote_loud_button`` and
-         ``remote_silent_button`` (never MQTT the transmitting unit). For ``panic_button``,
+      3. Build target list: **siblings only** for ``remote_loud_button``,
+         ``remote_silent_button`` and ``remote_pause_button`` (never MQTT the transmitting unit).
+         For ``panic_button``,
          MQTT **siblings** only; the pressing unit relies on firmware local siren.
-      4. Publish per-target ``siren_on`` or ``alarm_signal``, insert alarm row, queue email.
+      4. Publish per-target ``siren_on`` / ``siren_off`` / ``alarm_signal``, insert alarm row,
+         queue email.
     """
     source_zone = str(payload.get("source_zone") or "all")
     local_trigger = bool(payload.get("local_trigger"))
@@ -2525,6 +2527,7 @@ def _fan_out_alarm(device_id: str, payload: dict[str, Any]) -> None:
         "remote_button",
         "remote_loud_button",
         "remote_silent_button",
+        "remote_pause_button",
         "network",
         "group_link",
         "panic_button",
@@ -2532,7 +2535,7 @@ def _fan_out_alarm(device_id: str, payload: dict[str, Any]) -> None:
     if triggered_by == "remote_silent_button" and not bool(policy.get("remote_silent_link_enabled", True)):
         should_fanout = False
     # Remote "loud" pathways only (not panic — panic has its own toggle).
-    if triggered_by in ("remote_button", "remote_loud_button", "network", "group_link") and not bool(
+    if triggered_by in ("remote_button", "remote_loud_button", "remote_pause_button", "network", "group_link") and not bool(
         policy.get("remote_loud_link_enabled", True)
     ):
         should_fanout = False
@@ -2543,7 +2546,7 @@ def _fan_out_alarm(device_id: str, payload: dict[str, Any]) -> None:
     # Remote #1 silent / #2 loud: never command the originating device.
     # Panic: MQTT to siblings only; originator sounds via firmware TRIGGER_SELF_SIREN.
     include_source = not bool(policy.get("fanout_exclude_self", True))
-    if triggered_by in ("remote_button", "remote_loud_button", "remote_silent_button", "panic_button"):
+    if triggered_by in ("remote_button", "remote_loud_button", "remote_silent_button", "remote_pause_button", "panic_button"):
         include_source = False
 
     targets = _tenant_siblings(
@@ -2564,6 +2567,9 @@ def _fan_out_alarm(device_id: str, payload: dict[str, Any]) -> None:
                 if triggered_by == "remote_silent_button":
                     cmd = "alarm_signal"
                     params = {"kind": "silent"}
+                elif triggered_by == "remote_pause_button":
+                    cmd = "siren_off"
+                    params = {}
                 publish_command(
                     topic=f"{TOPIC_ROOT}/{did}/cmd",
                     cmd=cmd,

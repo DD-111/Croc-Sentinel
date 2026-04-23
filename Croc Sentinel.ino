@@ -203,6 +203,9 @@ static WebServer g_provHttp(80);
 static bool g_provActive = false;
 static bool g_provUnlocked = false;
 static char g_provAccessorySn[40] = {0};
+static unsigned long g_lastProvStartMs = 0;
+static unsigned long g_lastProvStopMs = 0;
+static bool g_resetByExternal = false;
 
 static bool isAccessorySnAllowedLocal(const String &snInput) {
   String sn = snInput;
@@ -280,7 +283,7 @@ static String provPageWifi(const String &msg) {
   html += F("<form method='post' action='/save' onsubmit=\"var b=this.querySelector('button');b.disabled=true;b.textContent='Saving, rebooting…';\">"
             "<label>SSID<br><input name='ssid' required maxlength='32' style='width:100%;padding:10px;margin-top:6px'></label><br><br>"
             "<label>Password<br><input name='password' maxlength='64' style='width:100%;padding:10px;margin-top:6px'></label><br>"
-            "<p style='color:#666;font-size:15px'>After save the page will show <b>Saved</b>, then the device reboots. 保存后会显示 <b>Saved</b> 并重启；若无法连上 Wi-Fi，会再次打开配网热点。</p>"
+            "<p style='color:#666;font-size:15px'>After save the page will show <b>Saved</b>, then the device reboots. 保存后会显示 <b>Saved</b> 并重启；若仍无法连上 Wi-Fi，请按 RESET 再次打开配网热点。</p>"
             "<button type='submit' style='margin-top:12px;padding:10px 14px'>Save and reboot</button></form>"
             "</body></html>");
   return html;
@@ -294,6 +297,7 @@ static void provisioningPortalStop() {
   g_provActive = false;
   g_provUnlocked = false;
   memset(g_provAccessorySn, 0, sizeof(g_provAccessorySn));
+  g_lastProvStopMs = millis();
 }
 
 static void provisioningPortalStart() {
@@ -355,19 +359,31 @@ static void provisioningPortalStart() {
     p.putString("wifi_sta_pass", pass);
     if (strlen(g_provAccessorySn) > 0) p.putString("acc_sn", g_provAccessorySn);
     p.end();
-    g_provHttp.send(200, "text/html", "<html><body style='font-family:Arial;padding:20px'><h3>Saved / 已保存</h3><p>Rebooting. If the router password or signal is wrong, the setup AP will start again. 设备正在重启；若 Wi-Fi 连不上，将重新出现配网热点（约数秒内或开机后数秒）。</p></body></html>");
+    g_provHttp.send(200, "text/html", "<html><body style='font-family:Arial;padding:20px'><h3>Saved / 已保存</h3><p>Rebooting. If Wi-Fi still fails, press RESET to reopen setup AP. 设备正在重启；若仍无法连上 Wi-Fi，请按 RESET 再次打开配网热点。</p></body></html>");
     delay(500);
     ESP.restart();
   });
   g_provHttp.begin();
   g_provActive = true;
+  g_lastProvStartMs = millis();
   logLine(String("[wifi] provisioning portal started ap=") + apName);
 }
 
 static void provisioningPortalLoop() {
   if (!g_provActive) return;
+  if (WIFI_PROVISION_WINDOW_MS > 0 &&
+      (millis() - g_lastProvStartMs) >= (unsigned long)WIFI_PROVISION_WINDOW_MS) {
+    logLine("[wifi] provisioning window elapsed; closing AP and continuing STA retries");
+    provisioningPortalStop();
+    return;
+  }
   g_provDns.processNextRequest();
   g_provHttp.handleClient();
+}
+
+static bool provisioningPortalManualBootAllowed() {
+  if (!WIFI_PROVISION_PORTAL_ENABLED) return false;
+  return g_resetByExternal;
 }
 #endif
 
@@ -582,6 +598,11 @@ unsigned long lastTriggerSilentReadAt = 0;
 bool triggerDirectPrevLevel = true;
 bool triggerRemotePrevLevel = true;
 bool triggerSilentPrevLevel = true;
+bool triggerSilentPressed = false;
+unsigned long triggerSilentPressAt = 0;
+#ifndef REMOTE_SILENT_LONG_PRESS_MS
+#define REMOTE_SILENT_LONG_PRESS_MS 1200UL
+#endif
 
 char lastError[48] = "none";
 bool ntpSynced = false;
@@ -1355,8 +1376,11 @@ void publishAlarmEvent(const char *triggerKind, bool localSiren) {
   // device_state.notification_group (not stored on the MCU). Empty string there
   // means no cross-device fan-out. Siblings: same owner_admin + same non-empty group
   // (+ zone), excluding revoked IDs.
-  // Mapping: panic_button → local siren optional (TRIGGER_SELF_SIREN) + sibling siren_on;
-  // remote_loud_button → sibling siren_on only; remote_silent_button → sibling alarm_signal.
+  // Mapping:
+  // panic_button → local siren optional (TRIGGER_SELF_SIREN) + sibling siren_on.
+  // remote_loud_button → sibling siren_on only.
+  // remote_silent_button(short) → sibling alarm_signal.
+  // remote_pause_button(long remote_silent) → local + sibling siren_off.
   StaticJsonDocument<320> doc;
   doc["type"]           = "alarm.trigger";
   doc["source_id"]      = deviceId;
@@ -1993,10 +2017,7 @@ void ensureWiFi() {
     wifiBackoffMs = min(wifiBackoffMs * 2UL, (unsigned long)RECONNECT_MAX_MS);
 #if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
     !defined(CONFIG_IDF_TARGET_ESP32P4)
-    // Fallback: if STA reconnect keeps failing for ~60s, open captive setup.
-    if (!g_provActive && (millis() - bootAtMs) > 60000UL) {
-      provisioningPortalStart();
-    }
+    // Manual policy: no auto-open. User presses RESET to reopen setup AP.
 #endif
   }
 }
@@ -2133,17 +2154,33 @@ void handleTriggerInput() {
     }
   }
 
-  // Remote ① silent: alarm_signal to siblings only (no local siren here).
+  // Remote ① silent button:
+  // - short press: alarm_signal to siblings only (no local siren here).
+  // - long press: pause/stop siren (local + siblings siren_off fan-out via API).
   if (!fired && now - lastTriggerSilentReadAt >= BUTTON_DEBOUNCE_MS) {
     lastTriggerSilentReadAt = now;
     bool level = (digitalRead(REMOTE_SILENT_BUTTON_GPIO) == HIGH);
     bool fallingEdge = (triggerSilentPrevLevel && !level);
+    bool risingEdge = (!triggerSilentPrevLevel && level);
     triggerSilentPrevLevel = level;
-    if (fallingEdge && !alarmInCooldown()) {
-      logLine("[trigger] remote_silent_button");
-      publishAlarmEvent("remote_silent_button", false);
-      publishHeartbeatEvent("alarm_remote_silent");
-      fired = true;
+    if (fallingEdge) {
+      triggerSilentPressed = true;
+      triggerSilentPressAt = now;
+    } else if (risingEdge && triggerSilentPressed) {
+      unsigned long heldMs = now - triggerSilentPressAt;
+      triggerSilentPressed = false;
+      if (heldMs >= REMOTE_SILENT_LONG_PRESS_MS) {
+        logLine("[trigger] remote_pause_button");
+        deactivateSiren();
+        publishAlarmEvent("remote_pause_button", false);
+        publishHeartbeatEvent("alarm_remote_pause");
+        fired = true;
+      } else if (!alarmInCooldown()) {
+        logLine("[trigger] remote_silent_button");
+        publishAlarmEvent("remote_silent_button", false);
+        publishHeartbeatEvent("alarm_remote_silent");
+        fired = true;
+      }
     }
   }
 
@@ -2224,6 +2261,7 @@ void setup() {
   setupTaskWatchdogEarly();
 
   resetReasonStr = decodeResetReason(esp_reset_reason());
+  g_resetByExternal = (strcmp(resetReasonStr, "external") == 0);
   buildDeviceId();
 
   pinMode(SIREN_GPIO, OUTPUT);
@@ -2238,6 +2276,8 @@ void setup() {
   triggerDirectPrevLevel = (digitalRead(PANIC_BUTTON_GPIO) == HIGH);
   triggerRemotePrevLevel = (digitalRead(REMOTE_LOUD_BUTTON_GPIO) == HIGH);
   triggerSilentPrevLevel = (digitalRead(REMOTE_SILENT_BUTTON_GPIO) == HIGH);
+  triggerSilentPressed = !triggerSilentPrevLevel;
+  triggerSilentPressAt = millis();
   {
     char tline[180];
     const char *silentIdle = triggerSilentPrevLevel ? "HIGH" : "LOW";
@@ -2314,8 +2354,11 @@ void setup() {
     !defined(CONFIG_IDF_TARGET_ESP32P4)
   g_wifiMultiRegisterAps();
   if (g_wifiMultiApCount == 0) {
-    logLine("[net] no STA credentials: compile-time WIFI_* empty and NVS wifi_sta_ssid empty.");
-    provisioningPortalStart();
+    logLine("[net] no STA credentials: press RESET to open setup AP window.");
+    if (provisioningPortalManualBootAllowed()) {
+      logLine("[net] external reset detected: opening setup AP window");
+      provisioningPortalStart();
+    }
   } else {
     unsigned long waitStart = millis();
     while (!netIf->connected() && millis() - waitStart < WIFI_CONNECT_WAIT_MS) {
@@ -2329,9 +2372,13 @@ void setup() {
       logLine("[net] STA join failed this boot (wrong password, AP missing, or RF); will retry in loop");
     }
   }
-  if (WIFI_PROVISION_PORTAL_ENABLED && !g_provActive && g_wifiMultiApCount > 0 && !netIf->connected()) {
-    logLine("[net] no STA link despite saved credentials: starting provisioning AP now (no 60s wait)");
-    provisioningPortalStart();
+  if (g_wifiMultiApCount > 0 && !netIf->connected()) {
+    if (provisioningPortalManualBootAllowed()) {
+      logLine("[net] external reset detected: opening setup AP window");
+      provisioningPortalStart();
+    } else {
+      logLine("[net] no STA link: reconnecting saved Wi-Fi only (RESET to open setup AP)");
+    }
   }
 #else
   {
