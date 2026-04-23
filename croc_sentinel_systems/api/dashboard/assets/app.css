@@ -173,9 +173,19 @@ body[data-layout="app"].app-shell > .main {
   .auth-page.auth-page-pro {
     grid-template-columns: 1fr;
     gap: 14px;
+    align-content: start;
+    place-items: start center;
+    padding-top: max(clamp(14px, 3vw, 28px), env(safe-area-inset-top, 0px));
   }
   .auth-hero {
-    width: min(560px, 100%);
+    width: 100%;
+    max-width: min(520px, 100%);
+    margin: 0 auto;
+    order: 0;
+  }
+  .auth-page.auth-page-pro .auth-card {
+    width: 100%;
+    max-width: min(520px, 100%);
     margin: 0 auto;
   }
 }
@@ -275,15 +285,31 @@ body[data-layout="auth"] .view {
 }
 
 .topbar {
-  position: sticky; top: 0; z-index: 20;
-  display: flex; align-items: center; gap: 10px;
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 10px;
   padding: 10px 16px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-top: max(10px, env(safe-area-inset-top, 0px));
   background: color-mix(in srgb, var(--bg) 85%, transparent);
   backdrop-filter: blur(8px);
   border-bottom: 1px solid var(--border);
   min-height: var(--topbar-h);
+  box-sizing: border-box;
 }
-.crumb { font-weight: 600; font-size: 15px; flex: 1; min-width: 0; }
+.crumb {
+  font-weight: 600;
+  font-size: 15px;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .topbar-actions { display: flex; align-items: center; gap: 8px; }
 
 .icon-btn {
@@ -304,7 +330,16 @@ body[data-layout="auth"] .view {
 .dot-status.ok { background: var(--ok); color: var(--ok); }
 .dot-status.bad { background: var(--danger); color: var(--danger); }
 
-.view { padding: 16px; max-width: none; width: 100%; margin: 0; }
+.view {
+  padding: 16px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-bottom: max(16px, env(safe-area-inset-bottom, 0px));
+  max-width: none;
+  width: 100%;
+  margin: 0;
+  box-sizing: border-box;
+}
 
 /* Phase-2 UI sections (Telegram/Admin first) */
 .ui-shell { display: grid; gap: 14px; }
@@ -437,7 +472,8 @@ body[data-layout="auth"] .view {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 16px;
+  padding: max(16px, env(safe-area-inset-top, 0px)) max(16px, env(safe-area-inset-right, 0px)) max(16px, env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px));
+  box-sizing: border-box;
 }
 .grp-modal-card {
   width: min(760px, 100%);
@@ -760,7 +796,11 @@ html[data-theme="dark"] .btn.ghost:hover {
   min-height: min(100vh, 100dvh);
   display: grid;
   place-items: center;
-  padding: clamp(16px, 4vw, 40px);
+  padding-top: max(clamp(16px, 4vw, 40px), env(safe-area-inset-top, 0px));
+  padding-right: max(clamp(16px, 4vw, 40px), env(safe-area-inset-right, 0px));
+  padding-bottom: max(clamp(16px, 4vw, 40px), env(safe-area-inset-bottom, 0px));
+  padding-left: max(clamp(16px, 4vw, 40px), env(safe-area-inset-left, 0px));
+  box-sizing: border-box;
   background:
     radial-gradient(ellipse 85% 55% at 12% -8%, color-mix(in srgb, var(--accent) 20%, transparent), transparent 58%),
     radial-gradient(ellipse 75% 50% at 102% 108%, color-mix(in srgb, var(--accent) 12%, transparent), transparent 52%),
@@ -1105,24 +1145,40 @@ form.auth-card__body {
   .auth-card__head,
   .auth-card__body,
   form.auth-card__body {
-    padding-left: 20px;
-    padding-right: 20px;
+    padding-left: max(20px, env(safe-area-inset-left, 0px));
+    padding-right: max(20px, env(safe-area-inset-right, 0px));
   }
   .auth-card {
     border-radius: 16px;
+  }
+  .auth-card__links .auth-link {
+    display: flex;
+    align-items: center;
+    min-height: 44px;
+    padding: 10px 6px;
+    box-sizing: border-box;
+    touch-action: manipulation;
   }
 }
 
 /* Toast */
 .toast {
-  position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%) translateY(80px);
+  position: fixed;
+  left: max(12px, env(safe-area-inset-left, 0px));
+  right: max(12px, env(safe-area-inset-right, 0px));
+  bottom: max(22px, calc(8px + env(safe-area-inset-bottom, 0px)));
+  margin: 0 auto;
+  width: fit-content;
+  max-width: min(92vw, 480px);
+  transform: translateY(80px);
   background: var(--text); color: var(--bg-elev);
   padding: 10px 14px; border-radius: 999px; font-size: 13px; font-weight: 500;
   box-shadow: var(--shadow-lg); pointer-events: none; opacity: 0;
   transition: transform var(--transition), opacity var(--transition);
-  z-index: 100; max-width: min(92vw, 480px); text-align: center;
+  z-index: 100;
+  text-align: center;
 }
-.toast.show { transform: translateX(-50%) translateY(0); opacity: 1; }
+.toast.show { transform: translateY(0); opacity: 1; }
 .toast.ok { background: var(--ok); color: #fff; }
 .toast.err { background: var(--danger); color: #fff; }
 
@@ -1143,10 +1199,19 @@ pre.code { background: var(--bg-muted); border: 1px solid var(--border); border-
   :root { --sidebar-w: 0px; }
   .app-shell { grid-template-columns: 1fr; }
   .sidebar {
-    position: fixed; top: 0; left: 0; z-index: 50;
-    width: min(280px, 86vw); height: 100vh;
-    transform: translateX(-105%); transition: transform var(--transition);
+    position: fixed;
+    top: 0;
+    left: 0;
+    z-index: 50;
+    width: min(300px, calc(100vw - max(20px, env(safe-area-inset-left, 0px) + env(safe-area-inset-right, 0px))));
+    height: 100vh;
+    height: 100dvh;
+    max-height: 100dvh;
+    transform: translateX(-105%);
+    transition: transform var(--transition);
     box-shadow: var(--shadow-lg);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    box-sizing: border-box;
   }
   body[data-nav="open"] .sidebar { transform: translateX(0); }
   body[data-nav="open"] .sidebar-backdrop { display: block; }
@@ -1154,13 +1219,54 @@ pre.code { background: var(--bg-muted); border: 1px solid var(--border); border-
   .menu-btn { display: inline-flex; }
   .sidebar-close { display: inline-flex; }
   .hide-sm { display: none; }
-  .view { padding: 14px; }
+  .brand {
+    padding-left: max(12px, env(safe-area-inset-left, 0px));
+    padding-right: max(8px, env(safe-area-inset-right, 0px));
+  }
+  .sidebar-foot {
+    padding-left: max(4px, env(safe-area-inset-left, 0px));
+    padding-right: max(4px, env(safe-area-inset-right, 0px));
+  }
+  .menu-btn,
+  .sidebar-close {
+    min-width: 44px;
+    min-height: 44px;
+    touch-action: manipulation;
+  }
+  .nav a {
+    min-height: 44px;
+    padding: 10px 12px;
+    box-sizing: border-box;
+    touch-action: manipulation;
+  }
+  .topbar {
+    padding-top: max(8px, env(safe-area-inset-top, 0px));
+    padding-left: max(10px, env(safe-area-inset-left, 0px));
+    padding-right: max(10px, env(safe-area-inset-right, 0px));
+  }
+  .view {
+    padding: 14px;
+    padding-left: max(14px, env(safe-area-inset-left, 0px));
+    padding-right: max(14px, env(safe-area-inset-right, 0px));
+    padding-bottom: max(14px, env(safe-area-inset-bottom, 0px));
+  }
   .kv { grid-template-columns: 120px 1fr; }
 }
 
 @media (max-width: 520px) {
-  .view { padding: 12px; }
-  .topbar { padding: 8px 10px; gap: 8px; }
+  .view {
+    padding: 12px;
+    padding-left: max(12px, env(safe-area-inset-left, 0px));
+    padding-right: max(12px, env(safe-area-inset-right, 0px));
+    padding-bottom: max(12px, env(safe-area-inset-bottom, 0px));
+  }
+  .topbar {
+    padding: 8px 10px;
+    padding-left: max(10px, env(safe-area-inset-left, 0px));
+    padding-right: max(10px, env(safe-area-inset-right, 0px));
+    padding-top: max(8px, env(safe-area-inset-top, 0px));
+    gap: 8px;
+  }
   .topbar-actions { gap: 6px; }
   .crumb { font-size: 14px; }
   .card { padding: 13px; border-radius: 10px; }
@@ -1253,8 +1359,11 @@ body.comfort-ui .brand-sub {
 body.comfort-ui .login-wrap,
 body.comfort-ui .auth-page {
   min-height: 100vh;
-  padding: 16px;
-  background: var(--bg);
+  min-height: 100dvh;
+}
+/* Keep .auth-page gradient + padded safe-area from base rules; do not flatten background here. */
+body.comfort-ui .login-wrap {
+  padding: max(24px, env(safe-area-inset-top, 0px)) max(24px, env(safe-area-inset-right, 0px)) max(24px, env(safe-area-inset-bottom, 0px)) max(24px, env(safe-area-inset-left, 0px));
 }
 
 body.comfort-ui .login-card,

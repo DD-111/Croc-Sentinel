@@ -966,6 +966,15 @@
     document.body.dataset.nav = open ? "open" : "";
   }
 
+  /** Collapse drawer when viewport is desktop width (e.g. rotate phone / resize). */
+  function syncNavForViewport() {
+    try {
+      if (window.matchMedia && window.matchMedia("(min-width: 901px)").matches) {
+        document.body.dataset.nav = "";
+      }
+    } catch (_) {}
+  }
+
   // ------------------------------------------------------------------ router
   const routes = {};
 
@@ -5895,6 +5904,8 @@
     $("#menuBtn").addEventListener("click", () => toggleNav());
     $("#sidebarClose").addEventListener("click", () => toggleNav(false));
     $("#sidebarBackdrop").addEventListener("click", () => toggleNav(false));
+    window.addEventListener("resize", syncNavForViewport);
+    window.addEventListener("orientationchange", syncNavForViewport);
     $("#themeBtn").addEventListener("click", () => {
       setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
     });
@@ -5917,6 +5928,7 @@
     }, true);
 
     await (getToken() ? loadMe() : Promise.resolve());
+    syncNavForViewport();
     if (!location.hash) location.hash = state.me ? "#/overview" : "#/login";
     else renderRoute();
     await loadHealth().catch(() => {});
