@@ -13,7 +13,7 @@
 | **宿主机 Nginx** | `443` 或 `8088` | 浏览器只访问这里；TLS 可在此终止 |
 | **API（容器）** | **`127.0.0.1:18088` → 容器 8088** | 不要与 Nginx 监听同一主机端口；见下文 `docker-compose.override.yml` |
 | **Mosquitto** | `8883`（TLS） | ESP32 连 Broker，与控制台端口无关 |
-| **OTA 文件 Nginx（容器）** | `8070` | `/fw/*.bin?token=`，与 `config.h` / `.env` 中 `OTA_TOKEN` 一致 |
+| **OTA 文件 Nginx（容器）** | `9231`（宿主机 **`127.0.0.1:9231`**） | `/fw/*.bin?token=`；对外由宿主机 **443** 反代到 `9231` |
 
 控制台 SPA 使用 `location.origin` 调 API，因此 **API 必须在同一 Origin 的根路径**（例如 `https://esasecure.com:8088/auth/...`），静态页在 **`/Croc_Sentinel_systems/`** 子路径即可。
 
@@ -23,7 +23,7 @@
 
 - Ubuntu 22.04/24.04 LTS，已安装 Docker + Compose（见主 [README.md](../README.md) §1.1）。
 - 域名解析到本机（若用 TLS）。
-- 防火墙放行：`443`/`8088`（你选的对公端口）、`8883`（MQTT）、`8070`（OTA，若公网拉固件）。
+- 防火墙放行：`443`/`8088`（你选的对公端口）、`8883`（MQTT）。OTA 推荐只走 **443** 反代到本机 **9231**，不必对公网放行 **9231**。
 
 ```bash
 sudo apt update

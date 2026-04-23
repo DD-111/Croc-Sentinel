@@ -147,7 +147,7 @@ docker compose ps
 ## 2) Service map
 
 - MQTT broker (TLS): `tls://<your-vps>:8883`
-- OTA file URL: `http://<your-vps>:8070/fw/<firmware>.bin?token=<OTA_TOKEN>`
+- OTA file URL: `https://<ota-subdomain>/fw/<firmware>.bin?token=<OTA_TOKEN>` (public **443** via host Nginx; container binds **127.0.0.1:9231** only)
 - API base（默认 compose）: `http://<your-domain>:18999`（无 `/api` 前缀；同一端口提供控制台静态页与 REST）
 - **Operations Console (SPA)**: `http://<your-domain>:18999${DASHBOARD_PATH}/`  
   Default is `http://<your-domain>:18999/console/` — total refresh: 侧边栏 + 移动端汉堡菜单 + 浅色/暗色主题 + 单页路由。  
@@ -260,7 +260,7 @@ curl -H "Authorization: Bearer CHANGE_ME_API_BEARER_TOKEN" \
 {
   "cmd": "ota",
   "params": {
-    "url": "http://your.vps.domain:8070/fw/sentinel-v2.1.0.bin",
+    "url": "https://ota.your.domain/fw/sentinel-v2.1.0.bin",
     "fw": "2.1.0"
   },
   "target_id": "all",
@@ -367,14 +367,14 @@ Recommended rollout:
 Open only needed ports:
 
 - `8883/tcp` MQTT TLS
-- `8070/tcp` OTA file serving
+- `9231/tcp` on **loopback** (host Nginx `proxy_pass` to OTA); do not expose 9231 publicly if you use HTTPS on 443
 - `8088/tcp` API
 
 Example (UFW):
 
 ```bash
 sudo ufw allow 8883/tcp
-sudo ufw allow 8070/tcp
+# OTA: prefer only 80/443 public; 9231 is loopback-only. If you must expose OTA without a reverse proxy: `sudo ufw allow 9231/tcp`
 sudo ufw allow 8088/tcp
 sudo ufw enable
 ```

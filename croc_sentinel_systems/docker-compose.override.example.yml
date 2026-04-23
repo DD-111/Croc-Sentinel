@@ -14,6 +14,12 @@
 #     ports:
 #       - "127.0.0.1:18999:8088"
 
+# --- OTA nginx: already in docker-compose.yml (127.0.0.1:9231). Override only if you need public 9231:
+# services:
+#   ota-nginx:
+#     ports:
+#       - "9231:9231"
+
 services:
   api:
     volumes:

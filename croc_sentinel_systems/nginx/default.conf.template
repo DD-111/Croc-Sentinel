@@ -1,5 +1,5 @@
 server {
-    listen 8070;
+    listen 9231;
     server_name _;
 
     location /fw/ {

@@ -81,7 +81,10 @@ services:
       && nginx -g 'daemon off;'"
 
     expose:
-      - "8070"
+      - "9231"
+    # Host nginx (e.g. ota.esasecure.com HTTPS) proxies to this — bind loopback only.
+    ports:
+      - "127.0.0.1:9231:9231"
 
     volumes:
       - ./nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro
