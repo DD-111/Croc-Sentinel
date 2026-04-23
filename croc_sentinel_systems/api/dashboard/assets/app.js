@@ -1519,7 +1519,9 @@
       }
       if (roleNorm === "admin") {
         return `
-      <div class="card" style="border-color:color-mix(in srgb,var(--danger)35%,var(--border))">
+      <details class="card danger-zone">
+        <summary style="cursor:pointer;font-weight:700">Danger zone · Close tenant</summary>
+        <div style="margin-top:10px">
         <h3>Close tenant · 注销管理员账号</h3>
         <p class="muted" style="margin:0 0 10px">If you close this admin tenant:</p>
         <ul class="muted" style="margin:0 0 12px;padding-left:1.25em;line-height:1.55">
@@ -1537,10 +1539,13 @@
         <div class="row" style="justify-content:flex-end;margin-top:10px">
           <button class="btn danger" id="accDeleteSelf">Close tenant permanently</button>
         </div>
-      </div>`;
+        </div>
+      </details>`;
       }
       return `
-      <div class="card">
+      <details class="card danger-zone">
+        <summary style="cursor:pointer;font-weight:700">Danger zone · Delete account</summary>
+        <div style="margin-top:10px">
         <h3>Delete account</h3>
         <p class="muted">This action is irreversible. Type <span class="mono">DELETE</span> and confirm your password.</p>
         <label class="field"><span>Current password</span><input id="accDelPw" type="password" autocomplete="current-password"/></label>
@@ -1548,7 +1553,8 @@
         <div class="row" style="justify-content:flex-end;margin-top:10px">
           <button class="btn danger" id="accDeleteSelf">Delete my account</button>
         </div>
-      </div>`;
+        </div>
+      </details>`;
     })();
     mountView(view, `
       <div class="card">
@@ -1972,7 +1978,6 @@
         : "";
       return `<article class="device-card js-group-card ${selectedGroup === g ? "is-selected" : ""}" data-group="${escapeHtml(g)}" style="cursor:pointer;position:relative">
         ${shareBtn}
-        <button class="group-del-ico js-del-group" data-group="${escapeHtml(g)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group cannot be deleted\"" : "title=\"Delete group\""} aria-label="Delete group">✕</button>
         <h3><div class="device-primary-name">${escapeHtml(m.display_name || g)}</div><div class="device-id-sub mono">${escapeHtml(g)}</div></h3>
         <div class="meta" style="margin-bottom:8px">
           Trigger: <span class="mono">${escapeHtml(modeLabel)}</span> ·
@@ -1987,10 +1992,16 @@
         </div>
         <div class="meta">Owner: ${escapeHtml(m.owner_name || "—")} · ${escapeHtml(m.phone || "—")} · ${escapeHtml(m.email || "—")}</div>
         <div class="row" style="margin-top:8px;gap:6px;flex-wrap:wrap">
-          <button class="btn sm secondary js-group-settings" data-group="${escapeHtml(g)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group follows owner settings\"" : ""}>Settings</button>
-          <button class="btn sm secondary js-edit-group" data-group="${escapeHtml(g)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group: device membership is read-only\"" : ""}>Edit</button>
           <button class="btn sm danger js-alert-on" data-group="${escapeHtml(g)}" type="button">Alarm ON</button>
           <button class="btn sm secondary js-alert-off" data-group="${escapeHtml(g)}" type="button">Alarm OFF</button>
+          <details class="toolbar-collapse" style="margin-left:auto;min-width:140px">
+            <summary>Manage</summary>
+            <div class="table-actions">
+              <button class="btn sm secondary js-group-settings" data-group="${escapeHtml(g)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group follows owner settings\"" : ""}>Settings</button>
+              <button class="btn sm secondary js-edit-group" data-group="${escapeHtml(g)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group: device membership is read-only\"" : ""}>Edit</button>
+              <button class="btn sm danger js-del-group" data-group="${escapeHtml(g)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group cannot be deleted\"" : "title=\"Delete group\""}>Delete</button>
+            </div>
+          </details>
         </div>
       </article>`;
     };
@@ -2524,7 +2535,6 @@
       <section class="card">
         <div class="row">
           <h2 style="margin:0">${escapeHtml(gm.display_name || g)}</h2>
-          <button class="btn sm danger right" id="grpDelete" ${isSharedGroup ? "disabled title=\"Shared group cannot be deleted\"" : ""}>Delete group</button>
           <a href="#/overview" class="btn ghost right">← Back</a>
         </div>
         <div class="divider"></div>
@@ -2544,6 +2554,13 @@
         <h3 style="margin:0">Devices</h3>
         <div class="divider"></div>
         <div class="device-grid" id="groupPageDevices"></div>
+      </section>
+      <section class="card danger-zone">
+        <h4 style="margin:0 0 8px">Danger zone</h4>
+        <p class="muted" style="margin:0 0 10px">Delete group will clear notification_group from all devices in this group.</p>
+        <div class="row" style="justify-content:flex-end">
+          <button class="btn danger btn-tap" id="grpDelete" ${isSharedGroup ? "disabled title=\"Shared group cannot be deleted\"" : ""}>Delete group</button>
+        </div>
       </section>
     `);
     const devGrid = $("#groupPageDevices", view);
@@ -2798,21 +2815,28 @@
               <input type="search" id="allDevFilter" placeholder="id / name / group / zone" autocomplete="off" />
             </label>
           </div>
-          <div class="inline-form" style="margin-top:12px;align-items:flex-end;gap:8px;flex-wrap:wrap">
+          <div class="action-bar" style="margin-top:12px">
             <span class="chip" id="bulkSelStat">0 selected · 0 visible</span>
             <button class="btn sm secondary" id="bulkSelectVisible" type="button">Select visible</button>
             <button class="btn sm secondary" id="bulkClearSel" type="button" disabled>Clear selection</button>
-            <label class="field" style="min-width:220px;max-width:300px">
-              <span>Bulk group</span>
-              <input id="bulkGroupValue" maxlength="80" placeholder="empty = clear group" />
-            </label>
-            <button class="btn sm" id="bulkApplyGroup" type="button" disabled>Apply group</button>
-            <label class="field" style="min-width:180px;max-width:240px">
-              <span>Zone override</span>
-              <input id="bulkZoneValue" maxlength="31" placeholder="e.g. all / Zone-A" />
-            </label>
-            <button class="btn sm" id="bulkApplyZone" type="button" disabled>Apply zone</button>
-            <button class="btn sm secondary" id="bulkClearZone" type="button" disabled>Clear zone override</button>
+            <details class="toolbar-collapse" style="min-width:260px;flex:1 1 420px">
+              <summary>Bulk actions</summary>
+              <div class="inline-form" style="margin-top:2px">
+                <label class="field">
+                  <span>Bulk group</span>
+                  <input id="bulkGroupValue" maxlength="80" placeholder="empty = clear group" />
+                </label>
+                <button class="btn sm" id="bulkApplyGroup" type="button" disabled>Apply group</button>
+                <label class="field">
+                  <span>Zone override</span>
+                  <input id="bulkZoneValue" maxlength="31" placeholder="e.g. all / Zone-A" />
+                </label>
+                <div class="row" style="gap:8px;justify-content:flex-end;flex-wrap:wrap">
+                  <button class="btn sm" id="bulkApplyZone" type="button" disabled>Apply zone</button>
+                  <button class="btn sm secondary" id="bulkClearZone" type="button" disabled>Clear zone override</button>
+                </div>
+              </div>
+            </details>
           </div>
         </div>
         <div id="allDevicesGrid" class="device-grid">
@@ -3053,12 +3077,6 @@
               <div><span class="muted">Email</span><span class="mono">${escapeHtml(d.owner_email || "—")}</span></div>
               <div><span class="muted">Shared</span><span class="mono">${d.is_shared ? `yes · by ${escapeHtml(d.shared_by || "?")}` : "no"}</span></div>
             </div>
-            <div class="row" style="margin-top:12px;gap:8px;flex-wrap:wrap">
-              <button class="btn danger" id="deleteReset" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Unbind (delete & reset)</button>
-              ${(state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_send_command"))))
-                ? `<button class="btn danger" id="factoryUnregister" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Rollback to unregistered</button>`
-                : ""}
-            </div>
           </div>
           <div class="card" style="margin:12px 0 0">
             <h3 style="margin:0 0 8px;font-size:13px;color:var(--text-muted)">Notifications</h3>
@@ -3089,7 +3107,6 @@
             <button class="btn secondary" id="doReboot" ${can("can_send_command") ? "" : "disabled"}>Schedule reboot</button>
           </div>
           <div class="row" style="margin-top:14px">
-            <button class="btn danger" id="revoke" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Revoke</button>
             <button class="btn secondary" id="unrevoke" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Unrevoke</button>
           </div>
         </div>
@@ -3109,7 +3126,6 @@
             <label class="field grow"><span>Password</span><input id="wifiNewPass" type="password" maxlength="64" autocomplete="new-password" placeholder="empty if open network" /></label>
             <div class="row wide" style="justify-content:flex-end;flex-wrap:wrap;gap:8px">
               <button class="btn btn-tap" type="button" id="wifiApplyBtn">Start provision task</button>
-              <button class="btn danger btn-tap" type="button" id="wifiClearBtn">Clear saved Wi‑Fi & reboot</button>
             </div>
           </div>
           <div style="margin-top:8px">
@@ -3118,6 +3134,19 @@
           <p class="muted" id="wifiScanStatus" style="margin-top:8px;min-height:1.3em"></p>` : `<p class="muted">Requires <span class="mono">can_send_command</span>.</p>`}
         </div>
       </details>
+
+      <div class="card danger-zone">
+        <h3 style="margin:0 0 8px">Danger zone</h3>
+        <p class="muted" style="margin:0 0 10px">Destructive actions are grouped here to reduce accidental taps.</p>
+        <div class="action-bar">
+          <button class="btn danger btn-tap" id="revoke" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Revoke</button>
+          <button class="btn danger btn-tap" id="deleteReset" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Unbind (delete & reset)</button>
+          ${(state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_send_command"))))
+            ? `<button class="btn danger btn-tap" id="factoryUnregister" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Rollback to unregistered</button>`
+            : ""}
+          <button class="btn danger btn-tap" type="button" id="wifiClearBtn">Clear saved Wi‑Fi & reboot</button>
+        </div>
+      </div>
 
       <details class="card device-drawer" id="triggerPolicyCard">
         <summary class="device-drawer__summary">
@@ -3253,8 +3282,12 @@
           });
           removeDeviceIdFromAllGroupMeta(id);
           bustDeviceListCaches();
-          const okNv = dr && (dr.nvs_purge_sent === true);
-          toast(`Device removed from account.${okNv ? " Device cleared WiFi+claim in NVS (rebooting)." : " If it was offline, use WiFi clear or reflash; deploy latest API+firmware to auto-clear on delete."} Re-add from Activate.`, "ok");
+          const sentNv = dr && (dr.nvs_purge_sent === true);
+          const ackNv = dr && (dr.nvs_purge_acked === true);
+          toast(
+            `Device removed from account.${ackNv ? " Device confirmed unclaim_reset (WiFi+claim cleared, rebooting)." : (sentNv ? " Command was dispatched but device ack not confirmed before unlink." : " Command dispatch failed/offline.")} Re-add from Activate.`,
+            ackNv ? "ok" : "err",
+          );
           location.hash = "#/overview";
         } catch (e) { toast(e.message || e, "err"); }
       });
@@ -3276,10 +3309,11 @@
           });
           removeDeviceIdFromAllGroupMeta(id);
           bustDeviceListCaches();
-          const okNv = fr && (fr.nvs_purge_sent === true);
+          const sentNv = fr && (fr.nvs_purge_sent === true);
+          const ackNv = fr && (fr.nvs_purge_acked === true);
           toast(
-            `Server: unclaimed / factory list updated.${okNv ? " Board received unclaim_reset (WiFi+creds cleared, rebooting)." : " If the board was offline, WiFi may still be in NVS — use WiFi clear, or flash API+firmware with unclaim_reset."} Serial in factory table preserved.`,
-            "ok",
+            `Server: unclaimed / factory list updated.${ackNv ? " Board ACKed unclaim_reset (WiFi+claim cleared, rebooting)." : (sentNv ? " Command sent but ACK not confirmed (device may reboot late/offline)." : " Command dispatch failed/offline.")} Serial in factory table preserved.`,
+            ackNv ? "ok" : "err",
           );
           location.hash = "#/overview";
         } catch (e) { toast(e.message || e, "err"); }
@@ -3644,9 +3678,9 @@
               <span><input type="checkbox" id="activateDlgShowPass" /> 显示密码</span>
             </label>
             <div class="activate-wifi-dlg__actions">
-              <button type="button" class="btn secondary" id="activateWifiDlgClear">清除草稿</button>
               <button type="button" class="btn ghost" id="activateWifiDlgClose">关闭</button>
               <button type="button" class="btn" id="activateWifiDlgSave">保存到本浏览器</button>
+              <button type="button" class="btn secondary" id="activateWifiDlgClear">清除草稿</button>
             </div>
           </div>
         </dialog>
@@ -3939,11 +3973,16 @@
           </label>
           <label class="field"><span>Device ID</span><input id="evDevice" placeholder="SN-… or id" /></label>
           <label class="field wide"><span>Search</span><input id="evQ" placeholder="summary / actor / event_type" /></label>
-          <div class="row wide" style="justify-content:flex-end;gap:8px;flex-wrap:wrap">
-            <button class="btn sm secondary" id="evApply">Apply filters</button>
-            <button class="btn sm" id="evReload">Last 200</button>
-            <button class="btn sm secondary" id="evStats">By device (7d)</button>
-            <button class="btn sm secondary" id="evCsv">Export CSV</button>
+          <div class="row wide action-bar" style="justify-content:flex-end;gap:8px;flex-wrap:wrap">
+            <button class="btn sm" id="evApply">Apply & reload</button>
+            <details class="toolbar-collapse" style="min-width:160px">
+              <summary>More tools</summary>
+              <div class="table-actions">
+                <button class="btn sm secondary" id="evStats">By device (7d)</button>
+                <button class="btn sm secondary" id="evCsv">Export CSV</button>
+                <button class="btn sm secondary" id="evReload">Last 200</button>
+              </div>
+            </details>
           </div>
         </div>
       </div>
@@ -4644,9 +4683,16 @@
                   <td class="mono">${escapeHtml(u.tenant || "—")}</td>
                   <td>${escapeHtml(fmtTs(u.created_at))}</td>
                   <td>
-                    ${isUser ? `<button type="button" class="btn sm secondary js-pol" data-u="${escapeHtml(u.username)}">Policy</button>` : ""}
-                    ${closeTenantBtn}
-                    ${self ? "" : (isAdminRow ? "" : `<button type="button" class="btn sm danger js-del" data-u="${escapeHtml(u.username)}">Delete</button>`)}
+                    <div class="table-actions">
+                      <details class="toolbar-collapse">
+                        <summary>Actions</summary>
+                        <div class="table-actions">
+                          ${isUser ? `<button type="button" class="btn sm secondary js-pol" data-u="${escapeHtml(u.username)}">Policy</button>` : ""}
+                          ${closeTenantBtn}
+                          ${self ? "" : (isAdminRow ? "" : `<button type="button" class="btn sm danger js-del" data-u="${escapeHtml(u.username)}">Delete</button>`)}
+                        </div>
+                      </details>
+                    </div>
                   </td>
                 </tr><tr class="sub" style="display:none" data-pol-row="${escapeHtml(u.username)}"><td colspan="6"></td></tr>`;
               }).join("")}</tbody></table></div>`,
@@ -4688,7 +4734,7 @@
                   <td>${it.can_operate ? "yes" : "no"}</td>
                   <td class="mono">${escapeHtml(it.granted_by || "")}</td>
                   <td>${it.revoked_at ? `<span class="badge offline">revoked</span>` : `<span class="badge online">active</span>`}</td>
-                  <td>${it.revoked_at ? "" : `<button class="btn sm danger js-gs-revoke" data-device="${escapeHtml(it.device_id || "")}" data-user="${escapeHtml(it.grantee_username || "")}">Revoke</button>`}</td>
+                  <td><div class="table-actions">${it.revoked_at ? "" : `<button class="btn sm danger js-gs-revoke" data-device="${escapeHtml(it.device_id || "")}" data-user="${escapeHtml(it.grantee_username || "")}">Revoke</button>`}</div></td>
                 </tr>`).join("")}</tbody></table></div>`,
         );
       } catch (e) {
@@ -4906,10 +4952,10 @@
                   <td>${escapeHtml(r.label || "—")}</td>
                   <td>${r.enabled ? `<span class="badge online">On</span>` : `<span class="badge offline">Off</span>`}</td>
                   <td class="mono">${escapeHtml(r.owner_admin || "")}</td>
-                  <td>
+                  <td><div class="table-actions">
                     <button class="btn sm secondary js-rtoggle" data-id="${r.id}" data-en="${r.enabled ? 1 : 0}">${r.enabled ? "Disable" : "Enable"}</button>
                     <button class="btn sm danger js-rdel" data-id="${r.id}">Delete</button>
-                  </td>
+                  </div></td>
                 </tr>`).join("")}</tbody></table></div>`,
         );
       } catch (e) {
@@ -4988,7 +5034,7 @@
                   <td>${escapeHtml(it.username || "")}</td>
                   <td>${it.enabled ? `<span class="badge online">on</span>` : `<span class="badge offline">off</span>`}</td>
                   <td>${escapeHtml(fmtTs(it.updated_at || it.created_at))}</td>
-                  <td><button class="btn sm danger js-tg-unbind" data-chat="${escapeHtml(String(it.chat_id || ""))}">Unbind</button></td>
+                  <td><div class="table-actions"><button class="btn sm danger js-tg-unbind" data-chat="${escapeHtml(String(it.chat_id || ""))}">Unbind</button></div></td>
                 </tr>`).join("")}</tbody></table></div>`,
         );
       } catch (e) {
@@ -5196,14 +5242,21 @@
         <td>${escapeHtml(decLabel)}</td>
         <td>${escapeHtml(c.created_at)}</td>
         <td>
-          ${(me.role === "admin" && (!myDec || myDec.action === "declined"))
-              ? `<button class="btn sm js-accept" data-id="${escapeHtml(c.id)}">Accept</button>
-                 <button class="btn sm secondary js-decline" data-id="${escapeHtml(c.id)}">Decline</button>`
-              : ""}
-          ${(myDec && myDec.action === "accepted")
-              ? `<button class="btn sm danger js-rollback" data-id="${escapeHtml(c.id)}">Rollback</button>`
-              : ""}
-          <button class="btn sm secondary js-detail" data-id="${escapeHtml(c.id)}">Detail</button>
+          <div class="table-actions">
+            <button class="btn sm secondary js-detail" data-id="${escapeHtml(c.id)}">Detail</button>
+            <details class="toolbar-collapse">
+              <summary>Actions</summary>
+              <div class="table-actions">
+                ${(me.role === "admin" && (!myDec || myDec.action === "declined"))
+                    ? `<button class="btn sm js-accept" data-id="${escapeHtml(c.id)}">Accept</button>
+                       <button class="btn sm secondary js-decline" data-id="${escapeHtml(c.id)}">Decline</button>`
+                    : ""}
+                ${(myDec && myDec.action === "accepted")
+                    ? `<button class="btn sm danger js-rollback" data-id="${escapeHtml(c.id)}">Rollback</button>`
+                    : ""}
+              </div>
+            </details>
+          </div>
         </td>
       </tr>`;
   }
@@ -5234,7 +5287,7 @@
           </label>
           <label class="field wide"><span>Notes</span><input id="c_notes" maxlength="500" /></label>
           <div class="row wide" style="justify-content:flex-end">
-            <button class="btn danger btn-tap" id="c_send">Create campaign</button>
+            <button class="btn btn-tap" id="c_send">Create campaign</button>
           </div>
         </div>
       </div>` : ""}

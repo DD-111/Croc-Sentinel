@@ -498,8 +498,8 @@ body[data-layout="auth"] .view {
   color: var(--text);
 }
 .card + .card { margin-top: 14px; }
-.card h2 { margin: 0 0 6px; font-size: 16px; }
-.card h3 { margin: 0 0 8px; font-size: 14px; }
+.card h2 { margin: 0 0 8px; font-size: 16px; letter-spacing: -0.01em; }
+.card h3 { margin: 0 0 8px; font-size: 14px; letter-spacing: -0.01em; }
 .muted { color: var(--text-muted); font-size: 12.5px; }
 
 .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
@@ -532,18 +532,21 @@ textarea { resize: vertical; min-height: 90px; font-family: var(--mono); }
   border: 1px solid var(--accent); background: var(--accent); color: #fff;
   padding: 8px 14px; border-radius: var(--radius-sm); font: inherit; font-size: 13.5px;
   cursor: pointer; font-weight: 600;
-  transition: transform var(--transition), background var(--transition), color var(--transition), border-color var(--transition);
+  box-shadow: 0 1px 0 color-mix(in srgb, var(--accent) 24%, transparent);
+  transition: transform var(--transition), background var(--transition), color var(--transition), border-color var(--transition), box-shadow var(--transition);
 }
-.btn:hover { background: var(--accent-strong); border-color: var(--accent-strong); }
+.btn:hover { background: var(--accent-strong); border-color: var(--accent-strong); box-shadow: 0 6px 14px color-mix(in srgb, var(--accent) 24%, transparent); }
 .btn:active { transform: translateY(1px); }
-.btn.secondary { background: var(--bg-elev); color: var(--text); border-color: var(--border-strong); }
-.btn.secondary:hover { background: var(--bg-muted); }
-.btn.ghost { background: transparent; color: var(--text-muted); border-color: transparent; font-weight: 500; }
+.btn.secondary { background: var(--bg-elev); color: var(--text); border-color: var(--border-strong); box-shadow: none; }
+.btn.secondary:hover { background: var(--bg-muted); border-color: color-mix(in srgb, var(--accent) 24%, var(--border-strong)); }
+.btn.ghost { background: transparent; color: var(--text-muted); border-color: transparent; font-weight: 500; box-shadow: none; }
 .btn.ghost:hover { background: var(--bg-muted); color: var(--text); }
 .btn.danger { background: var(--danger); border-color: var(--danger); }
-.btn.danger:hover { background: color-mix(in srgb, var(--danger) 80%, black); border-color: color-mix(in srgb, var(--danger) 80%, black); }
+.btn.danger:hover { background: color-mix(in srgb, var(--danger) 82%, black); border-color: color-mix(in srgb, var(--danger) 82%, black); box-shadow: 0 6px 14px color-mix(in srgb, var(--danger) 22%, transparent); }
 .btn.sm { padding: 5px 10px; font-size: 12px; }
 .btn[disabled] { opacity: 0.55; cursor: not-allowed; }
+.btn.btn-block { width: 100%; }
+.btn:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--ring); }
 
 /* Larger tap targets + subtle press (paired with optional navigator.vibrate in app.js) */
 .btn.btn-tap {
@@ -557,7 +560,7 @@ textarea { resize: vertical; min-height: 90px; font-family: var(--mono); }
 /* Tables */
 .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-elev); }
 table.t { width: 100%; border-collapse: collapse; min-width: 520px; }
-table.t th, table.t td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); font-size: 13px; vertical-align: middle; }
+table.t th, table.t td { padding: 9px 11px; text-align: left; border-bottom: 1px solid var(--border); font-size: 12.75px; vertical-align: middle; }
 table.t th { background: var(--bg-muted); color: var(--text-muted); font-weight: 600; position: sticky; top: 0; z-index: 1; }
 table.t tr:last-child td { border-bottom: none; }
 table.t tr.sub td { background: var(--bg-muted); }
@@ -636,6 +639,35 @@ details.card.device-drawer[open] > summary.device-drawer__summary {
 /* Inline forms in cards */
 .inline-form { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); align-items: end; }
 .inline-form .wide { grid-column: 1 / -1; }
+.action-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.danger-zone {
+  border: 1px solid color-mix(in srgb, var(--danger) 34%, var(--border));
+  background: color-mix(in srgb, var(--danger-weak) 42%, var(--bg-elev));
+}
+.danger-zone h3, .danger-zone h4 { color: var(--danger); }
+.danger-zone .muted { color: color-mix(in srgb, var(--danger) 45%, var(--text-muted)); }
+.table-actions { display: inline-flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+.toolbar-collapse { border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-elev); }
+.toolbar-collapse > summary { list-style: none; cursor: pointer; padding: 8px 10px; font-weight: 600; color: var(--text); }
+.toolbar-collapse > summary::-webkit-details-marker { display: none; }
+.toolbar-collapse > div { padding: 10px; border-top: 1px solid var(--border); }
+
+/* Dark mode contrast tune: keep cards/tables clearly separated */
+html[data-theme="dark"] .card,
+html[data-theme="dark"] .device-card,
+html[data-theme="dark"] .table-wrap,
+html[data-theme="dark"] .toolbar-collapse {
+  border-color: color-mix(in srgb, var(--border-strong) 78%, #9fb7e6 22%);
+}
+html[data-theme="dark"] .card {
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.36);
+}
+html[data-theme="dark"] .btn.secondary {
+  background: color-mix(in srgb, var(--bg-elev) 84%, #1c2942 16%);
+}
+html[data-theme="dark"] .btn.ghost:hover {
+  background: color-mix(in srgb, var(--bg-muted) 72%, #1a2740 28%);
+}
 
 /* Legacy standalone login shell (unused by router; kept for compatibility) */
 .login-wrap {
@@ -1066,7 +1098,20 @@ pre.code { background: var(--bg-muted); border: 1px solid var(--border); border-
 
 @media (max-width: 520px) {
   .view { padding: 12px; }
-  .card { padding: 14px; border-radius: 10px; }
+  .topbar { padding: 8px 10px; gap: 8px; }
+  .topbar-actions { gap: 6px; }
+  .crumb { font-size: 14px; }
+  .card { padding: 13px; border-radius: 10px; }
+  .stack { gap: 10px; }
+  .row { gap: 8px; }
+  .row > .btn:not(.sm) { min-height: 42px; }
+  .inline-form { grid-template-columns: 1fr; gap: 8px; }
+  .action-bar { grid-template-columns: 1fr; }
+  .toolbar-collapse { width: 100%; }
+  .toolbar-collapse > summary { padding: 9px 10px; }
+  .table-actions { grid-template-columns: 1fr; width: 100%; }
+  .table-actions .btn,
+  .table-actions .toolbar-collapse { width: 100%; }
   .stat .v { font-size: 18px; }
   .kv { grid-template-columns: 1fr; }
   /* Keep wide OTA campaign tables usable on phones */
@@ -1910,4 +1955,11 @@ html.tab-hidden body.motion-ui .toast.show {
   .activate-pending-card {
     border-radius: var(--radius-sm);
   }
+}
+
+@media (max-width: 860px) {
+  .btn.sm { min-height: 40px; padding: 8px 12px; font-size: 12.5px; }
+  .action-bar { display: grid; grid-template-columns: 1fr 1fr; }
+  .action-bar .btn, .action-bar .chip { width: 100%; }
+  .table-actions { display: grid; grid-template-columns: 1fr; width: 100%; }
 }

@@ -1005,6 +1005,15 @@ void requestRestartWithAck(const char *cmd, const char *detail) {
     logLine(line);
   }
   publishAck(cmd, true, detail);
+  // Give PubSubClient a brief window to flush ACK before restart.
+  // This avoids API-side timeouts for commands that reboot immediately.
+  if (mqttClient.connected()) {
+    unsigned long until = millis() + 220;
+    while ((long)(until - millis()) > 0) {
+      mqttClient.loop();
+      delay(10);
+    }
+  }
   flushNvsIfNeeded();
   delay(150);
   ESP.restart();
@@ -1656,10 +1665,6 @@ void executeCommand(const char *cmd, JsonVariant params) {
     scheduledRebootArmed = false;
     scheduledRebootEpoch = 0;
     persistScheduledRebootIfNeeded();
-    if (mqttClient.connected()) {
-      mqttClient.disconnect();
-      delay(50);
-    }
     requestRestartWithAck(resolvedCmd, "unclaim_reset");
     return;
   }
@@ -1706,10 +1711,6 @@ void executeCommand(const char *cmd, JsonVariant params) {
     prefs.putString("wifi_sta_ssid", ssid);
     prefs.putString("wifi_sta_pass", pass);
     prefs.end();
-    if (mqttClient.connected()) {
-      mqttClient.disconnect();
-      delay(50);
-    }
     requestRestartWithAck(resolvedCmd, "wifi_config saved");
     return;
   }
@@ -1719,10 +1720,6 @@ void executeCommand(const char *cmd, JsonVariant params) {
     prefs.remove("wifi_sta_ssid");
     prefs.remove("wifi_sta_pass");
     prefs.end();
-    if (mqttClient.connected()) {
-      mqttClient.disconnect();
-      delay(50);
-    }
     requestRestartWithAck(resolvedCmd, "wifi_cleared");
     return;
   }

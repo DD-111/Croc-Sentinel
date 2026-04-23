@@ -5044,8 +5044,27 @@ def _close_admin_tenant_cur(
     return summary
 
 
-def _try_mqtt_unclaim_reset(device_id: str) -> bool:
-    """Best-effort: device clears WiFi + claim NVS (keeps factory serial) before we delete creds in DB."""
+def _wait_cmd_ack(device_id: str, cmd: str, timeout_s: float = 2.5) -> bool:
+    deadline = time.time() + max(0.2, float(timeout_s))
+    while time.time() < deadline:
+        with db_lock:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute("SELECT IFNULL(last_ack_json,'') AS last_ack_json FROM device_state WHERE device_id = ?", (device_id,))
+            row = cur.fetchone()
+            conn.close()
+        try:
+            ack = json.loads(str((row["last_ack_json"] if row else "") or ""))
+        except Exception:
+            ack = {}
+        if str(ack.get("cmd") or "") == cmd and bool(ack.get("ok")):
+            return True
+        time.sleep(0.12)
+    return False
+
+
+def _try_mqtt_unclaim_reset(device_id: str) -> tuple[bool, bool]:
+    """Best-effort dispatch + short ack wait for unclaim_reset before DB unlink."""
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -5053,7 +5072,7 @@ def _try_mqtt_unclaim_reset(device_id: str) -> bool:
         has = cur.fetchone() is not None
         conn.close()
     if not has:
-        return False
+        return False, False
     try:
         publish_command(
             f"{TOPIC_ROOT}/{device_id}/cmd",
@@ -5063,10 +5082,10 @@ def _try_mqtt_unclaim_reset(device_id: str) -> bool:
             CMD_PROTO,
             get_cmd_key_for_device(device_id),
         )
-        return True
+        return True, _wait_cmd_ack(device_id, "unclaim_reset", timeout_s=2.8)
     except Exception as exc:
         logger.warning("unclaim_reset MQTT not delivered for %s: %s", device_id, exc)
-        return False
+        return False, False
 
 
 def _device_delete_reset_impl(
@@ -5087,7 +5106,7 @@ def _device_delete_reset_impl(
             assert_device_owner(principal, device_id)
     else:
         assert_device_owner(principal, device_id)
-    nvs_purge_sent = _try_mqtt_unclaim_reset(device_id)
+    nvs_purge_sent, nvs_purge_acked = _try_mqtt_unclaim_reset(device_id)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -5129,6 +5148,7 @@ def _device_delete_reset_impl(
         {
             "mac_nocolon": mac_nocolon or "",
             "nvs_purge_mqtt": nvs_purge_sent,
+            "nvs_purge_ack": nvs_purge_acked,
             "deleted_credentials": del_cred,
             "deleted_owner": del_owner,
             "deleted_acl": del_acl,
@@ -5144,7 +5164,8 @@ def _device_delete_reset_impl(
         "mode": "factory_unclaim" if super_unclaim else "delete_reset",
         "factory_unclaimed": super_unclaim,
         "nvs_purge_sent": nvs_purge_sent,
-        "nvs_purge_note": "When true, device received unclaim_reset to clear WiFi+claim in NVS (reboots). If false, device was offline: clear WiFi manually (wifi_clear) or reflash; deploy API from this build first.",
+        "nvs_purge_acked": nvs_purge_acked,
+        "nvs_purge_note": "sent=true means command reached broker; acked=true means device confirmed unclaim_reset before DB unlink.",
     }
 
 
