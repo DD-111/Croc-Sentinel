@@ -3543,34 +3543,16 @@
         </div>
       </details>
 
-      <details class="card danger-zone device-drawer">
+      <details class="card danger-zone danger-zone--compact device-drawer">
         <summary class="device-drawer__summary">
           <span class="device-drawer__title">Danger zone</span>
-          <span class="device-drawer__hint muted">Bundled board reset · expand for server actions</span>
+          <span class="device-drawer__hint muted">Unbind &amp; reset</span>
         </summary>
         <div class="device-drawer__body danger-zone-body">
-          <div class="danger-zone-primary">
-            <p class="danger-zone-kicker">Board reset (single MQTT command)</p>
-            <p class="muted danger-zone-lead">Use this when you want the firmware to run everything in order: <strong>clear STA Wi‑Fi</strong> → <strong>purge claim / MQTT from NVS</strong> (same effect as <span class="mono">unclaim_reset</span>) → <strong>one reboot</strong>. Command name: <span class="mono">deprovision_bundle</span>. Requires a recent firmware build. Does <strong>not</strong> remove dashboard rows — use <em>Unbind</em> or <em>Rollback</em> in “More” for that.</p>
-            <button class="btn danger btn-tap danger-zone-cta" type="button" id="deprovisionBundleBtn" ${can("can_send_command") && canOperateThisDevice ? "" : "disabled"} title="Runs deprovision_bundle on the device">Reset board — Wi‑Fi + NVS unclaim + reboot</button>
+          <p class="muted danger-zone-compact-lead">Removes this device from your tenant and sends <span class="mono">unclaim_reset</span> when online. Re-add from Activate.</p>
+          <div class="danger-zone-single-action">
+            <button class="btn danger sm danger-zone-unbind-btn" type="button" id="deleteReset" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Unbind &amp; reset</button>
           </div>
-          <details class="danger-zone-more">
-            <summary class="danger-zone-more-sum">More: server-side, Wi‑Fi-only</summary>
-            <div class="danger-zone-more-body">
-              <p class="muted danger-zone-more-intro"><strong>Tenant / dashboard</strong> — changes server database (and usually sends <span class="mono">unclaim_reset</span> to the board when online). <strong>Wi‑Fi-only</strong> — lighter reboot path.</p>
-              <div class="danger-actions-grid">
-                <button class="btn danger btn-tap danger-zone-secondary" id="revoke" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Revoke (server)</button>
-                <button class="btn danger btn-tap danger-zone-secondary" id="deleteReset" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Unbind — delete &amp; reset</button>
-                ${(state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_send_command"))))
-                  ? `<button class="btn danger btn-tap danger-zone-secondary" id="factoryUnregister" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Rollback to unregistered</button>`
-                  : ""}
-              </div>
-              <div class="danger-wifi-strip">
-                <span class="muted small-label">Wi‑Fi credentials only</span>
-                <button class="btn secondary btn-tap danger-zone-secondary" type="button" id="wifiClearBtn" ${can("can_send_command") && canOperateThisDevice ? "" : "disabled"}>Clear saved Wi‑Fi &amp; reboot</button>
-              </div>
-            </div>
-          </details>
         </div>
       </details>
 
@@ -3695,14 +3677,6 @@
       if (!Number.isFinite(v) || v < 5) throw new Error("delay must be >= 5 seconds");
       return api(`/devices/${encodeURIComponent(id)}/schedule-reboot`, { method: "POST", body: { delay_s: v } });
     }));
-    $("#revoke").addEventListener("click", async () => {
-      if (!confirm("Revoke this device?")) return;
-      try {
-        await api(`/devices/${encodeURIComponent(id)}/revoke`, { method: "POST", body: { reason: "console manual" } });
-        bustDeviceListCaches();
-        toast("Revoked", "ok");
-      } catch (e) { toast(e.message || e, "err"); }
-    });
     $("#unrevoke").addEventListener("click", withDev(async () => {
       await api(`/devices/${encodeURIComponent(id)}/unrevoke`, { method: "POST" });
       bustDeviceListCaches();
@@ -3730,34 +3704,6 @@
         } catch (e) { toast(e.message || e, "err"); }
       });
     }
-    const factoryUnregisterBtn = $("#factoryUnregister", view);
-    if (factoryUnregisterBtn) {
-      factoryUnregisterBtn.addEventListener("click", async () => {
-        const isSa = !!(state.me && state.me.role === "superadmin");
-        const msg = isSa
-          ? "Superadmin: rollback this device to UNREGISTERED (factory serial kept). Continue?"
-          : "Rollback YOUR device to UNREGISTERED (factory serial kept). You can claim again later. Continue?";
-        if (!confirm(msg)) return;
-        const typed = String(prompt(`Type device ID to confirm factory-unregister:\n${id}`) || "").trim();
-        if (typed.toUpperCase() !== String(id).toUpperCase()) { toast("Confirmation mismatch", "err"); return; }
-        try {
-          const fr = await api(`/devices/${encodeURIComponent(id)}/factory-unregister`, {
-            method: "POST",
-            body: { confirm_text: typed },
-          });
-          removeDeviceIdFromAllGroupMeta(id);
-          bustDeviceListCaches();
-          const sentNv = fr && (fr.nvs_purge_sent === true);
-          const ackNv = fr && (fr.nvs_purge_acked === true);
-          toast(
-            `Server: unclaimed / factory list updated.${ackNv ? " Board ACKed unclaim_reset (WiFi+claim cleared, rebooting)." : (sentNv ? " Command sent but ACK not confirmed (device may reboot late/offline)." : " Command dispatch failed/offline.")} Serial in factory table preserved.`,
-            ackNv ? "ok" : "err",
-          );
-          location.hash = "#/overview";
-        } catch (e) { toast(e.message || e, "err"); }
-      });
-    }
-
     const sendCmdBtn = $("#sendCmd");
     if (sendCmdBtn) {
       sendCmdBtn.addEventListener("click", async () => {
@@ -3774,18 +3720,6 @@
         } catch (e) { toast(e.message || e, "err"); }
       });
     }
-
-    const waitForCmdAck = async (expectedCmd) => runPollDedup(`ack:${id}:${String(expectedCmd || "")}`, async () => {
-      for (let i = 0; i < 36; i++) {
-        await new Promise((r) => setTimeout(r, 500));
-        const d2 = await api(`/devices/${encodeURIComponent(id)}`);
-        const a = d2.last_ack_json || {};
-        if (a.cmd === expectedCmd && typeof a.ok === "boolean") {
-          return a;
-        }
-      }
-      return null;
-    });
 
     const wifiApplyBtn = $("#wifiApplyBtn");
     try {
@@ -3865,49 +3799,6 @@
         finally { wifiApplyBtn.disabled = false; }
       });
     }
-    const wifiClearBtn = $("#wifiClearBtn");
-    if (wifiClearBtn) {
-      wifiClearBtn.addEventListener("click", async () => {
-        const st = $("#wifiScanStatus");
-        if (!confirm("Clear device-stored Wi‑Fi override and reboot? It will fall back to compile-time APs in firmware (if any) or remain offline until you apply new credentials.")) return;
-        try {
-          if (st) st.textContent = "Sending wifi_clear…";
-          await api(`/devices/${encodeURIComponent(id)}/commands`, { method: "POST", body: { cmd: "wifi_clear", params: {} } });
-          if (st) st.textContent = "Waiting for device ack…";
-          const a = await waitForCmdAck("wifi_clear");
-          if (a) {
-            if (st) st.textContent = String(a.detail || (a.ok ? "Cleared." : "wifi_clear failed"));
-            toast(a.ok ? "Wi‑Fi override cleared; rebooting." : (a.detail || "wifi_clear failed"), a.ok ? "ok" : "err");
-          } else {
-            if (st) st.textContent = "No ack yet — device may still reboot.";
-            toast("wifi_clear sent; no ack seen yet.", "");
-          }
-        } catch (e) { toast(e.message || e, "err"); if (st) st.textContent = String(e.message || e); }
-      });
-    }
-    const deprovisionBundleBtn = $("#deprovisionBundleBtn");
-    if (deprovisionBundleBtn) {
-      deprovisionBundleBtn.addEventListener("click", async () => {
-        const st = $("#wifiScanStatus");
-        if (!confirm(
-          "Send bundled board reset? This clears saved STA Wi‑Fi, wipes provision/MQTT claim from NVS (same as server factory rollback), then reboots. Requires firmware support for cmd deprovision_bundle.",
-        )) return;
-        try {
-          if (st) st.textContent = "Sending deprovision_bundle…";
-          await api(`/devices/${encodeURIComponent(id)}/commands`, { method: "POST", body: { cmd: "deprovision_bundle", params: {} } });
-          if (st) st.textContent = "Waiting for device ack…";
-          const a = await waitForCmdAck("deprovision_bundle");
-          if (a) {
-            if (st) st.textContent = String(a.detail || (a.ok ? "Done." : "deprovision_bundle failed"));
-            toast(a.ok ? "Board deprovisioned; rebooting." : (a.detail || "deprovision_bundle failed"), a.ok ? "ok" : "err");
-          } else {
-            if (st) st.textContent = "No ack yet — device may still reboot.";
-            toast("deprovision_bundle sent; no ack seen yet (update firmware if command unknown).", "");
-          }
-        } catch (e) { toast(e.message || e, "err"); if (st) st.textContent = String(e.message || e); }
-      });
-    }
-
     const tpPanicLocal = $("#tpPanicLocal");
     const tpPanicLink = $("#tpPanicLink");
     const tpSilentLink = $("#tpSilentLink");

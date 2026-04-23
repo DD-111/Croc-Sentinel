@@ -859,6 +859,37 @@ body.comfort-ui .danger-zone-secondary {
   min-height: 46px;
   font-size: 14px;
 }
+
+/* Minimal danger zone (single Unbind & reset) */
+.danger-zone--compact .device-drawer__summary .device-drawer__title {
+  font-size: 13px;
+}
+.danger-zone--compact .device-drawer__hint {
+  font-size: 11px;
+}
+.danger-zone--compact .danger-zone-body {
+  gap: 10px;
+}
+.danger-zone-compact-lead {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  max-width: 68ch;
+}
+.danger-zone-single-action {
+  display: flex;
+  justify-content: flex-start;
+}
+.danger-zone--compact .danger-zone-unbind-btn {
+  font-size: 12.5px;
+  min-height: 36px;
+  padding: 6px 14px;
+}
+body.comfort-ui .danger-zone--compact .danger-zone-unbind-btn {
+  min-height: 40px;
+  font-size: 13px;
+}
+
 .table-actions { display: inline-flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
 .toolbar-collapse { border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-elev); }
 .toolbar-collapse > summary { list-style: none; cursor: pointer; padding: 8px 10px; font-weight: 600; color: var(--text); }
