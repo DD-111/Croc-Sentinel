@@ -20,6 +20,7 @@
       title: "Dashboard",
       items: [
         { id: "overview", label: "Overview", ico: "◎", path: "#/overview", min: "user" },
+        { id: "devices", label: "All devices", ico: "▢", path: "#/devices", min: "user" },
       ],
     },
     {
@@ -739,13 +740,18 @@
     if (!nav) return;
     if (!state.me) { setHtmlIfChanged(nav, ""); return; }
     const hash = location.hash || "#/overview";
+    const hashNoQuery = hash.split("?")[0];
     const coreParts = [];
     for (const g of NAV_GROUPS) {
       const items = g.items.filter((n) => hasRole(n.min));
       if (items.length === 0) continue;
       coreParts.push(`<div class="nav-section">${escapeHtml(g.title)}</div>`);
       for (const n of items) {
-        const active = hash.startsWith(n.path) ? ` aria-current="page"` : "";
+        const active = (n.path === "#/devices"
+          ? hashNoQuery === "#/devices"
+          : hash.startsWith(n.path))
+          ? ` aria-current="page"`
+          : "";
         coreParts.push(
           `<a href="${n.path}"${active}><span class="nav-ico">${n.ico}</span>${escapeHtml(n.label)}</a>`,
         );
@@ -761,7 +767,7 @@
       const grp = String(d.notification_group || "").toLowerCase();
       return did.includes(q) || nm.includes(q) || grp.includes(q);
     });
-    const onDeviceRoute = hash.startsWith("#/devices/");
+    const onDeviceRoute = (hash === "#/devices" || hash.startsWith("#/devices/"));
     let drawerOpen = onDeviceRoute;
     try {
       if (sessionStorage.getItem("navDevicesOpen") === "1") drawerOpen = true;
@@ -811,7 +817,8 @@
     const html =
       `<div class="nav-core">${coreParts.join("")}</div>` +
       `<details class="sidebar-device-panel" id="navDeviceDrawer"${openAttr}>` +
-      `<summary><span class="sidebar-device-panel__title"><span>Devices</span>` +
+      `<summary><span class="sidebar-device-panel__title">` +
+      `<a href="#/devices" class="sidebar-devices-title-link" data-sidebar-devices-link>Devices</a>` +
       `<span class="nav-dev-count">${rows.length}</span></span>` +
       `<span class="sidebar-device-chev" aria-hidden="true">▼</span></summary>` +
       `<div class="sidebar-device-panel__body">` +
@@ -819,6 +826,10 @@
       `</div></details>`;
 
     setHtmlIfChanged(nav, html);
+    const devTitleLink = $("[data-sidebar-devices-link]", nav);
+    if (devTitleLink) {
+      devTitleLink.addEventListener("click", (e) => e.stopPropagation());
+    }
     const navQ = $("#navDeviceQuery", nav);
     if (navQ) {
       navQ.addEventListener("input", () => {
@@ -2630,10 +2641,86 @@
     scheduleRouteTicker(routeSeq, `group-live-${g}`, refreshGroupLive, 10000);
   });
 
-  // Device detail
+  // Device list (no id) + device detail
   registerRoute("devices", async (view, args, routeSeq) => {
     const id = decodeURIComponent(args[0] || "");
-    if (!id) { location.hash = "#/overview"; return; }
+    if (!id) {
+      setCrumb("All devices");
+      let allItems = [];
+      const deviceListCard = (d) => {
+        const on = isOnline(d);
+        const primary = escapeHtml(d.display_label || d.device_id || "unknown");
+        const subId = d.display_label ? `<div class="device-id-sub mono">${escapeHtml(d.device_id || "")}</div>` : "";
+        const letter = escapeHtml((d.display_label || d.device_id || "?").slice(0, 1).toUpperCase());
+        let subMeta = "";
+        if (state.me && state.me.role === "superadmin" && d.owner_admin) {
+          subMeta = `Owner: ${escapeHtml(String(d.owner_admin))}<br/>`;
+        } else if (d.is_shared && d.shared_by) {
+          subMeta = `Shared: ${escapeHtml(String(d.shared_by))}<br/>`;
+        }
+        return `<a class="device-card device-card--row-thumb" href="#/devices/${encodeURIComponent(d.device_id)}" style="text-decoration:none;color:inherit">` +
+          `<div class="device-thumb device-thumb--list" aria-hidden="true">${letter}</div>` +
+          `<div class="device-card--row-body">` +
+          `<h3 style="margin:0"><div class="device-primary-name">${primary}</div>${subId}</h3>` +
+          `<div><span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>` +
+          (d.zone ? ` <span class="chip">${escapeHtml(d.zone)}</span>` : "") +
+          (d.fw ? ` <span class="chip">v${escapeHtml(d.fw)}</span>` : "") +
+          (d.is_shared ? ` <span class="badge accent" title="shared device">shared</span>` : "") +
+          `</div>` +
+          `<div class="meta" style="margin-top:4px">${subMeta}Updated: ${escapeHtml(fmtRel(d.updated_at))}</div>` +
+          `</div></a>`;
+      };
+      const applyFilter = () => {
+        const inp = $("#allDevFilter", view);
+        const q = inp ? String(inp.value || "").trim().toLowerCase() : "";
+        const items = allItems.filter((d) => {
+          if (!q) return true;
+          const did = String(d.device_id || "").toLowerCase();
+          const nm = String(d.display_label || "").toLowerCase();
+          const grp = String(d.notification_group || "").toLowerCase();
+          return did.includes(q) || nm.includes(q) || grp.includes(q);
+        });
+        const grid = $("#allDevicesGrid", view);
+        if (!grid) return;
+        if (allItems.length === 0) {
+          setChildMarkup(grid, `<p class="muted" style="padding:8px 0">No devices in your scope.</p>`);
+          return;
+        }
+        setChildMarkup(
+          grid,
+          items.length === 0
+            ? `<p class="muted" style="padding:8px 0">No matches.</p>`
+            : items.map(deviceListCard).join(""),
+        );
+      };
+      const load = async () => {
+        if (!isRouteCurrent(routeSeq)) return;
+        const r = await api("/devices", { timeoutMs: 20000, retries: 2 });
+        if (!isRouteCurrent(routeSeq)) return;
+        allItems = Array.isArray(r.items) ? r.items : [];
+        applyFilter();
+      };
+      mountView(view, `
+        <div class="card" style="margin:0 0 12px">
+          <h2 class="ui-section-title" style="margin:0">All devices</h2>
+          <p class="muted" style="margin:8px 0 0">Thumbnails and quick status. Click a card for full device controls.</p>
+          <div class="inline-form" style="margin-top:12px">
+            <label class="field" style="max-width:min(100%, 360px)">
+              <span>Filter</span>
+              <input type="search" id="allDevFilter" placeholder="id / name / group" autocomplete="off" />
+            </label>
+          </div>
+        </div>
+        <div id="allDevicesGrid" class="device-grid">
+          <p class="muted">Loading…</p>
+        </div>
+      `);
+      const f = $("#allDevFilter", view);
+      if (f) f.addEventListener("input", () => { applyFilter(); });
+      await load();
+      scheduleRouteTicker(routeSeq, "devices-list-live", load, 12000);
+      return;
+    }
     const isSuperViewer = !!(state.me && state.me.role === "superadmin");
 
     let d = await api(`/devices/${encodeURIComponent(id)}`);
