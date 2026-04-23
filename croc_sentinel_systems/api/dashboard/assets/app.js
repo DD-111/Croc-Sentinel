@@ -1866,18 +1866,29 @@
           <button class="btn sm secondary right" id="grpNew">New group</button>
         </div>
         ${state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_manage_users"))) ? `
-        <details class="share-batch-details" style="margin-top:10px">
-          <summary style="cursor:pointer;font-weight:600">Sharing · batch grant</summary>
-          <p class="muted" style="margin:8px 0">Grant device or group access to multiple users at once.</p>
-          <button class="btn sm secondary" type="button" id="grpShareOpen">Open sharing tool…</button>
-        </details>` : ""}
+        <div class="share-global-panel">
+          <div class="share-global-head">
+            <div>
+              <h3 style="margin:0;font-size:14px;font-weight:650">Global sharing</h3>
+              <p class="muted" style="margin:4px 0 0">Batch grants on devices you own, edit existing ACL rows, or open per-group share from the ⇪ button on a card.</p>
+            </div>
+            <div class="share-global-toolbar">
+              <button class="btn sm secondary btn-tap" type="button" id="grpShareRefresh">Refresh list</button>
+              <button class="btn sm btn-tap" type="button" id="grpShareOpen">New grant…</button>
+            </div>
+          </div>
+          <div id="shareGrantsTableWrap" class="share-grants-table mini" style="margin-top:10px">
+            <p class="muted" style="margin:0;padding:8px 0">Loading shares…</p>
+          </div>
+        </div>` : ""}
         <div class="divider"></div>
         <div id="groupCards" class="device-grid"></div>
       </section>
       <div id="shareModal" class="grp-modal" style="display:none">
         <div class="grp-modal-card" style="max-width:760px;width:min(760px,96vw)">
-          <h3 style="margin:0 0 8px">Share devices / group</h3>
+          <h3 style="margin:0 0 8px" id="shareModalTitle">Share devices / group</h3>
           <p class="muted" id="shareTargetHint" style="margin:0 0 10px">Select devices, users, and permissions.</p>
+          <p class="muted" id="shareEditNote" style="margin:0 0 8px;display:none"></p>
           <div class="row" style="gap:10px;align-items:flex-start;flex-wrap:wrap">
             <div style="flex:1;min-width:280px">
               <div class="row" style="justify-content:space-between;align-items:center">
@@ -2004,6 +2015,42 @@
       const sharedFrom = new Set(rows.map((d) => String(d.shared_by || "")).filter(Boolean));
       return Array.from(sharedFrom);
     };
+    /** Grantees that already have an active ACL row on every device in `deviceIds` (batch modal locks these). */
+    const granteesFullyCoveringDevices = (deviceIds, shareItems) => {
+      const ids = (Array.isArray(deviceIds) ? deviceIds : []).map((x) => String(x || "").trim()).filter(Boolean);
+      const n = ids.length;
+      if (!n || !Array.isArray(shareItems)) return new Set();
+      const dset = new Set(ids);
+      const counts = new Map();
+      for (const it of shareItems) {
+        if (it && it.revoked_at) continue;
+        const did = String((it && it.device_id) || "").trim();
+        if (!dset.has(did)) continue;
+        const g = String((it && it.grantee_username) || "").trim();
+        if (!g) continue;
+        counts.set(g, (counts.get(g) || 0) + 1);
+      }
+      const out = new Set();
+      for (const [g, c] of counts) {
+        if (c >= n) out.add(g);
+      }
+      return out;
+    };
+    /** Badge: device-level ACL only — distinguish full card vs partial shared devices (grantee view). */
+    const shareScopeBadgesHtml = (rows) => {
+      const list = Array.isArray(rows) ? rows.filter(Boolean) : [];
+      const n = list.length;
+      if (!n) return "";
+      const sharedRows = list.filter((d) => d && d.is_shared);
+      const sn = sharedRows.length;
+      if (sn === 0) return "";
+      if (sn === n) {
+        const owners = [...new Set(sharedRows.map((d) => String(d.shared_by || "").trim()).filter(Boolean))];
+        const o = owners.length === 1 ? owners[0] : owners.join(", ");
+        return `<span class="badge accent" title="Device-level ACL: every device on this card is shared to you (same notification group)">ACL: full group · ${escapeHtml(o || "?")}</span>`;
+      }
+      return `<span class="badge partial" title="Device-level ACL: only some devices on this card are shared">ACL: partial devices (${sn}/${n})</span>`;
+    };
     const renderDeviceCard = (d) => {
       const on = isOnline(d);
       const primary = escapeHtml(d.display_label || d.device_id || "unknown");
@@ -2036,8 +2083,8 @@
         delay_seconds: 0,
         reboot_self_check: false,
       };
-      const sharedBy = groupSharedBySlot(slot);
-      const isSharedGroup = sharedBy.length > 0;
+      const isSharedGroup = groupSharedBySlot(slot).length > 0;
+      const scopeShareHtml = shareScopeBadgesHtml(rows);
       const modeLabel = String(gs.trigger_mode || "continuous") === "delay"
         ? `delay ${Number(gs.delay_seconds || 0)}s`
         : "continuous";
@@ -2056,24 +2103,23 @@
           Duration: <span class="mono">${escapeHtml(String(gs.trigger_duration_ms || 10000))}ms</span> ·
           Reboot+self-check: <span class="mono">${gs.reboot_self_check ? "yes" : "no"}</span>
         </div>
-        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;align-items:center">
           <span class="badge neutral">total ${total}</span>
           <span class="badge online">online ${on}</span>
           <span class="badge offline">offline ${off}</span>
-          ${isSharedGroup ? `<span class="badge accent" title="shared group">shared by ${escapeHtml(sharedBy.join(", "))}</span>` : ""}
+          ${scopeShareHtml}
         </div>
         <div class="meta">Owner: ${escapeHtml(m.owner_name || "—")} · ${escapeHtml(m.phone || "—")} · ${escapeHtml(m.email || "—")}</div>
-        <div class="row" style="margin-top:8px;gap:6px;flex-wrap:wrap">
-          <button class="btn sm danger js-alert-on" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button">Alarm ON</button>
-          <button class="btn sm secondary js-alert-off" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button">Alarm OFF</button>
-          <details class="toolbar-collapse" style="margin-left:auto;min-width:140px">
-            <summary>Manage</summary>
-            <div class="table-actions">
-              <button class="btn sm secondary js-group-settings" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group follows owner settings\"" : ""}>Settings</button>
-              <button class="btn sm secondary js-edit-group" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group: device membership is read-only\"" : ""}>Edit</button>
-              <button class="btn sm danger js-del-group" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group cannot be deleted\"" : "title=\"Delete group\""}>Delete</button>
-            </div>
-          </details>
+        <div class="group-card-actions">
+          <div class="group-card-actions__alarms">
+            <button class="btn sm danger js-alert-on" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button">Alarm ON</button>
+            <button class="btn sm secondary js-alert-off" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button">Alarm OFF</button>
+          </div>
+          <div class="group-card-actions__manage">
+            <button class="btn sm secondary js-group-settings" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group follows owner settings\"" : ""}>Settings</button>
+            <button class="btn sm secondary js-edit-group" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group: device membership is read-only\"" : ""}>Edit</button>
+            <button class="btn sm danger js-del-group" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group cannot be deleted\"" : "title=\"Delete group\""}>Delete</button>
+          </div>
         </div>
       </article>`;
     };
@@ -2324,71 +2370,246 @@
     const closeGroupModal = () => { grpModalEl.style.display = "none"; };
     let sharePrefillGroup = "";
     let sharePrefillOwner = "";
-    const openShareModal = async (prefillGroup, prefillOwner) => {
+    let shareModalUsersCache = [];
+    let shareModalEditSpec = null;
+    let overviewShareItems = [];
+    let shareDevChangeBound = false;
+
+    const refreshOverviewShareItemsSilently = async () => {
+      if (!(state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_manage_users"))))) return;
+      try {
+        const r = await api("/admin/shares?limit=2000", { timeoutMs: 12000 });
+        overviewShareItems = Array.isArray(r.items) ? r.items.filter((x) => x && !x.revoked_at) : [];
+      } catch (_) { /* keep previous cache */ }
+    };
+
+    const loadOverviewShareGrants = async () => {
+      const wrap = $("#shareGrantsTableWrap", view);
+      if (!wrap) return;
+      if (!(state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_manage_users"))))) return;
+      setChildMarkup(wrap, `<p class="muted" style="margin:0;padding:8px 0">Loading…</p>`);
+      try {
+        const r = await api("/admin/shares?limit=2000", { timeoutMs: 22000 });
+        overviewShareItems = Array.isArray(r.items) ? r.items.filter((x) => x && !x.revoked_at) : [];
+        const rows = [...overviewShareItems].sort((a, b) => {
+          const c = String(a.device_id || "").localeCompare(String(b.device_id || ""));
+          return c !== 0 ? c : String(a.grantee_username || "").localeCompare(String(b.grantee_username || ""));
+        });
+        if (!rows.length) {
+          setChildMarkup(wrap, `<p class="muted" style="margin:0;padding:8px 0">No active shares in your scope.</p>`);
+          return;
+        }
+        const body = rows.map((it) => {
+          const did = escapeHtml(String(it.device_id || ""));
+          const gu = escapeHtml(String(it.grantee_username || ""));
+          const v = it.can_view ? "✓" : "—";
+          const o = it.can_operate ? "✓" : "—";
+          return `<tr data-device-id="${did}" data-grantee="${gu}">
+            <td class="mono">${did}</td>
+            <td class="mono">${gu}</td>
+            <td>${v}</td>
+            <td>${o}</td>
+            <td style="white-space:nowrap">
+              <button type="button" class="btn sm secondary js-share-grant-edit">Edit</button>
+              <button type="button" class="btn sm danger js-share-grant-revoke">Revoke</button>
+            </td>
+          </tr>`;
+        }).join("");
+        setChildMarkup(wrap, `<div class="table-wrap"><table class="t"><thead><tr><th>Device</th><th>Grantee</th><th>View</th><th>Operate</th><th>Actions</th></tr></thead><tbody>${body}</tbody></table></div>`);
+      } catch (e) {
+        setChildMarkup(wrap, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
+      }
+    };
+
+    const renderShareUserPickList = () => {
+      const userListEl = $("#shareUserList", view);
+      if (!userListEl) return;
+      const preserve = new Map();
+      $$("input[type='checkbox']", userListEl).forEach((inp) => {
+        const v = String(inp.value || "").trim();
+        if (!inp.disabled && v) preserve.set(v, !!inp.checked);
+      });
+      if (!shareModalUsersCache.length) {
+        setChildMarkup(userListEl, `<p class="muted">No eligible users.</p>`);
+        return;
+      }
+      const selIds = $$("#shareDeviceList input[type='checkbox']", view)
+        .filter((x) => x.checked && !x.disabled)
+        .map((x) => String(x.value || "").trim())
+        .filter(Boolean);
+      const locked = granteesFullyCoveringDevices(selIds, overviewShareItems);
+      const eg = shareModalEditSpec;
+      const editUser = eg ? String(eg.grantee_username || "").trim() : "";
+      setChildMarkup(
+        userListEl,
+        shareModalUsersCache.map((x) => {
+          const u = String(x.username || "").trim();
+          const uname = escapeHtml(u);
+          const role = escapeHtml(x.role || "user");
+          const isEditUser = !!(eg && editUser && u === editUser);
+          const isLocked = !isEditUser && selIds.length > 0 && locked.has(u);
+          const checked = isEditUser ? true : !!preserve.get(u);
+          const dis = isLocked || isEditUser ? "disabled" : "";
+          const lockNote = isLocked ? ` <span class="muted" title="Already has ACL on every selected device">(already shared)</span>` : "";
+          const cls = isLocked ? "grp-pick-item is-grant-locked" : "grp-pick-item";
+          return `<label class="${cls}"><input type="checkbox" value="${uname}" ${checked ? "checked" : ""} ${dis}/> <span>${uname} <span class="mono">(${role})</span>${lockNote}</span></label>`;
+        }).join("") || `<p class="muted">No active admin/user accounts.</p>`,
+      );
+    };
+
+    const openShareModal = async (prefillGroup, prefillOwner, editSpec) => {
       if (!shareModalEl) return;
+      shareModalEditSpec = editSpec && typeof editSpec === "object" ? editSpec : null;
+      const editDid = shareModalEditSpec ? String(shareModalEditSpec.device_id || "").trim() : "";
       sharePrefillGroup = String(prefillGroup || "").trim();
       sharePrefillOwner = String(prefillOwner || "").trim();
       const devListEl = $("#shareDeviceList", view);
       const userListEl = $("#shareUserList", view);
       const hintEl = $("#shareTargetHint", view);
       const statEl = $("#shareBatchStat", view);
+      const titleEl = $("#shareModalTitle", view);
+      const noteEl = $("#shareEditNote", view);
       if (!devListEl || !userListEl || !hintEl || !statEl) return;
       statEl.textContent = "";
-      hintEl.textContent = sharePrefillGroup
-        ? `Group: ${sharePrefillGroup} (you can still adjust selections).`
-        : "Select devices, users, and permissions.";
+      if (titleEl) titleEl.textContent = shareModalEditSpec ? "Edit device share" : "Share devices / group";
+      if (noteEl) {
+        if (shareModalEditSpec) {
+          noteEl.style.display = "block";
+          noteEl.textContent = `Device ${editDid} · grantee ${String(shareModalEditSpec.grantee_username || "")} — adjust permissions and apply.`;
+        } else {
+          noteEl.style.display = "none";
+          noteEl.textContent = "";
+        }
+      }
+      if (shareModalEditSpec) {
+        hintEl.textContent = "Permissions apply to this device–user pair (UPSERT).";
+        const pv = $("#sharePermView", view);
+        const po = $("#sharePermOperate", view);
+        if (pv) pv.checked = !!shareModalEditSpec.can_view;
+        if (po) po.checked = !!shareModalEditSpec.can_operate;
+      } else {
+        hintEl.textContent = sharePrefillGroup
+          ? `Group: ${sharePrefillGroup} (prefilled; adjust as needed).`
+          : "Select devices, users, and permissions. Users already shared on all selected devices are not selectable — use Global sharing → Edit.";
+        const pv = $("#sharePermView", view);
+        const po = $("#sharePermOperate", view);
+        if (pv) pv.checked = true;
+        if (po) po.checked = false;
+      }
       const picked = new Set(
-        sharePrefillGroup
+        sharePrefillGroup && !shareModalEditSpec
           ? groupDeviceIdsFromList(sharePrefillGroup, sharePrefillOwner).map(String)
           : [],
       );
-      setChildMarkup(
-        devListEl,
-        devices
-          .filter((d) => !d.is_shared)
-          .map((d) => `<label class="grp-pick-item"><input type="checkbox" value="${escapeHtml(d.device_id)}" ${picked.has(String(d.device_id)) ? "checked" : ""}/> <span>${escapeHtml(d.display_label || d.device_id)} <span class="mono">(${escapeHtml(d.device_id)})</span></span></label>`)
-          .join("") || `<p class="muted">No own devices available.</p>`,
-      );
+      if (shareModalEditSpec) {
+        const row = devices.find((d) => String(d.device_id) === editDid);
+        const label = row ? `${row.display_label || editDid} (${editDid})` : editDid;
+        setChildMarkup(
+          devListEl,
+          `<label class="grp-pick-item"><input type="checkbox" value="${escapeHtml(editDid)}" checked disabled/> <span>${escapeHtml(label)}</span></label>`,
+        );
+      } else {
+        setChildMarkup(
+          devListEl,
+          devices
+            .filter((d) => !d.is_shared)
+            .map((d) => `<label class="grp-pick-item"><input type="checkbox" value="${escapeHtml(d.device_id)}" ${picked.has(String(d.device_id)) ? "checked" : ""}/> <span>${escapeHtml(d.display_label || d.device_id)} <span class="mono">(${escapeHtml(d.device_id)})</span></span></label>`)
+            .join("") || `<p class="muted">No own devices available.</p>`,
+        );
+      }
+      if (!shareDevChangeBound) {
+        shareDevChangeBound = true;
+        devListEl.addEventListener("change", () => {
+          if (shareModalEl && shareModalEl.style.display === "flex" && !shareModalEditSpec) renderShareUserPickList();
+        });
+      }
+      await refreshOverviewShareItemsSilently();
       setChildMarkup(userListEl, `<p class="muted">Loading users…</p>`);
       try {
         const u = await api("/auth/users", { timeoutMs: 16000 });
-        const users = (u.items || []).filter((x) => {
+        shareModalUsersCache = (u.items || []).filter((x) => {
           const role = String(x.role || "");
           const st = String(x.status || "active");
           if (!(st === "active" || st === "")) return false;
           if (state.me && state.me.role === "admin") return role === "user";
           return role === "admin" || role === "user";
         });
-        setChildMarkup(
-          userListEl,
-          users.map((x) =>
-            `<label class="grp-pick-item"><input type="checkbox" value="${escapeHtml(x.username)}"/> <span>${escapeHtml(x.username)} <span class="mono">(${escapeHtml(x.role || "user")})</span></span></label>`,
-          ).join("") || `<p class="muted">No active admin/user accounts.</p>`,
-        );
+        renderShareUserPickList();
       } catch (e) {
+        shareModalUsersCache = [];
         setChildMarkup(userListEl, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
       }
       const allDev = $("#shareSelAllDevices", view);
       const allUsr = $("#shareSelAllUsers", view);
       if (allDev) {
         allDev.checked = false;
+        allDev.disabled = !!shareModalEditSpec;
         allDev.onchange = () => {
-          $$("#shareDeviceList input[type='checkbox']", view).forEach((x) => { x.checked = !!allDev.checked; });
+          $$("#shareDeviceList input[type='checkbox']:not([disabled])", view).forEach((x) => { x.checked = !!allDev.checked; });
+          if (!shareModalEditSpec) renderShareUserPickList();
         };
       }
       if (allUsr) {
         allUsr.checked = false;
         allUsr.onchange = () => {
-          $$("#shareUserList input[type='checkbox']", view).forEach((x) => { x.checked = !!allUsr.checked; });
+          $$("#shareUserList input[type='checkbox']:not([disabled])", view).forEach((x) => { x.checked = !!allUsr.checked; });
         };
       }
       shareModalEl.style.display = "flex";
     };
-    const closeShareModal = () => { if (shareModalEl) shareModalEl.style.display = "none"; };
+    const closeShareModal = () => {
+      if (shareModalEl) shareModalEl.style.display = "none";
+      shareModalEditSpec = null;
+      const allDev = $("#shareSelAllDevices", view);
+      if (allDev) allDev.disabled = false;
+      const titleEl = $("#shareModalTitle", view);
+      if (titleEl) titleEl.textContent = "Share devices / group";
+      const noteEl = $("#shareEditNote", view);
+      if (noteEl) { noteEl.style.display = "none"; noteEl.textContent = ""; }
+    };
     $("#grpNew", view).addEventListener("click", () => openGroupModal(""));
     $("#gmCancel", view).addEventListener("click", closeGroupModal);
     const grpShareOpenBtn = $("#grpShareOpen", view);
-    if (grpShareOpenBtn) grpShareOpenBtn.addEventListener("click", () => openShareModal(""));
+    if (grpShareOpenBtn) grpShareOpenBtn.addEventListener("click", () => openShareModal("", "", null));
+    const grpShareRefreshBtn = $("#grpShareRefresh", view);
+    if (grpShareRefreshBtn) grpShareRefreshBtn.addEventListener("click", () => loadOverviewShareGrants());
+    const shareGrantsWrap = $("#shareGrantsTableWrap", view);
+    if (shareGrantsWrap) {
+      shareGrantsWrap.addEventListener("click", async (ev) => {
+        const btn = ev.target.closest("button");
+        if (!btn) return;
+        const tr = btn.closest("tr");
+        if (!tr) return;
+        const device_id = tr.getAttribute("data-device-id") || "";
+        const grantee_username = tr.getAttribute("data-grantee") || "";
+        if (!device_id || !grantee_username) return;
+        const row = overviewShareItems.find((x) => String(x.device_id) === device_id && String(x.grantee_username) === grantee_username);
+        if (btn.classList.contains("js-share-grant-edit")) {
+          openShareModal("", "", row ? {
+            device_id: row.device_id,
+            grantee_username: row.grantee_username,
+            can_view: !!Number(row.can_view),
+            can_operate: !!Number(row.can_operate),
+          } : {
+            device_id,
+            grantee_username,
+            can_view: true,
+            can_operate: false,
+          });
+          return;
+        }
+        if (btn.classList.contains("js-share-grant-revoke")) {
+          if (!confirm(`Revoke share for ${grantee_username} on ${device_id}?`)) return;
+          try {
+            await api(`/admin/devices/${encodeURIComponent(device_id)}/share/${encodeURIComponent(grantee_username)}`, { method: "DELETE" });
+            toast("Share revoked", "ok");
+            await loadOverviewShareGrants();
+            await refreshOverviewShareItemsSilently();
+            try { bustDeviceListCaches(); } catch (_) {}
+          } catch (e) { toast(e.message || e, "err"); }
+        }
+      });
+    }
     const shareCancelBtn = $("#shareModalCancel", view);
     if (shareCancelBtn) shareCancelBtn.addEventListener("click", closeShareModal);
     const shareApplyBtn = $("#shareModalApply", view);
@@ -2415,8 +2636,11 @@
         if (fail === 0) {
           toast(`Sharing applied (${ok}/${total})`, "ok");
           closeShareModal();
+          loadOverviewShareGrants();
+          try { bustDeviceListCaches(); } catch (_) {}
         } else {
           toast(`Sharing done with failures (${ok} ok, ${fail} failed)`, "warn");
+          loadOverviewShareGrants();
         }
       });
     }
@@ -2503,7 +2727,7 @@
           if (!(state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_manage_users"))))) {
             toast("No sharing permission", "err"); return;
           }
-          openShareModal(g, slot.tenantOwner);
+          openShareModal(g, slot.tenantOwner, null);
           return;
         }
         if (btn.classList.contains("js-del-group")) {
@@ -2613,6 +2837,9 @@
     };
     scheduleRouteTicker(routeSeq, "overview-live", refreshOverviewLive, OVERVIEW_LIVE_MS);
     renderGroups();
+    if (state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_manage_users")))) {
+      loadOverviewShareGrants();
+    }
   });
 
   registerRoute("group", async (view, args, routeSeq) => {

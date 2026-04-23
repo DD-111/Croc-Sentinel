@@ -488,6 +488,68 @@ body[data-layout="auth"] .view {
   cursor: not-allowed;
 }
 
+/* Group overview cards — aligned action grid */
+.group-card-actions {
+  display: grid;
+  gap: 8px;
+  margin-top: 4px;
+}
+.group-card-actions__alarms {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.group-card-actions__manage {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+@media (max-width: 420px) {
+  .group-card-actions__manage {
+    grid-template-columns: 1fr;
+  }
+}
+.group-card-actions .btn.sm {
+  width: 100%;
+  justify-content: center;
+}
+
+/* Overview — global sharing manager */
+.share-global-panel {
+  margin-top: 12px;
+  padding: 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-muted);
+}
+.share-global-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.share-global-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+.grp-pick-item.is-grant-locked {
+  opacity: 0.55;
+}
+.grp-pick-item.is-grant-locked input:disabled {
+  cursor: not-allowed;
+}
+.share-grants-table.mini table.t {
+  min-width: 0;
+  font-size: 12px;
+}
+.share-grants-table.mini table.t th,
+.share-grants-table.mini table.t td {
+  padding: 6px 8px;
+}
+
 /* Cards & layout */
 .card {
   background: var(--bg-elev);
