@@ -2807,7 +2807,7 @@ class ScheduleRebootRequest(BaseModel):
 
 class BulkAlertRequest(BaseModel):
     action: str = Field(pattern="^(on|off)$")
-    duration_ms: int = Field(default=8000, ge=500, le=120000)
+    duration_ms: int = Field(default=8000, ge=500, le=300000)
     device_ids: list[str] = Field(default_factory=list)
 
 
@@ -2821,7 +2821,7 @@ class TriggerPolicyBody(BaseModel):
     panic_link_enabled: bool = True
     remote_silent_link_enabled: bool = True
     remote_loud_link_enabled: bool = True
-    remote_loud_duration_ms: int = Field(default=10000, ge=500, le=120000)
+    remote_loud_duration_ms: int = Field(default=10000, ge=500, le=300000)
     fanout_exclude_self: bool = True
 
 
@@ -4993,6 +4993,31 @@ def _close_admin_tenant_cur(
     return summary
 
 
+def _try_mqtt_unclaim_reset(device_id: str) -> bool:
+    """Best-effort: device clears WiFi + claim NVS (keeps factory serial) before we delete creds in DB."""
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM provisioned_credentials WHERE device_id = ?", (device_id,))
+        has = cur.fetchone() is not None
+        conn.close()
+    if not has:
+        return False
+    try:
+        publish_command(
+            f"{TOPIC_ROOT}/{device_id}/cmd",
+            "unclaim_reset",
+            {},
+            device_id,
+            CMD_PROTO,
+            get_cmd_key_for_device(device_id),
+        )
+        return True
+    except Exception as exc:
+        logger.warning("unclaim_reset MQTT not delivered for %s: %s", device_id, exc)
+        return False
+
+
 def _device_delete_reset_impl(
     device_id: str,
     principal: Principal,
@@ -5011,6 +5036,7 @@ def _device_delete_reset_impl(
             assert_device_owner(principal, device_id)
     else:
         assert_device_owner(principal, device_id)
+    nvs_purge_sent = _try_mqtt_unclaim_reset(device_id)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -5051,6 +5077,7 @@ def _device_delete_reset_impl(
         device_id,
         {
             "mac_nocolon": mac_nocolon or "",
+            "nvs_purge_mqtt": nvs_purge_sent,
             "deleted_credentials": del_cred,
             "deleted_owner": del_owner,
             "deleted_acl": del_acl,
@@ -5065,6 +5092,8 @@ def _device_delete_reset_impl(
         "device_id": device_id,
         "mode": "factory_unclaim" if super_unclaim else "delete_reset",
         "factory_unclaimed": super_unclaim,
+        "nvs_purge_sent": nvs_purge_sent,
+        "nvs_purge_note": "When true, device received unclaim_reset to clear WiFi+claim in NVS (reboots). If false, device was offline: clear WiFi manually (wifi_clear) or reflash; deploy API from this build first.",
     }
 
 
@@ -5446,7 +5475,7 @@ class DeviceProfileBody(BaseModel):
 
 class GroupCardSettingsBody(BaseModel):
     trigger_mode: str = Field(default="continuous", pattern="^(continuous|delay)$")
-    trigger_duration_ms: int = Field(default=10000, ge=500, le=120000)
+    trigger_duration_ms: int = Field(default=10000, ge=500, le=300000)
     delay_seconds: int = Field(default=0, ge=0, le=3600)
     reboot_self_check: bool = False
 
@@ -7120,7 +7149,7 @@ def get_wifi_provision_task(
 @app.post("/devices/{device_id}/alert/on")
 def device_alert_on(
     device_id: str,
-    duration_ms: int = Query(default=8000, ge=500, le=120000),
+    duration_ms: int = Query(default=8000, ge=500, le=300000),
     request: Request = None,
     principal: Principal = Depends(require_principal),
 ) -> dict[str, Any]:
@@ -8149,7 +8178,7 @@ def _telegram_cmd_handle_text(principal: Principal, text: str) -> str:
         duration_ms = 10000
         if len(parts) >= 4 and parts[3].isdigit():
             duration_ms = int(parts[3])
-        duration_ms = max(500, min(duration_ms, 120000))
+        duration_ms = max(500, min(duration_ms, 300000))
         ids = _telegram_parse_targets(target_token)
         cap = "tg_siren_on"
         sent, total = _telegram_cmd_publish(principal, "siren_on", {"duration_ms": duration_ms}, ids, cap)

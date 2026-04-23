@@ -1441,6 +1441,24 @@ T clampParam(T val, T lo, T hi) { return (val < lo) ? lo : (val > hi) ? hi : val
 //  Command execution
 // ═══════════════════════════════════════════════
 
+// Wipe everything written by claim/bootstrap/wifi_config + runtime tuneables, but
+// keep factory "serial" in NVS (if burned) for factory_devices re-use.
+static void performUnclaimNvsPurge() {
+  static const char *kUnclaim[] = {
+    "prov", "dev_id", "mqtt_u", "mqtt_p", "cmd_key", "qr_code", "zone", "acc_sn",
+    "wifi_sta_ssid", "wifi_sta_pass",
+    "ota_pend", "ota_fail", "ota_tgt", "ota_cid",
+    "rb_arm", "rb_ep",
+    "boot_cnt", "hb_ms", "st_ms", "sir_ms", "rssi_t", "vbat_t",
+  };
+  prefs.begin(NVS_NAMESPACE, false);
+  for (size_t i = 0; i < sizeof(kUnclaim) / sizeof(kUnclaim[0]); i++) {
+    prefs.remove(kUnclaim[i]);
+  }
+  prefs.end();
+  logLine("[nvs] unclaim_reset: provision + WiFi cleared (serial key not touched)");
+}
+
 void executeCommand(const char *cmd, JsonVariant params) {
   const char *resolvedCmd = cmd;
   if (strcmp(cmd, "set_params") == 0) resolvedCmd = "set_param";
@@ -1604,6 +1622,19 @@ void executeCommand(const char *cmd, JsonVariant params) {
     scheduledRebootEpoch = 0;
     persistScheduledRebootIfNeeded();
     requestRestartWithAck(resolvedCmd, "factory reset");
+    return;
+  }
+
+  if (strcmp(resolvedCmd, "unclaim_reset") == 0) {
+    performUnclaimNvsPurge();
+    scheduledRebootArmed = false;
+    scheduledRebootEpoch = 0;
+    persistScheduledRebootIfNeeded();
+    if (mqttClient.connected()) {
+      mqttClient.disconnect();
+      delay(50);
+    }
+    requestRestartWithAck(resolvedCmd, "unclaim_reset");
     return;
   }
 
@@ -1798,6 +1829,7 @@ void publishCommandTable() {
   arr.add("assign_id");
   arr.add("reset_id");
   arr.add("factory_reset");
+  arr.add("unclaim_reset");
 #if OTA_ENABLED
   arr.add("ota");
 #endif

@@ -1874,7 +1874,7 @@
         <div class="grp-modal-card">
           <h3 style="margin:0 0 8px">Group trigger settings</h3>
           <p class="muted" id="gsKeyLabel" style="margin:0 0 10px"></p>
-          <label class="field"><span>Trigger duration (ms)</span><input id="gsDuration" type="number" min="500" max="120000" step="100" /></label>
+          <label class="field"><span>Trigger duration (ms)</span><input id="gsDuration" type="number" min="500" max="300000" step="100" /></label>
           <label class="field field--spaced"><span>Trigger mode</span>
             <select id="gsMode">
               <option value="continuous">Continuous trigger</option>
@@ -2042,8 +2042,8 @@
       const duration = parseInt($("#gsDuration", view).value, 10);
       const delay = parseInt($("#gsDelay", view).value, 10);
       const reboot = !!$("#gsReboot", view).checked;
-      if (!Number.isFinite(duration) || duration < 500 || duration > 120000) {
-        throw new Error("Trigger duration must be 500-120000 ms");
+      if (!Number.isFinite(duration) || duration < 500 || duration > 300000) {
+        throw new Error("Trigger duration must be 500-300000 ms");
       }
       if (!Number.isFinite(delay) || delay < 0 || delay > 3600) {
         throw new Error("Delay seconds must be 0-3600");
@@ -3009,7 +3009,7 @@
             <label class="field"><span>Remote silent link</span><input type="checkbox" id="tpSilentLink" /></label>
             <label class="field"><span>Remote loud link</span><input type="checkbox" id="tpLoudLink" /></label>
             <label class="field"><span>Exclude self</span><input type="checkbox" id="tpExcludeSelf" /></label>
-            <label class="field"><span>Loud duration (ms)</span><input id="tpLoudDur" type="number" min="500" max="120000" value="10000" /></label>
+            <label class="field"><span>Loud duration (ms)</span><input id="tpLoudDur" type="number" min="500" max="300000" value="10000" /></label>
             <div class="row wide" style="justify-content:flex-end">
               <button class="btn secondary btn-tap" type="button" id="tpRefresh">Refresh policy</button>
               <button class="btn btn-tap" type="button" id="tpSave">Save policy</button>
@@ -3121,12 +3121,13 @@
         const typed = String(prompt(`Type device ID to confirm delete/reset:\n${id}`) || "").trim();
         if (typed.toUpperCase() !== String(id).toUpperCase()) { toast("Confirmation mismatch", "err"); return; }
         try {
-          await api(`/devices/${encodeURIComponent(id)}/delete-reset`, {
+          const dr = await api(`/devices/${encodeURIComponent(id)}/delete-reset`, {
             method: "POST",
             body: { confirm_text: typed },
           });
           bustDeviceListCaches();
-          toast("Device deleted/reset. Re-add from Activate flow.", "ok");
+          const okNv = dr && (dr.nvs_purge_sent === true);
+          toast(`Device removed from account.${okNv ? " Device cleared WiFi+claim in NVS (rebooting)." : " If it was offline, use WiFi clear or reflash; deploy latest API+firmware to auto-clear on delete."} Re-add from Activate.`, "ok");
           location.hash = "#/overview";
         } catch (e) { toast(e.message || e, "err"); }
       });
@@ -3142,12 +3143,16 @@
         const typed = String(prompt(`Type device ID to confirm factory-unregister:\n${id}`) || "").trim();
         if (typed.toUpperCase() !== String(id).toUpperCase()) { toast("Confirmation mismatch", "err"); return; }
         try {
-          await api(`/devices/${encodeURIComponent(id)}/factory-unregister`, {
+          const fr = await api(`/devices/${encodeURIComponent(id)}/factory-unregister`, {
             method: "POST",
             body: { confirm_text: typed },
           });
           bustDeviceListCaches();
-          toast("Device rolled back to unregistered (serial preserved).", "ok");
+          const okNv = fr && (fr.nvs_purge_sent === true);
+          toast(
+            `Server: unclaimed / factory list updated.${okNv ? " Board received unclaim_reset (WiFi+creds cleared, rebooting)." : " If the board was offline, WiFi may still be in NVS — use WiFi clear, or flash API+firmware with unclaim_reset."} Serial in factory table preserved.`,
+            "ok",
+          );
           location.hash = "#/overview";
         } catch (e) { toast(e.message || e, "err"); }
       });
@@ -3303,8 +3308,8 @@
       tpSave.addEventListener("click", async () => {
         try {
           const duration = parseInt((tpLoudDur && tpLoudDur.value) || "10000", 10);
-          if (!Number.isFinite(duration) || duration < 500 || duration > 120000) {
-            throw new Error("Loud duration must be 500-120000 ms");
+          if (!Number.isFinite(duration) || duration < 500 || duration > 300000) {
+            throw new Error("Loud duration must be 500-300000 ms");
           }
           if (tpStatus) tpStatus.textContent = "Saving policy…";
           await api(`/devices/${encodeURIComponent(id)}/trigger-policy`, {
@@ -3425,7 +3430,7 @@
             <select id="action"><option value="on">ON</option><option value="off">OFF</option></select>
           </label>
           <label class="field"><span>Duration (ms)</span>
-            <input id="dur" type="number" value="10000" min="500" max="120000" />
+            <input id="dur" type="number" value="10000" min="500" max="300000" />
           </label>
           <label class="field wide"><span>Targets (empty = all visible)</span>
             <select id="targets" multiple size="6"></select>
