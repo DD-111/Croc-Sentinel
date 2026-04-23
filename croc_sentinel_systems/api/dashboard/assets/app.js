@@ -2958,10 +2958,11 @@
           <span class="device-drawer__hint muted">Server · group scope · expand</span>
         </summary>
         <div class="device-drawer__body">
-          <p class="muted" style="margin:0 0 10px">Scope: owner account + group <span class="mono">${escapeHtml(d.notification_group || "(default)")}</span>. Controls remote linkage behavior.</p>
+          <p class="muted" style="margin:0 0 10px">Scope: owner account + group <span class="mono">${escapeHtml(d.notification_group || "(default)")}</span>. Siblings = same tenant + same <span class="mono">notification_group</span> (+ zone match). Remote #1 = silent linkage; #2 = loud to siblings only; panic = local siren + optional sibling fan-out.</p>
           ${can("can_send_command") ? `
           <div class="inline-form" style="margin-top:4px;gap:12px;flex-wrap:wrap">
             <label class="field"><span>Panic local siren</span><input type="checkbox" id="tpPanicLocal" /></label>
+            <label class="field"><span>Panic sibling link</span><input type="checkbox" id="tpPanicLink" /></label>
             <label class="field"><span>Remote silent link</span><input type="checkbox" id="tpSilentLink" /></label>
             <label class="field"><span>Remote loud link</span><input type="checkbox" id="tpLoudLink" /></label>
             <label class="field"><span>Exclude self</span><input type="checkbox" id="tpExcludeSelf" /></label>
@@ -3229,18 +3230,20 @@
     }
 
     const tpPanicLocal = $("#tpPanicLocal");
+    const tpPanicLink = $("#tpPanicLink");
     const tpSilentLink = $("#tpSilentLink");
     const tpLoudLink = $("#tpLoudLink");
     const tpExcludeSelf = $("#tpExcludeSelf");
     const tpLoudDur = $("#tpLoudDur");
     const tpStatus = $("#tpStatus");
     const loadTriggerPolicy = async () => {
-      if (!tpPanicLocal || !tpSilentLink || !tpLoudLink || !tpExcludeSelf || !tpLoudDur) return;
+      if (!tpPanicLocal || !tpPanicLink || !tpSilentLink || !tpLoudLink || !tpExcludeSelf || !tpLoudDur) return;
       try {
         if (tpStatus) tpStatus.textContent = "Loading policy…";
         const r = await api(`/devices/${encodeURIComponent(id)}/trigger-policy`, { timeoutMs: 16000 });
         const p = r.policy || {};
         tpPanicLocal.checked = !!p.panic_local_siren;
+        if (tpPanicLink) tpPanicLink.checked = p.panic_link_enabled !== false;
         tpSilentLink.checked = !!p.remote_silent_link_enabled;
         tpLoudLink.checked = !!p.remote_loud_link_enabled;
         tpExcludeSelf.checked = !!p.fanout_exclude_self;
@@ -3265,6 +3268,7 @@
             method: "PUT",
             body: {
               panic_local_siren: !!(tpPanicLocal && tpPanicLocal.checked),
+              panic_link_enabled: !!(tpPanicLink && tpPanicLink.checked),
               remote_silent_link_enabled: !!(tpSilentLink && tpSilentLink.checked),
               remote_loud_link_enabled: !!(tpLoudLink && tpLoudLink.checked),
               fanout_exclude_self: !!(tpExcludeSelf && tpExcludeSelf.checked),

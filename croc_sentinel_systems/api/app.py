@@ -898,6 +898,7 @@ def init_db() -> None:
         ensure_column(conn, "role_policies", "tg_siren_off", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "role_policies", "tg_test_single", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "role_policies", "tg_test_bulk", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "trigger_policies", "panic_link_enabled", "INTEGER NOT NULL DEFAULT 1")
         cur.execute("UPDATE dashboard_users SET status='active' WHERE status IS NULL OR status = ''")
         cur.execute("SELECT mac_nocolon, COUNT(*) AS c FROM provisioned_credentials GROUP BY mac_nocolon HAVING c > 1")
         dup = cur.fetchone()
@@ -1760,11 +1761,17 @@ def _tenant_siblings(
     source_group: str = "",
     include_source: bool = False,
 ) -> list[tuple[str, str]]:
-    """Siblings in the same tenant to fan out an alarm to.
+    """Devices that receive group fan-out commands ("siblings") for this source_id.
 
-    Returns list of (device_id, zone). Excludes revoked devices. If
-    ALARM_FANOUT_SELF is false, the source is also excluded (default: the
-    source device already sounded its siren locally).
+    Selection: same ``owner_admin``, not revoked, optional matching ``source_zone``
+    (unless zone is ``all``/``*``), and **must match** ``notification_group`` on
+    ``device_state`` when the triggering device belongs to a non-empty group.
+
+    Non-siblings (other tenants, empty/wrong group string, revoked) are never targeted.
+
+    ``include_source``: when False (default), the originating ``source_id`` is omitted
+    from the list (typical for remote loud / panic where the originator uses local GPIO
+    or silent-only behaviour).
     """
     with db_lock:
         conn = get_conn()
@@ -1933,6 +1940,8 @@ def _device_notify_labels(device_id: str) -> tuple[str, str]:
 def _trigger_policy_defaults() -> dict[str, Any]:
     return {
         "panic_local_siren": True,
+        # MQTT fan-out of panic_button to same-group siblings (independent of remote loud link).
+        "panic_link_enabled": True,
         "remote_silent_link_enabled": True,
         "remote_loud_link_enabled": True,
         "remote_loud_duration_ms": int(ALARM_FANOUT_DURATION_MS),
@@ -1951,7 +1960,8 @@ def _trigger_policy_for(owner_admin: Optional[str], scope_group: str) -> dict[st
         cur.execute(
             """
             SELECT panic_local_siren, remote_silent_link_enabled, remote_loud_link_enabled,
-                   remote_loud_duration_ms, fanout_exclude_self
+                   remote_loud_duration_ms, fanout_exclude_self,
+                   panic_link_enabled
             FROM trigger_policies
             WHERE owner_admin = ? AND scope_group = ?
             """,
@@ -1966,6 +1976,7 @@ def _trigger_policy_for(owner_admin: Optional[str], scope_group: str) -> dict[st
     base["remote_loud_link_enabled"] = bool(row["remote_loud_link_enabled"])
     base["remote_loud_duration_ms"] = int(row["remote_loud_duration_ms"] or ALARM_FANOUT_DURATION_MS)
     base["fanout_exclude_self"] = bool(row["fanout_exclude_self"])
+    base["panic_link_enabled"] = bool(row["panic_link_enabled"])
     return base
 
 
@@ -2444,10 +2455,12 @@ def _fan_out_alarm(device_id: str, payload: dict[str, Any]) -> None:
     """Called from the MQTT thread when an `alarm.trigger` event arrives.
 
     Steps:
-      1. Determine owner_admin (tenant).
-      2. Find sibling devices with the same owner_admin (revoked excluded).
-      3. Publish siren_on command to each sibling, with that device's cmd_key.
-      4. Insert alarm record, queue email to the tenant's recipients.
+      1. Resolve ``owner_admin`` and this device's ``notification_group`` / zone (sibling scope).
+      2. Apply policy: remote silent vs loud vs panic use different linkage toggles.
+      3. Build target list: **siblings only** for ``remote_loud_button`` and
+         ``remote_silent_button`` (never MQTT the transmitting unit). For ``panic_button``,
+         MQTT **siblings** only; the pressing unit relies on firmware local siren.
+      4. Publish per-target ``siren_on`` or ``alarm_signal``, insert alarm row, queue email.
     """
     source_zone = str(payload.get("source_zone") or "all")
     local_trigger = bool(payload.get("local_trigger"))
@@ -2477,19 +2490,31 @@ def _fan_out_alarm(device_id: str, payload: dict[str, Any]) -> None:
         "remote_silent_button",
         "network",
         "group_link",
+        "panic_button",
     )
     if triggered_by == "remote_silent_button" and not bool(policy.get("remote_silent_link_enabled", True)):
         should_fanout = False
+    # Remote "loud" pathways only (not panic — panic has its own toggle).
     if triggered_by in ("remote_button", "remote_loud_button", "network", "group_link") and not bool(
         policy.get("remote_loud_link_enabled", True)
     ):
         should_fanout = False
+    if triggered_by == "panic_button" and not bool(policy.get("panic_link_enabled", True)):
+        should_fanout = False
+
+    # Who receives MQTT commands: siblings in the same tenant + notification_group (+ zone).
+    # Remote #1 silent / #2 loud: never command the originating device.
+    # Panic: MQTT to siblings only; originator sounds via firmware TRIGGER_SELF_SIREN.
+    include_source = not bool(policy.get("fanout_exclude_self", True))
+    if triggered_by in ("remote_button", "remote_loud_button", "remote_silent_button", "panic_button"):
+        include_source = False
+
     targets = _tenant_siblings(
         owner_admin,
         device_id,
         source_zone=source_zone,
         source_group=source_group,
-        include_source=not bool(policy.get("fanout_exclude_self", True)),
+        include_source=include_source,
     ) if should_fanout else []
     sent = 0
     failures: list[str] = []
@@ -2793,6 +2818,7 @@ class ProvisionWifiTaskRequest(BaseModel):
 
 class TriggerPolicyBody(BaseModel):
     panic_local_siren: bool = True
+    panic_link_enabled: bool = True
     remote_silent_link_enabled: bool = True
     remote_loud_link_enabled: bool = True
     remote_loud_duration_ms: int = Field(default=10000, ge=500, le=120000)
@@ -6928,14 +6954,16 @@ def save_device_trigger_policy(
             """
             INSERT INTO trigger_policies (
                 owner_admin, scope_group, panic_local_siren, remote_silent_link_enabled,
-                remote_loud_link_enabled, remote_loud_duration_ms, fanout_exclude_self, updated_by, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                remote_loud_link_enabled, remote_loud_duration_ms, fanout_exclude_self,
+                panic_link_enabled, updated_by, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(owner_admin, scope_group) DO UPDATE SET
                 panic_local_siren=excluded.panic_local_siren,
                 remote_silent_link_enabled=excluded.remote_silent_link_enabled,
                 remote_loud_link_enabled=excluded.remote_loud_link_enabled,
                 remote_loud_duration_ms=excluded.remote_loud_duration_ms,
                 fanout_exclude_self=excluded.fanout_exclude_self,
+                panic_link_enabled=excluded.panic_link_enabled,
                 updated_by=excluded.updated_by,
                 updated_at=excluded.updated_at
             """,
@@ -6947,6 +6975,7 @@ def save_device_trigger_policy(
                 1 if body.remote_loud_link_enabled else 0,
                 int(body.remote_loud_duration_ms),
                 1 if body.fanout_exclude_self else 0,
+                1 if body.panic_link_enabled else 0,
                 principal.username,
                 now,
             ),

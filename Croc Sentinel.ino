@@ -1350,11 +1350,11 @@ void publishStatus() {
 }
 
 void publishAlarmEvent(const char *triggerKind, bool localSiren) {
-  // NOTE: server-side fan-out model.
-  // Device publishes the alarm only on its own /event topic. The API verifies
-  // ownership (owner_admin) and dispatches siren_on commands to all sibling
-  // devices in the same tenant. This guarantees strict cross-admin isolation
-  // that no shared MQTT credential setup could provide.
+  // Server-only fan-out. The device never MQTT-subscribes to group topics; it only
+  // publishes JSON on its own `/event`. The API resolves **siblings** as devices
+  // sharing the same owner + `notification_group` (+ zone match), excluding revoked IDs.
+  // Mapping: panic_button → local siren optional (TRIGGER_SELF_SIREN) + sibling siren_on;
+  // remote_loud_button → sibling siren_on only; remote_silent_button → sibling alarm_signal.
   StaticJsonDocument<320> doc;
   doc["type"]           = "alarm.trigger";
   doc["source_id"]      = deviceId;
@@ -2083,7 +2083,7 @@ void handleTriggerInput() {
   unsigned long now = millis();
   bool fired = false;
 
-  // Panic button: local response + report.
+  // Panic: immediate local siren (if enabled) + API fans out siren_on to same-group siblings.
   if (now - lastTriggerDirectReadAt >= BUTTON_DEBOUNCE_MS) {
     lastTriggerDirectReadAt = now;
     bool level = (digitalRead(PANIC_BUTTON_GPIO) == HIGH);
@@ -2098,21 +2098,7 @@ void handleTriggerInput() {
     }
   }
 
-  // Remote loud button: report + fanout siren_on to siblings (exclude self by server policy).
-  if (!fired && now - lastTriggerRemoteReadAt >= BUTTON_DEBOUNCE_MS) {
-    lastTriggerRemoteReadAt = now;
-    bool level = (digitalRead(REMOTE_LOUD_BUTTON_GPIO) == HIGH);
-    bool fallingEdge = (triggerRemotePrevLevel && !level);
-    triggerRemotePrevLevel = level;
-    if (fallingEdge && !alarmInCooldown()) {
-      logLine("[trigger] remote_loud_button");
-      publishAlarmEvent("remote_loud_button", false);
-      publishHeartbeatEvent("alarm_remote_loud");
-      fired = true;
-    }
-  }
-
-  // Remote silent button: report + silent fanout (no siren sound).
+  // Remote ① silent: alarm_signal to siblings only (no local siren here).
   if (!fired && now - lastTriggerSilentReadAt >= BUTTON_DEBOUNCE_MS) {
     lastTriggerSilentReadAt = now;
     bool level = (digitalRead(REMOTE_SILENT_BUTTON_GPIO) == HIGH);
@@ -2122,6 +2108,20 @@ void handleTriggerInput() {
       logLine("[trigger] remote_silent_button");
       publishAlarmEvent("remote_silent_button", false);
       publishHeartbeatEvent("alarm_remote_silent");
+      fired = true;
+    }
+  }
+
+  // Remote ② loud: siren_on to siblings only (this unit stays quiet by design).
+  if (!fired && now - lastTriggerRemoteReadAt >= BUTTON_DEBOUNCE_MS) {
+    lastTriggerRemoteReadAt = now;
+    bool level = (digitalRead(REMOTE_LOUD_BUTTON_GPIO) == HIGH);
+    bool fallingEdge = (triggerRemotePrevLevel && !level);
+    triggerRemotePrevLevel = level;
+    if (fallingEdge && !alarmInCooldown()) {
+      logLine("[trigger] remote_loud_button");
+      publishAlarmEvent("remote_loud_button", false);
+      publishHeartbeatEvent("alarm_remote_loud");
       fired = true;
     }
   }
@@ -2209,7 +2209,7 @@ void setup() {
     snprintf(
       tline,
       sizeof(tline),
-      "[boot] panic_btn=%d(%s) remote_loud_btn=%d(%s) remote_silent_btn=%d(%s)",
+      "[boot] panic=%d(%s) rem②_loud=%d(%s) rem①_silent=%d(%s)",
       PANIC_BUTTON_GPIO, triggerDirectPrevLevel ? "HIGH" : "LOW",
       REMOTE_LOUD_BUTTON_GPIO, triggerRemotePrevLevel ? "HIGH" : "LOW",
       REMOTE_SILENT_BUTTON_GPIO, silentIdle
