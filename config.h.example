@@ -313,6 +313,24 @@
 // ── NVS write-wear protection ──
 #define NVS_SAVE_COOLDOWN_MS 10000
 
+// ── Captive Wi-Fi setup (soft AP + browser form; see Croc Sentinel.ino) ──
+// When 0, wrong NVS/mis-provisioned STA cannot be recovered on-device.
+#ifndef WIFI_PROVISION_PORTAL_ENABLED
+#define WIFI_PROVISION_PORTAL_ENABLED 1
+#endif
+#ifndef WIFI_PROVISION_AP_PREFIX
+#define WIFI_PROVISION_AP_PREFIX "CrocSetup"
+#endif
+#ifndef ACCESSORY_SN_MIN_LEN
+#define ACCESSORY_SN_MIN_LEN 1
+#endif
+#ifndef ACCESSORY_SN_ALLOWLIST
+#define ACCESSORY_SN_ALLOWLIST ""
+#endif
+#ifndef ACCESSORY_SN_REQUIRE_MATCH_DEVICE_SERIAL
+#define ACCESSORY_SN_REQUIRE_MATCH_DEVICE_SERIAL 0
+#endif
+
 // ── Bootstrap provisioning ──
 #define BOOTSTRAP_REGISTER_INTERVAL_MS 10000
 #define QR_DEFAULT_PREFIX "CROC"

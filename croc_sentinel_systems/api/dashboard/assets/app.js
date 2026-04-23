@@ -3623,7 +3623,10 @@
 
   // Event Center — global live + historical log stream
   // NOTE: Active stream lives on window.__evSSE (fetch shim); renderRoute closes it on navigation.
-  registerRoute("events", async (view, _args, routeSeq) => {
+  // navTok: capture state.routeSeq up front so nested async (loadHistory, openStream) always see a
+  // defined token even if a minifier / bad edit drops the 3rd handler param (avoids "routeSeq is not defined").
+  registerRoute("events", async (view, _args) => {
+    const navTok = state.routeSeq;
     setCrumb("Events");
     const me = state.me || { username: "", role: "" };
     const isSuper = me.role === "superadmin";
@@ -3787,15 +3790,15 @@
 
     async function loadHistory() {
       try {
-        if (!isRouteCurrent(routeSeq)) return;
+        if (!isRouteCurrent(navTok)) return;
         const p = currentFilters(); p.set("limit", "200");
         const r = await api("/events?" + p.toString(), { timeoutMs: 16000 });
-        if (!isRouteCurrent(routeSeq)) return;
+        if (!isRouteCurrent(navTok)) return;
         buffer = (r.items || []).slice();
         if (evRenderTimer) { clearTimeout(evRenderTimer); evRenderTimer = 0; }
         flushEvRender();
       } catch (e) {
-        if (!isRouteCurrent(routeSeq)) return;
+        if (!isRouteCurrent(navTok)) return;
         const listEl = document.getElementById("evList");
         if (listEl) mountView(listEl, hx`<p class="badge offline">${e.message || e}</p>`);
         toast(e.message || e, "err");
@@ -3824,7 +3827,7 @@
      * Server still emits ping keepalives for buffered proxies.
      */
     function openStream() {
-      if (!isRouteCurrent(routeSeq)) return;
+      if (!isRouteCurrent(navTok)) return;
       closeStream();
       const p = currentFilters();
       p.set("backlog", String(Math.min(100, BUFFER_MAX - buffer.length)));
@@ -3843,11 +3846,11 @@
       window.__evSSE = shim;
 
       const scheduleReconnect = () => {
-        if (!isRouteCurrent(routeSeq) || paused || window.__evReconnectTimer) return;
+        if (!isRouteCurrent(navTok) || paused || window.__evReconnectTimer) return;
         const wait = evReconnectBackoffMs + Math.floor(Math.random() * 480);
         window.__evReconnectTimer = setTimeout(() => {
           window.__evReconnectTimer = 0;
-          if (!isRouteCurrent(routeSeq) || paused) return;
+          if (!isRouteCurrent(navTok) || paused) return;
           openStream();
         }, wait);
         evReconnectBackoffMs = Math.min(8000, Math.floor(evReconnectBackoffMs * 1.5));
@@ -3857,7 +3860,7 @@
         if (!tok) {
           shim.readyState = EventSource.CLOSED;
           const live = $("#evLive");
-          if (live && isRouteCurrent(routeSeq)) {
+          if (live && isRouteCurrent(navTok)) {
             live.textContent = "Offline";
             live.className = "badge offline";
           }
@@ -3874,7 +3877,7 @@
             },
             signal: ac.signal,
           });
-          if (!isRouteCurrent(routeSeq)) return;
+          if (!isRouteCurrent(navTok)) return;
           if (!r.ok) {
             const errText = await r.text().catch(() => "");
             throw new Error(errText || String(r.status));
@@ -3892,16 +3895,16 @@
           }
           await pumpSseBody(r.body.getReader(), ac.signal, (kind, payload) => {
             if (kind === "ping") return;
-            if (!isRouteCurrent(routeSeq)) return;
+            if (!isRouteCurrent(navTok)) return;
             try {
               const ev = JSON.parse(payload);
               if (ev.event_type === "stream.hello") return;
               pushEvent(ev);
             } catch (_) {}
           });
-          if (ac.signal.aborted || !isRouteCurrent(routeSeq)) return;
+          if (ac.signal.aborted || !isRouteCurrent(navTok)) return;
           shim.readyState = EventSource.CLOSED;
-          if (!paused && isRouteCurrent(routeSeq)) {
+          if (!paused && isRouteCurrent(navTok)) {
             evReconnectBackoffMs = 800;
             const live = $("#evLive");
             if (live) {
@@ -3912,14 +3915,14 @@
           }
         } catch (e) {
           if (e && e.name === "AbortError") return;
-          if (!isRouteCurrent(routeSeq)) return;
+          if (!isRouteCurrent(navTok)) return;
           shim.readyState = EventSource.CLOSED;
           const live = $("#evLive");
-          if (live && isRouteCurrent(routeSeq)) {
+          if (live && isRouteCurrent(navTok)) {
             live.textContent = "Reconnecting…";
             live.className = "badge offline";
           }
-          if (!paused && isRouteCurrent(routeSeq)) scheduleReconnect();
+          if (!paused && isRouteCurrent(navTok)) scheduleReconnect();
         }
       };
       void run();
@@ -3938,12 +3941,12 @@
     $("#evReload").addEventListener("click", loadHistory);
     $("#evStats").addEventListener("click", async () => {
       try {
-        if (!isRouteCurrent(routeSeq)) return;
+        if (!isRouteCurrent(navTok)) return;
         const r = await api("/events/stats/by-device?hours=168&limit=200", { timeoutMs: 16000 });
         const items = r.items || [];
         const evStatsBoxEl = $("#evStatsBox", view);
         const evStatsInnerEl = $("#evStatsInner", view);
-        if (!evStatsBoxEl || !evStatsInnerEl || !isRouteCurrent(routeSeq)) return;
+        if (!evStatsBoxEl || !evStatsInnerEl || !isRouteCurrent(navTok)) return;
         evStatsBoxEl.style.display = "block";
         if (items.length === 0) {
           setChildMarkup(evStatsInnerEl, "<p class='muted'>No rows with device_id.</p>");
@@ -3981,7 +3984,7 @@
     openStream();
     window.__eventsStreamResume = () => {
       if (paused) return;
-      if (!isRouteCurrent(routeSeq)) return;
+      if (!isRouteCurrent(navTok)) return;
       openStream();
     };
   });

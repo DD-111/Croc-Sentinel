@@ -76,7 +76,8 @@ void macToDeviceId(char *out, size_t len) {
 // Serial priority order:
 //   1. NVS key "serial"   — burned at factory flashing time (RECOMMENDED for
 //                           production: SN-<16 base32> uploaded to the server's
-//                           factory_devices table).
+//                           factory_devices table). If "serial" is set, it wins
+//                           over "dev_id"; the server's claim device_id should match.
 //   2. NVS key "dev_id"   — assigned by a successful bootstrap claim.
 //   3. DEVICE_ID_MANUAL   — dev/lab builds with DEVICE_ID_AUTO=0.
 //   4. mac-derived fallback "croc-<mac>" — ONLY for pre-factory development.
@@ -260,9 +261,9 @@ static String provPageGate(const String &msg) {
     html += provEsc(msg);
     html += F("</p>");
   }
-  html += F("<form method='post' action='/unlock'>"
+  html += F("<form method='post' action='/unlock' onsubmit=\"var b=this.querySelector('button');b.disabled=true;b.textContent='Verifying…';\">"
             "<label>Accessory SN<br><input name='acc_sn' required maxlength='39' style='width:100%;padding:10px;margin-top:6px'></label>"
-            "<button style='margin-top:12px;padding:10px 14px'>Verify</button></form>"
+            "<button type='submit' style='margin-top:12px;padding:10px 14px'>Verify / 验证</button></form>"
             "</body></html>");
   return html;
 }
@@ -276,10 +277,11 @@ static String provPageWifi(const String &msg) {
     html += provEsc(msg);
     html += F("</p>");
   }
-  html += F("<form method='post' action='/save'>"
+  html += F("<form method='post' action='/save' onsubmit=\"var b=this.querySelector('button');b.disabled=true;b.textContent='Saving, rebooting…';\">"
             "<label>SSID<br><input name='ssid' required maxlength='32' style='width:100%;padding:10px;margin-top:6px'></label><br><br>"
             "<label>Password<br><input name='password' maxlength='64' style='width:100%;padding:10px;margin-top:6px'></label><br>"
-            "<button style='margin-top:12px;padding:10px 14px'>Save and reboot</button></form>"
+            "<p style='color:#666;font-size:15px'>After save the page will show <b>Saved</b>, then the device reboots. 保存后会显示 <b>Saved</b> 并重启；若无法连上 Wi-Fi，会再次打开配网热点。</p>"
+            "<button type='submit' style='margin-top:12px;padding:10px 14px'>Save and reboot</button></form>"
             "</body></html>");
   return html;
 }
@@ -353,7 +355,7 @@ static void provisioningPortalStart() {
     p.putString("wifi_sta_pass", pass);
     if (strlen(g_provAccessorySn) > 0) p.putString("acc_sn", g_provAccessorySn);
     p.end();
-    g_provHttp.send(200, "text/html", "<html><body style='font-family:Arial;padding:20px'><h3>Saved</h3><p>Device will reboot and connect to Wi-Fi.</p></body></html>");
+    g_provHttp.send(200, "text/html", "<html><body style='font-family:Arial;padding:20px'><h3>Saved / 已保存</h3><p>Rebooting. If the router password or signal is wrong, the setup AP will start again. 设备正在重启；若 Wi-Fi 连不上，将重新出现配网热点（约数秒内或开机后数秒）。</p></body></html>");
     delay(500);
     ESP.restart();
   });
@@ -762,6 +764,18 @@ bool isAllowedOtaUrl(const char *url) {
   if (!(u.startsWith("http://") || u.startsWith("https://"))) return false;
   if (strlen(OTA_ALLOWED_HOST) == 0) return true;
 
+  /* Also accept http(s)://<authority>/... where authority is exactly
+   * OTA_ALLOWED_HOST (e.g. host, or host:port). Legacy prefix
+   * http://OTA_ALLOWED_HOST/  alone rejected URLs like
+   * http://1.2.3.4:18999/fw/... when OTA_ALLOWED_HOST was "1.2.3.4:18999". */
+  int scheme = u.startsWith("https://") ? 8 : 7;
+  int pathStart = u.indexOf('/', scheme);
+  if (pathStart > scheme) {
+    String auth = u.substring(scheme, pathStart);
+    if (auth == String(OTA_ALLOWED_HOST)) {
+      return true;
+    }
+  }
   String hostHttp  = String("http://") + OTA_ALLOWED_HOST + "/";
   String hostHttps = String("https://") + OTA_ALLOWED_HOST + "/";
   return u.startsWith(hostHttp) || u.startsWith(hostHttps);
@@ -2279,6 +2293,10 @@ void setup() {
     if (!netIf->connected()) {
       logLine("[net] STA join failed this boot (wrong password, AP missing, or RF); will retry in loop");
     }
+  }
+  if (WIFI_PROVISION_PORTAL_ENABLED && !g_provActive && g_wifiMultiApCount > 0 && !netIf->connected()) {
+    logLine("[net] no STA link despite saved credentials: starting provisioning AP now (no 60s wait)");
+    provisioningPortalStart();
   }
 #else
   {
