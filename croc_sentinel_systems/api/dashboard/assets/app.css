@@ -114,6 +114,7 @@ body[data-layout="app"].app-shell > .main {
   padding: 4px 8px 14px;
   border-bottom: 1px solid var(--border);
   position: relative;
+  flex-shrink: 0;
 }
 
 .brand strong { font-size: 15px; letter-spacing: 0.2px; }
@@ -136,13 +137,17 @@ body[data-layout="app"].app-shell > .main {
   min-height: 0;
   overflow: hidden;
 }
+/* Fill remaining sidebar height so links scroll; 0 0 auto was full content height → clipped under .nav overflow:hidden (mobile saw only top + OTA stub). */
 .nav-core {
-  flex: 0 0 auto;
+  flex: 1 1 auto;
   display: flex;
   flex-direction: column;
   gap: 2px;
   min-height: 0;
+  overflow-x: hidden;
   overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
 }
 .nav a {
   display: flex; align-items: center; gap: 10px;
@@ -231,7 +236,14 @@ body[data-auth="ok"] .health-pills {
 .health-pill.warn { border-color: color-mix(in srgb, var(--warn) 50%, var(--border)); color: var(--warn); background: var(--warn-weak); }
 .health-pill.off { opacity: 0.55; }
 
-.sidebar-foot { border-top: 1px solid var(--border); padding-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+.sidebar-foot {
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex-shrink: 0;
+}
 .who { font-size: 12.5px; color: var(--text-muted); padding: 0 8px; word-break: break-all; }
 .sidebar-actions { display: flex; gap: 6px; padding: 0 4px; }
 .sidebar-actions .btn { flex: 1; padding: 6px 8px; font-size: 12.5px; }

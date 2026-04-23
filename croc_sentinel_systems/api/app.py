@@ -1486,6 +1486,28 @@ def _device_access_flags(principal: Principal, device_id: str) -> tuple[bool, bo
     return (owner_view or acl_view or acl_operate), (owner_operate or acl_operate)
 
 
+def _principal_tenant_owns_device(principal: Principal, owner_admin: Optional[str]) -> bool:
+    """True if principal is the registered owning tenant — not an ACL grantee on someone else's device."""
+    if principal.role == "superadmin":
+        return True
+    o = str(owner_admin or "").strip()
+    if not o:
+        return _legacy_unowned_device_scope(principal)
+    if principal.role == "admin":
+        return o == principal.username
+    mgr = get_manager_admin(principal.username) or ""
+    return bool(mgr) and o == mgr
+
+
+def _redact_notification_group_for_principal(
+    principal: Principal, owner_admin: Optional[str], payload: dict[str, Any]
+) -> None:
+    """Hide owner's notification_group in JSON for ACL grantees (device-only sharing)."""
+    if _principal_tenant_owns_device(principal, owner_admin):
+        return
+    payload["notification_group"] = ""
+
+
 def assert_device_view_access(principal: Principal, device_id: str) -> None:
     can_view, _ = _device_access_flags(principal, device_id)
     if not can_view:
@@ -5499,6 +5521,7 @@ def list_devices(principal: Principal = Depends(require_principal)) -> dict[str,
             d.pop("last_heartbeat_json", None)
             d.pop("last_ack_json", None)
             d.pop("last_event_json", None)
+            _redact_notification_group_for_principal(principal, owner_admin, d)
             if principal.role != "superadmin":
                 viewer_admin = principal.username if principal.role == "admin" else (get_manager_admin(principal.username) or "")
                 is_shared = bool(owner_admin) and bool(viewer_admin) and owner_admin != viewer_admin
@@ -5567,6 +5590,7 @@ def get_device(device_id: str, principal: Principal = Depends(require_principal)
         out["is_shared"] = bool(is_shared)
         if is_shared:
             out["shared_by"] = owner_admin
+    _redact_notification_group_for_principal(principal, owner_admin, out)
     out["can_view"] = bool(can_view)
     out["can_operate"] = bool(can_operate)
     return out
@@ -5596,6 +5620,11 @@ def preview_device_siblings(
     group_key = str(row[1] or "").strip()
     assert_zone_for_device(principal, zone)
     owner_admin = _lookup_owner_admin(device_id)
+    if not _principal_tenant_owns_device(principal, owner_admin):
+        raise HTTPException(
+            status_code=403,
+            detail="sibling preview is available to the owning tenant only",
+        )
     targets = _tenant_siblings(
         owner_admin,
         device_id,
@@ -6106,9 +6135,13 @@ def apply_group_card_settings(
                 status_code=400,
                 detail="owner_admin query required (multiple tenants share this group_key)",
             )
+    rows = [r for r in rows if _principal_tenant_owns_device(principal, str(r.get("owner_admin") or ""))]
     targets = [str(r["device_id"]) for r in rows if r.get("device_id")]
     if not targets:
-        raise HTTPException(status_code=404, detail="group has no devices in your scope")
+        raise HTTPException(
+            status_code=404,
+            detail="group has no devices owned by your tenant for this key (shared devices are excluded from group apply)",
+        )
 
     # Settings ownership policy:
     # - own devices => use caller's owner_scope setting
@@ -6306,6 +6339,12 @@ def _apply_device_profile_update(
         )
     assert_min_role(principal, "user")
     assert_device_owner(principal, device_id)
+    row_owner = _lookup_owner_admin(device_id) or ""
+    if body.notification_group is not None and not _principal_tenant_owns_device(principal, row_owner):
+        raise HTTPException(
+            status_code=403,
+            detail="only the owning tenant may change notification_group; shared access is device-scoped",
+        )
     sets: list[str] = []
     args: list[Any] = []
     if body.display_label is not None:
@@ -6416,6 +6455,13 @@ def bulk_patch_device_profile(
         raise HTTPException(status_code=400, detail="set_zone_override and clear_zone_override are mutually exclusive")
     for did in ids:
         assert_device_owner(principal, did)
+        if body.set_notification_group:
+            o = _lookup_owner_admin(did) or ""
+            if not _principal_tenant_owns_device(principal, o):
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"notification_group bulk-set denied for shared device {did} (owner-tenant only)",
+                )
     notif_group = (str(body.notification_group or "").strip() if body.set_notification_group else None)
     zone_override = (str(body.zone_override or "").strip() if body.set_zone_override else None)
     if body.set_zone_override and not zone_override:
@@ -7410,6 +7456,11 @@ def get_device_trigger_policy(device_id: str, principal: Principal = Depends(req
     assert_device_owner(principal, device_id)
     row, owner = _load_device_row_for_task(device_id)
     assert_zone_for_device(principal, str(row.get("zone") or ""))
+    if not _principal_tenant_owns_device(principal, owner):
+        raise HTTPException(
+            status_code=403,
+            detail="trigger policy is managed by the owning tenant only (device share does not include group policy)",
+        )
     group_key = str(row.get("notification_group") or "")
     pol = _trigger_policy_for(owner, group_key)
     return {"ok": True, "device_id": device_id, "scope_group": group_key, "policy": pol}
@@ -7424,6 +7475,11 @@ def save_device_trigger_policy(
     assert_device_command_actor(principal, device_id, check_revoked=False)
     row, owner = _load_device_row_for_task(device_id)
     assert_zone_for_device(principal, str(row.get("zone") or ""))
+    if not _principal_tenant_owns_device(principal, owner):
+        raise HTTPException(
+            status_code=403,
+            detail="trigger policy is managed by the owning tenant only (device share does not include group policy)",
+        )
     group_key = str(row.get("notification_group") or "")
     now = utc_now_iso()
     with db_lock:
@@ -8103,8 +8159,29 @@ def list_activity_signals(
         sig_rows = [dict(r) for r in cur.fetchall()]
         conn.close()
 
+    all_dids = sorted(
+        {str(r.get("device_id") or "").strip() for r in alarm_rows + sig_rows if r.get("device_id")}
+    )
+    owner_by_did: dict[str, str] = {}
+    if all_dids:
+        with db_lock:
+            conn = get_conn()
+            cur = conn.cursor()
+            ph = ",".join(["?"] * len(all_dids))
+            cur.execute(
+                f"SELECT device_id, IFNULL(owner_admin,'') AS owner_admin FROM device_ownership WHERE device_id IN ({ph})",
+                tuple(all_dids),
+            )
+            for owr in cur.fetchall():
+                owner_by_did[str(owr["device_id"])] = str(owr["owner_admin"] or "")
+            conn.close()
+
     merged: list[dict[str, Any]] = []
     for r in alarm_rows:
+        did = str(r["device_id"] or "")
+        ng = str(r.get("notification_group") or "")
+        if did and not _principal_tenant_owns_device(principal, owner_by_did.get(did, "")):
+            ng = ""
         merged.append(
             {
                 "ts": r["created_at"],
@@ -8112,7 +8189,7 @@ def list_activity_signals(
                 "what": "alarm_fanout",
                 "device_id": r["device_id"],
                 "display_label": r["display_label"] or "",
-                "notification_group": r.get("notification_group") or "",
+                "notification_group": ng,
                 "zone": r["zone"] or "",
                 "who": r["actor"],
                 "fanout_count": int(r["fanout_count"] or 0),
@@ -8123,6 +8200,10 @@ def list_activity_signals(
             }
         )
     for r in sig_rows:
+        did = str(r["device_id"] or "")
+        ng = str(r.get("notification_group") or "")
+        if did and not _principal_tenant_owns_device(principal, owner_by_did.get(did, "")):
+            ng = ""
         merged.append(
             {
                 "ts": r["created_at"],
@@ -8130,7 +8211,7 @@ def list_activity_signals(
                 "what": r["kind"],
                 "device_id": r["device_id"],
                 "display_label": r["display_label"] or "",
-                "notification_group": r.get("notification_group") or "",
+                "notification_group": ng,
                 "zone": r["zone"] or "",
                 "who": r["actor"],
                 "fanout_count": int(r["fanout_count"] or 0),

@@ -14,7 +14,7 @@
   };
   const OFFLINE_MS = 90 * 1000;
 
-  /** Sidebar: grouped by function (paths unchanged). */
+  /** Sidebar: grouped by function (paths unchanged). Order: dashboard → live data → fleet actions → integrations & RBAC. */
   const NAV_GROUPS = [
     {
       title: "Dashboard",
@@ -31,23 +31,18 @@
       ],
     },
     {
-      title: "Field ops",
+      title: "Alerts & fleet",
       items: [
         { id: "alerts", label: "Siren", ico: "!", path: "#/alerts", min: "user" },
         { id: "activate", label: "Activate device", ico: "+", path: "#/activate", min: "admin" },
-      ],
-    },
-    {
-      title: "Firmware",
-      items: [
         { id: "ota", label: "OTA", ico: "↑", path: "#/ota", min: "admin" },
       ],
     },
     {
-      title: "Governance",
+      title: "Account & admin",
       items: [
-        { id: "telegram", label: "Telegram", ico: "✆", path: "#/telegram", min: "user" },
         { id: "account", label: "Account", ico: "◍", path: "#/account", min: "user" },
+        { id: "telegram", label: "Telegram", ico: "✆", path: "#/telegram", min: "user" },
         { id: "audit", label: "Audit", ico: "≡", path: "#/audit", min: "admin" },
         { id: "admin", label: "Admin & users", ico: "☼", path: "#/admin", min: "admin" },
       ],
@@ -1879,7 +1874,7 @@
           <div class="share-global-head">
             <div>
               <h3 style="margin:0;font-size:14px;font-weight:650">Global sharing</h3>
-              <p class="muted" style="margin:4px 0 0">Batch grants on devices you own, edit existing ACL rows, or open per-group share from the ⇪ button on a card.</p>
+              <p class="muted" style="margin:4px 0 0"><strong>Device ACL only</strong> — each grant is per device. Grantees do <strong>not</strong> receive your notification groups, group cards, or trigger policy; they use their own tenant groups or single-device workflows. Superadmin-owned groups stay invisible to other tenants unless you share specific devices.</p>
             </div>
             <div class="share-global-toolbar">
               <button class="btn sm secondary btn-tap" type="button" id="grpShareRefresh">Refresh list</button>
@@ -2101,7 +2096,7 @@
         ? `<span class="chip" title="Owning admin">${escapeHtml(slot.tenantOwner)}</span>`
         : "";
       const shareBtn = state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_manage_users")))
-        ? `<button class="group-del-ico js-share-group" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button" title="Share group" style="right:32px">⇪</button>`
+        ? `<button class="group-del-ico js-share-group" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button" title="Share devices in this card (device ACL only — not group secrets)" style="right:32px">⇪</button>`
         : "";
       return `<article class="device-card js-group-card ${selectedGroup === slot.metaKey ? "is-selected" : ""}" data-meta-key="${escapeHtml(slot.metaKey)}" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" style="cursor:pointer;position:relative">
         ${shareBtn}
@@ -2491,15 +2486,15 @@
         }
       }
       if (shareModalEditSpec) {
-        hintEl.textContent = "Permissions apply to this device–user pair (UPSERT).";
+        hintEl.textContent = "Permissions apply to this device–user pair (UPSERT). Group/fleet semantics stay with the owning tenant.";
         const pv = $("#sharePermView", view);
         const po = $("#sharePermOperate", view);
         if (pv) pv.checked = !!shareModalEditSpec.can_view;
         if (po) po.checked = !!shareModalEditSpec.can_operate;
       } else {
         hintEl.textContent = sharePrefillGroup
-          ? `Group: ${sharePrefillGroup} (prefilled; adjust as needed).`
-          : "Select devices, users, and permissions. Users already shared on all selected devices are not selectable — use Global sharing → Edit.";
+          ? `Prefilling devices in “${sharePrefillGroup}” — still device-level ACL only (not a “group share”).`
+          : "Select devices and users. Grants are per-device; recipients never inherit your group keys or group-card settings. Users already fully covered on the current device selection are locked — use Edit in the table.";
         const pv = $("#sharePermView", view);
         const po = $("#sharePermOperate", view);
         if (pv) pv.checked = true;
@@ -3484,12 +3479,13 @@
           </div>
           <div class="card" style="margin:12px 0 0">
             <h3 style="margin:0 0 8px;font-size:13px;color:var(--text-muted)">Notifications</h3>
+            ${d.is_shared ? `<p class="muted" style="margin:0 0 8px">Device share is <strong>device-scoped</strong> only. You cannot see or edit the owner&rsquo;s notification group; use your own tenant group cards or single-device actions.</p>` : ""}
             <div class="row" style="gap:10px;align-items:flex-end;flex-wrap:wrap">
               <label class="field grow"><span>Display name</span>
                 <input id="dispLabel" value="${escapeHtml(d.display_label || "")}" maxlength="80" />
               </label>
               <label class="field grow"><span>Notification group</span>
-                <input id="notifGroup" value="${escapeHtml(d.notification_group || "")}" maxlength="80" placeholder="e.g. Warehouse A" />
+                <input id="notifGroup" value="${escapeHtml(d.notification_group || "")}" maxlength="80" placeholder="e.g. Warehouse A" ${d.is_shared ? "disabled title=\"Owner tenant only\"" : ""} />
               </label>
               <button class="btn secondary btn-tap" type="button" id="saveProfile">Save</button>
             </div>
@@ -3565,6 +3561,16 @@
         </div>
       </details>
 
+      ${d.is_shared ? `
+      <details class="card device-drawer" id="triggerPolicyCard">
+        <summary class="device-drawer__summary">
+          <span class="device-drawer__title">Trigger policy</span>
+          <span class="device-drawer__hint muted">Owner tenant only</span>
+        </summary>
+        <div class="device-drawer__body">
+          <p class="muted" style="margin:0">Sibling / group trigger policy is managed by the <strong>owning tenant</strong> only. Device share does not expose group policy.</p>
+        </div>
+      </details>` : `
       <details class="card device-drawer" id="triggerPolicyCard">
         <summary class="device-drawer__summary">
           <span class="device-drawer__title">Trigger policy</span>
@@ -3587,7 +3593,7 @@
           </div>
           <p class="muted" id="tpStatus" style="margin-top:8px;min-height:1.3em"></p>` : `<p class="muted">Requires <span class="mono">can_send_command</span> and <strong>operate</strong> access on this device.</p>`}
         </div>
-      </details>
+      </details>`}
 
       ${rawCommandDrawer}
 
@@ -3645,15 +3651,17 @@
 
     $("#saveProfile").addEventListener("click", async () => {
       try {
-        const newGroup = ($("#notifGroup").value || "").trim();
+        const body = { display_label: ($("#dispLabel").value || "").trim() };
+        if (!d.is_shared) {
+          body.notification_group = ($("#notifGroup") && $("#notifGroup").value || "").trim();
+        }
         await api(`/devices/${encodeURIComponent(id)}/profile`, {
           method: "PATCH",
-          body: {
-            display_label: ($("#dispLabel").value || "").trim(),
-            notification_group: newGroup,
-          },
+          body,
         });
-        reconcileGroupMetaForDevice(id, newGroup, d.owner_admin);
+        if (!d.is_shared) {
+          reconcileGroupMetaForDevice(id, body.notification_group || "", d.owner_admin);
+        }
         toast("Saved", "ok");
       } catch (e) { toast(e.message || e, "err"); }
     });
