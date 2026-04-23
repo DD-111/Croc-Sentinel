@@ -49,9 +49,11 @@ from email_templates import (
     render_smtp_test_email,
     render_welcome_email,
 )
+from tz_display import iso_timestamp_to_malaysia, malaysia_now_iso
 
 
 def utc_now_iso() -> str:
+    """UTC ISO string for SQLite storage and lexicographic ordering (canonical `ts`)."""
     return datetime.now(timezone.utc).isoformat()
 
 
@@ -579,6 +581,19 @@ def init_db() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS ix_tg_link_tokens_user ON telegram_link_tokens(username)")
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS user_fcm_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                token TEXT NOT NULL,
+                platform TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL,
+                UNIQUE(username, token)
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_user_fcm_tokens_username ON user_fcm_tokens(username)")
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS device_ownership (
                 device_id TEXT PRIMARY KEY,
                 owner_admin TEXT NOT NULL,
@@ -913,6 +928,7 @@ def init_db() -> None:
         # status ∈ pending | active | disabled | awaiting_approval
         ensure_column(conn, "dashboard_users", "status", "TEXT")
         ensure_column(conn, "dashboard_users", "welcome_email_sent", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "dashboard_users", "alarm_push_style", "TEXT NOT NULL DEFAULT 'fullscreen'")
         ensure_column(conn, "role_policies", "tg_view_logs", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "role_policies", "tg_view_devices", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "role_policies", "tg_siren_on", "INTEGER NOT NULL DEFAULT 0")
@@ -1206,6 +1222,7 @@ def emit_event(
     ev: dict[str, Any] = {
         "ts": ts_iso,
         "ts_epoch_ms": ts_ms,
+        "ts_malaysia": iso_timestamp_to_malaysia(ts_iso),
         "level": level,
         "category": category,
         "event_type": event_type,
@@ -1229,6 +1246,120 @@ def emit_event(
     except Exception as exc:
         # Avoid silent failures when Telegram module/env is misconfigured (default log level INFO).
         logger.warning("telegram_notify skipped: %s", exc)
+    try:
+        _maybe_dispatch_fcm_for_ev(ev)
+    except Exception as exc:
+        logger.warning("fcm_notify skipped: %s", exc)
+
+
+def _alarm_severity_bucket(level: str) -> str:
+    lv = (level or "").lower()
+    if lv == "critical":
+        return "HIGH"
+    if lv in ("error", "warn"):
+        return "MEDIUM"
+    return "LOW"
+
+
+def _sound_hint_from_severity(sev: str) -> str:
+    if sev == "HIGH":
+        return "siren"
+    if sev == "MEDIUM":
+        return "beep"
+    return "tone"
+
+
+def _trigger_method_from_ev(ev: dict[str, Any]) -> str:
+    actor = str(ev.get("actor") or "")
+    if actor.startswith("device:"):
+        return "MQTT"
+    if actor.startswith("telegram:"):
+        return "Telegram"
+    return "API"
+
+
+def _maybe_dispatch_fcm_for_ev(ev: dict[str, Any]) -> None:
+    """Tenant-owner FCM: ALARM lane for admin/user; SYSTEM (no siren) if owner row is superadmin."""
+    if str(ev.get("category") or "") != "alarm":
+        return
+    owner = str(ev.get("owner_admin") or "").strip()
+    if not owner:
+        return
+    device_id = str(ev.get("device_id") or "").strip()
+    grp, label = ("", "")
+    if device_id:
+        grp, label = _device_notify_labels(device_id)
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT role, IFNULL(alarm_push_style,'fullscreen') AS alarm_push_style, IFNULL(tenant,'') AS tenant "
+            "FROM dashboard_users WHERE username = ?",
+            (owner,),
+        )
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            return
+        role = str(row["role"] or "")
+        alarm_push_style = str(row["alarm_push_style"] or "fullscreen").strip() or "fullscreen"
+        system_name = str(row["tenant"] or "").strip() or owner
+        cur.execute(
+            "SELECT token, platform FROM user_fcm_tokens WHERE username = ? ORDER BY updated_at DESC",
+            (owner,),
+        )
+        tok_rows = cur.fetchall()
+        conn.close()
+    if not tok_rows:
+        return
+    sev = _alarm_severity_bucket(str(ev.get("level") or "warn"))
+    sound_hint = _sound_hint_from_severity(sev)
+    detail = ev.get("detail") or {}
+    if not isinstance(detail, dict):
+        detail = {}
+    triggered_by = str(
+        detail.get("trigger_kind") or detail.get("client_kind") or ev.get("event_type") or "",
+    ).strip()
+    push_kind = "SYSTEM" if role == "superadmin" else "ALARM"
+    if push_kind == "SYSTEM":
+        sound_hint = "none"
+        alarm_push_style = "heads_up"
+    method = _trigger_method_from_ev(ev)
+    lat = str(detail.get("lat") or detail.get("latitude") or "")
+    lng = str(detail.get("lng") or detail.get("longitude") or "")
+    loc = f"{lat},{lng}" if lat and lng else ""
+    ui_mode = "heads_up" if (push_kind == "SYSTEM" or alarm_push_style == "heads_up") else "fullscreen"
+    base: dict[str, str] = {
+        "push_kind": push_kind,
+        "severity": sev,
+        "sound_hint": sound_hint,
+        "alarm_ui_mode": ui_mode,
+        "event_id": str(int(ev.get("id") or 0)),
+        "event_type": str(ev.get("event_type") or ""),
+        "ts": str(ev.get("ts_malaysia") or iso_timestamp_to_malaysia(str(ev.get("ts") or "")))[:500],
+        "alarm_title": "ALARM",
+        "device_id": device_id,
+        "device_name": (label or device_id)[:200],
+        "system_name": system_name[:200],
+        "group": grp[:120],
+        "triggered_by": (triggered_by or "unknown")[:120],
+        "trigger_method": method[:32],
+        "summary": str(ev.get("summary") or "")[:500],
+        "location": loc[:120],
+    }
+    from fcm_notify import enqueue_alarm_payloads
+
+    out: list[dict[str, str]] = []
+    for tr in tok_rows:
+        tok = str(tr["token"] or "").strip()
+        if not tok:
+            continue
+        rowd = dict(base)
+        rowd["token"] = tok
+        rowd["platform"] = str(tr["platform"] or "")[:32]
+        out.append(rowd)
+    if out:
+        enqueue_alarm_payloads(out)
 
 
 def audit_event(actor: str, action: str, target: str = "", detail: Optional[dict[str, Any]] = None) -> None:
@@ -2961,6 +3092,21 @@ class SelfDeleteRequest(BaseModel):
     acknowledge_admin_tenant_closure: bool = Field(default=False)
 
 
+class FcmTokenRegisterRequest(BaseModel):
+    token: str = Field(min_length=32, max_length=512)
+    platform: str = Field(default="", max_length=32)
+
+
+class FcmTokenDeleteRequest(BaseModel):
+    token: str = Field(min_length=32, max_length=512)
+
+
+class NotificationPrefsPatchRequest(BaseModel):
+    """Mobile alarm presentation: fullscreen (high-urgency) vs heads_up (standard notification)."""
+
+    alarm_push_style: str = Field(pattern="^(fullscreen|heads_up)$")
+
+
 class AdminTenantCloseRequest(BaseModel):
     """Superadmin closes another admin tenant; optional device transfer instead of unclaim."""
 
@@ -3031,6 +3177,13 @@ def _blocking_api_bootstrap_inner() -> None:
         start_telegram_worker()
     except Exception:
         logger.exception("Telegram worker failed to start (check TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_IDS)")
+    try:
+        from fcm_notify import set_invalid_token_handler, start_fcm_worker
+
+        start_fcm_worker()
+        set_invalid_token_handler(_fcm_delete_stale_registration_token)
+    except Exception:
+        logger.exception("FCM worker failed to start (check FCM_SERVICE_ACCOUNT_JSON / FCM_PROJECT_ID)")
     mqtt_worker_stop.clear()
     mqtt_ingest_dropped = 0
     mqtt_worker_thread = threading.Thread(target=_mqtt_ingest_worker, name="mqtt-ingest", daemon=True)
@@ -3041,7 +3194,7 @@ def _blocking_api_bootstrap_inner() -> None:
     scheduler_thread.start()
     logger.info(
         "API started mqtt_host=%s mqtt_port=%s mqtt_tls=%s "
-        "mqtt_tls_verify_hostname=%s db=%s notifier_enabled=%s telegram=%s",
+        "mqtt_tls_verify_hostname=%s db=%s notifier_enabled=%s telegram=%s fcm=%s",
         MQTT_HOST,
         MQTT_PORT,
         MQTT_USE_TLS,
@@ -3049,6 +3202,7 @@ def _blocking_api_bootstrap_inner() -> None:
         DB_PATH,
         notifier.enabled(),
         _telegram_enabled_safe(),
+        _fcm_enabled_safe(),
     )
 
 
@@ -3069,6 +3223,12 @@ def _shutdown_api() -> None:
         from telegram_notify import stop_telegram_worker
 
         stop_telegram_worker()
+    except Exception:
+        pass
+    try:
+        from fcm_notify import stop_fcm_worker
+
+        stop_fcm_worker()
     except Exception:
         pass
     notifier.stop()
@@ -3174,6 +3334,34 @@ def _telegram_enabled_safe() -> bool:
         return bool(telegram_status().get("enabled"))
     except Exception:
         return False
+
+
+def _fcm_enabled_safe() -> bool:
+    try:
+        from fcm_notify import fcm_status
+
+        return bool(fcm_status().get("enabled"))
+    except Exception:
+        return False
+
+
+def _fcm_delete_stale_registration_token(token: str) -> None:
+    """Remove invalid FCM tokens reported by HTTP v1 (404 / unregistered)."""
+    tok = (token or "").strip()
+    if not tok or len(tok) < 32:
+        return
+    try:
+        with db_lock:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute("DELETE FROM user_fcm_tokens WHERE token = ?", (tok,))
+            n = int(cur.rowcount or 0)
+            conn.commit()
+            conn.close()
+        if n:
+            logger.info("fcm removed stale registration token (rows=%s)", n)
+    except Exception as exc:
+        logger.warning("fcm stale token delete failed: %s", exc)
 
 
 def _client_ip(request: Request) -> str:
@@ -4316,13 +4504,122 @@ def auth_login(body: LoginRequest, request: Request) -> dict[str, Any]:
 @app.get("/auth/me")
 def auth_me(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     assert_min_role(principal, "user")
+    alarm_push_style = "fullscreen"
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT IFNULL(alarm_push_style,'fullscreen') AS s FROM dashboard_users WHERE username = ?",
+            (principal.username,),
+        )
+        row = cur.fetchone()
+        conn.close()
+    if row:
+        alarm_push_style = str(row["s"] or "fullscreen").strip() or "fullscreen"
     return {
         "username": principal.username,
         "role": principal.role,
         "zones": principal.zones,
         "policy": get_effective_policy(principal),
         "manager_admin": get_manager_admin(principal.username) if principal.role == "user" else "",
+        "alarm_push_style": alarm_push_style,
     }
+
+
+@app.post("/auth/me/fcm-token")
+def auth_me_fcm_token_register(
+    body: FcmTokenRegisterRequest,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    """Register or refresh one FCM device token for the signed-in user."""
+    assert_min_role(principal, "user")
+    tok = body.token.strip()
+    plat = (body.platform or "").strip().lower()[:32]
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO user_fcm_tokens (username, token, platform, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(username, token) DO UPDATE SET
+              platform = excluded.platform,
+              updated_at = excluded.updated_at
+            """,
+            (principal.username, tok, plat, utc_now_iso()),
+        )
+        conn.commit()
+        conn.close()
+    audit_event(principal.username, "auth.fcm_token.upsert", principal.username, {"platform": plat})
+    return {"ok": True}
+
+
+@app.delete("/auth/me/fcm-token")
+def auth_me_fcm_token_delete(
+    body: FcmTokenDeleteRequest,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    assert_min_role(principal, "user")
+    tok = body.token.strip()
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM user_fcm_tokens WHERE username = ? AND token = ?", (principal.username, tok))
+        n = cur.rowcount
+        conn.commit()
+        conn.close()
+    audit_event(principal.username, "auth.fcm_token.delete", principal.username, {"removed": int(n or 0)})
+    return {"ok": True, "removed": int(n or 0)}
+
+
+@app.post("/auth/me/fcm-token/delete")
+def auth_me_fcm_token_delete_post(
+    body: FcmTokenDeleteRequest,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    """Same as DELETE /auth/me/fcm-token when reverse proxies drop DELETE bodies."""
+    return auth_me_fcm_token_delete(body, principal)
+
+
+@app.get("/auth/me/notification-prefs")
+def auth_me_notification_prefs_get(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "user")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT IFNULL(alarm_push_style,'fullscreen') AS s FROM dashboard_users WHERE username = ?",
+            (principal.username,),
+        )
+        row = cur.fetchone()
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="user not found")
+    return {"alarm_push_style": str(row["s"] or "fullscreen")}
+
+
+@app.patch("/auth/me/notification-prefs")
+def auth_me_notification_prefs_patch(
+    body: NotificationPrefsPatchRequest,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    assert_min_role(principal, "user")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE dashboard_users SET alarm_push_style = ? WHERE username = ?",
+            (body.alarm_push_style, principal.username),
+        )
+        conn.commit()
+        conn.close()
+    audit_event(
+        principal.username,
+        "auth.notification_prefs.patch",
+        principal.username,
+        {"alarm_push_style": body.alarm_push_style},
+    )
+    return {"ok": True, "alarm_push_style": body.alarm_push_style}
 
 
 @app.patch("/auth/me/password")
@@ -4357,7 +4654,7 @@ def auth_me_change_password(body: SelfPasswordChangeRequest, principal: Principa
     audit_event(principal.username, "auth.password.change", principal.username, {})
     if notify_email and notifier.enabled():
         try:
-            ps, pt, ph = render_password_changed_email(username=principal.username, iso_ts=utc_now_iso())
+            ps, pt, ph = render_password_changed_email(username=principal.username, iso_ts=malaysia_now_iso())
             notifier.send_sync([notify_email], ps, pt, ph)
         except Exception:
             logger.warning("password-changed email failed for %s", principal.username, exc_info=True)
@@ -5008,6 +5305,7 @@ def _delete_user_auxiliary_cur(cur: Any, username: str) -> None:
     cur.execute("DELETE FROM device_acl WHERE grantee_username = ?", (username,))
     cur.execute("DELETE FROM telegram_chat_bindings WHERE username = ?", (username,))
     cur.execute("DELETE FROM telegram_link_tokens WHERE username = ?", (username,))
+    cur.execute("DELETE FROM user_fcm_tokens WHERE username = ?", (username,))
     cur.execute("DELETE FROM password_reset_tokens WHERE username = ?", (username,))
     cur.execute("DELETE FROM dashboard_users WHERE username = ?", (username,))
 
@@ -5262,6 +5560,13 @@ def health() -> dict[str, Any]:
         tg = dict(telegram_status())
     except Exception as exc:
         tg = {"enabled": False, "worker_running": False, "error": str(exc)}
+    fcm: dict[str, Any] = {}
+    try:
+        from fcm_notify import fcm_status
+
+        fcm = dict(fcm_status())
+    except Exception as exc:
+        fcm = {"enabled": False, "error": str(exc), "queue_size": 0, "worker_running": False}
     ready = api_ready_event.is_set() and not api_bootstrap_error
     body: dict[str, Any] = {
         "ok": bool(ready),
@@ -5278,6 +5583,7 @@ def health() -> dict[str, Any]:
             "worker_running": notifier.worker_alive(),
         },
         "telegram": tg,
+        "fcm": fcm,
         "ts": int(time.time()),
     }
     if api_bootstrap_error:
@@ -8419,7 +8725,7 @@ def smtp_test(req: SmtpTestRequest, principal: Principal = Depends(require_princ
         raise HTTPException(status_code=400, detail="invalid recipient")
     subject, text, html_body = render_smtp_test_email(
         actor_username=principal.username,
-        iso_ts=utc_now_iso(),
+        iso_ts=malaysia_now_iso(),
         subject_override=req.subject,
     )
     try:
@@ -8450,6 +8756,25 @@ def telegram_admin_status(principal: Principal = Depends(require_principal)) -> 
             "last_send_ok": False,
             "token_hint": "",
             "status_module_error": True,
+        }
+
+
+@app.get("/admin/fcm/status")
+def fcm_admin_status(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "admin")
+    try:
+        from fcm_notify import fcm_status
+
+        return fcm_status()
+    except Exception as exc:
+        logging.getLogger(__name__).exception("fcm_admin_status import or call failed")
+        return {
+            "enabled": False,
+            "project_id": "",
+            "detail": str(exc),
+            "last_error": str(exc),
+            "queue_size": 0,
+            "worker_running": False,
         }
 
 
@@ -9524,6 +9849,7 @@ def list_events(
             r["detail"] = json.loads(raw) if raw else {}
         except Exception:
             r["detail"] = {"_raw": raw}
+        r["ts_malaysia"] = iso_timestamp_to_malaysia(str(r.get("ts") or ""))
     return {"items": rows, "count": len(rows)}
 
 
@@ -9561,7 +9887,9 @@ def export_events_csv(
     def gen():
         buf = io.StringIO()
         w = csv.writer(buf)
-        w.writerow(["id", "ts", "level", "category", "event_type", "actor", "target", "owner_admin", "device_id", "summary", "detail_json"])
+        w.writerow(
+            ["id", "ts", "ts_malaysia", "level", "category", "event_type", "actor", "target", "owner_admin", "device_id", "summary", "detail_json"],
+        )
         yield buf.getvalue()
         buf.seek(0)
         buf.truncate(0)
@@ -9570,6 +9898,7 @@ def export_events_csv(
                 [
                     r["id"],
                     r["ts"],
+                    iso_timestamp_to_malaysia(str(r["ts"] or "")),
                     r["level"],
                     r["category"],
                     r["event_type"],
@@ -9687,12 +10016,15 @@ def events_stream(
     def generator():
         # Initial hello frame — tells the UI which role is connected and
         # flushes any proxy buffering.
+        _hello_now = datetime.now(timezone.utc)
+        _hello_ts = _hello_now.isoformat()
         hello = {
             "event_type": "stream.hello",
             "level": "info",
             "category": "system",
-            "ts": utc_now_iso(),
-            "ts_epoch_ms": int(time.time() * 1000),
+            "ts": _hello_ts,
+            "ts_malaysia": iso_timestamp_to_malaysia(_hello_ts),
+            "ts_epoch_ms": int(_hello_now.timestamp() * 1000),
             "summary": f"connected as {principal.role}",
             "actor": "system",
             "detail": {"role": principal.role, "filters": filters},

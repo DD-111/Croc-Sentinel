@@ -461,13 +461,15 @@
     }
   }
 
+  /** All dashboard clocks: Asia/Kuala_Lumpur (Malaysia, UTC+08, no DST). */
   const MY_TZ = "Asia/Kuala_Lumpur";
+  const MY_OFFSET_HINT = "(UTC+08:00)";
   function fmtTs(v) {
     if (!v) return "—";
     const t = typeof v === "number" ? (v > 1e12 ? v : v * 1000) : Date.parse(v);
     if (!Number.isFinite(t)) return String(v);
     const d = new Date(t);
-    return new Intl.DateTimeFormat("en-CA", {
+    const base = new Intl.DateTimeFormat("en-CA", {
       timeZone: MY_TZ,
       year: "numeric",
       month: "2-digit",
@@ -477,6 +479,7 @@
       second: "2-digit",
       hour12: false,
     }).format(d).replace(",", "");
+    return `${base} ${MY_OFFSET_HINT}`;
   }
 
   function fmtRel(v) {
@@ -927,9 +930,9 @@
       : "Telegram disabled — set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS (numeric chat id; start a chat with the bot first)";
     const mqttTitle = mqConn
       ? (mqDrop > 0
-        ? `MQTT connected, but ingest dropped ${mqDrop} message(s); queue depth=${mqQ}. last_up=${mqLastUp || "—"}`
-        : `MQTT connected; ingest queue depth=${mqQ}. last_up=${mqLastUp || "—"}`)
-      : `MQTT disconnected — check broker/TLS/network. last_down=${mqLastDown || "—"} reason=${mqLastReason || "—"}`;
+        ? `MQTT connected, but ingest dropped ${mqDrop} message(s); queue depth=${mqQ}. last_up=${mqLastUp ? fmtTs(mqLastUp) : "—"}`
+        : `MQTT connected; ingest queue depth=${mqQ}. last_up=${mqLastUp ? fmtTs(mqLastUp) : "—"}`)
+      : `MQTT disconnected — check broker/TLS/network. last_down=${mqLastDown ? fmtTs(mqLastDown) : "—"} reason=${mqLastReason || "—"}`;
     setHtmlIfChanged(el, `
       <span class="health-pill ${mqConn ? (mqDrop > 0 ? "warn" : "ok") : "off"}" title="${escapeHtml(mqttTitle)}">MQTT</span>
       <span class="health-pill ${mailOk ? "ok" : sm.configured ? "warn" : "off"}" title="${escapeHtml(mailTitle)}">MAIL</span>
@@ -3418,7 +3421,7 @@
         return `<article class="audit-item">
           <div class="audit-item-top">
             <div class="audit-time">
-              <span class="audit-ts mono">${escapeHtml((m.ts_received || "").replace("T", " ").replace(/\..*/, ""))}</span>
+              <span class="audit-ts mono">${escapeHtml(fmtTs(m.ts_received))}</span>
               <span class="muted audit-rel">${escapeHtml(fmtRel(m.ts_received))}</span>
             </div>
             <span class="chip">${escapeHtml(m.channel || "—")}</span>
@@ -4188,7 +4191,7 @@
             setChildMarkup(
               resultBox,
               `${drawBadge("ok", "Ready to claim")}
-              <dl class="kv">${kv("Serial", r.serial)}${kv("MAC", r.mac_nocolon)}${kv("Firmware", r.fw || "—")}${kv("Last seen", r.last_seen_at || "—")}</dl>
+              <dl class="kv">${kv("Serial", r.serial)}${kv("MAC", r.mac_nocolon)}${kv("Firmware", r.fw || "—")}${kv("Last seen", r.last_seen_at ? fmtTs(r.last_seen_at) : "—")}</dl>
               <p>${escapeHtml(r.message)}</p>`,
             );
             showClaimForm(r.serial, r.mac_nocolon, raw.startsWith("CROC|") ? raw : "");
@@ -4200,7 +4203,7 @@
             setChildMarkup(
               resultBox,
               `${drawBadge("err", byYou ? "Already yours" : "Already registered")}
-              <dl class="kv">${kv("Serial", r.serial)}${kv("device_id", r.device_id)}${ownerKv}${kv("Claimed at", r.claimed_at)}</dl>
+              <dl class="kv">${kv("Serial", r.serial)}${kv("device_id", r.device_id)}${ownerKv}${kv("Claimed at", r.claimed_at ? fmtTs(r.claimed_at) : "—")}</dl>
               <p class="muted">${escapeHtml(r.message)}</p>
               ${byYou ? `<a class="btn secondary" href="#/devices/${encodeURIComponent(r.device_id)}">Open device</a>` : ""}`,
             );
@@ -4376,7 +4379,7 @@
     }
     function rowHtml(e) {
       const primary = (e.summary && String(e.summary).trim()) || (e.event_type || "—");
-      const tsShort = (e.ts || "").replace("T", " ").replace(/\..*/, "");
+      const tsShort = fmtTs(e.ts_malaysia || e.ts);
       const typeDiffers = e.event_type && String(e.event_type) !== String(primary);
       const extras = eventDetailDedupedRows(
         (e.detail && typeof e.detail === "object" && !Array.isArray(e.detail)) ? e.detail : {},
@@ -5554,7 +5557,7 @@
             const em = a.email_sent ? "queued" : (a.email_detail || "—");
             const fo = a.kind && a.kind.startsWith("bulk") ? String(a.fanout_count || 0) : String(a.fanout_count ?? "—");
             const whoS = a.kind === "device_alarm" ? whoLbl(a.who) : (a.who || "—");
-            const tShort = (a.ts || "").replace("T", " ").replace(/\..*/, "");
+            const tShort = fmtTs(a.ts);
             return `<article class="audit-item">
               <div class="audit-item-top">
                 <div class="audit-time">
@@ -5602,7 +5605,7 @@
         <td><span class="badge ${c.state}">${escapeHtml(c.state)}</span></td>
         <td>${counters || "<span class='muted'>—</span>"}</td>
         <td>${escapeHtml(decLabel)}</td>
-        <td>${escapeHtml(c.created_at)}</td>
+        <td>${escapeHtml(fmtTs(c.created_at))}</td>
         <td>
           <div class="table-actions">
             <button class="btn sm secondary js-detail" data-id="${escapeHtml(c.id)}">Detail</button>
@@ -5710,7 +5713,7 @@
               campDetailEl,
               `<div class="card">
               <h3>Campaign ${escapeHtml(c.id)}</h3>
-              <p class="muted">FW ${escapeHtml(c.fw_version)} · ${escapeHtml(c.state)} · created ${escapeHtml(c.created_at)}</p>
+              <p class="muted">FW ${escapeHtml(c.fw_version)} · ${escapeHtml(c.state)} · created ${escapeHtml(fmtTs(c.created_at))}</p>
               <p class="mono" style="word-break:break-all">${escapeHtml(c.url)}</p>
               <h4 style="margin:12px 0 4px">Device runs</h4>
               <div class="table-wrap"><table class="t">
@@ -5723,7 +5726,7 @@
                     <td>${escapeHtml(r.target_fw)}</td>
                     <td><span class="badge ${r.state}">${escapeHtml(r.state)}</span></td>
                     <td class="muted" style="max-width:220px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(r.error || "")}</td>
-                    <td>${escapeHtml(r.finished_at || "")}</td>
+                    <td>${escapeHtml(fmtTs(r.finished_at || ""))}</td>
                   </tr>`).join("")}</tbody>
               </table></div>
             </div>`,

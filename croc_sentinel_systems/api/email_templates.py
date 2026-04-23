@@ -168,7 +168,7 @@ def render_smtp_test_email(*, actor_username: str, iso_ts: str, subject_override
     plain = (
         "Croc Sentinel — Mail channel diagnostic\n\n"
         f"This test message was sent by dashboard user: {actor_username}\n"
-        f"UTC time: {iso_ts}\n\n"
+        f"Malaysia time (UTC+08:00): {iso_ts}\n\n"
         "If you can read this, SMTP configuration is working.\n\n"
         "(Automated no-reply)\n"
     )
@@ -190,7 +190,7 @@ def render_smtp_test_email(*, actor_username: str, iso_ts: str, subject_override
         f"<span style='font-family:ui-monospace,Consolas,monospace;font-size:14px;color:#4c1d95'>{actor_e}</span>"
         "</td></tr>"
         "<tr><td style='padding:0 20px 18px;font-size:12px;color:#7e22ce'>"
-        f"<strong>Timestamp (server)</strong><br/><span style='font-family:ui-monospace,Consolas,monospace'>{ts_e}</span>"
+        f"<strong>Timestamp (Malaysia UTC+08)</strong><br/><span style='font-family:ui-monospace,Consolas,monospace'>{ts_e}</span>"
         "</td></tr></table>"
         "<p style='margin:18px 0 0;font-size:13px;color:#64748b;line-height:1.65'>"
         "Use this check after changing <span style='font-family:monospace;font-size:12px'>SMTP_*</span> "
@@ -244,7 +244,7 @@ def render_password_changed_email(*, username: str, iso_ts: str) -> Tuple[str, s
     plain = (
         "Croc Sentinel — Password changed\n\n"
         f"Hello {username},\n\n"
-        f"The password for your account was changed at {iso_ts} (server time).\n\n"
+        f"The password for your account was changed at {iso_ts} (Malaysia UTC+08).\n\n"
         "If you did not make this change, contact your administrator immediately.\n\n"
         "(Automated no-reply)\n"
     )

@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from email.message import EmailMessage
 from typing import Iterable, Optional
 
+from tz_display import iso_timestamp_to_malaysia
+
 
 logger = logging.getLogger("croc-notifier")
 
@@ -190,6 +192,7 @@ def render_alarm_email(alarm: dict) -> tuple[str, str, str]:
     source = alarm.get("source_id") or "?"
     zone = alarm.get("zone") or "all"
     ts = alarm.get("created_at") or ""
+    ts_my = iso_timestamp_to_malaysia(str(ts)) if ts else ""
     fanout = alarm.get("fanout_count")
     grp = str(alarm.get("notification_group") or "").strip()
     disp = str(alarm.get("display_label") or "").strip()
@@ -204,7 +207,7 @@ def render_alarm_email(alarm: dict) -> tuple[str, str, str]:
         f"Display name  : {disp or '—'}",
         f"Zone          : {zone}",
         f"Triggered via : {triggered_by}",
-        f"Time (UTC)    : {ts}",
+        f"Time (MY +08) : {ts_my or ts}",
     ]
     if fanout is not None:
         lines.append(f"Fanned out to : {fanout} sibling device(s)")
@@ -219,7 +222,7 @@ def render_alarm_email(alarm: dict) -> tuple[str, str, str]:
             ("Display name", disp or "—"),
             ("Zone", zone),
             ("Triggered via", triggered_by),
-            ("Time (UTC)", ts),
+            ("Time (Malaysia UTC+08)", ts_my or ts),
             ("Fanned out to", fanout if fanout is not None else "—"),
         )
     )
