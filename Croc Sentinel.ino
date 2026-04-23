@@ -106,6 +106,42 @@ void buildDeviceId() {
 #endif
 }
 
+#if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
+    !defined(CONFIG_IDF_TARGET_ESP32P4)
+// Double external-reset tap: RTC slow memory survives chip EN/RST resets while VDD stays up.
+// Not a time window — two consecutive ESP_RST_EXT boots increment a counter; at 2 we open AP.
+// Cleared on power-on, brownout, or any non-EXT reset reason.
+#define CROC_DBL_EXT_MAGIC 0x43725044u
+RTC_DATA_ATTR static uint32_t s_crocDblExtMagic = 0;
+RTC_DATA_ATTR static uint8_t s_crocDblExtCount = 0;
+static bool g_doubleExtRstProvision = false;
+
+static void crocDoubleExtResetTapUpdate(esp_reset_reason_t rr) {
+  g_doubleExtRstProvision = false;
+  if (rr == ESP_RST_POWERON || rr == ESP_RST_BROWNOUT) {
+    s_crocDblExtMagic = 0;
+    s_crocDblExtCount = 0;
+    return;
+  }
+  if (rr != ESP_RST_EXT) {
+    s_crocDblExtMagic = 0;
+    s_crocDblExtCount = 0;
+    return;
+  }
+  if (s_crocDblExtMagic != CROC_DBL_EXT_MAGIC) {
+    s_crocDblExtMagic = CROC_DBL_EXT_MAGIC;
+    s_crocDblExtCount = 1;
+    return;
+  }
+  s_crocDblExtCount++;
+  if (s_crocDblExtCount >= 2) {
+    g_doubleExtRstProvision = true;
+    s_crocDblExtMagic = 0;
+    s_crocDblExtCount = 0;
+  }
+}
+#endif
+
 // ═══════════════════════════════════════════════
 //  Wi-Fi multi-AP (WiFiMulti): primary + optional WIFI_SSID_2..4 from config.h
 // ═══════════════════════════════════════════════
@@ -205,6 +241,7 @@ static bool g_provUnlocked = false;
 static char g_provAccessorySn[40] = {0};
 static unsigned long g_lastProvStartMs = 0;
 static unsigned long g_lastProvStopMs = 0;
+static bool g_provWifiSavedOk = false;
 static bool g_resetByExternal = false;
 
 static bool isAccessorySnAllowedLocal(const String &snInput) {
@@ -283,7 +320,7 @@ static String provPageWifi(const String &msg) {
   html += F("<form method='post' action='/save' onsubmit=\"var b=this.querySelector('button');b.disabled=true;b.textContent='Saving, rebooting…';\">"
             "<label>SSID<br><input name='ssid' required maxlength='32' style='width:100%;padding:10px;margin-top:6px'></label><br><br>"
             "<label>Password<br><input name='password' maxlength='64' style='width:100%;padding:10px;margin-top:6px'></label><br>"
-            "<p style='color:#666;font-size:15px'>After save the page will show <b>Saved</b>, then the device reboots. 保存后会显示 <b>Saved</b> 并重启；若仍无法连上 Wi-Fi，请按 RESET 再次打开配网热点。</p>"
+            "<p style='color:#666;font-size:15px'>After save the page will show <b>Saved</b>, then the device reboots. 保存后会显示 <b>Saved</b> 并重启；若仍无法连上 Wi-Fi，请按板载 <b>RST</b> 重启后再进配网热点。</p>"
             "<button type='submit' style='margin-top:12px;padding:10px 14px'>Save and reboot</button></form>"
             "</body></html>");
   return html;
@@ -302,6 +339,7 @@ static void provisioningPortalStop() {
 
 static void provisioningPortalStart() {
   if (!WIFI_PROVISION_PORTAL_ENABLED || g_provActive) return;
+  g_provWifiSavedOk = false;
   char apName[40];
   snprintf(apName, sizeof(apName), "%s-%c%c%c%c",
            WIFI_PROVISION_AP_PREFIX,
@@ -359,7 +397,8 @@ static void provisioningPortalStart() {
     p.putString("wifi_sta_pass", pass);
     if (strlen(g_provAccessorySn) > 0) p.putString("acc_sn", g_provAccessorySn);
     p.end();
-    g_provHttp.send(200, "text/html", "<html><body style='font-family:Arial;padding:20px'><h3>Saved / 已保存</h3><p>Rebooting. If Wi-Fi still fails, press RESET to reopen setup AP. 设备正在重启；若仍无法连上 Wi-Fi，请按 RESET 再次打开配网热点。</p></body></html>");
+    g_provWifiSavedOk = true;
+    g_provHttp.send(200, "text/html", "<html><body style='font-family:Arial;padding:20px'><h3>Saved / 已保存</h3><p>Rebooting. If Wi-Fi still fails, press board <b>RST</b> then connect to setup AP again. 设备正在重启；若仍无法连上 Wi-Fi，请按板载 RST 再开热点。</p></body></html>");
     delay(500);
     ESP.restart();
   });
@@ -373,8 +412,13 @@ static void provisioningPortalLoop() {
   if (!g_provActive) return;
   if (WIFI_PROVISION_WINDOW_MS > 0 &&
       (millis() - g_lastProvStartMs) >= (unsigned long)WIFI_PROVISION_WINDOW_MS) {
-    logLine("[wifi] provisioning window elapsed; closing AP and continuing STA retries");
+    logLine("[wifi] provisioning window elapsed; closing AP");
     provisioningPortalStop();
+    if (!g_provWifiSavedOk) {
+      logLine("[wifi] no Wi-Fi save in window; rebooting");
+      delay(150);
+      ESP.restart();
+    }
     return;
   }
   g_provDns.processNextRequest();
@@ -383,7 +427,11 @@ static void provisioningPortalLoop() {
 
 static bool provisioningPortalManualBootAllowed() {
   if (!WIFI_PROVISION_PORTAL_ENABLED) return false;
-  return g_resetByExternal;
+#if WIFI_PROVISION_REQUIRE_DOUBLE_RST
+  return g_doubleExtRstProvision;
+#else
+  return g_resetByExternal || g_doubleExtRstProvision;
+#endif
 }
 #endif
 
@@ -2014,7 +2062,7 @@ void ensureWiFi() {
     wifiBackoffMs = min(wifiBackoffMs * 2UL, (unsigned long)RECONNECT_MAX_MS);
 #if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
     !defined(CONFIG_IDF_TARGET_ESP32P4)
-    // Manual policy: no auto-open. User presses RESET to reopen setup AP.
+    // Manual policy: no auto-open AP here; use board RST (external reset) to open portal on boot.
 #endif
   }
 }
@@ -2257,8 +2305,23 @@ void setup() {
   delay(100);
   setupTaskWatchdogEarly();
 
-  resetReasonStr = decodeResetReason(esp_reset_reason());
-  g_resetByExternal = (strcmp(resetReasonStr, "external") == 0);
+  {
+    esp_reset_reason_t __rr = esp_reset_reason();
+    resetReasonStr = decodeResetReason(__rr);
+#if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
+    !defined(CONFIG_IDF_TARGET_ESP32P4)
+    crocDoubleExtResetTapUpdate(__rr);
+    g_resetByExternal = (__rr == ESP_RST_EXT);
+#if WIFI_PROVISION_RST_INCLUDING_POWERON
+    if (__rr == ESP_RST_POWERON) {
+      g_resetByExternal = true;
+    }
+#endif
+    if (g_doubleExtRstProvision) {
+      logLine("[wifi] double external reset detected: setup AP allowed this boot");
+    }
+#endif
+  }
   buildDeviceId();
 
   pinMode(SIREN_GPIO, OUTPUT);
@@ -2351,9 +2414,13 @@ void setup() {
     !defined(CONFIG_IDF_TARGET_ESP32P4)
   g_wifiMultiRegisterAps();
   if (g_wifiMultiApCount == 0) {
-    logLine("[net] no STA credentials: press RESET to open setup AP window.");
+#if WIFI_PROVISION_REQUIRE_DOUBLE_RST
+    logLine("[net] no STA creds: press board RST twice (while powered) to open setup AP.");
+#else
+    logLine("[net] no STA creds: press board RST once, or twice for double-tap path.");
+#endif
     if (provisioningPortalManualBootAllowed()) {
-      logLine("[net] external reset detected: opening setup AP window");
+      logLine("[net] opening setup AP (manual / double-RST)");
       provisioningPortalStart();
     }
   } else {
@@ -2371,10 +2438,14 @@ void setup() {
   }
   if (g_wifiMultiApCount > 0 && !netIf->connected()) {
     if (provisioningPortalManualBootAllowed()) {
-      logLine("[net] external reset detected: opening setup AP window");
+      logLine("[net] opening setup AP (manual / double-RST)");
       provisioningPortalStart();
     } else {
-      logLine("[net] no STA link: reconnecting saved Wi-Fi only (RESET to open setup AP)");
+#if WIFI_PROVISION_REQUIRE_DOUBLE_RST
+      logLine("[net] no STA link: reconnecting saved Wi-Fi (press RST twice for setup AP).");
+#else
+      logLine("[net] no STA link: reconnecting saved Wi-Fi (RST once or twice for setup AP).");
+#endif
     }
   }
 #else

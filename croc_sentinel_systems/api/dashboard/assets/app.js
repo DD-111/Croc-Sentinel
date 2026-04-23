@@ -4101,6 +4101,7 @@
         const r = await api("/events?" + p.toString(), { timeoutMs: 16000 });
         if (!isRouteCurrent(navTok)) return;
         buffer = (r.items || []).slice();
+        if (buffer.length > BUFFER_MAX) buffer = buffer.slice(0, BUFFER_MAX);
         if (evRenderTimer) { clearTimeout(evRenderTimer); evRenderTimer = 0; }
         flushEvRender();
       } catch (e) {
@@ -4136,7 +4137,8 @@
       if (!isRouteCurrent(navTok)) return;
       closeStream();
       const p = currentFilters();
-      p.set("backlog", String(Math.min(100, BUFFER_MAX - buffer.length)));
+      const slack = Math.max(0, BUFFER_MAX - buffer.length);
+      p.set("backlog", String(Math.min(100, slack)));
       const qs = p.toString();
       const tok = getToken();
       const ac = new AbortController();
