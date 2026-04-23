@@ -51,6 +51,30 @@
 
   const ROLE_WEIGHT = { user: 1, admin: 2, superadmin: 3 };
 
+  const AUTH_UI_REV = "UI rev 2026.04.23";
+  function authSiteFooterHtml() {
+    return `
+      <footer class="site-footer site-footer--auth" aria-label="Page footer">
+        <div class="site-footer__row site-footer__row--auth">
+          <div class="site-footer__brand">
+            <span class="site-footer__name">Croc Sentinel</span>
+            <span class="site-footer__tagline">Secure fleet console · 安全舰队控制台</span>
+          </div>
+          <nav class="site-footer__nav" aria-label="Sign-in help">
+            <a class="site-footer__a" href="#/login">Sign in</a>
+            <a class="site-footer__a" href="#/register">Register</a>
+            <a class="site-footer__a" href="#/forgot-password">Forgot password</a>
+            <a class="site-footer__a" href="#/account-activate">Activate</a>
+          </nav>
+        </div>
+        <div class="site-footer__row site-footer__row--meta">
+          <span class="site-footer__muted">${AUTH_UI_REV}</span>
+          <span class="site-footer__muted" aria-hidden="true">·</span>
+          <span class="site-footer__muted">ESA Secure Platform · Malaysia time (UTC+08)</span>
+        </div>
+      </footer>`;
+  }
+
   // ------------------------------------------------------------------ state
   const state = {
     me: null,
@@ -1105,7 +1129,6 @@
   registerRoute("login", async (view) => {
     setCrumb("Sign in");
     document.body.dataset.auth = "none";
-    const AUTH_UI_REV = "UI rev 2026.04.22";
     const cleanAuthMessage = (raw) => {
       const s = String(raw || "").trim();
       if (!s) return "Request failed. Please try again.";
@@ -1155,6 +1178,7 @@
             </nav>
           </form>
         </div>
+        ${authSiteFooterHtml()}
       </div>`);
     const form = $("#loginForm", view);
     const card = view.querySelector("[data-auth-card]");
@@ -1240,6 +1264,7 @@
           </div>
           </div>
         </div>
+        ${authSiteFooterHtml()}
       </div>`);
     const m1 = $("#fp_msg1"), m2 = $("#fp_msg2");
     let fpCooldown = 0;
@@ -1374,7 +1399,6 @@
   registerRoute("register", async (view) => {
     setCrumb("Register admin");
     document.body.dataset.auth = "none";
-    const AUTH_UI_REV = "UI rev 2026.04.22";
     const cleanSignupMessage = (raw) => {
       const s = String(raw || "").trim();
       if (!s) return "Request failed. Please try again.";
@@ -1431,6 +1455,7 @@
             </div>
           </div>
         </div>
+        ${authSiteFooterHtml()}
       </div>`);
     const m1 = $("#r_msg1"), m2 = $("#r_msg2");
     $("#r_start").addEventListener("click", async () => {
@@ -1517,6 +1542,7 @@
             <p class="auth-card__msg muted" id="a_msg" aria-live="polite"></p>
           </div>
         </div>
+        ${authSiteFooterHtml()}
       </div>`);
     const msg = $("#a_msg");
     $("#a_submit").addEventListener("click", async () => {
