@@ -3546,19 +3546,31 @@
       <details class="card danger-zone device-drawer">
         <summary class="device-drawer__summary">
           <span class="device-drawer__title">Danger zone</span>
-          <span class="device-drawer__hint muted">Revoke · unbind · Wi‑Fi · deprovision bundle · expand</span>
+          <span class="device-drawer__hint muted">Bundled board reset · expand for server actions</span>
         </summary>
-        <div class="device-drawer__body">
-          <p class="muted" style="margin:0 0 10px">Destructive actions are grouped here to reduce accidental taps.</p>
-          <div class="action-bar">
-            <button class="btn danger btn-tap" id="revoke" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Revoke</button>
-            <button class="btn danger btn-tap" id="deleteReset" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Unbind (delete & reset)</button>
-            ${(state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_send_command"))))
-              ? `<button class="btn danger btn-tap" id="factoryUnregister" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Rollback to unregistered</button>`
-              : ""}
-            <button class="btn danger btn-tap" type="button" id="wifiClearBtn" ${can("can_send_command") && canOperateThisDevice ? "" : "disabled"}>Clear saved Wi‑Fi & reboot</button>
-            <button class="btn danger btn-tap" type="button" id="deprovisionBundleBtn" ${can("can_send_command") && canOperateThisDevice ? "" : "disabled"} title="Firmware: clear STA Wi‑Fi, then unclaim NVS (same as factory rollback), one reboot">Wi‑Fi + unclaim + reboot</button>
+        <div class="device-drawer__body danger-zone-body">
+          <div class="danger-zone-primary">
+            <p class="danger-zone-kicker">Board reset (single MQTT command)</p>
+            <p class="muted danger-zone-lead">Use this when you want the firmware to run everything in order: <strong>clear STA Wi‑Fi</strong> → <strong>purge claim / MQTT from NVS</strong> (same effect as <span class="mono">unclaim_reset</span>) → <strong>one reboot</strong>. Command name: <span class="mono">deprovision_bundle</span>. Requires a recent firmware build. Does <strong>not</strong> remove dashboard rows — use <em>Unbind</em> or <em>Rollback</em> in “More” for that.</p>
+            <button class="btn danger btn-tap danger-zone-cta" type="button" id="deprovisionBundleBtn" ${can("can_send_command") && canOperateThisDevice ? "" : "disabled"} title="Runs deprovision_bundle on the device">Reset board — Wi‑Fi + NVS unclaim + reboot</button>
           </div>
+          <details class="danger-zone-more">
+            <summary class="danger-zone-more-sum">More: server-side, Wi‑Fi-only</summary>
+            <div class="danger-zone-more-body">
+              <p class="muted danger-zone-more-intro"><strong>Tenant / dashboard</strong> — changes server database (and usually sends <span class="mono">unclaim_reset</span> to the board when online). <strong>Wi‑Fi-only</strong> — lighter reboot path.</p>
+              <div class="danger-actions-grid">
+                <button class="btn danger btn-tap danger-zone-secondary" id="revoke" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Revoke (server)</button>
+                <button class="btn danger btn-tap danger-zone-secondary" id="deleteReset" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Unbind — delete &amp; reset</button>
+                ${(state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_send_command"))))
+                  ? `<button class="btn danger btn-tap danger-zone-secondary" id="factoryUnregister" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Rollback to unregistered</button>`
+                  : ""}
+              </div>
+              <div class="danger-wifi-strip">
+                <span class="muted small-label">Wi‑Fi credentials only</span>
+                <button class="btn secondary btn-tap danger-zone-secondary" type="button" id="wifiClearBtn" ${can("can_send_command") && canOperateThisDevice ? "" : "disabled"}>Clear saved Wi‑Fi &amp; reboot</button>
+              </div>
+            </div>
+          </details>
         </div>
       </details>
 
