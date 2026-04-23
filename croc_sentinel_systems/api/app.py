@@ -4968,11 +4968,18 @@ def revoke_device(
             """,
             (device_id, req.reason, principal.username, utc_now_iso()),
         )
+        cur.execute("DELETE FROM device_acl WHERE device_id = ?", (device_id,))
+        deleted_acl_rows = int(cur.rowcount or 0)
         conn.commit()
         conn.close()
     cache_invalidate("devices")
     cache_invalidate("overview")
-    audit_event(principal.username, "device.revoke", device_id, {"reason": req.reason})
+    audit_event(
+        principal.username,
+        "device.revoke",
+        device_id,
+        {"reason": req.reason, "deleted_device_acl_rows": deleted_acl_rows},
+    )
     return {"ok": True, "device_id": device_id}
 
 

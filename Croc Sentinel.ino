@@ -1726,6 +1726,24 @@ void executeCommand(const char *cmd, JsonVariant params) {
     return;
   }
 
+  // One-shot: clear STA Wi‑Fi credentials, then same NVS purge as unclaim_reset, then reboot.
+  // Used by dashboard "Wi‑Fi + unclaim + reboot" without chaining multiple MQTT round-trips.
+  if (strcmp(resolvedCmd, "deprovision_bundle") == 0) {
+#if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
+    !defined(CONFIG_IDF_TARGET_ESP32P4)
+    prefs.begin(NVS_NAMESPACE, false);
+    prefs.remove("wifi_sta_ssid");
+    prefs.remove("wifi_sta_pass");
+    prefs.end();
+#endif
+    performUnclaimNvsPurge();
+    scheduledRebootArmed = false;
+    scheduledRebootEpoch = 0;
+    persistScheduledRebootIfNeeded();
+    requestRestartWithAck(resolvedCmd, "deprovision_bundle");
+    return;
+  }
+
 #if OTA_ENABLED
   if (strcmp(resolvedCmd, "ota") == 0) {
     const char *url = params["url"] | "";
@@ -2005,6 +2023,7 @@ void publishCommandTable() {
   arr.add("reset_id");
   arr.add("factory_reset");
   arr.add("unclaim_reset");
+  arr.add("deprovision_bundle");
 #if OTA_ENABLED
   arr.add("ota");
 #endif

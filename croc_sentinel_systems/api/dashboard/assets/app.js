@@ -1567,7 +1567,7 @@
       <details class="card danger-zone">
         <summary style="cursor:pointer;font-weight:700">Danger zone · Close tenant</summary>
         <div style="margin-top:10px">
-        <h3>Close tenant · 注销管理员账号</h3>
+        <h3>Close tenant account</h3>
         <p class="muted" style="margin:0 0 10px">If you close this admin tenant:</p>
         <ul class="muted" style="margin:0 0 12px;padding-left:1.25em;line-height:1.55">
           <li><strong>Devices</strong> you own are <strong>factory-unclaimed</strong> (dashboard records removed; devices return to unregistered / reclaimable state).</li>
@@ -3546,7 +3546,7 @@
       <details class="card danger-zone device-drawer">
         <summary class="device-drawer__summary">
           <span class="device-drawer__title">Danger zone</span>
-          <span class="device-drawer__hint muted">Revoke · unbind · Wi‑Fi clear · expand</span>
+          <span class="device-drawer__hint muted">Revoke · unbind · Wi‑Fi · deprovision bundle · expand</span>
         </summary>
         <div class="device-drawer__body">
           <p class="muted" style="margin:0 0 10px">Destructive actions are grouped here to reduce accidental taps.</p>
@@ -3557,6 +3557,7 @@
               ? `<button class="btn danger btn-tap" id="factoryUnregister" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Rollback to unregistered</button>`
               : ""}
             <button class="btn danger btn-tap" type="button" id="wifiClearBtn" ${can("can_send_command") && canOperateThisDevice ? "" : "disabled"}>Clear saved Wi‑Fi & reboot</button>
+            <button class="btn danger btn-tap" type="button" id="deprovisionBundleBtn" ${can("can_send_command") && canOperateThisDevice ? "" : "disabled"} title="Firmware: clear STA Wi‑Fi, then unclaim NVS (same as factory rollback), one reboot">Wi‑Fi + unclaim + reboot</button>
           </div>
         </div>
       </details>
@@ -3788,7 +3789,7 @@
           if (wP) wP.value = String(pf.password || "");
           sessionStorage.removeItem("croc.deviceWifiPrefill.v1");
           if (card) card.open = true;
-          toast("已预填认领页保存的 Wi‑Fi；设备在线时可在下方启动下发。", "ok");
+          toast("Prefilled Wi‑Fi from Activate page — start provision below when the device is online.", "ok");
         }
       }
     } catch (_) {}
@@ -3868,6 +3869,28 @@
           } else {
             if (st) st.textContent = "No ack yet — device may still reboot.";
             toast("wifi_clear sent; no ack seen yet.", "");
+          }
+        } catch (e) { toast(e.message || e, "err"); if (st) st.textContent = String(e.message || e); }
+      });
+    }
+    const deprovisionBundleBtn = $("#deprovisionBundleBtn");
+    if (deprovisionBundleBtn) {
+      deprovisionBundleBtn.addEventListener("click", async () => {
+        const st = $("#wifiScanStatus");
+        if (!confirm(
+          "Send bundled board reset? This clears saved STA Wi‑Fi, wipes provision/MQTT claim from NVS (same as server factory rollback), then reboots. Requires firmware support for cmd deprovision_bundle.",
+        )) return;
+        try {
+          if (st) st.textContent = "Sending deprovision_bundle…";
+          await api(`/devices/${encodeURIComponent(id)}/commands`, { method: "POST", body: { cmd: "deprovision_bundle", params: {} } });
+          if (st) st.textContent = "Waiting for device ack…";
+          const a = await waitForCmdAck("deprovision_bundle");
+          if (a) {
+            if (st) st.textContent = String(a.detail || (a.ok ? "Done." : "deprovision_bundle failed"));
+            toast(a.ok ? "Board deprovisioned; rebooting." : (a.detail || "deprovision_bundle failed"), a.ok ? "ok" : "err");
+          } else {
+            if (st) st.textContent = "No ack yet — device may still reboot.";
+            toast("deprovision_bundle sent; no ack seen yet (update firmware if command unknown).", "");
           }
         } catch (e) { toast(e.message || e, "err"); if (st) st.textContent = String(e.message || e); }
       });
@@ -4060,7 +4083,7 @@
 
   // Activate
   registerRoute("activate", async (view) => {
-    setCrumb("激活设备");
+    setCrumb("Activate device");
     if (!hasRole("admin")) { mountView(view, `<div class="card"><p class="muted">Admins only.</p></div>`); return; }
     const canClaim = can("can_claim_device");
 
@@ -4068,29 +4091,29 @@
       <div class="activate-shell">
         <section class="card activate-hero">
           <p class="activate-kicker">Field · Claim</p>
-          <h2 class="activate-title">认领设备</h2>
+          <h2 class="activate-title">Claim device</h2>
           <p class="muted activate-lead">
-            清单内序列号必须先<strong>通电并联网</strong>才会变为「可认领」。可先在此填写<strong>目标 Wi‑Fi</strong>（保存在本浏览器）；认领成功后会预填设备页的「Wi‑Fi (device)」下发表单（设备在线后即可下发）。
+            A serial appears as <strong>claimable</strong> only after the unit is <strong>powered and has contacted the server</strong>. Optionally save a <strong>target Wi‑Fi</strong> here (stored in this browser only); after claim we pre-fill the device page Wi‑Fi form for MQTT provisioning when online.
           </p>
           <ol class="activate-steps">
-            <li><span class="n">1</span>填写目标 Wi‑Fi（可选，推荐）</li>
-            <li><span class="n">2</span>输入贴纸序列号或粘贴完整 <span class="mono">CROC|…</span></li>
-            <li><span class="n">3</span>识别 → 可认领则核对资料并完成认领</li>
+            <li><span class="n">1</span>Optional: save target Wi‑Fi (recommended)</li>
+            <li><span class="n">2</span>Enter sticker serial or paste full <span class="mono">CROC|…</span></li>
+            <li><span class="n">3</span>Identify → if claimable, confirm and complete claim</li>
           </ol>
-          ${canClaim ? "" : `<p class="badge revoked" style="margin-top:12px">当前账号无 <span class="mono">can_claim_device</span>，请联系管理员。</p>`}
+          ${canClaim ? "" : `<p class="badge revoked" style="margin-top:12px">Your account lacks <span class="mono">can_claim_device</span>; ask an administrator.</p>`}
         </section>
 
         <section class="card activate-main">
           <div class="activate-wifi-row">
-            <button type="button" class="btn secondary btn-tap" style="width:100%" id="activateWifiOpenBtn">① 填写目标 Wi‑Fi（SSID / 密码）</button>
+            <button type="button" class="btn secondary btn-tap" style="width:100%" id="activateWifiOpenBtn">① Target Wi‑Fi (SSID / password)</button>
             <p class="muted activate-wifi-status" id="activateWifiStatus"></p>
           </div>
           <div class="inline-form activate-serial-block">
-            <label class="field wide"><span>② 序列号或整段 QR（CROC|…）</span>
-              <input id="idn_input" class="activate-serial-input" placeholder="SN-… 或粘贴整行 CROC|…" autocomplete="off"/>
+            <label class="field wide"><span>② Serial or full QR line (CROC|…)</span>
+              <input id="idn_input" class="activate-serial-input" placeholder="SN-… or paste full CROC|… line" autocomplete="off"/>
             </label>
             <div class="row wide activate-actions">
-              <button class="btn btn-tap activate-id-btn" id="idn_go" ${canClaim ? "" : "disabled"}>③ 识别</button>
+              <button class="btn btn-tap activate-id-btn" id="idn_go" ${canClaim ? "" : "disabled"}>③ Identify</button>
             </div>
           </div>
           <div id="idnResult" class="activate-result"></div>
@@ -4098,32 +4121,32 @@
 
         <dialog id="activateWifiDialog" class="activate-wifi-dlg">
           <div class="activate-wifi-dlg__inner">
-            <h3 class="activate-wifi-dlg__title">目标 Wi‑Fi</h3>
+            <h3 class="activate-wifi-dlg__title">Target Wi‑Fi</h3>
             <p class="muted activate-wifi-dlg__lead">
-              设备<strong>从未联网</strong>时，服务器无法直接把 Wi‑Fi 发到板子；此处仅把 SSID/密码保存在<strong>本浏览器</strong>，认领后在设备页填入并下发（MQTT）。开放网络可留空密码。
+              If the device has <strong>never been online</strong>, the server cannot push Wi‑Fi to it directly. SSID/password here are saved only in <strong>this browser</strong>; after claim, paste them into the device page for MQTT delivery. Leave password empty on open networks.
             </p>
             <label class="field wide"><span>SSID</span>
-              <input type="text" id="activateDlgSsid" maxlength="32" autocomplete="off" placeholder="2.4 GHz 网络名称" />
+              <input type="text" id="activateDlgSsid" maxlength="32" autocomplete="off" placeholder="2.4 GHz network name" />
             </label>
-            <label class="field wide"><span>密码</span>
-              <input type="password" id="activateDlgPass" maxlength="64" autocomplete="new-password" placeholder="开放网络可留空" />
+            <label class="field wide"><span>Password</span>
+              <input type="password" id="activateDlgPass" maxlength="64" autocomplete="new-password" placeholder="Empty if open network" />
             </label>
             <label class="field" style="margin-bottom:0"><span></span>
-              <span><input type="checkbox" id="activateDlgShowPass" /> 显示密码</span>
+              <span><input type="checkbox" id="activateDlgShowPass" /> Show password</span>
             </label>
             <div class="activate-wifi-dlg__actions">
-              <button type="button" class="btn ghost" id="activateWifiDlgClose">关闭</button>
-              <button type="button" class="btn" id="activateWifiDlgSave">保存到本浏览器</button>
-              <button type="button" class="btn secondary" id="activateWifiDlgClear">清除草稿</button>
+              <button type="button" class="btn ghost" id="activateWifiDlgClose">Close</button>
+              <button type="button" class="btn" id="activateWifiDlgSave">Save to this browser</button>
+              <button type="button" class="btn secondary" id="activateWifiDlgClear">Clear draft</button>
             </div>
           </div>
         </dialog>
 
         <section class="card activate-pending-card">
           <div class="row between" style="flex-wrap:wrap;gap:8px;align-items:center">
-            <h3 style="margin:0">最近上报（待认领）</h3>
+            <h3 style="margin:0">Recently reported (pending claim)</h3>
             <span class="muted" style="font-size:13px">MQTT <span class="mono">bootstrap.register</span></span>
-            <button class="btn secondary btn-tap" id="reload">刷新</button>
+            <button class="btn secondary btn-tap" id="reload">Refresh</button>
           </div>
           <div class="divider"></div>
           <div id="pendList"></div>
@@ -4147,8 +4170,8 @@
       const d = readWifiDraft();
       if (!el) return;
       el.textContent = d
-        ? `已保存目标 Wi‑Fi：「${d.ssid}」。认领成功后会打开设备页并预填「Wi‑Fi (device)」表单（需设备在线才能下发）。`
-        : "可先填写将要使用的 Wi‑Fi（仅保存在此浏览器）；也可跳过，稍后在设备页填写。";
+        ? `Saved target Wi‑Fi “${d.ssid}”. After claim we open the device page with Wi‑Fi (device) prefilled (requires device online to push).`
+        : "Optionally save the Wi‑Fi you plan to use (this browser only), or skip and fill it later on the device page.";
     };
     const dlgWifi = $("#activateWifiDialog", view);
     const openActivateWifiDialog = () => {
@@ -4170,11 +4193,11 @@
       wifiSaveBtn.addEventListener("click", () => {
         const ssid = ($("#activateDlgSsid", view).value || "").trim();
         const password = $("#activateDlgPass", view).value || "";
-        if (!ssid) { toast("请输入 Wi‑Fi 名称 (SSID)", "err"); return; }
+        if (!ssid) { toast("Enter Wi‑Fi name (SSID)", "err"); return; }
         sessionStorage.setItem(ACTIVATE_WIFI_STORE, JSON.stringify({ ssid, password }));
         refreshWifiBanner();
         closeActivateWifiDialog();
-        toast("已保存（仅本浏览器）", "ok");
+        toast("Saved (this browser only)", "ok");
       });
     }
     const wifiClrDlg = $("#activateWifiDlgClear", view);
@@ -4183,7 +4206,7 @@
         sessionStorage.removeItem(ACTIVATE_WIFI_STORE);
         refreshWifiBanner();
         closeActivateWifiDialog();
-        toast("已清除 Wi‑Fi 草稿", "ok");
+        toast("Wi‑Fi draft cleared", "ok");
       });
     }
     const wifiClsDlg = $("#activateWifiDlgClose", view);
@@ -4204,21 +4227,21 @@
     const showClaimForm = (serial, mac, qr) => {
       const draft = readWifiDraft();
       const draftNote = draft
-        ? `<p class="muted" style="margin:0 0 12px">已保存目标 Wi‑Fi <span class="mono">${escapeHtml(draft.ssid)}</span> — 认领后将跳转设备页并预填「Wi‑Fi (device)」。</p>`
+        ? `<p class="muted" style="margin:0 0 12px">Saved target Wi‑Fi <span class="mono">${escapeHtml(draft.ssid)}</span> — after claim we jump to the device page with Wi‑Fi (device) prefilled.</p>`
         : "";
       appendChildMarkup(
         resultBox,
         `
         <div class="card" style="margin-top:10px">
-          <h4 style="margin-top:0">确认认领</h4>
+          <h4 style="margin-top:0">Confirm claim</h4>
           ${draftNote}
           <div class="inline-form">
-            <label class="field"><span>device_id（一般为序列号）</span><input id="c_id" value="${escapeHtml(serial)}"/></label>
+            <label class="field"><span>device_id (usually serial)</span><input id="c_id" value="${escapeHtml(serial)}"/></label>
             <label class="field"><span>mac_nocolon</span><input id="c_mac" value="${escapeHtml(mac)}"/></label>
             <label class="field"><span>zone</span><input id="c_zone" value="all"/></label>
-            <label class="field wide"><span>qr_code（可选）</span><input id="c_qr" value="${escapeHtml(qr || "")}"/></label>
+            <label class="field wide"><span>qr_code (optional)</span><input id="c_qr" value="${escapeHtml(qr || "")}"/></label>
             <div class="row wide" style="justify-content:flex-end">
-              <button class="btn btn-tap" id="c_submit">确认认领</button>
+              <button class="btn btn-tap" id="c_submit">Confirm claim</button>
             </div>
           </div>
         </div>`,
@@ -4243,7 +4266,7 @@
           }
           sessionStorage.removeItem(ACTIVATE_WIFI_STORE);
           refreshWifiBanner();
-          toast("认领成功", "ok");
+          toast("Claim completed", "ok");
           location.hash = `#/devices/${encodeURIComponent(did)}`;
         } catch (e) { toast(e.message || e, "err"); }
       });
@@ -4282,7 +4305,7 @@
           case "offline": {
             const dw = readWifiDraft();
             const draftNote = dw
-              ? `<p class="muted" style="margin-top:10px">已在本机保存 Wi‑Fi：<strong>${escapeHtml(dw.ssid)}</strong>。设备上线并完成认领后，可在设备页下发该网络。</p>`
+              ? `<p class="muted" style="margin-top:10px">Saved Wi‑Fi on this machine: <strong>${escapeHtml(dw.ssid)}</strong>. After the unit is online and claimed, push credentials from the device page.</p>`
               : "";
             setChildMarkup(
               resultBox,
@@ -4291,8 +4314,8 @@
               <p>${escapeHtml(r.message)}</p>
               ${draftNote}
               <div class="activate-offline-actions">
-                <button type="button" class="btn secondary btn-tap" id="activateOfflineWifiBtn">填写 / 更改目标 Wi‑Fi</button>
-                <button type="button" class="btn btn-tap" id="idn_retry_offline">已通电联网 · 重新识别</button>
+                <button type="button" class="btn secondary btn-tap" id="activateOfflineWifiBtn">Edit target Wi‑Fi</button>
+                <button type="button" class="btn btn-tap" id="idn_retry_offline">Powered & online — retry identify</button>
               </div>`,
             );
             break;
