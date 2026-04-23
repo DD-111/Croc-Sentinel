@@ -2115,7 +2115,8 @@ void handleTriggerInput() {
   unsigned long now = millis();
   bool fired = false;
 
-  // Panic: immediate local siren (if enabled) + API fans out siren_on to same-group siblings.
+  // Panic: local siren FIRST (GPIO), then MQTT so TLS/publish cannot delay the relay.
+  // Siblings still go through the API (network delay is unavoidable there).
   if (now - lastTriggerDirectReadAt >= BUTTON_DEBOUNCE_MS) {
     lastTriggerDirectReadAt = now;
     bool level = (digitalRead(PANIC_BUTTON_GPIO) == HIGH);
@@ -2123,9 +2124,9 @@ void handleTriggerInput() {
     triggerDirectPrevLevel = level;
     if (fallingEdge && !alarmInCooldown()) {
       logLine("[trigger] panic_button");
+      if (TRIGGER_SELF_SIREN) activateSiren(rtSirenMs);
       publishAlarmEvent("panic_button", true);
       publishHeartbeatEvent("alarm_panic");
-      if (TRIGGER_SELF_SIREN) activateSiren(rtSirenMs);
       fired = true;
     }
   }
@@ -2367,6 +2368,10 @@ void loop() {
   }
 #endif
 
+  // Physical triggers before ensureWiFi/ensureMqtt/publishStatus so one loop
+  // is not stuck behind slow STA or 5s status cadence.
+  handleTriggerInput();
+
   // Run MQTT before Wi-Fi may block for seconds; avoids broker keepalive
   // timeouts while STA is re-associating.
   if (netIf->connected() && mqttClient.connected()) {
@@ -2419,7 +2424,6 @@ void loop() {
     publishStatus();
   }
 
-  handleTriggerInput();
   flushNvsIfNeeded();
   confirmOtaIfHealthy();
 
