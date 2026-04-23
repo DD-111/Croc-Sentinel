@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.gzip import GZipMiddleware
@@ -112,6 +112,7 @@ def _legacy_unowned_device_scope(principal: "Principal") -> bool:
 OTA_FIRMWARE_DIR = os.getenv("OTA_FIRMWARE_DIR", "/opt/sentinel/firmware")
 OTA_PUBLIC_BASE_URL = os.getenv("OTA_PUBLIC_BASE_URL", "").rstrip("/")
 OTA_TOKEN = os.getenv("OTA_TOKEN", "")
+MAX_OTA_UPLOAD_BYTES = int(os.getenv("MAX_OTA_UPLOAD_BYTES", str(16 * 1024 * 1024)))
 ALARM_FANOUT_DURATION_MS = int(os.getenv("ALARM_FANOUT_DURATION_MS", "8000"))
 ALARM_FANOUT_MAX_TARGETS = int(os.getenv("ALARM_FANOUT_MAX_TARGETS", "200"))
 ALARM_FANOUT_SELF = os.getenv("ALARM_FANOUT_SELF", "0") == "1"
@@ -9444,9 +9445,7 @@ def _list_all_admin_usernames() -> list[str]:
     return [str(r["username"]) for r in rows]
 
 
-@app.post("/ota/campaigns")
-def create_ota_campaign(req: OtaCampaignCreateRequest, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_min_role(principal, "superadmin")
+def _insert_ota_campaign(principal: Principal, req: OtaCampaignCreateRequest) -> dict[str, Any]:
     if not req.url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="url must be http(s)")
 
@@ -9476,6 +9475,91 @@ def create_ota_campaign(req: OtaCampaignCreateRequest, principal: Principal = De
         "fw_version": req.fw_version, "url": req.url, "target_admins": admins,
     })
     return {"ok": True, "campaign_id": campaign_id, "target_admins": admins, "state": "dispatched"}
+
+
+def _safe_ota_stored_filename(fw_version: str, original_filename: str) -> str:
+    base = os.path.basename(original_filename or "")
+    if not base.lower().endswith(".bin"):
+        raise HTTPException(status_code=400, detail="upload must be a .bin file")
+    safe_fw = re.sub(r"[^a-zA-Z0-9._-]", "_", (fw_version or "").strip())[:28]
+    if not safe_fw:
+        safe_fw = "fw"
+    tail = secrets.token_hex(4)
+    return f"croc-{safe_fw}-{tail}.bin"
+
+
+@app.post("/ota/campaigns")
+def create_ota_campaign(req: OtaCampaignCreateRequest, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    assert_min_role(principal, "superadmin")
+    return _insert_ota_campaign(principal, req)
+
+
+@app.post("/ota/campaigns/from-upload")
+async def ota_campaign_from_upload(
+    principal: Principal = Depends(require_principal),
+    file: UploadFile = File(...),
+    fw_version: str = Form(...),
+    notes: str = Form(""),
+    target_admins: str = Form("*"),
+) -> dict[str, Any]:
+    """Superadmin: upload .bin to OTA_FIRMWARE_DIR, HEAD-verify public URL, then create the same campaign row as POST /ota/campaigns."""
+    assert_min_role(principal, "superadmin")
+    if not OTA_PUBLIC_BASE_URL:
+        raise HTTPException(
+            status_code=400,
+            detail="OTA_PUBLIC_BASE_URL is not set (e.g. https://ota.esasecure.com). Devices must match config.h OTA_ALLOWED_HOST + OTA_TOKEN.",
+        )
+    os.makedirs(OTA_FIRMWARE_DIR, mode=0o755, exist_ok=True)
+    fname = _safe_ota_stored_filename(fw_version, file.filename or "")
+    dest = os.path.join(OTA_FIRMWARE_DIR, fname)
+    body = await file.read()
+    if len(body) > MAX_OTA_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"file exceeds {MAX_OTA_UPLOAD_BYTES} bytes")
+    if len(body) < 1024:
+        raise HTTPException(status_code=400, detail="file too small to be a firmware image")
+    sha_hex = hashlib.sha256(body).hexdigest()
+    try:
+        with open(dest, "wb") as out:
+            out.write(body)
+        with open(dest + ".sha256", "w", encoding="utf-8") as sf:
+            sf.write(f"{sha_hex}  {fname}\n")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"failed to save firmware: {exc}") from exc
+
+    url = f"{OTA_PUBLIC_BASE_URL}/fw/{fname}"
+    ok, verify_detail = _verify_ota_url(url)
+    if not ok:
+        try:
+            os.remove(dest)
+            if os.path.isfile(dest + ".sha256"):
+                os.remove(dest + ".sha256")
+        except OSError:
+            pass
+        raise HTTPException(
+            status_code=400,
+            detail=f"firmware saved but URL not reachable (HEAD failed): {verify_detail}. Check OTA nginx, DNS, and OTA_PUBLIC_BASE_URL.",
+        )
+
+    ta = (target_admins or "").strip()
+    if not ta or ta == "*":
+        admins_list: list[str] = ["*"]
+    else:
+        admins_list = [x for x in re.split(r"[\s,;]+", ta) if x]
+
+    req = OtaCampaignCreateRequest(
+        fw_version=fw_version.strip(),
+        url=url,
+        sha256=sha_hex,
+        notes=(notes.strip() or None),
+        target_admins=admins_list,
+    )
+    out = _insert_ota_campaign(principal, req)
+    out["stored_as"] = fname
+    out["download_url"] = url
+    out["sha256"] = sha_hex
+    out["verify"] = verify_detail
+    audit_event(principal.username, "ota.firmware.upload", fname, {"size": len(body), "url": url})
+    return out
 
 
 @app.get("/ota/campaigns")

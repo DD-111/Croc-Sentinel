@@ -5653,7 +5653,25 @@
     mountView(view, `
       ${isSuper ? `
       <div class="card">
-        <h2>New OTA campaign</h2>
+        <h2>Quick: upload → verify → campaign</h2>
+        <p class="muted">
+          Upload a compiled <strong>.bin</strong>. The API saves it to the server firmware folder, builds the public
+          <code>/fw/</code> URL from <strong>OTA_PUBLIC_BASE_URL</strong>, runs the same HEAD check as manual campaigns, then creates the campaign.
+          Align firmware <strong>OTA_ALLOWED_HOST</strong> / <strong>OTA_TOKEN</strong> in <code>config.h</code> with this deployment.
+        </p>
+        <div class="inline-form" style="margin-top:10px">
+          <label class="field"><span>Firmware file (.bin) *</span><input type="file" id="uq_file" accept=".bin,application/octet-stream" /></label>
+          <label class="field"><span>Firmware version string *</span><input id="uq_fw" placeholder="6.6.8" maxlength="40" /></label>
+          <label class="field wide"><span>Target admins (blank = all)</span>
+            <input id="uq_admins" placeholder="admin-a, admin-b or leave blank" /></label>
+          <label class="field wide"><span>Notes</span><input id="uq_notes" maxlength="500" /></label>
+          <div class="row wide" style="justify-content:flex-end">
+            <button class="btn btn-tap" type="button" id="uq_send">Upload &amp; create campaign</button>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>New OTA campaign (manual URL)</h2>
         <p class="muted">
           Superadmin sets firmware version + download URL. Each admin sees the campaign as
           <strong>pending</strong>; on <strong>Accept</strong> the server HEAD-checks the URL then dispatches OTA to that admin’s devices.
@@ -5797,6 +5815,69 @@
         if (!isRouteCurrent(routeSeq)) return;
         const fwListEl = $("#fwList", view);
         if (fwListEl) setChildMarkup(fwListEl, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
+      }
+
+      const uqSend = $("#uq_send", view);
+      if (uqSend) {
+        uqSend.addEventListener("click", async () => {
+          const inp = $("#uq_file", view);
+          const file = inp && inp.files && inp.files[0];
+          const fw = (($("#uq_fw", view) && $("#uq_fw", view).value) || "").trim();
+          const notes = (($("#uq_notes", view) && $("#uq_notes", view).value) || "").trim();
+          const adminsRaw = (($("#uq_admins", view) && $("#uq_admins", view).value) || "").trim();
+          if (!file) { toast("Choose a .bin file", "err"); return; }
+          if (!fw) { toast("Firmware version required", "err"); return; }
+          if (!confirm("Upload firmware, verify public URL, and create campaign for selected admins?")) return;
+          const fd = new FormData();
+          fd.append("file", file);
+          fd.append("fw_version", fw);
+          fd.append("notes", notes);
+          fd.append("target_admins", adminsRaw || "*");
+          try {
+            const r = await api("/ota/campaigns/from-upload", { method: "POST", body: fd, timeoutMs: 120000 });
+            if (!isRouteCurrent(routeSeq)) return;
+            toast(`Campaign ${r.campaign_id} · stored ${r.stored_as} · ${r.verify}`, "ok");
+            const uqNotes = $("#uq_notes", view);
+            const uqAdmins = $("#uq_admins", view);
+            if (inp) inp.value = "";
+            const uqFw = $("#uq_fw", view);
+            if (uqFw) uqFw.value = "";
+            if (uqNotes) uqNotes.value = "";
+            if (uqAdmins) uqAdmins.value = "";
+            loadCampaigns();
+            try {
+              const fw2 = await api("/ota/firmwares", { timeoutMs: 30000 });
+              if (!isRouteCurrent(routeSeq)) return;
+              const fwListEl = $("#fwList", view);
+              if (!fwListEl) return;
+              setChildMarkup(
+                fwListEl,
+                (fw2.items || []).length === 0
+                  ? `<p class="muted">No .bin files under ${escapeHtml(fw2.dir || "/opt/sentinel/firmware")}.</p>`
+                  : `<div class="table-wrap"><table class="t">
+                    <thead><tr><th>File</th><th>Size</th><th>SHA-256</th><th>Modified</th><th></th></tr></thead>
+                    <tbody>${fw2.items.map((it) => `
+                      <tr>
+                        <td class="mono">${escapeHtml(it.name)}</td>
+                        <td>${(it.size / 1024).toFixed(1)} KB</td>
+                        <td class="mono" style="max-width:280px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(it.sha256 || "—")}</td>
+                        <td>${escapeHtml(fmtTs(it.mtime))}</td>
+                        <td>${it.download_url ? `<button class="btn sm secondary js-use" data-url="${escapeHtml(it.download_url)}" data-fw="${escapeHtml(it.name.replace(/\\.bin$/i, ""))}" data-sha="${escapeHtml(it.sha256 || "")}">Use in form</button>` : ""}</td>
+                      </tr>`).join("")}</tbody></table></div>`,
+              );
+              view.querySelectorAll(".js-use").forEach((b) => {
+                b.addEventListener("click", () => {
+                  const cUrl = $("#c_url", view);
+                  const cFw = $("#c_fw", view);
+                  const cSha = $("#c_sha", view);
+                  if (cUrl) cUrl.value = b.dataset.url;
+                  if (cFw) cFw.value = b.dataset.fw;
+                  if (cSha && b.dataset.sha) cSha.value = b.dataset.sha;
+                });
+              });
+            } catch { /* ignore refresh table */ }
+          } catch (e) { toast(e.message || e, "err"); }
+        });
       }
 
       const cSend = $("#c_send", view);
