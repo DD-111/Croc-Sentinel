@@ -1351,8 +1351,10 @@ void publishStatus() {
 
 void publishAlarmEvent(const char *triggerKind, bool localSiren) {
   // Server-only fan-out. The device never MQTT-subscribes to group topics; it only
-  // publishes JSON on its own `/event`. The API resolves **siblings** as devices
-  // sharing the same owner + `notification_group` (+ zone match), excluding revoked IDs.
+  // publishes JSON on its own /event. Sibling linkage uses the API DB field
+  // device_state.notification_group (not stored on the MCU). Empty string there
+  // means no cross-device fan-out. Siblings: same owner_admin + same non-empty group
+  // (+ zone), excluding revoked IDs.
   // Mapping: panic_button → local siren optional (TRIGGER_SELF_SIREN) + sibling siren_on;
   // remote_loud_button → sibling siren_on only; remote_silent_button → sibling alarm_signal.
   StaticJsonDocument<320> doc;

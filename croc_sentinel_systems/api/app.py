@@ -1772,12 +1772,18 @@ def _tenant_siblings(
     ``include_source``: when False (default), the originating ``source_id`` is omitted
     from the list (typical for remote loud / panic where the originator uses local GPIO
     or silent-only behaviour).
+
+    If ``notification_group`` is empty for the source device, there are **no** siblings:
+    dashboard / API fan-out must not target other devices (``无联动``). Group linkage is
+    opt-in via a non-empty ``device_state.notification_group`` string.
     """
+    zone_filter = source_zone.strip()
+    group_filter = source_group.strip()
+    if not group_filter:
+        return []
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
-        zone_filter = source_zone.strip()
-        group_filter = source_group.strip()
         if owner_admin:
             sql = """
                 SELECT d.device_id, d.zone
@@ -1790,9 +1796,8 @@ def _tenant_siblings(
             if zone_filter and zone_filter.lower() not in ("all", "*"):
                 sql += " AND IFNULL(d.zone,'') = ?"
                 args.append(zone_filter)
-            if group_filter:
-                sql += " AND IFNULL(d.notification_group,'') = ?"
-                args.append(group_filter)
+            sql += " AND IFNULL(d.notification_group,'') = ?"
+            args.append(group_filter)
             cur.execute(
                 sql,
                 args,
@@ -1811,9 +1816,8 @@ def _tenant_siblings(
             if zone_filter and zone_filter.lower() not in ("all", "*"):
                 sql += " AND IFNULL(d.zone,'') = ?"
                 args.append(zone_filter)
-            if group_filter:
-                sql += " AND IFNULL(d.notification_group,'') = ?"
-                args.append(group_filter)
+            sql += " AND IFNULL(d.notification_group,'') = ?"
+            args.append(group_filter)
             cur.execute(sql, args)
         rows = cur.fetchall()
         conn.close()

@@ -101,6 +101,74 @@
     reconcileGroupMetaForDevice(deviceId, "");
   }
 
+  /**
+   * Single source of truth for group membership: device_state.notification_group from /devices.
+   * - Overwrites each group's device_ids from the API.
+   * - Keeps display_name / owner / contact for groups that still exist or draft cards (0 devices, local only).
+   * - Drops stale group keys that had local device_ids but no device on the server lists that group (unlink).
+   */
+  function syncGroupMetaWithDevices(meta, devices) {
+    if (!meta || typeof meta !== "object") return meta;
+    const list = Array.isArray(devices) ? devices : [];
+    const notifMap = new Map();
+    for (const d of list) {
+      const g = String(d && d.notification_group != null ? d.notification_group : "").trim();
+      if (!g) continue;
+      if (!notifMap.has(g)) notifMap.set(g, []);
+      notifMap.get(g).push(String(d.device_id));
+    }
+    for (const [g, ids] of notifMap.entries()) {
+      const prev = meta[g] && typeof meta[g] === "object" ? meta[g] : {};
+      const dn = (prev.display_name && String(prev.display_name).trim()) || g;
+      meta[g] = {
+        display_name: dn,
+        owner_name: prev.owner_name != null ? String(prev.owner_name) : "",
+        phone: prev.phone != null ? String(prev.phone) : "",
+        email: prev.email != null ? String(prev.email) : "",
+        device_ids: ids,
+      };
+    }
+    for (const g of Object.keys(meta)) {
+      if (notifMap.has(g)) continue;
+      const m = meta[g];
+      const ids = Array.isArray(m && m.device_ids) ? m.device_ids : [];
+      if (ids.length > 0) delete meta[g];
+    }
+    return meta;
+  }
+
+  /** Re-fetch /devices and reconcile group-card localStorage (after profile/delete cache bust). */
+  let _groupMetaSyncTimer = null;
+  let _groupMetaSyncChain = Promise.resolve();
+  function syncGroupMetaFromServer() {
+    if (!state.me) {
+      return _groupMetaSyncChain;
+    }
+    _groupMetaSyncChain = _groupMetaSyncChain
+      .then(async () => {
+        if (!state.me) return;
+        const r = await api("/devices", { timeoutMs: 18000, retries: 1 });
+        let meta = {};
+        try {
+          const raw = localStorage.getItem(groupMetaStorageKey());
+          meta = raw ? JSON.parse(raw) : {};
+        } catch (_) { meta = {}; }
+        if (!meta || typeof meta !== "object") meta = {};
+        syncGroupMetaWithDevices(meta, (r && r.items) || []);
+        localStorage.setItem(groupMetaStorageKey(), JSON.stringify(meta));
+      })
+      .catch(() => {});
+    return _groupMetaSyncChain;
+  }
+  function scheduleSyncGroupMetaFromServer() {
+    if (!state.me) return;
+    if (_groupMetaSyncTimer) clearTimeout(_groupMetaSyncTimer);
+    _groupMetaSyncTimer = setTimeout(() => {
+      _groupMetaSyncTimer = null;
+      void syncGroupMetaFromServer();
+    }, 400);
+  }
+
   /** Route redirect timer (signup / activate → login); cleared on navigation. */
   let routeRedirectTimer = null;
   function clearRouteRedirectTimer() {
@@ -232,7 +300,12 @@
   }
 
   function getToken() { return localStorage.getItem(LS.token) || ""; }
-  function setToken(t) { t ? localStorage.setItem(LS.token, t) : localStorage.removeItem(LS.token); }
+  function setToken(t) {
+    t ? localStorage.setItem(LS.token, t) : localStorage.removeItem(LS.token);
+    if (!t) {
+      _groupMetaSyncChain = Promise.resolve();
+    }
+  }
 
   function escapeHtml(v) {
     return String(v == null ? "" : v)
@@ -699,6 +772,7 @@
   function bustDeviceListCaches() {
     bustApiGetCachedPrefix("/devices");
     bustApiGetCachedPrefix("/dashboard/overview");
+    scheduleSyncGroupMetaFromServer();
   }
 
   async function login(username, password) {
@@ -1672,18 +1746,8 @@
     const groupSettingsMap = new Map();
     for (const [k, v] of Object.entries(localGroupSettings)) groupSettingsMap.set(String(k), v || {});
     for (const x of groupSettingsItems) groupSettingsMap.set(String(x.group_key || ""), x);
-    const normalizeGroup = (s) => String(s || "").trim();
     const meta = loadGroupMeta();
-    const notifMap = new Map();
-    for (const d of devices) {
-      const g = normalizeGroup(d.notification_group);
-      if (!g) continue;
-      if (!notifMap.has(g)) notifMap.set(g, []);
-      notifMap.get(g).push(String(d.device_id));
-    }
-    for (const [g, ids] of notifMap.entries()) {
-      if (!meta[g]) meta[g] = { display_name: g, owner_name: "", phone: "", email: "", device_ids: ids };
-    }
+    syncGroupMetaWithDevices(meta, devices);
     saveGroupMeta(meta);
 
     let selectedGroup = "";
@@ -2381,6 +2445,8 @@
           risk: mqStatus,
           riskClass: mqClass,
         });
+        syncGroupMetaWithDevices(meta, devices);
+        saveGroupMeta(meta);
         renderGroups();
       } catch (_) {}
     };
@@ -2430,8 +2496,10 @@
     const [listRes] = await Promise.allSettled([apiGetCached("/devices", { timeoutMs: 16000 }, 3000)]);
     let list = (listRes.status === "fulfilled" && listRes.value) ? listRes.value : { items: [] };
     let byId = new Map((list.items || []).map((d) => [String(d.device_id), d]));
+    syncGroupMetaWithDevices(meta, list.items || []);
+    try { localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(meta)); } catch (_) {}
     const gm = meta[g] || { display_name: g, owner_name: "", phone: "", email: "", device_ids: [] };
-    const ids = Array.isArray(gm.device_ids) ? gm.device_ids.map(String) : [];
+    let ids = Array.isArray(gm.device_ids) ? gm.device_ids.map(String) : [];
     let rows = ids.map((id) => byId.get(id)).filter(Boolean);
     const isSharedGroup = rows.some((d) => !!d.is_shared);
     const online = rows.filter((d) => isOnline(d)).length;
@@ -2593,6 +2661,10 @@
       if (!isRouteCurrent(routeSeq)) return;
       list = latest || { items: [] };
       byId = new Map((list.items || []).map((d) => [String(d.device_id), d]));
+      syncGroupMetaWithDevices(meta, list.items || []);
+      try { localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(meta)); } catch (_) {}
+      const gm2 = meta[g] || { display_name: g, owner_name: "", phone: "", email: "", device_ids: [] };
+      ids = Array.isArray(gm2.device_ids) ? gm2.device_ids.map(String) : [];
       rows = ids.map((id2) => byId.get(id2)).filter(Boolean);
       renderGroupDevices();
     };

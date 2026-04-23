@@ -2,6 +2,8 @@
 
 > **新来的请先看 [`docs/OVERVIEW_CN.md`](docs/OVERVIEW_CN.md)** — 用大白话把这套系统能做 / 不能做 / 怎么部署讲清楚（3 分钟读完）。
 >
+> **设备组与联动**（`notification_group` 怎么用、空组含义、能/不能做什么）：见 [`docs/GROUP_AND_LINKAGE.md`](docs/GROUP_AND_LINKAGE.md)。
+>
 > **前端 / 第三方对接**：端点清单见 [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md)（含 OTA 活动流程、presence probe、预留的 `/subscribe` 窗口）。
 >
 > **固件 OTA 与 NVS 配置是否丢失**（设备侧）：见仓库根目录 [`../DEVICE_CONFIG_AND_OTA.md`](../DEVICE_CONFIG_AND_OTA.md)。
