@@ -51,14 +51,13 @@
 
   const ROLE_WEIGHT = { user: 1, admin: 2, superadmin: 3 };
 
-  const AUTH_UI_REV = "UI rev 2026.04.23";
   function authSiteFooterHtml() {
     return `
       <footer class="site-footer site-footer--auth" aria-label="Page footer">
         <div class="site-footer__row site-footer__row--auth">
           <div class="site-footer__brand">
             <span class="site-footer__name">Croc Sentinel</span>
-            <span class="site-footer__tagline">Secure fleet console · 安全舰队控制台</span>
+            <span class="site-footer__tagline">Fleet console · 舰队控制台</span>
           </div>
           <nav class="site-footer__nav" aria-label="Sign-in help">
             <a class="site-footer__a" href="#/login">Sign in</a>
@@ -66,11 +65,6 @@
             <a class="site-footer__a" href="#/forgot-password">Forgot password</a>
             <a class="site-footer__a" href="#/account-activate">Activate</a>
           </nav>
-        </div>
-        <div class="site-footer__row site-footer__row--meta">
-          <span class="site-footer__muted">${AUTH_UI_REV}</span>
-          <span class="site-footer__muted" aria-hidden="true">·</span>
-          <span class="site-footer__muted">ESA Secure Platform · Malaysia time (UTC+08)</span>
         </div>
       </footer>`;
   }
@@ -1140,23 +1134,22 @@
       return s.replace(/^error:\s*/i, "");
     };
     mountView(view, `
-      <div class="auth-page auth-page-pro" role="main">
-        <section class="auth-hero">
+      <div class="auth-page auth-page-pro auth-page--login" role="main">
+        <section class="auth-hero auth-hero--compact">
           <div class="auth-hero__tag">ESA Secure Platform</div>
-          <h2>Unified fleet security console</h2>
-          <p>Real-time monitoring, role-based control, and protected device operations in one place.</p>
+          <h2>Fleet security console</h2>
+          <p>Monitoring, roles, and device control in one place.</p>
           <ul class="auth-hero__bullets">
-            <li>Live device visibility by role scope</li>
-            <li>Secure command and trigger orchestration</li>
-            <li>Audit-ready operations and recovery flow</li>
+            <li>Role-scoped live visibility</li>
+            <li>Secure commands & triggers</li>
+            <li>Audit-ready operations</li>
           </ul>
         </section>
-        <div class="auth-card auth-card--pro" data-auth-card>
+        <div class="auth-card auth-card--pro auth-card--login" data-auth-card>
           <header class="auth-card__head">
-            <div class="auth-rev">${AUTH_UI_REV}</div>
             <div class="auth-card__logo" aria-hidden="true"></div>
             <h1 class="auth-card__title">Sign in</h1>
-            <p class="auth-card__lead">Welcome back. Continue to dashboard.</p>
+            <p class="auth-card__lead">Welcome back — continue to your dashboard.</p>
           </header>
           <form class="auth-card__body" id="loginForm" autocomplete="on">
             <label class="field">
@@ -1410,19 +1403,18 @@
     };
     mountView(view, `
       <div class="auth-page auth-page-pro" role="main">
-        <section class="auth-hero">
+        <section class="auth-hero auth-hero--compact">
           <div class="auth-hero__tag">Admin Onboarding</div>
-          <h2>Professional setup, immediate access</h2>
-          <p>Register once, verify by email, then manage your own device fleet directly.</p>
+          <h2>Create your admin workspace</h2>
+          <p>Verify by email, then manage your fleet.</p>
           <ul class="auth-hero__bullets">
-            <li>No superadmin approval required</li>
-            <li>Email verification with cooldown protection</li>
-            <li>Tenant-isolated admin workspace</li>
+            <li>No superadmin approval</li>
+            <li>Email verification & cooldown</li>
+            <li>Tenant-isolated workspace</li>
           </ul>
         </section>
         <div class="auth-card auth-card--wide auth-card--pro" data-auth-card>
           <header class="auth-card__head">
-            <div class="auth-rev">${AUTH_UI_REV}</div>
             <div class="auth-card__logo" aria-hidden="true"></div>
             <h1 class="auth-card__title">Create admin</h1>
             <p class="auth-card__lead">Create your account with email verification.</p>
