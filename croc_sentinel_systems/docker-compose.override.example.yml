@@ -1,12 +1,21 @@
 # Copy to docker-compose.override.yml (same folder as docker-compose.yml).
 # Compose merges this automatically — no change to the default compose file.
 #
-# Main docker-compose already maps :18999 -> api:8088. Use this only to *add*
-# localhost-only bind or change mapping, e.g.:
+# --- FCM (Firebase HTTP v1) ---
+# Host must have the Firebase service-account JSON (not committed to git):
+#   /etc/sentinel/fcm-service-account.json
+# Then add to .env next to this compose file:
+#   FCM_SERVICE_ACCOUNT_JSON=/etc/sentinel/fcm-service-account.json
+#   # optional: FCM_PROJECT_ID=your-gcp-project-id
 #
+# --- Localhost-only API port (optional) ---
 # services:
 #   api:
 #     ports:
 #       - "127.0.0.1:18999:8088"
 
-services: {}
+services:
+  api:
+    volumes:
+      # Mount host Firebase admin JSON into the container at the same path.
+      - /etc/sentinel/fcm-service-account.json:/etc/sentinel/fcm-service-account.json:ro
