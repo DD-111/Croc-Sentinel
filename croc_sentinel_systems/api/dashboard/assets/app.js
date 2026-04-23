@@ -104,8 +104,8 @@
   /**
    * Single source of truth for group membership: device_state.notification_group from /devices.
    * - Overwrites each group's device_ids from the API.
-   * - Keeps display_name / owner / contact for groups that still exist or draft cards (0 devices, local only).
-   * - Drops stale group keys that had local device_ids but no device on the server lists that group (unlink).
+   * - Keeps display_name / owner / contact for groups that still exist.
+   * - Drops any local-only/stale group keys to avoid residual data after edits.
    */
   function syncGroupMetaWithDevices(meta, devices) {
     if (!meta || typeof meta !== "object") return meta;
@@ -129,10 +129,7 @@
       };
     }
     for (const g of Object.keys(meta)) {
-      if (notifMap.has(g)) continue;
-      const m = meta[g];
-      const ids = Array.isArray(m && m.device_ids) ? m.device_ids : [];
-      if (ids.length > 0) delete meta[g];
+      if (!notifMap.has(g)) delete meta[g];
     }
     return meta;
   }
@@ -1905,9 +1902,28 @@
     if (!groupCardsEl || !grpModalEl || !grpSetModalEl) return;
 
     let editingGroup = "";
-    const groupKeys = () => Object.keys(meta).sort((a, b) => a.localeCompare(b));
+    const normalizeGroupKey = (v) => String(v == null ? "" : v).trim();
+    const groupDeviceIdsFromList = (g) => {
+      const key = normalizeGroupKey(g);
+      if (!key) return [];
+      const out = [];
+      for (const d of devices) {
+        if (!d || normalizeGroupKey(d.notification_group) !== key) continue;
+        const did = String(d.device_id || "").trim();
+        if (did) out.push(did);
+      }
+      return out;
+    };
+    const groupKeys = () => {
+      const keys = new Set();
+      for (const d of devices) {
+        const gk = normalizeGroupKey(d && d.notification_group);
+        if (gk) keys.add(gk);
+      }
+      return Array.from(keys).sort((a, b) => a.localeCompare(b));
+    };
     const groupDeviceIds = (g) => {
-      const ids = Array.isArray(meta[g] && meta[g].device_ids) ? meta[g].device_ids : [];
+      const ids = groupDeviceIdsFromList(g);
       return ids.filter((x) => byId.has(String(x)));
     };
     const groupSharedBy = (g) => {
@@ -2293,9 +2309,7 @@
         toast("Group card updated (shared group — device list is owner-managed)", "ok");
         return;
       }
-      const previousDeviceIds = (oldEntry && Array.isArray(oldEntry.device_ids))
-        ? oldEntry.device_ids.map((x) => String(x || "").trim())
-        : [];
+      const previousDeviceIds = oldKey ? groupDeviceIdsFromList(oldKey) : [];
       if (picks.length > 0) {
         try {
           for (const id of picks) {
@@ -2499,8 +2513,9 @@
     syncGroupMetaWithDevices(meta, list.items || []);
     try { localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(meta)); } catch (_) {}
     const gm = meta[g] || { display_name: g, owner_name: "", phone: "", email: "", device_ids: [] };
-    let ids = Array.isArray(gm.device_ids) ? gm.device_ids.map(String) : [];
-    let rows = ids.map((id) => byId.get(id)).filter(Boolean);
+    const rowsByGroup = () => (list.items || []).filter((d) => String(d.notification_group || "").trim() === g);
+    let rows = rowsByGroup();
+    let ids = rows.map((d) => String(d.device_id || "")).filter(Boolean);
     const isSharedGroup = rows.some((d) => !!d.is_shared);
     const online = rows.filter((d) => isOnline(d)).length;
     const offline = Math.max(0, rows.length - online);
@@ -2663,9 +2678,8 @@
       byId = new Map((list.items || []).map((d) => [String(d.device_id), d]));
       syncGroupMetaWithDevices(meta, list.items || []);
       try { localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(meta)); } catch (_) {}
-      const gm2 = meta[g] || { display_name: g, owner_name: "", phone: "", email: "", device_ids: [] };
-      ids = Array.isArray(gm2.device_ids) ? gm2.device_ids.map(String) : [];
-      rows = ids.map((id2) => byId.get(id2)).filter(Boolean);
+      rows = rowsByGroup();
+      ids = rows.map((d) => String(d.device_id || "")).filter(Boolean);
       renderGroupDevices();
     };
     scheduleRouteTicker(routeSeq, `group-live-${g}`, refreshGroupLive, 10000);
@@ -2677,8 +2691,40 @@
     if (!id) {
       setCrumb("All devices");
       let allItems = [];
+      const selectedIds = new Set();
+      const filteredItems = () => {
+        const inp = $("#allDevFilter", view);
+        const q = inp ? String(inp.value || "").trim().toLowerCase() : "";
+        return allItems.filter((d) => {
+          if (!q) return true;
+          const did = String(d.device_id || "").toLowerCase();
+          const nm = String(d.display_label || "").toLowerCase();
+          const grp = String(d.notification_group || "").toLowerCase();
+          const zn = String(d.zone || "").toLowerCase();
+          return did.includes(q) || nm.includes(q) || grp.includes(q) || zn.includes(q);
+        });
+      };
+      const bulkBarState = () => {
+        const c = selectedIds.size;
+        const stat = $("#bulkSelStat", view);
+        const grpBtn = $("#bulkApplyGroup", view);
+        const zoBtn = $("#bulkApplyZone", view);
+        const zcBtn = $("#bulkClearZone", view);
+        const selVisBtn = $("#bulkSelectVisible", view);
+        const clrBtn = $("#bulkClearSel", view);
+        const totalVisible = filteredItems().length;
+        if (stat) stat.textContent = `${c} selected · ${totalVisible} visible`;
+        const disable = c === 0;
+        if (grpBtn) grpBtn.disabled = disable;
+        if (zoBtn) zoBtn.disabled = disable;
+        if (zcBtn) zcBtn.disabled = disable;
+        if (clrBtn) clrBtn.disabled = disable;
+        if (selVisBtn) selVisBtn.disabled = totalVisible === 0;
+      };
       const deviceListCard = (d) => {
         const on = isOnline(d);
+        const did = String(d.device_id || "");
+        const checked = selectedIds.has(did);
         const primary = escapeHtml(d.display_label || d.device_id || "unknown");
         const subId = d.display_label ? `<div class="device-id-sub mono">${escapeHtml(d.device_id || "")}</div>` : "";
         const letter = escapeHtml((d.display_label || d.device_id || "?").slice(0, 1).toUpperCase());
@@ -2688,9 +2734,13 @@
         } else if (d.is_shared && d.shared_by) {
           subMeta = `Shared: ${escapeHtml(String(d.shared_by))}<br/>`;
         }
-        return `<a class="device-card device-card--row-thumb" href="#/devices/${encodeURIComponent(d.device_id)}" style="text-decoration:none;color:inherit">` +
+        return `<div class="device-card device-card--row-thumb" style="position:relative">` +
+          `<label style="position:absolute;right:8px;top:8px;z-index:2;display:flex;align-items:center;gap:6px;font-size:12px">` +
+          `<input type="checkbox" class="bulk-dev-pick" data-device-id="${escapeHtml(did)}" ${checked ? "checked" : ""} />` +
+          `<span class="muted">Pick</span></label>` +
+          `<a href="#/devices/${encodeURIComponent(d.device_id)}" style="display:flex;gap:10px;text-decoration:none;color:inherit;flex:1;min-width:0">` +
           `<div class="device-thumb device-thumb--list" aria-hidden="true">${letter}</div>` +
-          `<div class="device-card--row-body">` +
+          `<div class="device-card--row-body" style="padding-right:56px">` +
           `<h3 style="margin:0"><div class="device-primary-name">${primary}</div>${subId}</h3>` +
           `<div><span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>` +
           (d.zone ? ` <span class="chip">${escapeHtml(d.zone)}</span>` : "") +
@@ -2698,22 +2748,15 @@
           (d.is_shared ? ` <span class="badge accent" title="shared device">shared</span>` : "") +
           `</div>` +
           `<div class="meta" style="margin-top:4px">${subMeta}Updated: ${escapeHtml(fmtRel(d.updated_at))}</div>` +
-          `</div></a>`;
+          `</div></a></div>`;
       };
       const applyFilter = () => {
-        const inp = $("#allDevFilter", view);
-        const q = inp ? String(inp.value || "").trim().toLowerCase() : "";
-        const items = allItems.filter((d) => {
-          if (!q) return true;
-          const did = String(d.device_id || "").toLowerCase();
-          const nm = String(d.display_label || "").toLowerCase();
-          const grp = String(d.notification_group || "").toLowerCase();
-          return did.includes(q) || nm.includes(q) || grp.includes(q);
-        });
+        const items = filteredItems();
         const grid = $("#allDevicesGrid", view);
         if (!grid) return;
         if (allItems.length === 0) {
           setChildMarkup(grid, `<p class="muted" style="padding:8px 0">No devices in your scope.</p>`);
+          bulkBarState();
           return;
         }
         setChildMarkup(
@@ -2722,23 +2765,54 @@
             ? `<p class="muted" style="padding:8px 0">No matches.</p>`
             : items.map(deviceListCard).join(""),
         );
+        bulkBarState();
+      };
+      const runBulkProfile = async (payload) => {
+        if (!selectedIds.size) { toast("Select at least one device", "err"); return; }
+        const ids = Array.from(selectedIds.values());
+        const r = await api("/devices/bulk/profile", {
+          method: "POST",
+          body: Object.assign({ device_ids: ids }, payload || {}),
+        });
+        bustDeviceListCaches();
+        toast(`Bulk done · ${Number(r.count || ids.length)} devices`, "ok");
+        await load();
       };
       const load = async () => {
         if (!isRouteCurrent(routeSeq)) return;
         const r = await api("/devices", { timeoutMs: 20000, retries: 2 });
         if (!isRouteCurrent(routeSeq)) return;
         allItems = Array.isArray(r.items) ? r.items : [];
+        for (const did of Array.from(selectedIds)) {
+          if (!allItems.some((x) => String(x.device_id) === did)) selectedIds.delete(did);
+        }
         applyFilter();
       };
       mountView(view, `
         <div class="card" style="margin:0 0 12px">
           <h2 class="ui-section-title" style="margin:0">All devices</h2>
-          <p class="muted" style="margin:8px 0 0">Thumbnails and quick status. Click a card for full device controls.</p>
+          <p class="muted" style="margin:8px 0 0">Thumbnails and quick status. Multi-select for production bulk updates.</p>
           <div class="inline-form" style="margin-top:12px">
             <label class="field" style="max-width:min(100%, 360px)">
               <span>Filter</span>
-              <input type="search" id="allDevFilter" placeholder="id / name / group" autocomplete="off" />
+              <input type="search" id="allDevFilter" placeholder="id / name / group / zone" autocomplete="off" />
             </label>
+          </div>
+          <div class="inline-form" style="margin-top:12px;align-items:flex-end;gap:8px;flex-wrap:wrap">
+            <span class="chip" id="bulkSelStat">0 selected · 0 visible</span>
+            <button class="btn sm secondary" id="bulkSelectVisible" type="button">Select visible</button>
+            <button class="btn sm secondary" id="bulkClearSel" type="button" disabled>Clear selection</button>
+            <label class="field" style="min-width:220px;max-width:300px">
+              <span>Bulk group</span>
+              <input id="bulkGroupValue" maxlength="80" placeholder="empty = clear group" />
+            </label>
+            <button class="btn sm" id="bulkApplyGroup" type="button" disabled>Apply group</button>
+            <label class="field" style="min-width:180px;max-width:240px">
+              <span>Zone override</span>
+              <input id="bulkZoneValue" maxlength="31" placeholder="e.g. all / Zone-A" />
+            </label>
+            <button class="btn sm" id="bulkApplyZone" type="button" disabled>Apply zone</button>
+            <button class="btn sm secondary" id="bulkClearZone" type="button" disabled>Clear zone override</button>
           </div>
         </div>
         <div id="allDevicesGrid" class="device-grid">
@@ -2747,6 +2821,69 @@
       `);
       const f = $("#allDevFilter", view);
       if (f) f.addEventListener("input", () => { applyFilter(); });
+      const grid = $("#allDevicesGrid", view);
+      if (grid) {
+        grid.addEventListener("change", (ev) => {
+          const el = ev.target;
+          if (!(el instanceof HTMLInputElement)) return;
+          if (!el.classList.contains("bulk-dev-pick")) return;
+          const did = String(el.dataset.deviceId || "").trim();
+          if (!did) return;
+          if (el.checked) selectedIds.add(did);
+          else selectedIds.delete(did);
+          bulkBarState();
+        });
+      }
+      const selVis = $("#bulkSelectVisible", view);
+      if (selVis) {
+        selVis.addEventListener("click", () => {
+          for (const d of filteredItems()) {
+            const did = String(d.device_id || "").trim();
+            if (did) selectedIds.add(did);
+          }
+          applyFilter();
+        });
+      }
+      const clrSel = $("#bulkClearSel", view);
+      if (clrSel) {
+        clrSel.addEventListener("click", () => {
+          selectedIds.clear();
+          applyFilter();
+        });
+      }
+      const grpBtn = $("#bulkApplyGroup", view);
+      if (grpBtn) {
+        grpBtn.addEventListener("click", async () => {
+          const grpVal = String($("#bulkGroupValue", view)?.value || "").trim();
+          const promptTxt = grpVal
+            ? `Apply group "${grpVal}" to ${selectedIds.size} selected device(s)?`
+            : `Clear group for ${selectedIds.size} selected device(s)?`;
+          if (!confirm(promptTxt)) return;
+          try {
+            await runBulkProfile({ set_notification_group: true, notification_group: grpVal });
+          } catch (e) { toast(e.message || e, "err"); }
+        });
+      }
+      const zoneBtn = $("#bulkApplyZone", view);
+      if (zoneBtn) {
+        zoneBtn.addEventListener("click", async () => {
+          const z = String($("#bulkZoneValue", view)?.value || "").trim();
+          if (!z) { toast("Enter zone value", "err"); return; }
+          if (!confirm(`Apply zone override "${z}" to ${selectedIds.size} selected device(s)?`)) return;
+          try {
+            await runBulkProfile({ set_zone_override: true, zone_override: z });
+          } catch (e) { toast(e.message || e, "err"); }
+        });
+      }
+      const clrZoneBtn = $("#bulkClearZone", view);
+      if (clrZoneBtn) {
+        clrZoneBtn.addEventListener("click", async () => {
+          if (!confirm(`Clear zone override for ${selectedIds.size} selected device(s)?`)) return;
+          try {
+            await runBulkProfile({ clear_zone_override: true });
+          } catch (e) { toast(e.message || e, "err"); }
+        });
+      }
       await load();
       scheduleRouteTicker(routeSeq, "devices-list-live", load, 12000);
       return;
