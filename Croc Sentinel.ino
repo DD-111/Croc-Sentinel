@@ -301,7 +301,25 @@ static void provisioningPortalStart() {
            WIFI_PROVISION_AP_PREFIX,
            deviceMacNoColon[8], deviceMacNoColon[9], deviceMacNoColon[10], deviceMacNoColon[11]);
   WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP(apName);
+  /* Explicit AP LAN — some phones fail to resolve captive portal unless AP IP is stable. */
+  {
+    IPAddress apIp(192, 168, 4, 1);
+    IPAddress gw(192, 168, 4, 1);
+    IPAddress nm(255, 255, 255, 0);
+    if (!WiFi.softAPConfig(apIp, gw, nm)) {
+      logLine("[wifi] softAPConfig returned false (continuing)");
+    }
+  }
+  if (!WiFi.softAP(apName)) {
+    logLine(String("[wifi] softAP failed for ") + apName);
+    return;
+  }
+  {
+    char _apip[48];
+    snprintf(_apip, sizeof(_apip), "[wifi] provisioning AP IP=%s ch=%d",
+             WiFi.softAPIP().toString().c_str(), WiFi.channel());
+    logLine(_apip);
+  }
   g_provDns.start(53, "*", WiFi.softAPIP());
   g_provHttp.on("/", HTTP_GET, []() {
     if (!g_provUnlocked) g_provHttp.send(200, "text/html", provPageGate(""));

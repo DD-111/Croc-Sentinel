@@ -1809,3 +1809,202 @@ html.tab-hidden body.motion-ui .toast.show {
     transform: none;
   }
 }
+
+/* —— Activate device (mobile-first) —— */
+.activate-shell {
+  max-width: 42rem;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+}
+
+.activate-hero {
+  padding: 18px 18px 16px;
+}
+
+.activate-kicker {
+  margin: 0 0 4px;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  font-weight: 600;
+}
+
+.activate-title {
+  margin: 0 0 8px;
+  font-size: 1.65rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+}
+
+.activate-lead {
+  margin: 0 0 14px;
+  font-size: 15px;
+  line-height: 1.55;
+}
+
+.activate-steps {
+  margin: 0;
+  padding: 0 0 0 4px;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.activate-steps li {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  font-size: 14px;
+  line-height: 1.45;
+  color: var(--text-muted);
+}
+
+.activate-steps .n {
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  border-radius: 999px;
+  background: var(--accent-weak);
+  color: var(--accent-strong);
+  font-size: 13px;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.activate-main {
+  padding: 16px 18px 18px;
+}
+
+.activate-wifi-row {
+  margin-bottom: 16px;
+}
+
+.activate-wifi-status {
+  margin: 10px 0 0;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.activate-serial-block {
+  margin-top: 4px;
+}
+
+.activate-serial-input {
+  font-size: 16px !important;
+  padding: 12px 14px !important;
+  border-radius: var(--radius-sm);
+}
+
+.activate-actions {
+  margin-top: 12px;
+  justify-content: stretch;
+}
+
+.activate-actions .btn,
+.activate-wifi-row .btn {
+  min-height: 46px;
+  font-size: 15px;
+}
+
+.activate-id-btn {
+  flex: 1;
+  width: 100%;
+}
+
+.activate-result {
+  margin-top: 16px;
+}
+
+.activate-offline-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.activate-offline-actions .btn {
+  min-height: 46px;
+}
+
+.activate-pending-card h3 {
+  font-size: 1.05rem;
+}
+
+.activate-wifi-dlg {
+  border: none;
+  border-radius: var(--radius);
+  padding: 0;
+  max-width: calc(100vw - 24px);
+  width: min(400px, 100%);
+  background: var(--bg-elev);
+  color: var(--text);
+  box-shadow: var(--shadow-lg);
+}
+
+.activate-wifi-dlg::backdrop {
+  background: rgba(15, 23, 42, 0.45);
+}
+
+.activate-wifi-dlg__inner {
+  padding: 20px 20px 18px;
+}
+
+.activate-wifi-dlg__title {
+  margin: 0 0 8px;
+  font-size: 1.2rem;
+}
+
+.activate-wifi-dlg__lead {
+  margin: 0 0 16px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.activate-wifi-dlg__inner .field {
+  margin-bottom: 12px;
+}
+
+.activate-wifi-dlg__inner .field span {
+  font-size: 13px;
+}
+
+.activate-wifi-dlg__inner input[type="text"],
+.activate-wifi-dlg__inner input[type="password"] {
+  font-size: 16px;
+  padding: 11px 12px;
+  width: 100%;
+}
+
+.activate-wifi-dlg__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+  justify-content: flex-end;
+}
+
+.activate-wifi-dlg__actions .btn {
+  min-height: 44px;
+  padding-left: 16px;
+  padding-right: 16px;
+}
+
+@media (max-width: 720px) {
+  .activate-shell {
+    max-width: none;
+    margin: 0;
+  }
+
+  .activate-hero,
+  .activate-main,
+  .activate-pending-card {
+    border-radius: var(--radius-sm);
+  }
+}

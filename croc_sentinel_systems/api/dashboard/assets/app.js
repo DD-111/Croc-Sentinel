@@ -613,7 +613,10 @@
     return { total, ok, fail };
   }
 
-  /** Short-lived GET cache to avoid duplicate round-trips when navigating (server still uses CACHE_TTL). */
+  /**
+   * Short-lived GET cache to coalesce identical in-flight requests only (ttlMs > 0 adds a brief stale window).
+   * Overview / device list: prefer `api()` + server-side CACHE_TTL (see .env) so truth stays on the server.
+   */
   const _apiGetCache = new Map();
   const _apiGetInflight = new Map();
   const _API_GET_CACHE_MAX_KEYS = 48;
@@ -841,7 +844,7 @@
     state.navDevicesLoading = true;
     if (force) state.navDevicesError = "";
     try {
-      const r = await apiGetCached("/devices", { timeoutMs: 16000 }, force ? 0 : 7000);
+      const r = await api("/devices", { timeoutMs: 18000, retries: 2 });
       state.navDevices = Array.isArray(r && r.items) ? r.items : [];
       state.navDevicesError = "";
       state.navDevicesAt = Date.now();
@@ -1681,19 +1684,33 @@
         throw e;
       }
     };
-    const [ovRes, listRes, grpSetRes] = await Promise.allSettled([
-      apiGetCached("/dashboard/overview", { timeoutMs: 16000 }, 4000),
-      apiGetCached("/devices", { timeoutMs: 16000 }, 4000),
+    const fetchOverviewAndDevices = async () => {
+      let bestOv = null;
+      let bestList = null;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const [ovR, liR] = await Promise.allSettled([
+          api("/dashboard/overview", { timeoutMs: 22000, retries: 3 }),
+          api("/devices", { timeoutMs: 22000, retries: 3 }),
+        ]);
+        if (ovR.status === "fulfilled" && ovR.value) bestOv = ovR.value;
+        if (liR.status === "fulfilled" && liR.value) bestList = liR.value;
+        if (bestOv && bestList) return { ov: bestOv, list: bestList };
+        if (attempt === 0) await _sleep(500);
+      }
+      return { ov: bestOv, list: bestList };
+    };
+    const [ovListRes, grpSetRes] = await Promise.allSettled([
+      fetchOverviewAndDevices(),
       loadGroupSettingsCompat(),
     ]);
-    let ov = (ovRes.status === "fulfilled" && ovRes.value) ? ovRes.value : null;
-    let list = (listRes.status === "fulfilled" && listRes.value) ? listRes.value : null;
+    let ov = (ovListRes.status === "fulfilled" && ovListRes.value && ovListRes.value.ov) ? ovListRes.value.ov : null;
+    let list = (ovListRes.status === "fulfilled" && ovListRes.value && ovListRes.value.list) ? ovListRes.value.list : null;
     if (!ov || !list) {
       const cached = state.overviewCache;
       if (cached && cached.ov && cached.list) {
         ov = ov || cached.ov;
         list = list || cached.list;
-        toast("Overview is partially loaded from cache; refreshing in background.", "warn");
+        toast("Showing last known data — server is slow or offline; will retry on refresh.", "warn");
       }
     }
     if (!ov) ov = { mqtt_connected: false };
@@ -2356,8 +2373,8 @@
         bustApiGetCachedPrefix("/dashboard/overview");
         bustApiGetCachedPrefix("/devices");
         const [ovN, listN] = await Promise.all([
-          api("/dashboard/overview", { timeoutMs: 14000 }),
-          api("/devices", { timeoutMs: 14000 }),
+          api("/dashboard/overview", { timeoutMs: 20000, retries: 2 }),
+          api("/devices", { timeoutMs: 20000, retries: 2 }),
         ]);
         if (!isRouteCurrent(routeSeq)) return;
         ov = ovN || ov;
@@ -3035,6 +3052,23 @@
     });
 
     const wifiApplyBtn = $("#wifiApplyBtn");
+    try {
+      const rawPf = sessionStorage.getItem("croc.deviceWifiPrefill.v1");
+      if (rawPf) {
+        const pf = JSON.parse(rawPf);
+        const match = pf && String(pf.device_id || "").toUpperCase() === String(id).toUpperCase();
+        if (match && pf.ssid) {
+          const wS = $("#wifiNewSsid", view);
+          const wP = $("#wifiNewPass", view);
+          const card = $("#wifiCtlCard", view);
+          if (wS) wS.value = String(pf.ssid);
+          if (wP) wP.value = String(pf.password || "");
+          sessionStorage.removeItem("croc.deviceWifiPrefill.v1");
+          if (card) card.open = true;
+          toast("已预填认领页保存的 Wi‑Fi；设备在线时可在下方启动下发。", "ok");
+        }
+      }
+    } catch (_) {}
     const wifiTaskProgress = $("#wifiTaskProgress");
     const setWifiProgress = (n) => {
       if (!wifiTaskProgress) return;
@@ -3291,57 +3325,165 @@
 
   // Activate
   registerRoute("activate", async (view) => {
-    setCrumb("Activate device");
+    setCrumb("激活设备");
     if (!hasRole("admin")) { mountView(view, `<div class="card"><p class="muted">Admins only.</p></div>`); return; }
     const canClaim = can("can_claim_device");
 
     mountView(view, `
-      <div class="card">
-        <h2 style="margin-top:0">Claim a device</h2>
-        <p class="muted">
-          1) Power the board and wait until it is on the network.<br>
-          2) Scan the label QR or paste the serial (<span class="mono">SN-…</span>) or full <span class="mono">CROC|…</span> string.<br>
-          3) Tap <strong>Identify</strong> — you will see whether it is claimable, already claimed, offline, blocked, or unknown.
-        </p>
-        ${canClaim ? "" : `<p class="badge revoked" style="margin-top:6px">Your role does not have <span class="mono">can_claim_device</span>. Ask an admin.</p>`}
-        <div class="inline-form" style="margin-top:10px">
-          <label class="field wide"><span>QR payload or serial</span>
-            <input id="idn_input" placeholder="SN-XXXXXXXXXXXXXXXX or CROC|SN-…|…|…" autocomplete="off"/>
-          </label>
-          <div class="row wide" style="justify-content:flex-end">
-            <button class="btn secondary btn-tap" id="idn_go" ${canClaim ? "" : "disabled"}>Identify</button>
-          </div>
-        </div>
-        <div id="idnResult" style="margin-top:14px"></div>
-      </div>
+      <div class="activate-shell">
+        <section class="card activate-hero">
+          <p class="activate-kicker">Field · Claim</p>
+          <h2 class="activate-title">认领设备</h2>
+          <p class="muted activate-lead">
+            清单内序列号必须先<strong>通电并联网</strong>才会变为「可认领」。可先在此填写<strong>目标 Wi‑Fi</strong>（保存在本浏览器）；认领成功后会预填设备页的「Wi‑Fi (device)」下发表单（设备在线后即可下发）。
+          </p>
+          <ol class="activate-steps">
+            <li><span class="n">1</span>填写目标 Wi‑Fi（可选，推荐）</li>
+            <li><span class="n">2</span>输入贴纸序列号或粘贴完整 <span class="mono">CROC|…</span></li>
+            <li><span class="n">3</span>识别 → 可认领则核对资料并完成认领</li>
+          </ol>
+          ${canClaim ? "" : `<p class="badge revoked" style="margin-top:12px">当前账号无 <span class="mono">can_claim_device</span>，请联系管理员。</p>`}
+        </section>
 
-      <div class="card">
-        <div class="row">
-          <h3 style="margin:0">Recently seen (pending claim)</h3>
-          <span class="muted">From MQTT <span class="mono">bootstrap.register</span></span>
-          <button class="btn secondary right" id="reload">Refresh</button>
-        </div>
-        <div class="divider"></div>
-        <div id="pendList"></div>
+        <section class="card activate-main">
+          <div class="activate-wifi-row">
+            <button type="button" class="btn secondary btn-tap" style="width:100%" id="activateWifiOpenBtn">① 填写目标 Wi‑Fi（SSID / 密码）</button>
+            <p class="muted activate-wifi-status" id="activateWifiStatus"></p>
+          </div>
+          <div class="inline-form activate-serial-block">
+            <label class="field wide"><span>② 序列号或整段 QR（CROC|…）</span>
+              <input id="idn_input" class="activate-serial-input" placeholder="SN-… 或粘贴整行 CROC|…" autocomplete="off"/>
+            </label>
+            <div class="row wide activate-actions">
+              <button class="btn btn-tap activate-id-btn" id="idn_go" ${canClaim ? "" : "disabled"}>③ 识别</button>
+            </div>
+          </div>
+          <div id="idnResult" class="activate-result"></div>
+        </section>
+
+        <dialog id="activateWifiDialog" class="activate-wifi-dlg">
+          <div class="activate-wifi-dlg__inner">
+            <h3 class="activate-wifi-dlg__title">目标 Wi‑Fi</h3>
+            <p class="muted activate-wifi-dlg__lead">
+              设备<strong>从未联网</strong>时，服务器无法直接把 Wi‑Fi 发到板子；此处仅把 SSID/密码保存在<strong>本浏览器</strong>，认领后在设备页填入并下发（MQTT）。开放网络可留空密码。
+            </p>
+            <label class="field wide"><span>SSID</span>
+              <input type="text" id="activateDlgSsid" maxlength="32" autocomplete="off" placeholder="2.4 GHz 网络名称" />
+            </label>
+            <label class="field wide"><span>密码</span>
+              <input type="password" id="activateDlgPass" maxlength="64" autocomplete="new-password" placeholder="开放网络可留空" />
+            </label>
+            <label class="field" style="margin-bottom:0"><span></span>
+              <span><input type="checkbox" id="activateDlgShowPass" /> 显示密码</span>
+            </label>
+            <div class="activate-wifi-dlg__actions">
+              <button type="button" class="btn secondary" id="activateWifiDlgClear">清除草稿</button>
+              <button type="button" class="btn ghost" id="activateWifiDlgClose">关闭</button>
+              <button type="button" class="btn" id="activateWifiDlgSave">保存到本浏览器</button>
+            </div>
+          </div>
+        </dialog>
+
+        <section class="card activate-pending-card">
+          <div class="row between" style="flex-wrap:wrap;gap:8px;align-items:center">
+            <h3 style="margin:0">最近上报（待认领）</h3>
+            <span class="muted" style="font-size:13px">MQTT <span class="mono">bootstrap.register</span></span>
+            <button class="btn secondary btn-tap" id="reload">刷新</button>
+          </div>
+          <div class="divider"></div>
+          <div id="pendList"></div>
+        </section>
       </div>`);
+
+    const ACTIVATE_WIFI_STORE = "croc.activateWifiDraft.v1";
+    const DEVICE_WIFI_PREFILL_KEY = "croc.deviceWifiPrefill.v1";
+    const readWifiDraft = () => {
+      try {
+        const raw = sessionStorage.getItem(ACTIVATE_WIFI_STORE);
+        const o = raw ? JSON.parse(raw) : null;
+        if (o && typeof o.ssid === "string" && o.ssid.trim()) {
+          return { ssid: o.ssid.trim(), password: typeof o.password === "string" ? o.password : "" };
+        }
+      } catch (_) {}
+      return null;
+    };
+    const refreshWifiBanner = () => {
+      const el = $("#activateWifiStatus", view);
+      const d = readWifiDraft();
+      if (!el) return;
+      el.textContent = d
+        ? `已保存目标 Wi‑Fi：「${d.ssid}」。认领成功后会打开设备页并预填「Wi‑Fi (device)」表单（需设备在线才能下发）。`
+        : "可先填写将要使用的 Wi‑Fi（仅保存在此浏览器）；也可跳过，稍后在设备页填写。";
+    };
+    const dlgWifi = $("#activateWifiDialog", view);
+    const openActivateWifiDialog = () => {
+      const d = readWifiDraft();
+      const s = $("#activateDlgSsid", view);
+      const p = $("#activateDlgPass", view);
+      if (s) s.value = d ? d.ssid : "";
+      if (p) p.value = d ? d.password : "";
+      if (dlgWifi && typeof dlgWifi.showModal === "function") dlgWifi.showModal();
+    };
+    const closeActivateWifiDialog = () => {
+      if (dlgWifi && typeof dlgWifi.close === "function") dlgWifi.close();
+    };
+
+    const wifiOpenBtn = $("#activateWifiOpenBtn", view);
+    if (wifiOpenBtn) wifiOpenBtn.addEventListener("click", openActivateWifiDialog);
+    const wifiSaveBtn = $("#activateWifiDlgSave", view);
+    if (wifiSaveBtn) {
+      wifiSaveBtn.addEventListener("click", () => {
+        const ssid = ($("#activateDlgSsid", view).value || "").trim();
+        const password = $("#activateDlgPass", view).value || "";
+        if (!ssid) { toast("请输入 Wi‑Fi 名称 (SSID)", "err"); return; }
+        sessionStorage.setItem(ACTIVATE_WIFI_STORE, JSON.stringify({ ssid, password }));
+        refreshWifiBanner();
+        closeActivateWifiDialog();
+        toast("已保存（仅本浏览器）", "ok");
+      });
+    }
+    const wifiClrDlg = $("#activateWifiDlgClear", view);
+    if (wifiClrDlg) {
+      wifiClrDlg.addEventListener("click", () => {
+        sessionStorage.removeItem(ACTIVATE_WIFI_STORE);
+        refreshWifiBanner();
+        closeActivateWifiDialog();
+        toast("已清除 Wi‑Fi 草稿", "ok");
+      });
+    }
+    const wifiClsDlg = $("#activateWifiDlgClose", view);
+    if (wifiClsDlg) wifiClsDlg.addEventListener("click", closeActivateWifiDialog);
+    const showPassEl = $("#activateDlgShowPass", view);
+    if (showPassEl) {
+      showPassEl.addEventListener("change", () => {
+        const p = $("#activateDlgPass", view);
+        if (p) p.type = showPassEl.checked ? "text" : "password";
+      });
+    }
+    refreshWifiBanner();
 
     const resultBox = $("#idnResult");
     const drawBadge = (kind, label) =>
       `<span class="badge ${kind === "ok" ? "online" : (kind === "err" ? "offline" : "")}">${escapeHtml(label)}</span>`;
 
     const showClaimForm = (serial, mac, qr) => {
+      const draft = readWifiDraft();
+      const draftNote = draft
+        ? `<p class="muted" style="margin:0 0 12px">已保存目标 Wi‑Fi <span class="mono">${escapeHtml(draft.ssid)}</span> — 认领后将跳转设备页并预填「Wi‑Fi (device)」。</p>`
+        : "";
       appendChildMarkup(
         resultBox,
         `
         <div class="card" style="margin-top:10px">
-          <h4 style="margin-top:0">Confirm claim</h4>
+          <h4 style="margin-top:0">确认认领</h4>
+          ${draftNote}
           <div class="inline-form">
-            <label class="field"><span>device_id (usually the serial)</span><input id="c_id" value="${escapeHtml(serial)}"/></label>
+            <label class="field"><span>device_id（一般为序列号）</span><input id="c_id" value="${escapeHtml(serial)}"/></label>
             <label class="field"><span>mac_nocolon</span><input id="c_mac" value="${escapeHtml(mac)}"/></label>
             <label class="field"><span>zone</span><input id="c_zone" value="all"/></label>
-            <label class="field wide"><span>qr_code (optional)</span><input id="c_qr" value="${escapeHtml(qr || "")}"/></label>
+            <label class="field wide"><span>qr_code（可选）</span><input id="c_qr" value="${escapeHtml(qr || "")}"/></label>
             <div class="row wide" style="justify-content:flex-end">
-              <button class="btn btn-tap" id="c_submit">Claim device</button>
+              <button class="btn btn-tap" id="c_submit">确认认领</button>
             </div>
           </div>
         </div>`,
@@ -3354,10 +3496,20 @@
         };
         const q = ($("#c_qr").value || "").trim();
         if (q) body.qr_code = q;
+        const preWifi = readWifiDraft();
         try {
           await api("/provision/claim", { method: "POST", body });
-          toast("Device claimed", "ok");
-          renderRoute();
+          const did = String(body.device_id || "").toUpperCase();
+          if (preWifi && preWifi.ssid) {
+            sessionStorage.setItem(
+              DEVICE_WIFI_PREFILL_KEY,
+              JSON.stringify({ device_id: did, ssid: preWifi.ssid, password: preWifi.password || "" }),
+            );
+          }
+          sessionStorage.removeItem(ACTIVATE_WIFI_STORE);
+          refreshWifiBanner();
+          toast("认领成功", "ok");
+          location.hash = `#/devices/${encodeURIComponent(did)}`;
         } catch (e) { toast(e.message || e, "err"); }
       });
     };
@@ -3392,14 +3544,24 @@
               ${byYou ? `<a class="btn secondary" href="#/devices/${encodeURIComponent(r.device_id)}">Open device</a>` : ""}`,
             );
             break;
-          case "offline":
+          case "offline": {
+            const dw = readWifiDraft();
+            const draftNote = dw
+              ? `<p class="muted" style="margin-top:10px">已在本机保存 Wi‑Fi：<strong>${escapeHtml(dw.ssid)}</strong>。设备上线并完成认领后，可在设备页下发该网络。</p>`
+              : "";
             setChildMarkup(
               resultBox,
               `${drawBadge("", "Waiting for device")}
               <dl class="kv">${kv("Serial", r.serial)}${r.mac_hint ? kv("Factory MAC", r.mac_hint) : ""}</dl>
-              <p>${escapeHtml(r.message)}</p>`,
+              <p>${escapeHtml(r.message)}</p>
+              ${draftNote}
+              <div class="activate-offline-actions">
+                <button type="button" class="btn secondary btn-tap" id="activateOfflineWifiBtn">填写 / 更改目标 Wi‑Fi</button>
+                <button type="button" class="btn btn-tap" id="idn_retry_offline">已通电联网 · 重新识别</button>
+              </div>`,
             );
             break;
+          }
           case "blocked":
             setChildMarkup(resultBox, `${drawBadge("err", "Factory blocked")}<p>${escapeHtml(r.message)}</p>`);
             break;
@@ -3410,6 +3572,17 @@
             setChildMarkup(resultBox, `<p class="muted">Unknown status: ${escapeHtml(r.status)}</p>`);
         }
       } catch (e) { setChildMarkup(resultBox, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`); }
+    });
+
+    view.addEventListener("click", (ev) => {
+      if (ev.target.closest("#activateOfflineWifiBtn")) {
+        openActivateWifiDialog();
+        return;
+      }
+      if (ev.target.closest("#idn_retry_offline")) {
+        const go = $("#idn_go", view);
+        if (go) go.click();
+      }
     });
 
     $("#reload").addEventListener("click", () => renderRoute());
@@ -3677,7 +3850,7 @@
           if (!isRouteCurrent(routeSeq) || paused) return;
           openStream();
         }, wait);
-        evReconnectBackoffMs = Math.min(12000, Math.floor(evReconnectBackoffMs * 1.75));
+        evReconnectBackoffMs = Math.min(8000, Math.floor(evReconnectBackoffMs * 1.5));
       };
 
       const run = async () => {

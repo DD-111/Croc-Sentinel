@@ -83,8 +83,8 @@ PROVISION_USE_SHARED_MQTT_CREDS = os.getenv("PROVISION_USE_SHARED_MQTT_CREDS", "
 SCHEDULER_POLL_SECONDS = float(os.getenv("SCHEDULER_POLL_SECONDS", "1.0"))
 CLAIM_RESPONSE_INCLUDE_SECRETS = os.getenv("CLAIM_RESPONSE_INCLUDE_SECRETS", "0") == "1"
 MAX_BULK_TARGETS = int(os.getenv("MAX_BULK_TARGETS", "500"))
-# Short TTL for dashboard list/overview JSON; higher = snappier repeat-nav, slightly staler counts.
-CACHE_TTL_SECONDS = float(os.getenv("CACHE_TTL_SECONDS", "10.0"))
+# Short TTL for dashboard list/overview JSON; higher = fewer DB hits on repeat views (good on flaky links).
+CACHE_TTL_SECONDS = float(os.getenv("CACHE_TTL_SECONDS", "18.0"))
 MESSAGE_RETENTION_DAYS = int(os.getenv("MESSAGE_RETENTION_DAYS", "14"))
 STRICT_STARTUP_ENV_CHECK = os.getenv("STRICT_STARTUP_ENV_CHECK", "0") == "1"
 JWT_SECRET = os.getenv("JWT_SECRET", "")
@@ -165,8 +165,8 @@ EVENT_RING_SIZE = int(os.getenv("EVENT_RING_SIZE", "2000"))
 # Per-SSE-subscriber queue. Slow client → oldest events dropped with warning.
 EVENT_SUB_QUEUE_SIZE = int(os.getenv("EVENT_SUB_QUEUE_SIZE", "500"))
 # SSE keepalive: comment + named `ping` event so proxies that strip `:`
-# comments still see traffic. Keep below ~50s if your proxy read_timeout is 60s.
-EVENT_SSE_KEEPALIVE_SECONDS = int(os.getenv("EVENT_SSE_KEEPALIVE_SECONDS", "15"))
+# comments still see traffic. Keep well below your reverse-proxy read_timeout (often 60s).
+EVENT_SSE_KEEPALIVE_SECONDS = int(os.getenv("EVENT_SSE_KEEPALIVE_SECONDS", "12"))
 # Hint for browser EventSource automatic reconnect delay (milliseconds).
 EVENT_SSE_RETRY_MS = int(os.getenv("EVENT_SSE_RETRY_MS", "4000"))
 # Hard cap on concurrent SSE subscribers (cheap, but bound the damage).

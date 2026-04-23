@@ -213,6 +213,17 @@ class FactoryApp(tk.Tk):
         self._ping_lock = threading.Lock()
         self._api_base.trace_add("write", lambda *_: self.after(60, self._refresh_resolved_ping_label))
         self._load_env()
+        self._sync_api_combo_choices()
+
+    def _sync_api_combo_choices(self) -> None:
+        """Windows ttk.Combobox resets the displayed text to the first `values` entry when
+        the current string is not in the list (e.g. after FocusOut / dialog). Always include
+        the active URL (from .env or typed) in `values`."""
+        cur = self._api_base.get().strip()
+        vals = list(self._api_presets)
+        if cur and cur not in vals:
+            vals.append(cur)
+        self._api_combo.configure(values=tuple(vals))
 
     def _effective_api_base(self, dot: Path) -> str:
         raw_ui = self._api_base.get().strip()
@@ -222,6 +233,7 @@ class FactoryApp(tk.Tk):
         return normalize_factory_api_base(merged)
 
     def _refresh_resolved_ping_label(self) -> None:
+        self._sync_api_combo_choices()
         dot = Path(self._dotenv_path.get())
         api = self._effective_api_base(dot)
         if api:
@@ -240,6 +252,7 @@ class FactoryApp(tk.Tk):
             )
             return
         self._api_base.set(raw.replace(":8088", f":{FACTORY_PUBLIC_HTTP_PORT}", 1))
+        self._sync_api_combo_choices()
         self._refresh_resolved_ping_label()
         self._line(f"[ui] replaced :8088 → :{FACTORY_PUBLIC_HTTP_PORT} in API base")
 
@@ -287,6 +300,7 @@ class FactoryApp(tk.Tk):
         env = read_dotenv_keys(dot, ("QR_SIGN_SECRET", "FACTORY_API_TOKEN", "FACTORY_UI_API_BASE"))
         if env.get("FACTORY_UI_API_BASE", "").strip():
             self._api_base.set(normalize_factory_api_base(env["FACTORY_UI_API_BASE"].strip()))
+            self._sync_api_combo_choices()
         if env.get("FACTORY_API_TOKEN") and not self._factory_token.get().strip():
             self._factory_token.set(env["FACTORY_API_TOKEN"].strip())
         qs = "yes" if env.get("QR_SIGN_SECRET") else "NO"
