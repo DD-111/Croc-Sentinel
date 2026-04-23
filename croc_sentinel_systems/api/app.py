@@ -5684,8 +5684,9 @@ def save_group_card_settings(
         raise HTTPException(status_code=400, detail="group_key required")
     owner_scope = _group_owner_scope(principal)
     rows = _group_devices_with_owner(g, principal)
-    if not rows:
-        raise HTTPException(status_code=404, detail="group not found in your scope")
+    # Allow saving even when no devices are tagged yet: otherwise UI 404s before any
+    # `device_state.notification_group` is written (e.g. group name saved before members).
+    # Sibling fan-out and apply still require devices with matching notification_group.
     # Shared groups are owner-managed: grantee cannot override owner strategy.
     if principal.role != "superadmin":
         for r in rows:
@@ -5744,6 +5745,7 @@ def save_group_card_settings(
         "reboot_self_check": bool(body.reboot_self_check),
         "updated_by": principal.username,
         "updated_at": now,
+        "device_count": len(rows),
     }
 
 

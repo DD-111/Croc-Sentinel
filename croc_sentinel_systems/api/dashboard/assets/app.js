@@ -2292,19 +2292,62 @@
         }
       });
     }
-    $("#gmSave", view).addEventListener("click", () => {
+    $("#gmSave", view).addEventListener("click", async () => {
       const key = String($("#gmKey", view).value || "").trim();
       if (!key) { toast("Group key required", "err"); return; }
+      const oldKey = String(editingGroup || "").trim();
+      const oldEntry = oldKey && Object.prototype.hasOwnProperty.call(meta, oldKey) ? meta[oldKey] : null;
       const display_name = String($("#gmName", view).value || "").trim();
       const owner_name = String($("#gmOwner", view).value || "").trim();
       const phone = String($("#gmPhone", view).value || "").trim();
       const email = String($("#gmEmail", view).value || "").trim();
-      const picks = Array.from($$("#gmDevices input[type='checkbox']", view)).filter((x) => x.checked).map((x) => x.value);
+      const picks = Array.from($$("#gmDevices input[type='checkbox']", view)).filter((x) => x.checked).map((x) => String(x.value || "").trim());
+      if (groupSharedBy(key).length > 0) {
+        const keepIds = (oldEntry && Array.isArray(oldEntry.device_ids)) ? oldEntry.device_ids.map((x) => String(x)) : [];
+        if (editingGroup && editingGroup !== key && meta[editingGroup]) delete meta[editingGroup];
+        meta[key] = { display_name, owner_name, phone, email, device_ids: keepIds };
+        saveGroupMeta(meta);
+        try { bustDeviceListCaches(); } catch (_) {}
+        closeGroupModal();
+        renderGroups();
+        toast("Group card updated (shared group — device list is owner-managed)", "ok");
+        return;
+      }
+      const previousDeviceIds = (oldEntry && Array.isArray(oldEntry.device_ids))
+        ? oldEntry.device_ids.map((x) => String(x || "").trim())
+        : [];
+      if (picks.length > 0) {
+        try {
+          for (const id of picks) {
+            await api(`/devices/${encodeURIComponent(id)}/profile`, { method: "PATCH", body: { notification_group: key } });
+          }
+          const nextSet = new Set(picks);
+          for (const id of previousDeviceIds) {
+            if (!nextSet.has(id)) {
+              await api(`/devices/${encodeURIComponent(id)}/profile`, { method: "PATCH", body: { notification_group: "" } });
+            }
+          }
+        } catch (e) {
+          toast(e.message || e, "err");
+          return;
+        }
+      } else {
+        for (const id of previousDeviceIds) {
+          try {
+            await api(`/devices/${encodeURIComponent(id)}/profile`, { method: "PATCH", body: { notification_group: "" } });
+          } catch (e) {
+            toast(e.message || e, "err");
+            return;
+          }
+        }
+      }
       if (editingGroup && editingGroup !== key && meta[editingGroup]) delete meta[editingGroup];
       meta[key] = { display_name, owner_name, phone, email, device_ids: picks };
       saveGroupMeta(meta);
+      try { bustDeviceListCaches(); } catch (_) {}
       closeGroupModal();
       renderGroups();
+      toast("Group saved — device notification groups synced for sibling alarm fan-out", "ok");
     });
     groupCardsEl.addEventListener("click", async (ev) => {
       const btn = ev.target.closest("button");
