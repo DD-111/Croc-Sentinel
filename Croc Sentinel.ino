@@ -106,42 +106,6 @@ void buildDeviceId() {
 #endif
 }
 
-#if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
-    !defined(CONFIG_IDF_TARGET_ESP32P4)
-// Double external-reset tap: RTC slow memory survives chip EN/RST resets while VDD stays up.
-// Not a time window — two consecutive ESP_RST_EXT boots increment a counter; at 2 we open AP.
-// Cleared on power-on, brownout, or any non-EXT reset reason.
-#define CROC_DBL_EXT_MAGIC 0x43725044u
-RTC_DATA_ATTR static uint32_t s_crocDblExtMagic = 0;
-RTC_DATA_ATTR static uint8_t s_crocDblExtCount = 0;
-static bool g_doubleExtRstProvision = false;
-
-static void crocDoubleExtResetTapUpdate(esp_reset_reason_t rr) {
-  g_doubleExtRstProvision = false;
-  if (rr == ESP_RST_POWERON || rr == ESP_RST_BROWNOUT) {
-    s_crocDblExtMagic = 0;
-    s_crocDblExtCount = 0;
-    return;
-  }
-  if (rr != ESP_RST_EXT) {
-    s_crocDblExtMagic = 0;
-    s_crocDblExtCount = 0;
-    return;
-  }
-  if (s_crocDblExtMagic != CROC_DBL_EXT_MAGIC) {
-    s_crocDblExtMagic = CROC_DBL_EXT_MAGIC;
-    s_crocDblExtCount = 1;
-    return;
-  }
-  s_crocDblExtCount++;
-  if (s_crocDblExtCount >= 2) {
-    g_doubleExtRstProvision = true;
-    s_crocDblExtMagic = 0;
-    s_crocDblExtCount = 0;
-  }
-}
-#endif
-
 // ═══════════════════════════════════════════════
 //  Wi-Fi multi-AP (WiFiMulti): primary + optional WIFI_SSID_2..4 from config.h
 // ═══════════════════════════════════════════════
@@ -241,8 +205,44 @@ static bool g_provUnlocked = false;
 static char g_provAccessorySn[40] = {0};
 static unsigned long g_lastProvStartMs = 0;
 static unsigned long g_lastProvStopMs = 0;
+static unsigned long g_lastProvActivityMs = 0;
 static bool g_provWifiSavedOk = false;
-static bool g_resetByExternal = false;
+
+static inline void provPortalTouchActivity() {
+  g_lastProvActivityMs = millis();
+}
+
+static void provisioningPortalStart();
+
+#if BOARD_BOOT_GPIO >= 0
+static unsigned long s_bootHoldStartMs = 0;
+static bool s_bootHoldLedOverride = false;
+
+static void pollBootLongPressForPortal(unsigned long now) {
+  s_bootHoldLedOverride = false;
+  if (!WIFI_PROVISION_PORTAL_ENABLED || g_provActive) {
+    s_bootHoldStartMs = 0;
+    return;
+  }
+  bool down = (digitalRead(BOARD_BOOT_GPIO) == LOW);
+  if (!down) {
+    s_bootHoldStartMs = 0;
+    return;
+  }
+  if (s_bootHoldStartMs == 0) s_bootHoldStartMs = now;
+  unsigned long held = now - s_bootHoldStartMs;
+  if (held >= (unsigned long)WIFI_PROVISION_BOOT_HOLD_MS) {
+    logLine("[wifi] BOOT long-press: opening setup AP");
+    s_bootHoldStartMs = 0;
+    provisioningPortalStart();
+    return;
+  }
+  s_bootHoldLedOverride = true;
+  unsigned period = 500 - (unsigned)((held * 420UL) / (unsigned long)WIFI_PROVISION_BOOT_HOLD_MS);
+  if (period < 80) period = 80;
+  digitalWrite(STATUS_LED_GPIO, ((now / period) & 1U) ? HIGH : LOW);
+}
+#endif
 
 static bool isAccessorySnAllowedLocal(const String &snInput) {
   String sn = snInput;
@@ -320,7 +320,7 @@ static String provPageWifi(const String &msg) {
   html += F("<form method='post' action='/save' onsubmit=\"var b=this.querySelector('button');b.disabled=true;b.textContent='Saving, rebooting…';\">"
             "<label>SSID<br><input name='ssid' required maxlength='32' style='width:100%;padding:10px;margin-top:6px'></label><br><br>"
             "<label>Password<br><input name='password' maxlength='64' style='width:100%;padding:10px;margin-top:6px'></label><br>"
-            "<p style='color:#666;font-size:15px'>After save the page will show <b>Saved</b>, then the device reboots. 保存后会显示 <b>Saved</b> 并重启；若仍无法连上 Wi-Fi，请按板载 <b>RST</b> 重启后再进配网热点。</p>"
+            "<p style='color:#666;font-size:15px'>After save the page will show <b>Saved</b>, then the device reboots. To open this portal again, hold the board <b>BOOT</b> button ~10s (LED slow→fast) while running.</p>"
             "<button type='submit' style='margin-top:12px;padding:10px 14px'>Save and reboot</button></form>"
             "</body></html>");
   return html;
@@ -366,10 +366,12 @@ static void provisioningPortalStart() {
   }
   g_provDns.start(53, "*", WiFi.softAPIP());
   g_provHttp.on("/", HTTP_GET, []() {
+    provPortalTouchActivity();
     if (!g_provUnlocked) g_provHttp.send(200, "text/html", provPageGate(""));
     else g_provHttp.send(200, "text/html", provPageWifi(""));
   });
   g_provHttp.on("/unlock", HTTP_POST, []() {
+    provPortalTouchActivity();
     String sn = g_provHttp.arg("acc_sn");
     if (!isAccessorySnAllowedLocal(sn)) {
       g_provHttp.send(403, "text/html", provPageGate("Accessory SN verification failed."));
@@ -380,6 +382,7 @@ static void provisioningPortalStart() {
     g_provHttp.send(200, "text/html", provPageWifi("Verified."));
   });
   g_provHttp.on("/save", HTTP_POST, []() {
+    provPortalTouchActivity();
     if (!g_provUnlocked) {
       g_provHttp.send(403, "text/html", provPageGate("Accessory SN verification required."));
       return;
@@ -398,40 +401,31 @@ static void provisioningPortalStart() {
     if (strlen(g_provAccessorySn) > 0) p.putString("acc_sn", g_provAccessorySn);
     p.end();
     g_provWifiSavedOk = true;
-    g_provHttp.send(200, "text/html", "<html><body style='font-family:Arial;padding:20px'><h3>Saved / 已保存</h3><p>Rebooting. If Wi-Fi still fails, press board <b>RST</b> then connect to setup AP again. 设备正在重启；若仍无法连上 Wi-Fi，请按板载 RST 再开热点。</p></body></html>");
+    g_provHttp.send(200, "text/html", "<html><body style='font-family:Arial;padding:20px'><h3>Saved / 已保存</h3><p>Rebooting. To open setup AP later, hold <b>BOOT</b> ~10s while the device runs.</p></body></html>");
     delay(500);
     ESP.restart();
   });
   g_provHttp.begin();
   g_provActive = true;
   g_lastProvStartMs = millis();
+  provPortalTouchActivity();
   logLine(String("[wifi] provisioning portal started ap=") + apName);
 }
 
 static void provisioningPortalLoop() {
   if (!g_provActive) return;
-  if (WIFI_PROVISION_WINDOW_MS > 0 &&
-      (millis() - g_lastProvStartMs) >= (unsigned long)WIFI_PROVISION_WINDOW_MS) {
-    logLine("[wifi] provisioning window elapsed; closing AP");
-    provisioningPortalStop();
-    if (!g_provWifiSavedOk) {
-      logLine("[wifi] no Wi-Fi save in window; rebooting");
-      delay(150);
-      ESP.restart();
-    }
-    return;
-  }
   g_provDns.processNextRequest();
   g_provHttp.handleClient();
-}
-
-static bool provisioningPortalManualBootAllowed() {
-  if (!WIFI_PROVISION_PORTAL_ENABLED) return false;
-#if WIFI_PROVISION_REQUIRE_DOUBLE_RST
-  return g_doubleExtRstProvision;
-#else
-  return g_resetByExternal || g_doubleExtRstProvision;
-#endif
+  if (WIFI_PROVISION_IDLE_TIMEOUT_MS > 0 &&
+      (millis() - g_lastProvActivityMs) >= (unsigned long)WIFI_PROVISION_IDLE_TIMEOUT_MS) {
+    logLine("[wifi] provisioning idle timeout; closing AP and resuming STA");
+    provisioningPortalStop();
+    WiFi.mode(WIFI_STA);
+    g_wifiMultiApsRegistered = false;
+    if (g_provWifiSavedOk) {
+      // Should not happen (save path reboots); guard anyway.
+    }
+  }
 }
 #endif
 
@@ -759,6 +753,22 @@ bool secureEquals(const char *a, const char *b) {
   return diff == 0;
 }
 
+/** Constant-time compare for 16-char hex keys; ASCII case-insensitive for a-f/A-F. */
+static bool secureEqualsHex16Ci(const char *a, const char *b) {
+  size_t la = strlen(a);
+  size_t lb = strlen(b);
+  if (la != 16 || lb != 16) return false;
+  uint8_t diff = 0;
+  for (size_t i = 0; i < 16; i++) {
+    char ca = a[i];
+    char cb = b[i];
+    if (ca >= 'a' && ca <= 'f') ca = (char)(ca - ('a' - 'A'));
+    if (cb >= 'a' && cb <= 'f') cb = (char)(cb - ('a' - 'A'));
+    diff |= (uint8_t)((uint8_t)ca ^ (uint8_t)cb);
+  }
+  return diff == 0;
+}
+
 bool isHexStr(const char *s, size_t len) {
   if (strlen(s) != len) return false;
   for (size_t i = 0; i < len; i++) {
@@ -909,15 +919,42 @@ bool saveProvisioningFromClaim(JsonVariant doc) {
   const char *newPass = doc["mqtt_password"] | "";
   const char *newCmdKey = doc["cmd_key"] | "";
 
-  if (!secureEquals(bindKey, BOOTSTRAP_BIND_KEY)) return false;
-  if (!secureEquals(macHex, deviceMacNoColon)) return false;
-  if (!secureEquals(nonce, bootstrapClaimNonce)) return false;
-  if (strlen(newId) == 0 || strlen(newId) >= sizeof(deviceId)) return false;
-  if (strlen(newUser) == 0 || strlen(newUser) >= sizeof(mqttUser)) return false;
-  if (strlen(newPass) == 0 || strlen(newPass) >= sizeof(mqttPass)) return false;
-  if (!isHexStr(newCmdKey, 16)) return false;
-  if (strlen(newZone) >= sizeof(deviceZone)) return false;
-  if (strlen(newQr) >= sizeof(deviceQrCode)) return false;
+  if (!secureEquals(bindKey, BOOTSTRAP_BIND_KEY)) {
+    logLine("[claim] rejected: bind_key mismatch (stale MQTT retained assign?)");
+    return false;
+  }
+  if (!secureEquals(macHex, deviceMacNoColon)) {
+    logLine("[claim] rejected: mac_nocolon mismatch");
+    return false;
+  }
+  if (!secureEquals(nonce, bootstrapClaimNonce)) {
+    logLine("[claim] rejected: claim_nonce mismatch (need fresh assign for this boot)");
+    return false;
+  }
+  if (strlen(newId) == 0 || strlen(newId) >= sizeof(deviceId)) {
+    logLine("[claim] rejected: device_id invalid");
+    return false;
+  }
+  if (strlen(newUser) == 0 || strlen(newUser) >= sizeof(mqttUser)) {
+    logLine("[claim] rejected: mqtt_username invalid");
+    return false;
+  }
+  if (strlen(newPass) == 0 || strlen(newPass) >= sizeof(mqttPass)) {
+    logLine("[claim] rejected: mqtt_password invalid");
+    return false;
+  }
+  if (!isHexStr(newCmdKey, 16)) {
+    logLine("[claim] rejected: cmd_key must be 16 hex chars");
+    return false;
+  }
+  if (strlen(newZone) >= sizeof(deviceZone)) {
+    logLine("[claim] rejected: zone too long");
+    return false;
+  }
+  if (strlen(newQr) >= sizeof(deviceQrCode)) {
+    logLine("[claim] rejected: qr_code too long");
+    return false;
+  }
 
   prefs.begin(NVS_NAMESPACE, false);
   prefs.putBool("prov", true);
@@ -1938,7 +1975,7 @@ bool zoneMatch(const char *sourceZone) {
 bool verifyKey(const char *provided) {
   const char *expected = cmdAuthKey;
   if (!isHexStr(expected, 16) || !isHexStr(provided, 16)) return false;
-  return secureEquals(expected, provided);
+  return secureEqualsHex16Ci(expected, provided);
 }
 
 // Runs on loop() stack — never call from onMqttMessage (retained /cmd + nested publish).
@@ -1958,10 +1995,32 @@ static void handleCmdFromBody(const char *body) {
     return;
   }
 
+  const char *cmdForAck = doc["cmd"] | "cmd";
   const char *key = doc["key"] | "";
+  if (strlen(key) == 0) {
+    strlcpy(lastError, "auth_fail", sizeof(lastError));
+    logLine("[auth] rejected: MQTT cmd JSON has empty \"key\" (server publish bug?)");
+    publishAck(cmdForAck, false, "missing key");
+    return;
+  }
+  if (!isHexStr(key, 16)) {
+    strlcpy(lastError, "auth_fail", sizeof(lastError));
+    logLine("[auth] rejected: \"key\" must be exactly 16 hex chars");
+    publishAck(cmdForAck, false, "key not 16 hex");
+    return;
+  }
+  if (!isHexStr(cmdAuthKey, 16)) {
+    strlcpy(lastError, "auth_fail", sizeof(lastError));
+    logLine("[auth] rejected: device has no valid NVS cmd_key — reclaim or factory NVS clear");
+    publishAck(cmdForAck, false, "device cmd_key unset");
+    return;
+  }
   if (!verifyKey(key)) {
     strlcpy(lastError, "auth_fail", sizeof(lastError));
-    logLine("[auth] bad key rejected");
+    logLine("[auth] rejected: key mismatch — server DB cmd_key vs device NVS differ. "
+            "Fix: re-claim so assign updates NVS, or Unbind+deprovision then claim again. "
+            "If device is unprovisioned, API CMD_AUTH_KEY and firmware CMD_AUTH_KEY must match.");
+    publishAck(cmdForAck, false, "bad key");
     return;
   }
 
@@ -2081,7 +2140,6 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
     if (isProvisioned) return;
     if (!saveProvisioningFromClaim(doc.as<JsonVariant>())) {
       strlcpy(lastError, "claim_invalid", sizeof(lastError));
-      logLine("[claim] rejected");
       return;
     }
     logLine("[claim] accepted, rebooting");
@@ -2185,7 +2243,7 @@ void ensureWiFi() {
     wifiBackoffMs = min(wifiBackoffMs * 2UL, (unsigned long)RECONNECT_MAX_MS);
 #if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
     !defined(CONFIG_IDF_TARGET_ESP32P4)
-    // Manual policy: no auto-open AP here; use board RST (external reset) to open portal on boot.
+    // No auto-open AP on link loss; use BOOT long-press while running.
 #endif
   }
 }
@@ -2431,19 +2489,6 @@ void setup() {
   {
     esp_reset_reason_t __rr = esp_reset_reason();
     resetReasonStr = decodeResetReason(__rr);
-#if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
-    !defined(CONFIG_IDF_TARGET_ESP32P4)
-    crocDoubleExtResetTapUpdate(__rr);
-    g_resetByExternal = (__rr == ESP_RST_EXT);
-#if WIFI_PROVISION_RST_INCLUDING_POWERON
-    if (__rr == ESP_RST_POWERON) {
-      g_resetByExternal = true;
-    }
-#endif
-    if (g_doubleExtRstProvision) {
-      logLine("[wifi] double external reset detected: setup AP allowed this boot");
-    }
-#endif
   }
   buildDeviceId();
 
@@ -2452,6 +2497,10 @@ void setup() {
   pinMode(PANIC_BUTTON_GPIO, INPUT_PULLUP);
   pinMode(REMOTE_LOUD_BUTTON_GPIO, INPUT_PULLUP);
   pinMode(REMOTE_SILENT_BUTTON_GPIO, INPUT_PULLUP);
+#if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
+    !defined(CONFIG_IDF_TARGET_ESP32P4) && BOARD_BOOT_GPIO >= 0
+  pinMode(BOARD_BOOT_GPIO, INPUT_PULLUP);
+#endif
   digitalWrite(SIREN_GPIO, SIREN_OFF);
   digitalWrite(STATUS_LED_GPIO, LOW);
   // Sync edge-detector baseline to actual pin (assumes NO switch to GND + pull-up: idle HIGH).
@@ -2537,15 +2586,7 @@ void setup() {
     !defined(CONFIG_IDF_TARGET_ESP32P4)
   g_wifiMultiRegisterAps();
   if (g_wifiMultiApCount == 0) {
-#if WIFI_PROVISION_REQUIRE_DOUBLE_RST
-    logLine("[net] no STA creds: press board RST twice (while powered) to open setup AP.");
-#else
-    logLine("[net] no STA creds: press board RST once, or twice for double-tap path.");
-#endif
-    if (provisioningPortalManualBootAllowed()) {
-      logLine("[net] opening setup AP (manual / double-RST)");
-      provisioningPortalStart();
-    }
+    logLine("[net] no STA creds: hold BOOT ~10s (LED slow→fast) to open setup AP, or use Dashboard wifi_config.");
   } else {
     unsigned long waitStart = millis();
     while (!netIf->connected() && millis() - waitStart < WIFI_CONNECT_WAIT_MS) {
@@ -2560,16 +2601,7 @@ void setup() {
     }
   }
   if (g_wifiMultiApCount > 0 && !netIf->connected()) {
-    if (provisioningPortalManualBootAllowed()) {
-      logLine("[net] opening setup AP (manual / double-RST)");
-      provisioningPortalStart();
-    } else {
-#if WIFI_PROVISION_REQUIRE_DOUBLE_RST
-      logLine("[net] no STA link: reconnecting saved Wi-Fi (press RST twice for setup AP).");
-#else
-      logLine("[net] no STA link: reconnecting saved Wi-Fi (RST once or twice for setup AP).");
-#endif
-    }
+    logLine("[net] no STA link: will retry; hold BOOT ~10s for setup AP if needed.");
   }
 #else
   {
@@ -2687,6 +2719,17 @@ void loop() {
 
   if (sirenExpired()) deactivateSiren();
 
+#if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
+    !defined(CONFIG_IDF_TARGET_ESP32P4) && BOARD_BOOT_GPIO >= 0
+  pollBootLongPressForPortal(now);
+#endif
   bool mqttOk = mqttClient.connected();
+#if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
+    !defined(CONFIG_IDF_TARGET_ESP32P4) && BOARD_BOOT_GPIO >= 0
+  if (!s_bootHoldLedOverride) {
+    digitalWrite(STATUS_LED_GPIO, mqttOk ? HIGH : (((now / 250) & 1) ? HIGH : LOW));
+  }
+#else
   digitalWrite(STATUS_LED_GPIO, mqttOk ? HIGH : (((now / 250) & 1) ? HIGH : LOW));
+#endif
 }

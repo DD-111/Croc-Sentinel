@@ -6810,15 +6810,24 @@ def generate_device_credentials(device_id: str) -> tuple[str, str, str]:
 
 
 def get_cmd_key_for_device(device_id: str) -> str:
+    """Resolve signing key for MQTT /cmd. Match credentials case-insensitively — claim may
+    have stored mixed-case device_id while the console route uses uppercase (or vice versa);
+    falling back to CMD_AUTH_KEY then breaks every Danger-zone /commands publish."""
+    raw = str(device_id or "").strip()
+    if not raw:
+        return str(CMD_AUTH_KEY or "").strip().upper()
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute("SELECT cmd_key FROM provisioned_credentials WHERE device_id = ?", (device_id,))
+        cur.execute(
+            "SELECT cmd_key FROM provisioned_credentials WHERE UPPER(device_id) = UPPER(?) LIMIT 1",
+            (raw,),
+        )
         row = cur.fetchone()
         conn.close()
     if row and row["cmd_key"]:
-        return str(row["cmd_key"])
-    return CMD_AUTH_KEY
+        return str(row["cmd_key"]).strip().upper()
+    return str(CMD_AUTH_KEY or "").strip().upper()
 
 
 def publish_bootstrap_claim(
@@ -7124,7 +7133,8 @@ def claim_device(req: ClaimDeviceRequest, principal: Principal = Depends(require
         raise HTTPException(status_code=400, detail="device_id format rejected by policy")
     if not BOOTSTRAP_BIND_KEY:
         raise HTTPException(status_code=500, detail="server BOOTSTRAP_BIND_KEY not configured")
-    ensure_not_revoked(req.device_id)
+    did_norm = req.device_id.strip().upper()
+    ensure_not_revoked(did_norm)
 
     with db_lock:
         conn = get_conn()
@@ -7134,7 +7144,10 @@ def claim_device(req: ClaimDeviceRequest, principal: Principal = Depends(require
         if not pending:
             conn.close()
             raise HTTPException(status_code=404, detail="pending device not found")
-        cur.execute("SELECT mac_nocolon FROM provisioned_credentials WHERE device_id = ?", (req.device_id,))
+        cur.execute(
+            "SELECT mac_nocolon FROM provisioned_credentials WHERE UPPER(device_id) = UPPER(?) LIMIT 1",
+            (did_norm,),
+        )
         exist_id = cur.fetchone()
         if exist_id:
             conn.close()
@@ -7165,13 +7178,13 @@ def claim_device(req: ClaimDeviceRequest, principal: Principal = Depends(require
                 WHERE mac_nocolon = ? AND device_id = ? AND expires_at_ts >= ?
                 ORDER BY id DESC LIMIT 1
                 """,
-                (mac_nocolon, req.device_id.strip().upper(), int(time.time())),
+                (mac_nocolon, did_norm, int(time.time())),
             )
             ch = cur.fetchone()
             if not ch or not ch["verified_at"] or int(ch["used"]) == 1:
                 conn.close()
                 raise HTTPException(status_code=412, detail="verified device challenge required before claim")
-        mqtt_username, mqtt_password, cmd_key = generate_device_credentials(req.device_id)
+        mqtt_username, mqtt_password, cmd_key = generate_device_credentials(did_norm)
 
         cur.execute(
             """
@@ -7188,7 +7201,7 @@ def claim_device(req: ClaimDeviceRequest, principal: Principal = Depends(require
                 claimed_at = excluded.claimed_at
             """,
             (
-                req.device_id,
+                did_norm,
                 mac_nocolon,
                 mqtt_username,
                 mqtt_password,
@@ -7204,7 +7217,6 @@ def claim_device(req: ClaimDeviceRequest, principal: Principal = Depends(require
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
-        did = req.device_id.strip().upper()
         cur.execute(
             """
             INSERT INTO device_ownership (device_id, owner_admin, assigned_by, assigned_at)
@@ -7214,12 +7226,12 @@ def claim_device(req: ClaimDeviceRequest, principal: Principal = Depends(require
               assigned_by = excluded.assigned_by,
               assigned_at = excluded.assigned_at
             """,
-            (did, owner_admin, principal.username, utc_now_iso()),
+            (did_norm, owner_admin, principal.username, utc_now_iso()),
         )
         # Stale device_state from a previous tenant/owner: clear profile fields on (re)claim
         cur.execute(
             "UPDATE device_state SET display_label = '', notification_group = '' WHERE device_id = ?",
-            (did,),
+            (did_norm,),
         )
         conn.commit()
         conn.close()
@@ -7234,7 +7246,7 @@ def claim_device(req: ClaimDeviceRequest, principal: Principal = Depends(require
                 UPDATE provision_challenges SET used = 1
                 WHERE mac_nocolon = ? AND device_id = ? AND verified_at IS NOT NULL AND used = 0
                 """,
-                (mac_nocolon, req.device_id.strip().upper()),
+                (mac_nocolon, did_norm),
             )
             conn.commit()
             conn.close()
@@ -7242,7 +7254,7 @@ def claim_device(req: ClaimDeviceRequest, principal: Principal = Depends(require
     publish_bootstrap_claim(
         mac_nocolon=mac_nocolon,
         claim_nonce=claim_nonce,
-        device_id=req.device_id,
+        device_id=did_norm,
         zone=req.zone,
         qr_code=qr_code,
         mqtt_username=mqtt_username,
@@ -7252,7 +7264,7 @@ def claim_device(req: ClaimDeviceRequest, principal: Principal = Depends(require
 
     resp = {
         "ok": True,
-        "device_id": req.device_id,
+        "device_id": did_norm,
         "mac_nocolon": mac_nocolon,
         "mqtt_username": mqtt_username if CLAIM_RESPONSE_INCLUDE_SECRETS else "***",
         "mqtt_password": mqtt_password if CLAIM_RESPONSE_INCLUDE_SECRETS else "***",
@@ -7261,12 +7273,12 @@ def claim_device(req: ClaimDeviceRequest, principal: Principal = Depends(require
     audit_event(
         principal.username,
         "provision.claim",
-        req.device_id,
+        did_norm,
         {
             "mac_nocolon": mac_nocolon,
             "zone": req.zone,
             "owner_admin": owner_admin,
-            "device_id": req.device_id.strip().upper(),
+            "device_id": did_norm,
             "role": principal.role,
         },
     )

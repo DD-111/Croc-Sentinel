@@ -44,5 +44,8 @@
 #ifndef BOARD_HAS_ETH
 #define BOARD_HAS_ETH 0
 #endif
+#ifndef BOARD_BOOT_GPIO
+#define BOARD_BOOT_GPIO (-1)
+#endif
 
 #endif

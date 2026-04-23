@@ -8,6 +8,7 @@
 #define BOARD_DEFAULT_SIREN_GPIO 25
 #define BOARD_DEFAULT_TRIGGER_GPIO 33
 #define BOARD_DEFAULT_STATUS_LED_GPIO 2
+#define BOARD_BOOT_GPIO (-1)
 #define BOARD_HAS_VBAT_ADC 0
 
 // Placeholder PHY defaults for P4 Ethernet board.
