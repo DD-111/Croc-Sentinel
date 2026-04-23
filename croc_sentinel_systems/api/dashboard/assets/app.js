@@ -63,12 +63,43 @@
     health: null,
     overviewCache: null,
     routeSeq: 0,
-    navDevices: [],
-    navDevicesLoading: false,
-    navDevicesError: "",
-    navDevicesAt: 0,
-    navDeviceQuery: "",
   };
+
+  /** Group cards (Overview) are stored in localStorage; keep in sync when device group changes in profile. */
+  function groupMetaStorageKey() {
+    return (state.me && state.me.username) ? `croc.group.meta.v2.${state.me.username}` : "croc.group.meta.v2.anon";
+  }
+  function reconcileGroupMetaForDevice(deviceId, newGroupKey) {
+    try {
+      const k = groupMetaStorageKey();
+      const raw = localStorage.getItem(k);
+      const meta = raw ? JSON.parse(raw) : {};
+      if (!meta || typeof meta !== "object") return;
+      const id = String(deviceId || "");
+      for (const gk of Object.keys(meta)) {
+        const m = meta[gk];
+        if (!m || !Array.isArray(m.device_ids)) continue;
+        const fil = m.device_ids.filter((x) => String(x) !== id);
+        if (fil.length !== m.device_ids.length) {
+          if (fil.length) meta[gk] = { ...m, device_ids: fil };
+          else delete meta[gk];
+        }
+      }
+      const ng = String(newGroupKey || "").trim();
+      if (ng) {
+        if (!meta[ng] || typeof meta[ng] !== "object") {
+          meta[ng] = { display_name: ng, owner_name: "", phone: "", email: "", device_ids: [] };
+        }
+        const s = new Set((meta[ng].device_ids || []).map(String));
+        s.add(id);
+        meta[ng].device_ids = Array.from(s);
+      }
+      localStorage.setItem(k, JSON.stringify(meta));
+    } catch (_) {}
+  }
+  function removeDeviceIdFromAllGroupMeta(deviceId) {
+    reconcileGroupMetaForDevice(deviceId, "");
+  }
 
   /** Route redirect timer (signup / activate → login); cleared on navigation. */
   let routeRedirectTimer = null;
@@ -757,122 +788,7 @@
         );
       }
     }
-    /* Device list: server already scopes /devices by role (superadmin=all, admin=own+ACL, user=manager+ACL). */
-    const rowsAll = Array.isArray(state.navDevices) ? state.navDevices : [];
-    const q = String(state.navDeviceQuery || "").trim().toLowerCase();
-    const rows = rowsAll.filter((d) => {
-      if (!q) return true;
-      const did = String(d.device_id || "").toLowerCase();
-      const nm = String(d.display_label || "").toLowerCase();
-      const grp = String(d.notification_group || "").toLowerCase();
-      return did.includes(q) || nm.includes(q) || grp.includes(q);
-    });
-    const onDeviceRoute = (hash === "#/devices" || hash.startsWith("#/devices/"));
-    let drawerOpen = onDeviceRoute;
-    try {
-      if (sessionStorage.getItem("navDevicesOpen") === "1") drawerOpen = true;
-    } catch (_) {}
-    const openAttr = drawerOpen ? " open" : "";
-
-    const listParts = [];
-    listParts.push(
-      `<label class="field compact nav-device-search">` +
-      `<span>Search</span>` +
-      `<input id="navDeviceQuery" type="search" placeholder="id / name / group" value="${escapeHtml(state.navDeviceQuery || "")}" autocomplete="off" />` +
-      `</label>`,
-    );
-    if (state.navDevicesLoading && rows.length === 0) {
-      listParts.push(`<div class="nav-device-empty">Loading devices...</div>`);
-    } else if (state.navDevicesError && rows.length === 0) {
-      listParts.push(`<div class="nav-device-empty">${escapeHtml(state.navDevicesError)}</div>`);
-    } else if (rows.length === 0) {
-      listParts.push(`<div class="nav-device-empty">No devices in scope.</div>`);
-    } else {
-      listParts.push(`<div class="nav-device-list">`);
-      for (const d of rows) {
-        const did = String(d.device_id || "").trim();
-        if (!did) continue;
-        const nm = String(d.display_label || "").trim();
-        const title = nm || did;
-        let sub = "";
-        if (state.me.role === "superadmin") {
-          sub = d.owner_admin ? `owner: ${String(d.owner_admin)}` : "owner: unassigned";
-        } else if (d.is_shared) {
-          sub = `shared · ${String(d.shared_by || "?")}`;
-        } else {
-          sub = "owned";
-        }
-        const active = hash.startsWith(`#/devices/${encodeURIComponent(did)}`) ? ` aria-current="page"` : "";
-        listParts.push(
-          `<a href="#/devices/${encodeURIComponent(did)}"${active} class="nav-device-link" title="${escapeHtml(did)}">` +
-          `<span class="nav-ico">${isOnline(d) ? "●" : "○"}</span>` +
-          `<span class="nav-device-txt"><span class="nav-device-title">${escapeHtml(title)}</span>` +
-          `<span class="nav-device-sub">${escapeHtml(sub)}</span></span>` +
-          `</a>`,
-        );
-      }
-      listParts.push(`</div>`);
-    }
-
-    const html =
-      `<div class="nav-core">${coreParts.join("")}</div>` +
-      `<details class="sidebar-device-panel" id="navDeviceDrawer"${openAttr}>` +
-      `<summary><span class="sidebar-device-panel__title">` +
-      `<a href="#/devices" class="sidebar-devices-title-link" data-sidebar-devices-link>Devices</a>` +
-      `<span class="nav-dev-count">${rows.length}</span></span>` +
-      `<span class="sidebar-device-chev" aria-hidden="true">▼</span></summary>` +
-      `<div class="sidebar-device-panel__body">` +
-      `<div class="sidebar-device-panel__scroll">${listParts.join("")}</div>` +
-      `</div></details>`;
-
-    setHtmlIfChanged(nav, html);
-    const devTitleLink = $("[data-sidebar-devices-link]", nav);
-    if (devTitleLink) {
-      devTitleLink.addEventListener("click", (e) => e.stopPropagation());
-    }
-    const navQ = $("#navDeviceQuery", nav);
-    if (navQ) {
-      navQ.addEventListener("input", () => {
-        state.navDeviceQuery = String(navQ.value || "");
-        renderNav();
-      });
-    }
-    const drawerEl = $("#navDeviceDrawer", nav);
-    if (drawerEl) {
-      drawerEl.addEventListener("toggle", () => {
-        try {
-          sessionStorage.setItem("navDevicesOpen", drawerEl.open ? "1" : "0");
-        } catch (_) {}
-      });
-    }
-    const stale = (Date.now() - Number(state.navDevicesAt || 0)) > 10000;
-    if (stale && !state.navDevicesLoading) void refreshNavDevices();
-  }
-
-  async function refreshNavDevices(force) {
-    if (!state.me) return;
-    if (state.navDevicesLoading) return;
-    state.navDevicesLoading = true;
-    if (force) state.navDevicesError = "";
-    try {
-      const r = await api("/devices", { timeoutMs: 18000, retries: 2 });
-      state.navDevices = Array.isArray(r && r.items) ? r.items : [];
-      state.navDevicesError = "";
-      state.navDevicesAt = Date.now();
-    } catch (e) {
-      state.navDevicesError = String((e && e.message) || e || "Device list unavailable");
-    } finally {
-      state.navDevicesLoading = false;
-      const nav = $("#nav");
-      if (nav && state.me) {
-        const currentHash = location.hash || "#/overview";
-        const onAuthRoute = currentHash.startsWith("#/login")
-          || currentHash.startsWith("#/signup")
-          || currentHash.startsWith("#/activate")
-          || currentHash.startsWith("#/forgot-password");
-        if (!onAuthRoute) renderNav();
-      }
-    }
+    setHtmlIfChanged(nav, `<div class="nav-core">${coreParts.join("")}</div>`);
   }
 
   function renderHealthPills() {
@@ -2466,7 +2382,6 @@
           riskClass: mqClass,
         });
         renderGroups();
-        void refreshNavDevices(true);
       } catch (_) {}
     };
     scheduleRouteTicker(routeSeq, "overview-live", refreshOverviewLive, OVERVIEW_LIVE_MS);
@@ -3075,13 +2990,15 @@
 
     $("#saveProfile").addEventListener("click", async () => {
       try {
+        const newGroup = ($("#notifGroup").value || "").trim();
         await api(`/devices/${encodeURIComponent(id)}/profile`, {
           method: "PATCH",
           body: {
             display_label: ($("#dispLabel").value || "").trim(),
-            notification_group: ($("#notifGroup").value || "").trim(),
+            notification_group: newGroup,
           },
         });
+        reconcileGroupMetaForDevice(id, newGroup);
         toast("Saved", "ok");
       } catch (e) { toast(e.message || e, "err"); }
     });
@@ -3125,6 +3042,7 @@
             method: "POST",
             body: { confirm_text: typed },
           });
+          removeDeviceIdFromAllGroupMeta(id);
           bustDeviceListCaches();
           const okNv = dr && (dr.nvs_purge_sent === true);
           toast(`Device removed from account.${okNv ? " Device cleared WiFi+claim in NVS (rebooting)." : " If it was offline, use WiFi clear or reflash; deploy latest API+firmware to auto-clear on delete."} Re-add from Activate.`, "ok");
@@ -3147,6 +3065,7 @@
             method: "POST",
             body: { confirm_text: typed },
           });
+          removeDeviceIdFromAllGroupMeta(id);
           bustDeviceListCaches();
           const okNv = fr && (fr.nvs_purge_sent === true);
           toast(

@@ -4963,6 +4963,8 @@ def _close_admin_tenant_cur(
             raise HTTPException(status_code=400, detail="transfer_devices_to must be an existing admin or superadmin")
         if secrets.compare_digest(transfer_to, admin_username):
             raise HTTPException(status_code=400, detail="cannot transfer to the same admin")
+        cur.execute("SELECT device_id FROM device_ownership WHERE owner_admin = ?", (admin_username,))
+        transfer_ids = [str(r["device_id"]) for r in cur.fetchall() if r and r["device_id"]]
         cur.execute(
             """
             UPDATE device_ownership
@@ -4972,6 +4974,12 @@ def _close_admin_tenant_cur(
             (transfer_to, actor_username, utc_now_iso(), admin_username),
         )
         summary["devices_transferred"] = int(cur.rowcount or 0)
+        if transfer_ids:
+            ph = ",".join("?" * len(transfer_ids))
+            cur.execute(
+                f"UPDATE device_state SET display_label = '', notification_group = '' WHERE device_id IN ({ph})",
+                transfer_ids,
+            )
     else:
         cur.execute("SELECT device_id FROM device_ownership WHERE owner_admin = ?", (admin_username,))
         for r in cur.fetchall():
@@ -6001,18 +6009,27 @@ def _apply_device_profile_update(
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute("SELECT zone FROM device_state WHERE device_id = ?", (device_id,))
+        cur.execute(
+            "SELECT zone, display_label, notification_group FROM device_state WHERE device_id = ?",
+            (device_id,),
+        )
         zr = cur.fetchone()
         if not zr:
             conn.close()
             raise HTTPException(status_code=404, detail="device not found")
         assert_zone_for_device(principal, str(zr["zone"]) if zr["zone"] is not None else "")
+        old_label = (str(zr["display_label"]).strip() if zr["display_label"] is not None else "")
+        old_group = (str(zr["notification_group"]).strip() if zr["notification_group"] is not None else "")
         cur.execute(
             f"UPDATE device_state SET {', '.join(sets)} WHERE device_id = ?",
             tuple(args),
         )
         conn.commit()
         conn.close()
+    new_label = (body.display_label.strip() if body.display_label is not None else old_label)
+    new_group = (body.notification_group.strip() if body.notification_group is not None else old_group)
+    group_changed = body.notification_group is not None and new_group != old_group
+    label_changed = body.display_label is not None and new_label != old_label
     cache_invalidate("devices")
     cache_invalidate("overview")
     emit_event(
@@ -6024,15 +6041,19 @@ def _apply_device_profile_update(
         target=device_id,
         device_id=device_id,
         detail={
-            "display_label": body.display_label.strip() if body.display_label is not None else None,
-            "notification_group": body.notification_group.strip() if body.notification_group is not None else None,
+            "display_label": new_label,
+            "notification_group": new_group,
+            "previous_display_label": old_label,
+            "previous_notification_group": old_group,
+            "display_label_changed": label_changed,
+            "notification_group_changed": group_changed,
         },
     )
     out: dict[str, Any] = {"ok": True, "device_id": device_id}
     if body.display_label is not None:
-        out["display_label"] = body.display_label.strip()
+        out["display_label"] = new_label
     if body.notification_group is not None:
-        out["notification_group"] = body.notification_group.strip()
+        out["notification_group"] = new_group
     return out
 
 
@@ -6717,6 +6738,7 @@ def claim_device(req: ClaimDeviceRequest, principal: Principal = Depends(require
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
+        did = req.device_id.strip().upper()
         cur.execute(
             """
             INSERT INTO device_ownership (device_id, owner_admin, assigned_by, assigned_at)
@@ -6726,10 +6748,17 @@ def claim_device(req: ClaimDeviceRequest, principal: Principal = Depends(require
               assigned_by = excluded.assigned_by,
               assigned_at = excluded.assigned_at
             """,
-            (req.device_id, owner_admin, principal.username, utc_now_iso()),
+            (did, owner_admin, principal.username, utc_now_iso()),
+        )
+        # Stale device_state from a previous tenant/owner: clear profile fields on (re)claim
+        cur.execute(
+            "UPDATE device_state SET display_label = '', notification_group = '' WHERE device_id = ?",
+            (did,),
         )
         conn.commit()
         conn.close()
+        cache_invalidate("devices")
+        cache_invalidate("overview")
     if ENFORCE_DEVICE_CHALLENGE:
         with db_lock:
             conn = get_conn()
