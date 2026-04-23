@@ -97,6 +97,16 @@ DEVICE_ID_REGEX = os.getenv("DEVICE_ID_REGEX", r"^SN-[A-Z2-7]{16}$")
 QR_CODE_REGEX = os.getenv("QR_CODE_REGEX", r"^CROC\|SN-[A-Z2-7]{16}\|\d{10}\|[A-Za-z0-9_-]{20,120}$")
 QR_SIGN_SECRET = os.getenv("QR_SIGN_SECRET", "")
 ALLOW_LEGACY_UNOWNED = os.getenv("ALLOW_LEGACY_UNOWNED", "1") == "1"
+# When true (default), admins/users never see "unowned" devices in list/API scope unless they are
+# the owning tenant — prevents cross-tenant leakage. Set TENANT_STRICT=0 for legacy lab behavior.
+TENANT_STRICT = os.getenv("TENANT_STRICT", "1") == "1"
+
+
+def _legacy_unowned_device_scope(principal: "Principal") -> bool:
+    """Whether unowned device_state rows appear in non-superadmin device queries."""
+    if principal.is_superadmin():
+        return False
+    return bool(ALLOW_LEGACY_UNOWNED) and not TENANT_STRICT
 OTA_FIRMWARE_DIR = os.getenv("OTA_FIRMWARE_DIR", "/opt/sentinel/firmware")
 OTA_PUBLIC_BASE_URL = os.getenv("OTA_PUBLIC_BASE_URL", "").rstrip("/")
 OTA_TOKEN = os.getenv("OTA_TOKEN", "")
@@ -1465,12 +1475,12 @@ def _device_access_flags(principal: Principal, device_id: str) -> tuple[bool, bo
     acl_operate = bool(int(acl["can_operate"])) if acl else False
     if principal.role == "admin":
         owner_view = bool(owner) and owner == principal.username
-        if not owner and ALLOW_LEGACY_UNOWNED:
+        if not owner and _legacy_unowned_device_scope(principal):
             owner_view = True
         owner_operate = bool(owner) and owner == principal.username
         return (owner_view or acl_view or acl_operate), (owner_operate or acl_operate)
     owner_view = bool(owner) and bool(manager) and owner == manager
-    if not owner and ALLOW_LEGACY_UNOWNED and bool(manager):
+    if not owner and _legacy_unowned_device_scope(principal) and bool(manager):
         owner_view = True
     owner_operate = bool(owner) and bool(manager) and owner == manager
     return (owner_view or acl_view or acl_operate), (owner_operate or acl_operate)
@@ -1493,16 +1503,28 @@ def assert_device_owner(principal: Principal, device_id: str) -> None:
     assert_device_operate_access(principal, device_id)
 
 
+def assert_device_command_actor(
+    principal: Principal, device_id: str, *, check_revoked: bool = True
+) -> None:
+    """Publish-style device commands: at least user, policy capability, operate ACL, optional revoke."""
+    assert_min_role(principal, "user")
+    require_capability(principal, "can_send_command")
+    if check_revoked:
+        ensure_not_revoked(device_id)
+    assert_device_operate_access(principal, device_id)
+
+
 def owner_sql_suffix(principal: Principal, alias: str = "d") -> tuple[str, list[Any]]:
     if principal.role == "superadmin":
         return "", []
     col = f"{alias}.owner_admin"
+    leg = _legacy_unowned_device_scope(principal)
     if principal.role == "admin":
-        return f" AND ({col} = ? {'OR '+col+' IS NULL' if ALLOW_LEGACY_UNOWNED else ''}) ", [principal.username]
+        return f" AND ({col} = ? {'OR '+col+' IS NULL' if leg else ''}) ", [principal.username]
     manager = get_manager_admin(principal.username)
     if not manager:
         return " AND 1=0 ", []
-    return f" AND ({col} = ? {'OR '+col+' IS NULL' if ALLOW_LEGACY_UNOWNED else ''}) ", [manager]
+    return f" AND ({col} = ? {'OR '+col+' IS NULL' if leg else ''}) ", [manager]
 
 
 def owner_scope_clause_for_device_state(principal: Principal, device_alias: str = "device_state") -> tuple[str, list[Any]]:
@@ -1513,7 +1535,7 @@ def owner_scope_clause_for_device_state(principal: Principal, device_alias: str 
             f"EXISTS (SELECT 1 FROM device_acl a WHERE a.device_id={device_alias}.device_id "
             "AND a.grantee_username=? AND a.revoked_at IS NULL AND (a.can_view=1 OR a.can_operate=1))"
         )
-        if ALLOW_LEGACY_UNOWNED:
+        if _legacy_unowned_device_scope(principal):
             return (
                 f" AND ((EXISTS (SELECT 1 FROM device_ownership o WHERE o.device_id={device_alias}.device_id AND o.owner_admin=?)) "
                 "OR (" + acl_clause + ") "
@@ -1532,7 +1554,7 @@ def owner_scope_clause_for_device_state(principal: Principal, device_alias: str 
         f"EXISTS (SELECT 1 FROM device_acl a WHERE a.device_id={device_alias}.device_id "
         "AND a.grantee_username=? AND a.revoked_at IS NULL AND (a.can_view=1 OR a.can_operate=1))"
     )
-    if ALLOW_LEGACY_UNOWNED:
+    if _legacy_unowned_device_scope(principal):
         return (
             f" AND ((EXISTS (SELECT 1 FROM device_ownership o WHERE o.device_id={device_alias}.device_id AND o.owner_admin=?)) "
             "OR (" + acl_clause + ") "
@@ -2854,9 +2876,20 @@ class BulkAlertRequest(BaseModel):
     device_ids: list[str] = Field(default_factory=list)
 
 
+_WIFI_DEFERRED_CMDS = frozenset({"get_info", "ping", "self_test", "set_param"})
+
+
+class WifiDeferredCmd(BaseModel):
+    """Executed on-device after Wi-Fi credentials are saved + reboot, once MQTT reconnects (order preserved)."""
+
+    cmd: str = Field(min_length=1, max_length=32)
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
 class ProvisionWifiTaskRequest(BaseModel):
     ssid: str = Field(min_length=1, max_length=32)
     password: str = Field(default="", max_length=64)
+    chain: list[WifiDeferredCmd] = Field(default_factory=list, max_length=4)
 
 
 class TriggerPolicyBody(BaseModel):
@@ -5493,6 +5526,7 @@ def get_device(device_id: str, principal: Principal = Depends(require_principal)
     if not row:
         raise HTTPException(status_code=404, detail="device not found")
     assert_zone_for_device(principal, str(row["zone"]) if row["zone"] is not None else "")
+    can_view, can_operate = _device_access_flags(principal, device_id)
 
     out = dict(row)
     for key in ("last_status_json", "last_heartbeat_json", "last_ack_json", "last_event_json"):
@@ -5533,6 +5567,8 @@ def get_device(device_id: str, principal: Principal = Depends(require_principal)
         out["is_shared"] = bool(is_shared)
         if is_shared:
             out["shared_by"] = owner_admin
+    out["can_view"] = bool(can_view)
+    out["can_operate"] = bool(can_operate)
     return out
 
 
@@ -5604,6 +5640,8 @@ class GroupCardSettingsBody(BaseModel):
     trigger_duration_ms: int = Field(default=10000, ge=500, le=300000)
     delay_seconds: int = Field(default=0, ge=0, le=3600)
     reboot_self_check: bool = False
+    # Superadmin only: which tenant's group_card_settings row / device slice to target.
+    owner_admin: Optional[str] = Field(default=None, max_length=64)
 
 
 class DeviceShareRequest(BaseModel):
@@ -5612,17 +5650,31 @@ class DeviceShareRequest(BaseModel):
     can_operate: bool = False
 
 
-def _delete_group_card_impl(group_key: str, principal: Principal) -> dict[str, Any]:
+def _delete_group_card_impl(
+    group_key: str,
+    principal: Principal,
+    *,
+    tenant_owner: Optional[str] = None,
+) -> dict[str, Any]:
     """Delete a group card by clearing notification_group on target devices.
 
     Security rule:
       - admin: can only delete groups fully owned by self (shared devices block deletion)
-      - superadmin: can delete any group
+      - superadmin: can delete any group; pass `tenant_owner` to clear only that admin's slice
+        (recommended when multiple tenants reuse the same group_key).
     """
     assert_min_role(principal, "admin")
     g = (group_key or "").strip()
     if not g:
         raise HTTPException(status_code=400, detail="group_key required")
+    tenant = (tenant_owner or "").strip()
+    if principal.role != "superadmin" and tenant:
+        raise HTTPException(status_code=400, detail="owner_admin filter is superadmin-only")
+    slice_sql = ""
+    slice_args: list[Any] = []
+    if principal.role == "superadmin" and tenant:
+        slice_sql = " AND IFNULL(o.owner_admin,'') = ? "
+        slice_args.append(tenant)
     zs, za = zone_sql_suffix(principal, "d.zone")
     osf, osa = owner_scope_clause_for_device_state(principal, "d")
     with db_lock:
@@ -5633,10 +5685,10 @@ def _delete_group_card_impl(group_key: str, principal: Principal) -> dict[str, A
             SELECT d.device_id, IFNULL(o.owner_admin,'') AS owner_admin
             FROM device_state d
             LEFT JOIN device_ownership o ON d.device_id = o.device_id
-            WHERE IFNULL(d.notification_group,'') = ? {zs} {osf}
+            WHERE IFNULL(d.notification_group,'') = ? {zs} {osf} {slice_sql}
             ORDER BY d.device_id ASC
             """,
-            tuple([g] + za + osa),
+            tuple([g] + za + osa + slice_args),
         )
         rows = [dict(r) for r in cur.fetchall()]
         if not rows:
@@ -5663,29 +5715,55 @@ def _delete_group_card_impl(group_key: str, principal: Principal) -> dict[str, A
         conn.close()
     cache_invalidate("devices")
     cache_invalidate("overview")
-    owner_scope = principal.username if principal.role == "admin" else (get_manager_admin(principal.username) or principal.username)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute(
-            "DELETE FROM group_card_settings WHERE owner_admin = ? AND group_key = ?",
-            (owner_scope, g),
-        )
+        if principal.role == "superadmin":
+            if tenant:
+                cur.execute(
+                    "DELETE FROM group_card_settings WHERE owner_admin = ? AND group_key = ?",
+                    (tenant, g),
+                )
+            else:
+                cur.execute("DELETE FROM group_card_settings WHERE group_key = ?", (g,))
+        else:
+            owner_scope = (
+                principal.username
+                if principal.role == "admin"
+                else (get_manager_admin(principal.username) or principal.username)
+            )
+            cur.execute(
+                "DELETE FROM group_card_settings WHERE owner_admin = ? AND group_key = ?",
+                (owner_scope, g),
+            )
         conn.commit()
         conn.close()
-    audit_event(principal.username, "group.delete", g, {"device_count": len(ids), "changed": changed})
+    audit_event(
+        principal.username,
+        "group.delete",
+        g,
+        {"device_count": len(ids), "changed": changed, "tenant_owner": tenant or None},
+    )
     return {"ok": True, "group_key": g, "device_count": len(ids), "changed": changed}
 
 
 @app.delete("/group-cards/{group_key}")
-def delete_group_card(group_key: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    return _delete_group_card_impl(group_key, principal)
+def delete_group_card(
+    group_key: str,
+    owner_admin: Optional[str] = Query(default=None, max_length=64),
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    return _delete_group_card_impl(group_key, principal, tenant_owner=owner_admin)
 
 
 @app.post("/group-cards/{group_key}/delete")
-def delete_group_card_post(group_key: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+def delete_group_card_post(
+    group_key: str,
+    owner_admin: Optional[str] = Query(default=None, max_length=64),
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
     """Proxy-friendly delete route for environments that block HTTP DELETE."""
-    return _delete_group_card_impl(group_key, principal)
+    return _delete_group_card_impl(group_key, principal, tenant_owner=owner_admin)
 
 
 @app.get("/group-cards/capabilities")
@@ -5725,10 +5803,23 @@ def _group_settings_defaults(group_key: str) -> dict[str, Any]:
     }
 
 
-def _group_devices_with_owner(group_key: str, principal: Principal) -> list[dict[str, str]]:
+def _group_devices_with_owner(
+    group_key: str,
+    principal: Principal,
+    *,
+    tenant_owner: Optional[str] = None,
+) -> list[dict[str, str]]:
     g = (group_key or "").strip()
     if not g:
         return []
+    tenant = (tenant_owner or "").strip()
+    if principal.role != "superadmin" and tenant:
+        raise HTTPException(status_code=400, detail="owner_admin filter is superadmin-only")
+    slice_sql = ""
+    slice_args: list[Any] = []
+    if principal.role == "superadmin" and tenant:
+        slice_sql = " AND IFNULL(o.owner_admin,'') = ? "
+        slice_args.append(tenant)
     zs, za = zone_sql_suffix(principal, "d.zone")
     osf, osa = owner_scope_clause_for_device_state(principal, "d")
     with db_lock:
@@ -5739,10 +5830,10 @@ def _group_devices_with_owner(group_key: str, principal: Principal) -> list[dict
             SELECT d.device_id, IFNULL(o.owner_admin,'') AS owner_admin
             FROM device_state d
             LEFT JOIN device_ownership o ON d.device_id = o.device_id
-            WHERE IFNULL(d.notification_group,'') = ? {zs} {osf}
+            WHERE IFNULL(d.notification_group,'') = ? {zs} {osf} {slice_sql}
             ORDER BY d.device_id ASC
             """,
-            tuple([g] + za + osa),
+            tuple([g] + za + osa + slice_args),
         )
         rows = [{"device_id": str(r["device_id"]), "owner_admin": str(r["owner_admin"] or "")} for r in cur.fetchall()]
         conn.close()
@@ -5756,21 +5847,33 @@ def list_group_card_settings(principal: Principal = Depends(require_principal)) 
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT group_key, trigger_mode, trigger_duration_ms, delay_seconds, reboot_self_check, updated_by, updated_at
-            FROM group_card_settings
-            WHERE owner_admin = ?
-            ORDER BY group_key ASC
-            """,
-            (owner_scope,),
-        )
+        if principal.role == "superadmin":
+            cur.execute(
+                """
+                SELECT owner_admin, group_key, trigger_mode, trigger_duration_ms, delay_seconds,
+                       reboot_self_check, updated_by, updated_at
+                FROM group_card_settings
+                ORDER BY owner_admin ASC, group_key ASC
+                """
+            )
+        else:
+            cur.execute(
+                """
+                SELECT owner_admin, group_key, trigger_mode, trigger_duration_ms, delay_seconds,
+                       reboot_self_check, updated_by, updated_at
+                FROM group_card_settings
+                WHERE owner_admin = ?
+                ORDER BY group_key ASC
+                """,
+                (owner_scope,),
+            )
         rows = [dict(r) for r in cur.fetchall()]
         conn.close()
     out = []
     for r in rows:
         out.append(
             {
+                "owner_admin": str(r.get("owner_admin") or ""),
                 "group_key": str(r.get("group_key") or ""),
                 "trigger_mode": str(r.get("trigger_mode") or "continuous"),
                 "trigger_duration_ms": int(r.get("trigger_duration_ms") or 10000),
@@ -5789,29 +5892,72 @@ def list_group_card_settings_api(principal: Principal = Depends(require_principa
 
 
 @app.get("/group-cards/{group_key}/settings")
-def get_group_card_settings(group_key: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+def get_group_card_settings(
+    group_key: str,
+    owner_admin: Optional[str] = Query(default=None, max_length=64),
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
     assert_min_role(principal, "user")
     g = (group_key or "").strip()
     if not g:
         raise HTTPException(status_code=400, detail="group_key required")
     owner_scope = _group_owner_scope(principal)
+    tenant_q = (owner_admin or "").strip()
+    if principal.role != "superadmin" and tenant_q:
+        raise HTTPException(status_code=400, detail="owner_admin query is superadmin-only")
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT group_key, trigger_mode, trigger_duration_ms, delay_seconds, reboot_self_check, updated_by, updated_at
-            FROM group_card_settings
-            WHERE owner_admin = ? AND group_key = ?
-            """,
-            (owner_scope, g),
-        )
-        row = cur.fetchone()
+        if principal.role == "superadmin":
+            if tenant_q:
+                cur.execute(
+                    """
+                    SELECT owner_admin, group_key, trigger_mode, trigger_duration_ms, delay_seconds,
+                           reboot_self_check, updated_by, updated_at
+                    FROM group_card_settings
+                    WHERE owner_admin = ? AND group_key = ?
+                    """,
+                    (tenant_q, g),
+                )
+                row = cur.fetchone()
+            else:
+                cur.execute(
+                    """
+                    SELECT owner_admin, group_key, trigger_mode, trigger_duration_ms, delay_seconds,
+                           reboot_self_check, updated_by, updated_at
+                    FROM group_card_settings
+                    WHERE group_key = ?
+                    """,
+                    (g,),
+                )
+                matches = cur.fetchall()
+                if not matches:
+                    row = None
+                elif len(matches) == 1:
+                    row = matches[0]
+                else:
+                    conn.close()
+                    raise HTTPException(
+                        status_code=400,
+                        detail="owner_admin query parameter required (multiple tenants use this group_key)",
+                    )
+        else:
+            cur.execute(
+                """
+                SELECT owner_admin, group_key, trigger_mode, trigger_duration_ms, delay_seconds,
+                       reboot_self_check, updated_by, updated_at
+                FROM group_card_settings
+                WHERE owner_admin = ? AND group_key = ?
+                """,
+                (owner_scope, g),
+            )
+            row = cur.fetchone()
         conn.close()
     if not row:
         return _group_settings_defaults(g)
     r = dict(row)
     return {
+        "owner_admin": str(r.get("owner_admin") or ""),
         "group_key": g,
         "trigger_mode": str(r.get("trigger_mode") or "continuous"),
         "trigger_duration_ms": int(r.get("trigger_duration_ms") or 10000),
@@ -5823,8 +5969,12 @@ def get_group_card_settings(group_key: str, principal: Principal = Depends(requi
 
 
 @app.get("/api/group-cards/{group_key}/settings")
-def get_group_card_settings_api(group_key: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    return get_group_card_settings(group_key, principal)
+def get_group_card_settings_api(
+    group_key: str,
+    owner_admin: Optional[str] = Query(default=None, max_length=64),
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    return get_group_card_settings(group_key, owner_admin=owner_admin, principal=principal)
 
 
 @app.put("/group-cards/{group_key}/settings")
@@ -5838,7 +5988,24 @@ def save_group_card_settings(
     if not g:
         raise HTTPException(status_code=400, detail="group_key required")
     owner_scope = _group_owner_scope(principal)
-    rows = _group_devices_with_owner(g, principal)
+    tenant_body = (body.owner_admin or "").strip()
+    if principal.role != "superadmin" and tenant_body:
+        raise HTTPException(status_code=400, detail="owner_admin in body is superadmin-only")
+    tenant_for_slice: Optional[str] = None
+    if principal.role == "superadmin" and tenant_body:
+        owner_scope = tenant_body
+        tenant_for_slice = tenant_body
+    rows = _group_devices_with_owner(g, principal, tenant_owner=tenant_for_slice)
+    if principal.role == "superadmin" and not tenant_body:
+        owners_set = {str(r.get("owner_admin") or "").strip() for r in rows}
+        owners_set.discard("")
+        if len(owners_set) > 1:
+            raise HTTPException(
+                status_code=400,
+                detail="owner_admin required in body (multiple tenants share this group_key)",
+            )
+        if len(owners_set) == 1:
+            owner_scope = next(iter(owners_set))
     # Allow saving even when no devices are tagged yet: otherwise UI 404s before any
     # `device_state.notification_group` is written (e.g. group name saved before members).
     # Sibling fan-out and apply still require devices with matching notification_group.
@@ -5889,10 +6056,12 @@ def save_group_card_settings(
             "trigger_duration_ms": int(body.trigger_duration_ms),
             "delay_seconds": int(body.delay_seconds),
             "reboot_self_check": bool(body.reboot_self_check),
+            "owner_admin": owner_scope,
         },
     )
     return {
         "ok": True,
+        "owner_admin": owner_scope,
         "group_key": g,
         "trigger_mode": body.trigger_mode,
         "trigger_duration_ms": int(body.trigger_duration_ms),
@@ -5916,6 +6085,7 @@ def save_group_card_settings_api(
 @app.post("/group-cards/{group_key}/apply")
 def apply_group_card_settings(
     group_key: str,
+    owner_admin: Optional[str] = Query(default=None, max_length=64),
     principal: Principal = Depends(require_principal),
 ) -> dict[str, Any]:
     assert_min_role(principal, "user")
@@ -5923,7 +6093,19 @@ def apply_group_card_settings(
     if not g:
         raise HTTPException(status_code=400, detail="group_key required")
     owner_scope = _group_owner_scope(principal)
-    rows = _group_devices_with_owner(g, principal)
+    tenant_q = (owner_admin or "").strip()
+    if principal.role != "superadmin" and tenant_q:
+        raise HTTPException(status_code=400, detail="owner_admin query is superadmin-only")
+    tenant_for_slice: Optional[str] = tenant_q or None
+    rows = _group_devices_with_owner(g, principal, tenant_owner=tenant_for_slice)
+    if principal.role == "superadmin" and not tenant_for_slice:
+        owners_set = {str(r.get("owner_admin") or "").strip() for r in rows}
+        owners_set.discard("")
+        if len(owners_set) > 1:
+            raise HTTPException(
+                status_code=400,
+                detail="owner_admin query required (multiple tenants share this group_key)",
+            )
     targets = [str(r["device_id"]) for r in rows if r.get("device_id")]
     if not targets:
         raise HTTPException(status_code=404, detail="group has no devices in your scope")
@@ -5997,8 +6179,10 @@ def apply_group_card_settings(
             siren_sent += 1
 
         if reboot_self_check:
-            assert_min_role(principal, "admin")
             require_capability(principal, "can_send_command")
+            _, can_op = _device_access_flags(principal, did)
+            if not can_op:
+                continue
             publish_command(
                 topic=f"{TOPIC_ROOT}/{did}/cmd",
                 cmd="self_test",
@@ -6086,19 +6270,28 @@ def apply_group_card_settings(
 @app.post("/api/group-cards/{group_key}/apply")
 def apply_group_card_settings_api(
     group_key: str,
+    owner_admin: Optional[str] = Query(default=None, max_length=64),
     principal: Principal = Depends(require_principal),
 ) -> dict[str, Any]:
-    return apply_group_card_settings(group_key, principal)
+    return apply_group_card_settings(group_key, owner_admin=owner_admin, principal=principal)
 
 
 @app.delete("/api/group-cards/{group_key}")
-def delete_group_card_api(group_key: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    return _delete_group_card_impl(group_key, principal)
+def delete_group_card_api(
+    group_key: str,
+    owner_admin: Optional[str] = Query(default=None, max_length=64),
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    return _delete_group_card_impl(group_key, principal, tenant_owner=owner_admin)
 
 
 @app.post("/api/group-cards/{group_key}/delete")
-def delete_group_card_post_api(group_key: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    return _delete_group_card_impl(group_key, principal)
+def delete_group_card_post_api(
+    group_key: str,
+    owner_admin: Optional[str] = Query(default=None, max_length=64),
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    return _delete_group_card_impl(group_key, principal, tenant_owner=owner_admin)
 
 
 def _apply_device_profile_update(
@@ -7012,7 +7205,18 @@ def claim_device(req: ClaimDeviceRequest, principal: Principal = Depends(require
         "mqtt_password": mqtt_password if CLAIM_RESPONSE_INCLUDE_SECRETS else "***",
         "cmd_key": cmd_key if CLAIM_RESPONSE_INCLUDE_SECRETS else "***",
     }
-    audit_event(principal.username, "provision.claim", req.device_id, {"mac_nocolon": mac_nocolon, "zone": req.zone})
+    audit_event(
+        principal.username,
+        "provision.claim",
+        req.device_id,
+        {
+            "mac_nocolon": mac_nocolon,
+            "zone": req.zone,
+            "owner_admin": owner_admin,
+            "device_id": req.device_id.strip().upper(),
+            "role": principal.role,
+        },
+    )
     return resp
 
 
@@ -7148,10 +7352,7 @@ def send_device_command(
     request: Request,
     principal: Principal = Depends(require_principal),
 ) -> dict[str, Any]:
-    assert_min_role(principal, "admin")
-    require_capability(principal, "can_send_command")
-    ensure_not_revoked(device_id)
-    assert_device_owner(principal, device_id)
+    assert_device_command_actor(principal, device_id)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -7220,9 +7421,7 @@ def save_device_trigger_policy(
     body: TriggerPolicyBody,
     principal: Principal = Depends(require_principal),
 ) -> dict[str, Any]:
-    assert_min_role(principal, "admin")
-    require_capability(principal, "can_send_command")
-    assert_device_owner(principal, device_id)
+    assert_device_command_actor(principal, device_id, check_revoked=False)
     row, owner = _load_device_row_for_task(device_id)
     assert_zone_for_device(principal, str(row.get("zone") or ""))
     group_key = str(row.get("notification_group") or "")
@@ -7272,18 +7471,27 @@ def start_wifi_provision_task(
     body: ProvisionWifiTaskRequest,
     principal: Principal = Depends(require_principal),
 ) -> dict[str, Any]:
-    assert_min_role(principal, "admin")
-    require_capability(principal, "can_send_command")
-    ensure_not_revoked(device_id)
-    assert_device_owner(principal, device_id)
+    assert_device_command_actor(principal, device_id)
     row, owner = _load_device_row_for_task(device_id)
     assert_zone_for_device(principal, str(row.get("zone") or ""))
+    chain_out: list[dict[str, Any]] = []
+    for it in body.chain:
+        c = (it.cmd or "").strip()
+        if c not in _WIFI_DEFERRED_CMDS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"chain cmd not allowed: {c!r} (allowed: {', '.join(sorted(_WIFI_DEFERRED_CMDS))})",
+            )
+        chain_out.append({"cmd": c, "params": dict(it.params or {})})
     now = utc_now_iso()
     task_id = secrets.token_hex(12)
+    params: dict[str, Any] = {"ssid": body.ssid, "password": body.password}
+    if chain_out:
+        params["chain"] = chain_out
     publish_command(
         topic=f"{TOPIC_ROOT}/{device_id}/cmd",
         cmd="wifi_config",
-        params={"ssid": body.ssid, "password": body.password},
+        params=params,
         target_id=device_id,
         proto=CMD_PROTO,
         cmd_key=get_cmd_key_for_device(device_id),
@@ -7306,7 +7514,7 @@ def start_wifi_provision_task(
                 "running",
                 35,
                 "command sent, waiting ack",
-                json.dumps({"ssid": body.ssid}, ensure_ascii=False),
+                json.dumps({"ssid": body.ssid, "chain": chain_out}, ensure_ascii=False),
                 principal.username,
                 now,
                 now,
@@ -7323,7 +7531,7 @@ def start_wifi_provision_task(
         target=device_id,
         owner_admin=owner or "",
         device_id=device_id,
-        detail={"task_id": task_id},
+        detail={"task_id": task_id, "chain_len": len(chain_out)},
     )
     return {"ok": True, "task_id": task_id, "status": "running", "progress": 35}
 
@@ -7609,10 +7817,7 @@ def bulk_alert(req: BulkAlertRequest, request: Request, principal: Principal = D
 
 @app.post("/devices/{device_id}/self-test")
 def device_self_test(device_id: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_min_role(principal, "admin")
-    require_capability(principal, "can_send_command")
-    ensure_not_revoked(device_id)
-    assert_device_owner(principal, device_id)
+    assert_device_command_actor(principal, device_id)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -7636,10 +7841,7 @@ def device_self_test(device_id: str, principal: Principal = Depends(require_prin
 
 @app.post("/devices/{device_id}/schedule-reboot")
 def device_schedule_reboot(device_id: str, req: ScheduleRebootRequest, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_min_role(principal, "admin")
-    require_capability(principal, "can_send_command")
-    ensure_not_revoked(device_id)
-    assert_device_owner(principal, device_id)
+    assert_device_command_actor(principal, device_id)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -7671,10 +7873,7 @@ def device_schedule_reboot(device_id: str, req: ScheduleRebootRequest, principal
 
 @app.get("/devices/{device_id}/scheduled-jobs")
 def device_scheduled_jobs(device_id: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_min_role(principal, "admin")
-    require_capability(principal, "can_send_command")
-    ensure_not_revoked(device_id)
-    assert_device_owner(principal, device_id)
+    assert_device_command_actor(principal, device_id)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -7761,7 +7960,7 @@ def _alarm_scope_for(
         f"AND (a2.can_view=1 OR a2.can_operate=1))"
     )
     if principal.role == "admin":
-        if ALLOW_LEGACY_UNOWNED:
+        if _legacy_unowned_device_scope(principal):
             return (
                 f" AND (owner_admin = ? OR owner_admin IS NULL OR ({acl})) ",
                 [principal.username, principal.username],
@@ -7773,7 +7972,7 @@ def _alarm_scope_for(
     manager = get_manager_admin(principal.username)
     if not manager:
         return " AND 1=0 ", []
-    if ALLOW_LEGACY_UNOWNED:
+    if _legacy_unowned_device_scope(principal):
         return (
             f" AND (owner_admin = ? OR owner_admin IS NULL OR ({acl})) ",
             [manager, principal.username],

@@ -65,11 +65,42 @@
     routeSeq: 0,
   };
 
+  const GROUP_CARD_TENANT_SEP = "\u001e";
+  function normalizeGroupKeyStr(v) {
+    return String(v == null ? "" : v).trim();
+  }
+  /** Stable localStorage / UI key for a group card; superadmin includes owning admin in the key. */
+  function groupCardMetaKey(groupKey, tenantOwner) {
+    const gk = normalizeGroupKeyStr(groupKey);
+    const o = String(tenantOwner || "").trim();
+    if (state.me && state.me.role === "superadmin" && o) return `${o}${GROUP_CARD_TENANT_SEP}${gk}`;
+    return gk;
+  }
+  function parseGroupMetaKey(metaKey) {
+    const mk = String(metaKey || "");
+    if (state.me && state.me.role === "superadmin" && mk.includes(GROUP_CARD_TENANT_SEP)) {
+      const i = mk.indexOf(GROUP_CARD_TENANT_SEP);
+      return { tenantOwner: mk.slice(0, i).trim(), groupKey: normalizeGroupKeyStr(mk.slice(i + 1)) };
+    }
+    return { tenantOwner: "", groupKey: normalizeGroupKeyStr(mk) };
+  }
+  function groupApiQueryOwner(tenantOwner) {
+    const o = String(tenantOwner || "").trim();
+    if (!(state.me && state.me.role === "superadmin" && o)) return "";
+    return `owner_admin=${encodeURIComponent(o)}`;
+  }
+  function groupApiSuffixWithOwner(pathSuffix, tenantOwner) {
+    const q = groupApiQueryOwner(tenantOwner);
+    if (!q) return pathSuffix;
+    const join = pathSuffix.includes("?") ? "&" : "?";
+    return `${pathSuffix}${join}${q}`;
+  }
+
   /** Group cards (Overview) are stored in localStorage; keep in sync when device group changes in profile. */
   function groupMetaStorageKey() {
     return (state.me && state.me.username) ? `croc.group.meta.v2.${state.me.username}` : "croc.group.meta.v2.anon";
   }
-  function reconcileGroupMetaForDevice(deviceId, newGroupKey) {
+  function reconcileGroupMetaForDevice(deviceId, newGroupKey, ownerHint) {
     try {
       const k = groupMetaStorageKey();
       const raw = localStorage.getItem(k);
@@ -87,12 +118,14 @@
       }
       const ng = String(newGroupKey || "").trim();
       if (ng) {
-        if (!meta[ng] || typeof meta[ng] !== "object") {
-          meta[ng] = { display_name: ng, owner_name: "", phone: "", email: "", device_ids: [] };
+        const ck = groupCardMetaKey(ng, ownerHint);
+        if (!ck) return;
+        if (!meta[ck] || typeof meta[ck] !== "object") {
+          meta[ck] = { display_name: ng, owner_name: "", phone: "", email: "", device_ids: [] };
         }
-        const s = new Set((meta[ng].device_ids || []).map(String));
+        const s = new Set((meta[ck].device_ids || []).map(String));
         s.add(id);
-        meta[ng].device_ids = Array.from(s);
+        meta[ck].device_ids = Array.from(s);
       }
       localStorage.setItem(k, JSON.stringify(meta));
     } catch (_) {}
@@ -110,17 +143,25 @@
   function syncGroupMetaWithDevices(meta, devices) {
     if (!meta || typeof meta !== "object") return meta;
     const list = Array.isArray(devices) ? devices : [];
+    const isSuper = state.me && state.me.role === "superadmin";
     const notifMap = new Map();
     for (const d of list) {
       const g = String(d && d.notification_group != null ? d.notification_group : "").trim();
       if (!g) continue;
-      if (!notifMap.has(g)) notifMap.set(g, []);
-      notifMap.get(g).push(String(d.device_id));
+      const ck = groupCardMetaKey(g, isSuper ? d.owner_admin : "");
+      if (!notifMap.has(ck)) notifMap.set(ck, []);
+      notifMap.get(ck).push(String(d.device_id));
     }
-    for (const [g, ids] of notifMap.entries()) {
-      const prev = meta[g] && typeof meta[g] === "object" ? meta[g] : {};
-      const dn = (prev.display_name && String(prev.display_name).trim()) || g;
-      meta[g] = {
+    for (const [ck, ids] of notifMap.entries()) {
+      const prev = meta[ck] && typeof meta[ck] === "object" ? meta[ck] : {};
+      let dn = (prev.display_name && String(prev.display_name).trim()) || "";
+      if (!dn) {
+        const gOnly = isSuper && ck.includes(GROUP_CARD_TENANT_SEP)
+          ? ck.slice(ck.indexOf(GROUP_CARD_TENANT_SEP) + 1)
+          : ck;
+        dn = gOnly;
+      }
+      meta[ck] = {
         display_name: dn,
         owner_name: prev.owner_name != null ? String(prev.owner_name) : "",
         phone: prev.phone != null ? String(prev.phone) : "",
@@ -650,35 +691,35 @@
     };
   }
   async function runGroupApplyOnAction(ctx) {
-    const { groupKey, payload, apiCaps, saveApiCaps, tryApplyRoute, applyFallback } = ctx;
+    const { groupKey, ownerAdmin, payload, apiCaps, saveApiCaps, tryApplyRoute, applyFallback } = ctx;
     if (apiCaps && apiCaps.apply && typeof tryApplyRoute === "function") {
       try {
-        return await tryApplyRoute(groupKey);
+        return await tryApplyRoute(groupKey, ownerAdmin);
       } catch (e) {
         if (isGroupRouteMissingError(e)) {
           apiCaps.apply = false;
           if (typeof saveApiCaps === "function") saveApiCaps(apiCaps);
-          return await applyFallback(groupKey, payload);
+          return await applyFallback(groupKey, ownerAdmin, payload);
         }
         throw e;
       }
     }
-    return await applyFallback(groupKey, payload);
+    return await applyFallback(groupKey, ownerAdmin, payload);
   }
   async function runGroupDeleteAction(ctx) {
-    const { groupKey, apiCaps, saveApiCaps, tryDeletePostRoute, tryDeleteRoute, clearFallback } = ctx;
-    if (apiCaps && apiCaps.delete === false) return await clearFallback(groupKey);
+    const { groupKey, ownerAdmin, apiCaps, saveApiCaps, tryDeletePostRoute, tryDeleteRoute, clearFallback } = ctx;
+    if (apiCaps && apiCaps.delete === false) return await clearFallback(groupKey, ownerAdmin);
     try {
-      return await tryDeletePostRoute(groupKey);
+      return await tryDeletePostRoute(groupKey, ownerAdmin);
     } catch (e) {
       if (!isGroupRouteMissingError(e)) throw e;
       try {
-        return await tryDeleteRoute(groupKey);
+        return await tryDeleteRoute(groupKey, ownerAdmin);
       } catch (e2) {
         if (isGroupRouteMissingError(e2)) {
           if (apiCaps) apiCaps.delete = false;
           if (typeof saveApiCaps === "function" && apiCaps) saveApiCaps(apiCaps);
-          return await clearFallback(groupKey);
+          return await clearFallback(groupKey, ownerAdmin);
         }
         throw e2;
       }
@@ -1748,7 +1789,13 @@
     const localGroupSettings = loadLocalGroupSettings();
     const groupSettingsMap = new Map();
     for (const [k, v] of Object.entries(localGroupSettings)) groupSettingsMap.set(String(k), v || {});
-    for (const x of groupSettingsItems) groupSettingsMap.set(String(x.group_key || ""), x);
+    for (const x of groupSettingsItems) {
+      const mk = groupCardMetaKey(
+        x.group_key,
+        state.me && state.me.role === "superadmin" ? x.owner_admin : "",
+      );
+      if (mk) groupSettingsMap.set(mk, x);
+    }
     const meta = loadGroupMeta();
     syncGroupMetaWithDevices(meta, devices);
     saveGroupMeta(meta);
@@ -1816,9 +1863,14 @@
       <section class="card">
         <div class="row">
           <h2 style="margin:0">Group cards</h2>
-          ${state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_manage_users"))) ? `<button class="btn sm secondary right" id="grpShareOpen">Sharing</button>` : ""}
           <button class="btn sm secondary right" id="grpNew">New group</button>
         </div>
+        ${state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_manage_users"))) ? `
+        <details class="share-batch-details" style="margin-top:10px">
+          <summary style="cursor:pointer;font-weight:600">Sharing · batch grant</summary>
+          <p class="muted" style="margin:8px 0">Grant device or group access to multiple users at once.</p>
+          <button class="btn sm secondary" type="button" id="grpShareOpen">Open sharing tool…</button>
+        </details>` : ""}
         <div class="divider"></div>
         <div id="groupCards" class="device-grid"></div>
       </section>
@@ -1909,31 +1961,46 @@
 
     let editingGroup = "";
     const normalizeGroupKey = (v) => String(v == null ? "" : v).trim();
-    const groupDeviceIdsFromList = (g) => {
+    const groupDeviceIdsFromList = (g, tenantOwner) => {
       const key = normalizeGroupKey(g);
       if (!key) return [];
+      const t = String(tenantOwner || "").trim();
       const out = [];
       for (const d of devices) {
         if (!d || normalizeGroupKey(d.notification_group) !== key) continue;
+        if (t && String(d.owner_admin || "").trim() !== t) continue;
         const did = String(d.device_id || "").trim();
         if (did) out.push(did);
       }
       return out;
     };
-    const groupKeys = () => {
-      const keys = new Set();
+    const collectGroupSlots = () => {
+      const acc = new Map();
       for (const d of devices) {
         const gk = normalizeGroupKey(d && d.notification_group);
-        if (gk) keys.add(gk);
+        if (!gk) continue;
+        const tenant = state.me && state.me.role === "superadmin" ? String(d.owner_admin || "").trim() : "";
+        const mk = groupCardMetaKey(gk, tenant);
+        if (!acc.has(mk)) acc.set(mk, { metaKey: mk, groupKey: gk, tenantOwner: tenant });
       }
-      return Array.from(keys).sort((a, b) => a.localeCompare(b));
+      return Array.from(acc.values()).sort((a, b) => {
+        const c = a.groupKey.localeCompare(b.groupKey);
+        return c !== 0 ? c : a.tenantOwner.localeCompare(b.tenantOwner);
+      });
     };
-    const groupDeviceIds = (g) => {
-      const ids = groupDeviceIdsFromList(g);
+    const groupDeviceIdsFromSlot = (slot) => {
+      const ids = groupDeviceIdsFromList(slot.groupKey, slot.tenantOwner);
       return ids.filter((x) => byId.has(String(x)));
     };
-    const groupSharedBy = (g) => {
-      const rows = groupDeviceIds(g).map((id) => byId.get(String(id))).filter(Boolean);
+    const groupSharedBySlot = (slot) => {
+      const rows = groupDeviceIdsFromSlot(slot).map((id) => byId.get(String(id))).filter(Boolean);
+      const sharedFrom = new Set(rows.map((d) => String(d.shared_by || "")).filter(Boolean));
+      return Array.from(sharedFrom);
+    };
+    const groupSharedByNotificationKey = (gk) => {
+      const key = normalizeGroupKey(gk);
+      if (!key) return [];
+      const rows = devices.filter((d) => normalizeGroupKey(d.notification_group) === key);
       const sharedFrom = new Set(rows.map((d) => String(d.shared_by || "")).filter(Boolean));
       return Array.from(sharedFrom);
     };
@@ -1955,30 +2022,35 @@
         </div>
       </a>`;
     };
-    const buildGroupCardHtml = (g) => {
-      const ids = groupDeviceIds(g);
+    const buildGroupCardHtml = (slot) => {
+      const g = slot.groupKey;
+      const ids = groupDeviceIdsFromSlot(slot);
       const rows = ids.map((id) => byId.get(String(id))).filter(Boolean);
       const total = rows.length;
       const on = rows.filter((d) => isOnline(d)).length;
       const off = Math.max(0, total - on);
-      const m = meta[g] || {};
-      const gs = groupSettingsMap.get(g) || {
+      const m = meta[slot.metaKey] || {};
+      const gs = groupSettingsMap.get(slot.metaKey) || {
         trigger_mode: "continuous",
         trigger_duration_ms: 10000,
         delay_seconds: 0,
         reboot_self_check: false,
       };
-      const sharedBy = groupSharedBy(g);
+      const sharedBy = groupSharedBySlot(slot);
       const isSharedGroup = sharedBy.length > 0;
       const modeLabel = String(gs.trigger_mode || "continuous") === "delay"
         ? `delay ${Number(gs.delay_seconds || 0)}s`
         : "continuous";
-      const shareBtn = state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_manage_users")))
-        ? `<button class="group-del-ico js-share-group" data-group="${escapeHtml(g)}" type="button" title="Share group" style="right:32px">⇪</button>`
+      const tenantChip = slot.tenantOwner
+        ? `<span class="chip" title="Owning admin">${escapeHtml(slot.tenantOwner)}</span>`
         : "";
-      return `<article class="device-card js-group-card ${selectedGroup === g ? "is-selected" : ""}" data-group="${escapeHtml(g)}" style="cursor:pointer;position:relative">
+      const shareBtn = state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_manage_users")))
+        ? `<button class="group-del-ico js-share-group" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button" title="Share group" style="right:32px">⇪</button>`
+        : "";
+      return `<article class="device-card js-group-card ${selectedGroup === slot.metaKey ? "is-selected" : ""}" data-meta-key="${escapeHtml(slot.metaKey)}" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" style="cursor:pointer;position:relative">
         ${shareBtn}
         <h3><div class="device-primary-name">${escapeHtml(m.display_name || g)}</div><div class="device-id-sub mono">${escapeHtml(g)}</div></h3>
+        <div class="row" style="gap:6px;flex-wrap:wrap;margin-bottom:8px">${tenantChip}</div>
         <div class="meta" style="margin-bottom:8px">
           Trigger: <span class="mono">${escapeHtml(modeLabel)}</span> ·
           Duration: <span class="mono">${escapeHtml(String(gs.trigger_duration_ms || 10000))}ms</span> ·
@@ -1992,51 +2064,63 @@
         </div>
         <div class="meta">Owner: ${escapeHtml(m.owner_name || "—")} · ${escapeHtml(m.phone || "—")} · ${escapeHtml(m.email || "—")}</div>
         <div class="row" style="margin-top:8px;gap:6px;flex-wrap:wrap">
-          <button class="btn sm danger js-alert-on" data-group="${escapeHtml(g)}" type="button">Alarm ON</button>
-          <button class="btn sm secondary js-alert-off" data-group="${escapeHtml(g)}" type="button">Alarm OFF</button>
+          <button class="btn sm danger js-alert-on" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button">Alarm ON</button>
+          <button class="btn sm secondary js-alert-off" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button">Alarm OFF</button>
           <details class="toolbar-collapse" style="margin-left:auto;min-width:140px">
             <summary>Manage</summary>
             <div class="table-actions">
-              <button class="btn sm secondary js-group-settings" data-group="${escapeHtml(g)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group follows owner settings\"" : ""}>Settings</button>
-              <button class="btn sm secondary js-edit-group" data-group="${escapeHtml(g)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group: device membership is read-only\"" : ""}>Edit</button>
-              <button class="btn sm danger js-del-group" data-group="${escapeHtml(g)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group cannot be deleted\"" : "title=\"Delete group\""}>Delete</button>
+              <button class="btn sm secondary js-group-settings" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group follows owner settings\"" : ""}>Settings</button>
+              <button class="btn sm secondary js-edit-group" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group: device membership is read-only\"" : ""}>Edit</button>
+              <button class="btn sm danger js-del-group" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button" ${isSharedGroup ? "disabled title=\"Shared group cannot be deleted\"" : "title=\"Delete group\""}>Delete</button>
             </div>
           </details>
         </div>
       </article>`;
     };
     const renderGroups = () => {
-      const keys = groupKeys();
-      if (keys.length === 0) {
+      const slots = collectGroupSlots();
+      if (slots.length === 0) {
         setChildMarkup(groupCardsEl, `<p class="muted">No groups yet.</p>`);
         return;
       }
       const existing = new Map(
-        $$(".js-group-card", groupCardsEl).map((el) => [String(el.getAttribute("data-group") || ""), el]),
+        $$(".js-group-card", groupCardsEl).map((el) => [String(el.getAttribute("data-meta-key") || el.getAttribute("data-group") || ""), el]),
       );
       const frag = document.createDocumentFragment();
-      for (const g of keys) {
-        const html = buildGroupCardHtml(g);
-        let node = existing.get(g) || null;
+      for (const slot of slots) {
+        const html = buildGroupCardHtml(slot);
+        let node = existing.get(slot.metaKey) || null;
         if (!node || node.outerHTML !== html) {
-          const frag = parseHtmlToFragment(html.trim());
-          node = frag.firstElementChild;
+          const sub = parseHtmlToFragment(html.trim());
+          node = sub.firstElementChild;
         }
         if (node) frag.appendChild(node);
       }
       groupCardsEl.replaceChildren(frag);
     };
-    let editingSettingsGroup = "";
-    const openSettingsModal = (g) => {
-      editingSettingsGroup = g || "";
-      if (!editingSettingsGroup) return;
-      const gs = groupSettingsMap.get(editingSettingsGroup) || {
+    const editingSettingsSlot = { metaKey: "", groupKey: "", tenantOwner: "" };
+    const readSlotFromBtn = (btn) => {
+      const card = btn && btn.closest ? btn.closest(".js-group-card") : null;
+      const metaKey = String((btn && btn.dataset && btn.dataset.metaKey) || (card && card.getAttribute("data-meta-key")) || "");
+      const groupKey = String((btn && btn.dataset && btn.dataset.group) || (card && card.getAttribute("data-group")) || "");
+      const tenantOwner = String((btn && btn.dataset && btn.dataset.owner) || (card && card.getAttribute("data-owner")) || "");
+      return { metaKey, groupKey, tenantOwner };
+    };
+    const openSettingsModal = (slot) => {
+      editingSettingsSlot.metaKey = slot.metaKey || "";
+      editingSettingsSlot.groupKey = slot.groupKey || "";
+      editingSettingsSlot.tenantOwner = slot.tenantOwner || "";
+      if (!editingSettingsSlot.metaKey) return;
+      const gs = groupSettingsMap.get(editingSettingsSlot.metaKey) || {
         trigger_mode: "continuous",
         trigger_duration_ms: 10000,
         delay_seconds: 0,
         reboot_self_check: false,
       };
-      $("#gsKeyLabel", view).textContent = `Group: ${editingSettingsGroup}`;
+      const label = editingSettingsSlot.tenantOwner
+        ? `Group: ${editingSettingsSlot.groupKey} · admin: ${editingSettingsSlot.tenantOwner}`
+        : `Group: ${editingSettingsSlot.groupKey}`;
+      $("#gsKeyLabel", view).textContent = label;
       $("#gsDuration", view).value = String(Number(gs.trigger_duration_ms || 10000));
       $("#gsMode", view).value = String(gs.trigger_mode || "continuous");
       $("#gsDelay", view).value = String(Number(gs.delay_seconds || 0));
@@ -2065,42 +2149,50 @@
         reboot_self_check: reboot,
       };
     };
-    const persistSettingsLocal = (groupKey, payload) => {
+    const persistSettingsLocal = (metaKey, payload) => {
       const all = loadLocalGroupSettings();
-      all[groupKey] = Object.assign({}, payload || {});
+      all[metaKey] = Object.assign({}, payload || {});
       saveLocalGroupSettings(all);
     };
-    const saveGroupSettingsCompat = async (groupKey, payload) => {
+    const saveGroupSettingsCompat = async (groupKey, tenantOwner, payload) => {
+      const mk = groupCardMetaKey(groupKey, tenantOwner);
+      const path = groupApiSuffixWithOwner(`/${encodeURIComponent(groupKey)}/settings`, tenantOwner);
+      const body = Object.assign({}, payload || {});
+      if (state.me && state.me.role === "superadmin" && String(tenantOwner || "").trim()) {
+        body.owner_admin = String(tenantOwner).trim();
+      }
       if (!groupApiCaps.settings) {
-        persistSettingsLocal(groupKey, payload);
-        return payload;
+        persistSettingsLocal(mk, body);
+        return body;
       }
       try {
-        return await tryGroupApiCall(`/${encodeURIComponent(groupKey)}/settings`, {
+        return await tryGroupApiCall(path, {
           method: "PUT",
-          body: payload,
+          body,
         });
       } catch (e) {
         const msg = String((e && e.message) || e || "");
         if (msg.includes("404") || msg.includes("405") || msg.includes("501")) {
           groupApiCaps.settings = false;
           saveGroupApiCaps(groupApiCaps);
-          persistSettingsLocal(groupKey, payload);
-          return payload;
+          persistSettingsLocal(mk, body);
+          return body;
         }
         throw e;
       }
     };
-    const applyGroupSettingsFallback = async (groupKey, payload) => {
-      const ids = groupDeviceIds(groupKey);
+    const applyGroupSettingsFallback = async (groupKey, tenantOwner, payload) => {
+      const slot = { metaKey: groupCardMetaKey(groupKey, tenantOwner), groupKey, tenantOwner: tenantOwner || "" };
+      const ids = groupDeviceIdsFromSlot(slot);
       if (!ids.length) throw new Error("No devices in this group");
       if (!can("can_alert")) throw new Error("No can_alert capability");
       const durationMs = Number(payload.trigger_duration_ms || 10000);
       const delaySeconds = Number(payload.delay_seconds || 0);
-      const prevTimer = groupDelayTimers.get(groupKey);
+      const timerKey = slot.metaKey;
+      const prevTimer = groupDelayTimers.get(timerKey);
       if (prevTimer) {
         clearTimeout(prevTimer);
-        groupDelayTimers.delete(groupKey);
+        groupDelayTimers.delete(timerKey);
       }
       if (String(payload.trigger_mode || "continuous") === "delay" && delaySeconds > 0) {
         const tid = setTimeout(async () => {
@@ -2108,7 +2200,7 @@
             await api("/alerts", { method: "POST", body: { action: "on", duration_ms: durationMs, device_ids: ids } });
           } catch {}
         }, delaySeconds * 1000);
-        groupDelayTimers.set(groupKey, tid);
+        groupDelayTimers.set(timerKey, tid);
       } else {
         await api("/alerts", { method: "POST", body: { action: "on", duration_ms: durationMs, device_ids: ids } });
       }
@@ -2131,10 +2223,14 @@
     $("#gsCancel", view).addEventListener("click", closeSettingsModal);
     $("#gsSave", view).addEventListener("click", async () => {
       try {
-        if (!editingSettingsGroup) throw new Error("No group selected");
+        if (!editingSettingsSlot.metaKey) throw new Error("No group selected");
         const payload = collectSettingsPayload();
-        const r = await saveGroupSettingsCompat(editingSettingsGroup, payload);
-        groupSettingsMap.set(editingSettingsGroup, r || payload);
+        const r = await saveGroupSettingsCompat(
+          editingSettingsSlot.groupKey,
+          editingSettingsSlot.tenantOwner,
+          payload,
+        );
+        groupSettingsMap.set(editingSettingsSlot.metaKey, r || payload);
         renderGroups();
         closeSettingsModal();
         toast("Group settings saved", "ok");
@@ -2144,16 +2240,24 @@
     });
     $("#gsApply", view).addEventListener("click", async () => {
       try {
-        if (!editingSettingsGroup) throw new Error("No group selected");
+        if (!editingSettingsSlot.metaKey) throw new Error("No group selected");
         const payload = collectSettingsPayload();
-        await saveGroupSettingsCompat(editingSettingsGroup, payload);
-        groupSettingsMap.set(editingSettingsGroup, payload);
+        await saveGroupSettingsCompat(
+          editingSettingsSlot.groupKey,
+          editingSettingsSlot.tenantOwner,
+          payload,
+        );
+        groupSettingsMap.set(editingSettingsSlot.metaKey, payload);
         const r = await runGroupApplyOnAction({
-          groupKey: editingSettingsGroup,
+          groupKey: editingSettingsSlot.groupKey,
+          ownerAdmin: editingSettingsSlot.tenantOwner,
           payload,
           apiCaps: groupApiCaps,
           saveApiCaps: saveGroupApiCaps,
-          tryApplyRoute: (gk) => tryGroupApiCall(`/${encodeURIComponent(gk)}/apply`, { method: "POST" }),
+          tryApplyRoute: (gk, oa) => tryGroupApiCall(
+            groupApiSuffixWithOwner(`/${encodeURIComponent(gk)}/apply`, oa),
+            { method: "POST" },
+          ),
           applyFallback: applyGroupSettingsFallback,
         });
         renderGroups();
@@ -2163,8 +2267,9 @@
         toast(e.message || e, "err");
       }
     });
-    const clearGroupByDevicePatch = async (groupKey) => {
-      const ids = groupDeviceIds(groupKey);
+    const clearGroupByDevicePatch = async (groupKey, tenantOwner) => {
+      const slot = { metaKey: groupCardMetaKey(groupKey, tenantOwner), groupKey, tenantOwner: tenantOwner || "" };
+      const ids = groupDeviceIdsFromSlot(slot);
       if (!ids.length) return { ok: true, changed: 0 };
       let changed = 0;
       for (const id of ids) {
@@ -2176,25 +2281,35 @@
       }
       return { ok: true, changed };
     };
-    const deleteGroupCard = async (groupKey) => runGroupDeleteAction({
+    const deleteGroupCard = async (groupKey, tenantOwner) => runGroupDeleteAction({
       groupKey,
+      ownerAdmin: tenantOwner,
       apiCaps: groupApiCaps,
       saveApiCaps: saveGroupApiCaps,
-      tryDeletePostRoute: (gk) => tryGroupApiCall(`/${encodeURIComponent(gk)}/delete`, { method: "POST" }),
-      tryDeleteRoute: (gk) => tryGroupApiCall(`/${encodeURIComponent(gk)}`, { method: "DELETE" }),
+      tryDeletePostRoute: (gk, oa) => tryGroupApiCall(
+        groupApiSuffixWithOwner(`/${encodeURIComponent(gk)}/delete`, oa),
+        { method: "POST" },
+      ),
+      tryDeleteRoute: (gk, oa) => tryGroupApiCall(
+        groupApiSuffixWithOwner(`/${encodeURIComponent(gk)}`, oa),
+        { method: "DELETE" },
+      ),
       clearFallback: clearGroupByDevicePatch,
     });
-    const openGroupModal = (g) => {
-      editingGroup = g || "";
-      const m = meta[g] || { display_name: g || "", owner_name: "", phone: "", email: "", device_ids: [] };
-      $("#gmKey", view).value = g || "";
+    const openGroupModal = (metaKey) => {
+      editingGroup = metaKey || "";
+      const parsed = parseGroupMetaKey(editingGroup);
+      const gk = parsed.groupKey || "";
+      const m = meta[editingGroup] || { display_name: gk || "", owner_name: "", phone: "", email: "", device_ids: [] };
+      const slot = { metaKey: editingGroup, groupKey: gk, tenantOwner: parsed.tenantOwner };
+      $("#gmKey", view).value = gk || "";
       $("#gmName", view).value = m.display_name || "";
       $("#gmOwner", view).value = m.owner_name || "";
       $("#gmPhone", view).value = m.phone || "";
       $("#gmEmail", view).value = m.email || "";
       const sel = new Set((m.device_ids || []).map(String));
       const pick = $("#gmDevices", view);
-      const isSharedGroup = groupSharedBy(g || "").length > 0;
+      const isSharedGroup = groupSharedBySlot(slot).length > 0;
       if (pick) {
         setChildMarkup(
           pick,
@@ -2208,9 +2323,11 @@
     };
     const closeGroupModal = () => { grpModalEl.style.display = "none"; };
     let sharePrefillGroup = "";
-    const openShareModal = async (prefillGroup) => {
+    let sharePrefillOwner = "";
+    const openShareModal = async (prefillGroup, prefillOwner) => {
       if (!shareModalEl) return;
       sharePrefillGroup = String(prefillGroup || "").trim();
+      sharePrefillOwner = String(prefillOwner || "").trim();
       const devListEl = $("#shareDeviceList", view);
       const userListEl = $("#shareUserList", view);
       const hintEl = $("#shareTargetHint", view);
@@ -2220,7 +2337,11 @@
       hintEl.textContent = sharePrefillGroup
         ? `Group: ${sharePrefillGroup} (you can still adjust selections).`
         : "Select devices, users, and permissions.";
-      const picked = new Set(sharePrefillGroup ? groupDeviceIds(sharePrefillGroup).map(String) : []);
+      const picked = new Set(
+        sharePrefillGroup
+          ? groupDeviceIdsFromList(sharePrefillGroup, sharePrefillOwner).map(String)
+          : [],
+      );
       setChildMarkup(
         devListEl,
         devices
@@ -2302,17 +2423,27 @@
     $("#gmSave", view).addEventListener("click", async () => {
       const key = String($("#gmKey", view).value || "").trim();
       if (!key) { toast("Group key required", "err"); return; }
-      const oldKey = String(editingGroup || "").trim();
-      const oldEntry = oldKey && Object.prototype.hasOwnProperty.call(meta, oldKey) ? meta[oldKey] : null;
+      const oldMetaKey = String(editingGroup || "").trim();
+      const oldParsed = parseGroupMetaKey(oldMetaKey);
+      const oldEntry = oldMetaKey && Object.prototype.hasOwnProperty.call(meta, oldMetaKey) ? meta[oldMetaKey] : null;
       const display_name = String($("#gmName", view).value || "").trim();
       const owner_name = String($("#gmOwner", view).value || "").trim();
       const phone = String($("#gmPhone", view).value || "").trim();
       const email = String($("#gmEmail", view).value || "").trim();
       const picks = Array.from($$("#gmDevices input[type='checkbox']", view)).filter((x) => x.checked).map((x) => String(x.value || "").trim());
-      if (groupSharedBy(key).length > 0) {
+      let tenantForMeta = oldParsed.tenantOwner || "";
+      if (state.me && state.me.role === "superadmin") {
+        for (const id of picks) {
+          const dev = byId.get(String(id));
+          const o = dev && String(dev.owner_admin || "").trim();
+          if (o) { tenantForMeta = o; break; }
+        }
+      }
+      const newMetaKey = groupCardMetaKey(key, tenantForMeta);
+      if (groupSharedByNotificationKey(key).length > 0) {
         const keepIds = (oldEntry && Array.isArray(oldEntry.device_ids)) ? oldEntry.device_ids.map((x) => String(x)) : [];
-        if (editingGroup && editingGroup !== key && meta[editingGroup]) delete meta[editingGroup];
-        meta[key] = { display_name, owner_name, phone, email, device_ids: keepIds };
+        if (oldMetaKey && oldMetaKey !== newMetaKey && meta[oldMetaKey]) delete meta[oldMetaKey];
+        meta[newMetaKey] = { display_name, owner_name, phone, email, device_ids: keepIds };
         saveGroupMeta(meta);
         try { bustDeviceListCaches(); } catch (_) {}
         closeGroupModal();
@@ -2320,7 +2451,7 @@
         toast("Group card updated (shared group — device list is owner-managed)", "ok");
         return;
       }
-      const previousDeviceIds = oldKey ? groupDeviceIdsFromList(oldKey) : [];
+      const previousDeviceIds = oldMetaKey ? groupDeviceIdsFromList(oldParsed.groupKey, oldParsed.tenantOwner) : [];
       if (picks.length > 0) {
         try {
           for (const id of picks) {
@@ -2346,8 +2477,8 @@
           }
         }
       }
-      if (editingGroup && editingGroup !== key && meta[editingGroup]) delete meta[editingGroup];
-      meta[key] = { display_name, owner_name, phone, email, device_ids: picks };
+      if (oldMetaKey && oldMetaKey !== newMetaKey && meta[oldMetaKey]) delete meta[oldMetaKey];
+      meta[newMetaKey] = { display_name, owner_name, phone, email, device_ids: picks };
       saveGroupMeta(meta);
       try { bustDeviceListCaches(); } catch (_) {}
       closeGroupModal();
@@ -2357,29 +2488,30 @@
     groupCardsEl.addEventListener("click", async (ev) => {
       const btn = ev.target.closest("button");
       if (btn) {
-        const g = btn.dataset.group || "";
+        const slot = readSlotFromBtn(btn);
+        const g = slot.groupKey;
         if (!g) return;
         if (btn.classList.contains("js-edit-group")) {
-          openGroupModal(g);
+          openGroupModal(slot.metaKey);
           return;
         }
         if (btn.classList.contains("js-group-settings")) {
-          openSettingsModal(g);
+          openSettingsModal(slot);
           return;
         }
         if (btn.classList.contains("js-share-group")) {
           if (!(state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_manage_users"))))) {
             toast("No sharing permission", "err"); return;
           }
-          openShareModal(g);
+          openShareModal(g, slot.tenantOwner);
           return;
         }
         if (btn.classList.contains("js-del-group")) {
-          if (groupSharedBy(g).length > 0) { toast("Shared group cannot be deleted", "err"); return; }
+          if (groupSharedBySlot(slot).length > 0) { toast("Shared group cannot be deleted", "err"); return; }
           if (!confirm(`Delete group card "${g}"?`)) return;
           try {
-            await deleteGroupCard(g);
-            delete meta[g];
+            await deleteGroupCard(g, slot.tenantOwner);
+            if (slot.metaKey && meta[slot.metaKey]) delete meta[slot.metaKey];
             saveGroupMeta(meta);
             renderGroups();
             toast("Group deleted", "ok");
@@ -2389,27 +2521,30 @@
           return;
         }
         if (!can("can_alert")) { toast("No can_alert capability", "err"); return; }
-        const ids = groupDeviceIds(g);
+        const ids = groupDeviceIdsFromSlot(slot);
         if (ids.length === 0) { toast("No devices in this group", "warn"); return; }
         const action = btn.classList.contains("js-alert-on") ? "on" : "off";
         if (!confirm(`${action === "on" ? "Open" : "Close"} alarm for ${ids.length} devices in ${g}?`)) return;
         try {
           if (action === "on") {
-            // Alarm ON should honor group settings (delay/continuous/reboot flow) via server apply.
-            const payload = groupTriggerPayloadFromSettings(groupSettingsMap.get(g) || {});
+            const payload = groupTriggerPayloadFromSettings(groupSettingsMap.get(slot.metaKey) || {});
             await runGroupApplyOnAction({
               groupKey: g,
+              ownerAdmin: slot.tenantOwner,
               payload,
               apiCaps: groupApiCaps,
               saveApiCaps: saveGroupApiCaps,
-              tryApplyRoute: (gk) => tryGroupApiCall(`/${encodeURIComponent(gk)}/apply`, { method: "POST" }),
+              tryApplyRoute: (gk, oa) => tryGroupApiCall(
+                groupApiSuffixWithOwner(`/${encodeURIComponent(gk)}/apply`, oa),
+                { method: "POST" },
+              ),
               applyFallback: applyGroupSettingsFallback,
             });
           } else {
-            const prevTimer = groupDelayTimers.get(g);
+            const prevTimer = groupDelayTimers.get(slot.metaKey);
             if (prevTimer) {
               clearTimeout(prevTimer);
-              groupDelayTimers.delete(g);
+              groupDelayTimers.delete(slot.metaKey);
             }
             await api("/alerts", { method: "POST", body: { action, duration_ms: 10000, device_ids: ids } });
           }
@@ -2423,7 +2558,8 @@
       if (!card) return;
       const g = card.dataset.group || "";
       if (!g) return;
-      location.hash = `#/group/${encodeURIComponent(g)}`;
+      const ow = String(card.getAttribute("data-owner") || "").trim();
+      location.hash = `#/group/${encodeURIComponent(g)}${ow ? `?owner=${encodeURIComponent(ow)}` : ""}`;
     });
     const OVERVIEW_LIVE_MS = 7500;
     const refreshOverviewLive = async () => {
@@ -2482,6 +2618,8 @@
   registerRoute("group", async (view, args, routeSeq) => {
     const g = decodeURIComponent(args[0] || "").trim();
     if (!g) { location.hash = "#/overview"; return; }
+    const tenantOwner = String((window.__routeQuery && window.__routeQuery.get("owner")) || "").trim();
+    const metaKey = groupCardMetaKey(g, tenantOwner);
     const groupScope = (state.me && state.me.username) ? state.me.username : "anon";
     const GROUP_META_LS_KEY = `croc.group.meta.v2.${groupScope}`;
     const GROUP_SETTINGS_LS_KEY = `croc.group.settings.v1.${groupScope}`;
@@ -2523,8 +2661,14 @@
     let byId = new Map((list.items || []).map((d) => [String(d.device_id), d]));
     syncGroupMetaWithDevices(meta, list.items || []);
     try { localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(meta)); } catch (_) {}
-    const gm = meta[g] || { display_name: g, owner_name: "", phone: "", email: "", device_ids: [] };
-    const rowsByGroup = () => (list.items || []).filter((d) => String(d.notification_group || "").trim() === g);
+    const gm = meta[metaKey] || meta[g] || { display_name: g, owner_name: "", phone: "", email: "", device_ids: [] };
+    const rowsByGroup = () => (list.items || []).filter((d) => {
+      if (String(d.notification_group || "").trim() !== g) return false;
+      if (state.me && state.me.role === "superadmin" && tenantOwner) {
+        return String(d.owner_admin || "").trim() === tenantOwner;
+      }
+      return true;
+    });
     let rows = rowsByGroup();
     let ids = rows.map((d) => String(d.device_id || "")).filter(Boolean);
     const isSharedGroup = rows.some((d) => !!d.is_shared);
@@ -2543,6 +2687,7 @@
           <span class="badge online">online <span id="grpOnline">${online}</span></span>
           <span class="badge offline">offline <span id="grpOffline">${offline}</span></span>
           <span class="chip">${escapeHtml(g)}</span>
+          ${tenantOwner ? `<span class="chip" title="Owning admin">${escapeHtml(tenantOwner)}</span>` : ""}
         </div>
         <p class="muted" style="margin-top:8px">Owner: ${escapeHtml(gm.owner_name || "—")} · ${escapeHtml(gm.phone || "—")} · ${escapeHtml(gm.email || "—")}</p>
         <div class="row" style="margin-top:8px;gap:8px;justify-content:flex-end">
@@ -2555,13 +2700,18 @@
         <div class="divider"></div>
         <div class="device-grid" id="groupPageDevices"></div>
       </section>
-      <section class="card danger-zone">
-        <h4 style="margin:0 0 8px">Danger zone</h4>
-        <p class="muted" style="margin:0 0 10px">Delete group will clear notification_group from all devices in this group.</p>
-        <div class="row" style="justify-content:flex-end">
-          <button class="btn danger btn-tap" id="grpDelete" ${isSharedGroup ? "disabled title=\"Shared group cannot be deleted\"" : ""}>Delete group</button>
+      <details class="card danger-zone device-drawer">
+        <summary class="device-drawer__summary">
+          <span class="device-drawer__title">Danger zone</span>
+          <span class="device-drawer__hint muted">Delete group · expand</span>
+        </summary>
+        <div class="device-drawer__body">
+          <p class="muted" style="margin:0 0 10px">Delete group will clear notification_group from all devices in this group.</p>
+          <div class="row" style="justify-content:flex-end">
+            <button class="btn danger btn-tap" id="grpDelete" ${isSharedGroup ? "disabled title=\"Shared group cannot be deleted\"" : ""}>Delete group</button>
+          </div>
         </div>
-      </section>
+      </details>
     `);
     const devGrid = $("#groupPageDevices", view);
     const renderGroupDevices = () => {
@@ -2601,56 +2751,68 @@
       }
       return { ok: true, changed };
     };
-    const deleteGroupCardCompat = async (groupKey) => runGroupDeleteAction({
+    const withOwnerQuery = (path, ownerO) => {
+      const q = groupApiQueryOwner(ownerO);
+      if (!q) return path;
+      const join = path.includes("?") ? "&" : "?";
+      return `${path}${join}${q}`;
+    };
+    const deleteGroupCardCompat = async (groupKey, ownerO) => runGroupDeleteAction({
       groupKey,
+      ownerAdmin: ownerO,
       apiCaps: groupApiCaps,
       saveApiCaps: saveGroupApiCaps,
-      tryDeletePostRoute: async (gk) => {
-        try { return await api(`/group-cards/${encodeURIComponent(gk)}/delete`, { method: "POST" }); } catch (e) {
+      tryDeletePostRoute: async (gk, oa) => {
+        const p = withOwnerQuery(`/group-cards/${encodeURIComponent(gk)}/delete`, oa);
+        try { return await api(p, { method: "POST" }); } catch (e) {
           if (!isGroupRouteMissingError(e)) throw e;
         }
-        return await api(`/api/group-cards/${encodeURIComponent(gk)}/delete`, { method: "POST" });
+        return await api(withOwnerQuery(`/api/group-cards/${encodeURIComponent(gk)}/delete`, oa), { method: "POST" });
       },
-      tryDeleteRoute: async (gk) => {
-        try { return await api(`/group-cards/${encodeURIComponent(gk)}`, { method: "DELETE" }); } catch (e) {
+      tryDeleteRoute: async (gk, oa) => {
+        const p = withOwnerQuery(`/group-cards/${encodeURIComponent(gk)}`, oa);
+        try { return await api(p, { method: "DELETE" }); } catch (e) {
           if (!isGroupRouteMissingError(e)) throw e;
         }
-        return await api(`/api/group-cards/${encodeURIComponent(gk)}`, { method: "DELETE" });
+        return await api(withOwnerQuery(`/api/group-cards/${encodeURIComponent(gk)}`, oa), { method: "DELETE" });
       },
       clearFallback: clearGroupByDevicePatchCompat,
     });
-    const applyGroupSettingsFallbackCompat = async (groupKey, payload) => {
+    const applyGroupSettingsFallbackCompat = async (_groupKey, _ownerO, payload) => {
       const durationMs = Number(payload.trigger_duration_ms || 10000);
       const delaySeconds = Number(payload.delay_seconds || 0);
-      const prev = window.__groupDelayTimers.get(groupKey);
+      const tkey = metaKey;
+      const prev = window.__groupDelayTimers.get(tkey);
       if (prev) {
         clearTimeout(prev);
-        window.__groupDelayTimers.delete(groupKey);
+        window.__groupDelayTimers.delete(tkey);
       }
       if (String(payload.trigger_mode || "continuous") === "delay" && delaySeconds > 0) {
         const tid = setTimeout(async () => {
           try { await api("/alerts", { method: "POST", body: { action: "on", duration_ms: durationMs, device_ids: ids } }); } catch {}
         }, delaySeconds * 1000);
-        window.__groupDelayTimers.set(groupKey, tid);
+        window.__groupDelayTimers.set(tkey, tid);
       } else {
         await api("/alerts", { method: "POST", body: { action: "on", duration_ms: durationMs, device_ids: ids } });
       }
       return { ok: true, fallback: true, device_count: ids.length };
     };
-    const tryApplyRouteCompat = async (groupKey) => {
-      try { return await api(`/group-cards/${encodeURIComponent(groupKey)}/apply`, { method: "POST" }); } catch (e) {
+    const tryApplyRouteCompat = async (groupKey, ownerO) => {
+      const p = withOwnerQuery(`/group-cards/${encodeURIComponent(groupKey)}/apply`, ownerO);
+      try { return await api(p, { method: "POST" }); } catch (e) {
         if (!isGroupRouteMissingError(e)) throw e;
       }
-      return await api(`/api/group-cards/${encodeURIComponent(groupKey)}/apply`, { method: "POST" });
+      return await api(withOwnerQuery(`/api/group-cards/${encodeURIComponent(groupKey)}/apply`, ownerO), { method: "POST" });
     };
     const sendAlert = async (action) => {
       if (!can("can_alert")) { toast("No can_alert capability", "err"); return; }
       if (ids.length === 0) { toast("No devices in this group", "warn"); return; }
       if (!confirm(`${action === "on" ? "Open" : "Close"} alarm for ${ids.length} devices in ${g}?`)) return;
       if (action === "on") {
-        const payload = groupTriggerPayloadFromSettings(gsMap[g] || {});
+        const payload = groupTriggerPayloadFromSettings(gsMap[metaKey] || gsMap[g] || {});
         await runGroupApplyOnAction({
           groupKey: g,
+          ownerAdmin: tenantOwner,
           payload,
           apiCaps: groupApiCaps,
           saveApiCaps: saveGroupApiCaps,
@@ -2658,10 +2820,10 @@
           applyFallback: applyGroupSettingsFallbackCompat,
         });
       } else {
-        const prev = window.__groupDelayTimers.get(g);
+        const prev = window.__groupDelayTimers.get(metaKey);
         if (prev) {
           clearTimeout(prev);
-          window.__groupDelayTimers.delete(g);
+          window.__groupDelayTimers.delete(metaKey);
         }
         await api("/alerts", { method: "POST", body: { action: "off", duration_ms: 10000, device_ids: ids } });
       }
@@ -2677,8 +2839,9 @@
         if (isSharedGroup) { toast("Shared group cannot be deleted", "err"); return; }
         if (!confirm(`Delete group card "${g}"?`)) return;
         try {
-          await deleteGroupCardCompat(g);
-          delete meta[g];
+          await deleteGroupCardCompat(g, tenantOwner);
+          if (meta[metaKey]) delete meta[metaKey];
+          else if (meta[g]) delete meta[g];
           localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(meta));
           toast("Group deleted", "ok");
           location.hash = "#/overview";
@@ -2915,6 +3078,7 @@
     const isSuperViewer = !!(state.me && state.me.role === "superadmin");
 
     let d = await api(`/devices/${encodeURIComponent(id)}`);
+    const canOperateThisDevice = !!(d.can_operate ?? (state.me && (state.me.role === "superadmin" || state.me.role === "admin")));
     window.__devicePollLocks = window.__devicePollLocks || new Map();
     const runPollDedup = (key, worker) => {
       const k = String(key || "");
@@ -2982,29 +3146,33 @@
       && (!d.is_shared || state.me.role === "superadmin")
     );
     const sharePanel = canUseSharePanel ? `
-      <div class="card" id="sharePanel">
-        <div class="row">
-          <h3 style="margin:0">Sharing</h3>
-          <span class="muted">Grant or revoke per-account access (admin: your users only)</span>
-          <button class="btn secondary right" id="shareRefresh">Refresh</button>
-        </div>
-        <div class="divider"></div>
-        <div class="inline-form" style="margin-top:10px">
-          <label class="field grow"><span>Grantee username</span>
-            <input id="shareUser" placeholder="admin_x or user_x" />
-          </label>
-          <label class="field"><span>View</span>
-            <input id="shareCanView" type="checkbox" checked />
-          </label>
-          <label class="field"><span>Operate</span>
-            <input id="shareCanOperate" type="checkbox" />
-          </label>
-          <div class="row wide" style="justify-content:flex-end">
-            <button class="btn btn-tap" id="shareGrant">Grant / Update</button>
+      <details class="card device-drawer" id="sharePanel">
+        <summary class="device-drawer__summary">
+          <span class="device-drawer__title">Sharing</span>
+          <span class="device-drawer__hint muted">Grant / revoke · expand</span>
+        </summary>
+        <div class="device-drawer__body">
+          <div class="row" style="justify-content:flex-end;margin-bottom:8px">
+            <button class="btn secondary btn-tap sm" type="button" id="shareRefresh">Refresh</button>
           </div>
+          <p class="muted" style="margin:0 0 10px">Grant or revoke per-account access (admin: your users only).</p>
+          <div class="inline-form" style="margin-top:4px">
+            <label class="field grow"><span>Grantee username</span>
+              <input id="shareUser" placeholder="admin_x or user_x" />
+            </label>
+            <label class="field"><span>View</span>
+              <input id="shareCanView" type="checkbox" checked />
+            </label>
+            <label class="field"><span>Operate</span>
+              <input id="shareCanOperate" type="checkbox" />
+            </label>
+            <div class="row wide" style="justify-content:flex-end">
+              <button class="btn btn-tap" id="shareGrant">Grant / Update</button>
+            </div>
+          </div>
+          <div id="shareList" style="margin-top:12px"></div>
         </div>
-        <div id="shareList" style="margin-top:12px"></div>
-      </div>
+      </details>
     ` : "";
     const renderMsgFeed = (items) => {
       const msgItems = Array.isArray(items) ? items : [];
@@ -3100,11 +3268,11 @@
           <div class="row">
             <button class="btn" id="alertOn" ${can("can_alert") ? "" : "disabled"}>Siren ON</button>
             <button class="btn secondary" id="alertOff" ${can("can_alert") ? "" : "disabled"}>Siren OFF</button>
-            <button class="btn secondary" id="selfTest" ${can("can_send_command") ? "" : "disabled"}>Self-test</button>
+            <button class="btn secondary" id="selfTest" ${can("can_send_command") && canOperateThisDevice ? "" : "disabled"}>Self-test</button>
           </div>
           <div class="row" style="margin-top:10px">
             <input id="rebootDelay" placeholder="Delay seconds (e.g. 30)" style="max-width:200px" />
-            <button class="btn secondary" id="doReboot" ${can("can_send_command") ? "" : "disabled"}>Schedule reboot</button>
+            <button class="btn secondary" id="doReboot" ${can("can_send_command") && canOperateThisDevice ? "" : "disabled"}>Schedule reboot</button>
           </div>
           <div class="row" style="margin-top:14px">
             <button class="btn secondary" id="unrevoke" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Unrevoke</button>
@@ -3119,11 +3287,19 @@
           <span class="device-drawer__hint muted">Provision · NVS · expand</span>
         </summary>
         <div class="device-drawer__body">
-          <p class="muted" style="margin:0 0 10px">Online/offline unified provisioning: create a Wi‑Fi task, then poll until success/fail. Credentials are saved to device NVS and device reboots.</p>
-          ${can("can_send_command") ? `
+          <p class="muted" style="margin:0 0 10px">Credentials are written to device NVS, then the board reboots. Optional <strong>follow‑up commands</strong> are stored in NVS and run <strong>in order</strong> after Wi‑Fi + MQTT reconnect — no second dashboard click (safe cmds only: get_info, ping, self_test, set_param).</p>
+          ${can("can_send_command") && canOperateThisDevice ? `
           <div class="inline-form" style="margin-top:4px">
             <label class="field grow"><span>New SSID</span><input id="wifiNewSsid" maxlength="32" autocomplete="off" placeholder="2.4 GHz network name" /></label>
             <label class="field grow"><span>Password</span><input id="wifiNewPass" type="password" maxlength="64" autocomplete="new-password" placeholder="empty if open network" /></label>
+            <div class="field" style="margin-top:10px">
+              <span>After reconnect (stored on device, sequential)</span>
+              <div class="row" style="gap:14px;flex-wrap:wrap;margin-top:6px">
+                <label><input type="checkbox" id="wifiChainGetInfo" checked /> <span class="mono">get_info</span> (status)</label>
+                <label><input type="checkbox" id="wifiChainPing" checked /> <span class="mono">ping</span></label>
+                <label><input type="checkbox" id="wifiChainSelfTest" /> <span class="mono">self_test</span></label>
+              </div>
+            </div>
             <div class="row wide" style="justify-content:flex-end;flex-wrap:wrap;gap:8px">
               <button class="btn btn-tap" type="button" id="wifiApplyBtn">Start provision task</button>
             </div>
@@ -3131,22 +3307,27 @@
           <div style="margin-top:8px">
             <progress id="wifiTaskProgress" value="0" max="100" style="width:100%;height:12px"></progress>
           </div>
-          <p class="muted" id="wifiScanStatus" style="margin-top:8px;min-height:1.3em"></p>` : `<p class="muted">Requires <span class="mono">can_send_command</span>.</p>`}
+          <p class="muted" id="wifiScanStatus" style="margin-top:8px;min-height:1.3em"></p>` : `<p class="muted">Requires <span class="mono">can_send_command</span> and <strong>operate</strong> access on this device (tenant owner, admin, or shared grant with Operate).</p>`}
         </div>
       </details>
 
-      <div class="card danger-zone">
-        <h3 style="margin:0 0 8px">Danger zone</h3>
-        <p class="muted" style="margin:0 0 10px">Destructive actions are grouped here to reduce accidental taps.</p>
-        <div class="action-bar">
-          <button class="btn danger btn-tap" id="revoke" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Revoke</button>
-          <button class="btn danger btn-tap" id="deleteReset" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Unbind (delete & reset)</button>
-          ${(state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_send_command"))))
-            ? `<button class="btn danger btn-tap" id="factoryUnregister" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Rollback to unregistered</button>`
-            : ""}
-          <button class="btn danger btn-tap" type="button" id="wifiClearBtn">Clear saved Wi‑Fi & reboot</button>
+      <details class="card danger-zone device-drawer">
+        <summary class="device-drawer__summary">
+          <span class="device-drawer__title">Danger zone</span>
+          <span class="device-drawer__hint muted">Revoke · unbind · Wi‑Fi clear · expand</span>
+        </summary>
+        <div class="device-drawer__body">
+          <p class="muted" style="margin:0 0 10px">Destructive actions are grouped here to reduce accidental taps.</p>
+          <div class="action-bar">
+            <button class="btn danger btn-tap" id="revoke" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Revoke</button>
+            <button class="btn danger btn-tap" id="deleteReset" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Unbind (delete & reset)</button>
+            ${(state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_send_command"))))
+              ? `<button class="btn danger btn-tap" id="factoryUnregister" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Rollback to unregistered</button>`
+              : ""}
+            <button class="btn danger btn-tap" type="button" id="wifiClearBtn" ${can("can_send_command") && canOperateThisDevice ? "" : "disabled"}>Clear saved Wi‑Fi & reboot</button>
+          </div>
         </div>
-      </div>
+      </details>
 
       <details class="card device-drawer" id="triggerPolicyCard">
         <summary class="device-drawer__summary">
@@ -3155,7 +3336,7 @@
         </summary>
         <div class="device-drawer__body">
           <p class="muted" style="margin:0 0 10px">Scope: owner account + group <span class="mono">${escapeHtml(d.notification_group || "(default)")}</span>. Siblings = same tenant + same <span class="mono">notification_group</span> (+ zone match). Remote #1 = silent linkage; #2 = loud to siblings only; panic = local siren + optional sibling fan-out.</p>
-          ${can("can_send_command") ? `
+          ${can("can_send_command") && canOperateThisDevice ? `
           <div class="inline-form" style="margin-top:4px;gap:12px;flex-wrap:wrap">
             <label class="field"><span>Panic local siren</span><input type="checkbox" id="tpPanicLocal" /></label>
             <label class="field"><span>Panic sibling link</span><input type="checkbox" id="tpPanicLink" /></label>
@@ -3168,7 +3349,7 @@
               <button class="btn btn-tap" type="button" id="tpSave">Save policy</button>
             </div>
           </div>
-          <p class="muted" id="tpStatus" style="margin-top:8px;min-height:1.3em"></p>` : `<p class="muted">Requires <span class="mono">can_send_command</span>.</p>`}
+          <p class="muted" id="tpStatus" style="margin-top:8px;min-height:1.3em"></p>` : `<p class="muted">Requires <span class="mono">can_send_command</span> and <strong>operate</strong> access on this device.</p>`}
         </div>
       </details>
 
@@ -3236,7 +3417,7 @@
             notification_group: newGroup,
           },
         });
-        reconcileGroupMetaForDevice(id, newGroup);
+        reconcileGroupMetaForDevice(id, newGroup, d.owner_admin);
         toast("Saved", "ok");
       } catch (e) { toast(e.message || e, "err"); }
     });
@@ -3398,18 +3579,27 @@
     });
     if (wifiApplyBtn) {
       wifiApplyBtn.addEventListener("click", async () => {
-        const ssid = ($("#wifiNewSsid").value || "").trim();
-        const password = $("#wifiNewPass").value || "";
-        const st = $("#wifiScanStatus");
+        const ssid = ($("#wifiNewSsid", view).value || "").trim();
+        const password = ($("#wifiNewPass", view).value || "");
+        const st = $("#wifiScanStatus", view);
         if (!ssid) { toast("Enter SSID", "err"); return; }
         if (!confirm("Save Wi‑Fi on device and reboot? You may lose contact until it joins the new network.")) return;
         try {
           wifiApplyBtn.disabled = true;
           setWifiProgress(10);
           if (st) st.textContent = "Creating provision task…";
+          const chain = [];
+          const cGi = $("#wifiChainGetInfo", view);
+          const cPi = $("#wifiChainPing", view);
+          const cSt = $("#wifiChainSelfTest", view);
+          if (cGi && cGi.checked) chain.push({ cmd: "get_info", params: {} });
+          if (cPi && cPi.checked) chain.push({ cmd: "ping", params: {} });
+          if (cSt && cSt.checked) chain.push({ cmd: "self_test", params: {} });
+          const body = { ssid, password };
+          if (chain.length) body.chain = chain;
           const r = await api(`/devices/${encodeURIComponent(id)}/provision/wifi-task`, {
             method: "POST",
-            body: { ssid, password },
+            body,
           });
           setWifiProgress(r.progress || 35);
           if (st) st.textContent = `Task ${r.task_id} running…`;

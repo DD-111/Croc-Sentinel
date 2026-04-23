@@ -1524,12 +1524,21 @@ T clampParam(T val, T lo, T hi) { return (val < lo) ? lo : (val > hi) ? hi : val
 //  Command execution
 // ═══════════════════════════════════════════════
 
+// Deferred commands after wifi_config: stored in NVS, run one per loop() when MQTT is up.
+static bool wifiChainCmdAllowed(const char *c) {
+  if (!c || !*c) return false;
+  return strcmp(c, "get_info") == 0 || strcmp(c, "ping") == 0 ||
+         strcmp(c, "self_test") == 0 || strcmp(c, "set_param") == 0;
+}
+
+static void processPendingWifiChain();
+
 // Wipe everything written by claim/bootstrap/wifi_config + runtime tuneables, but
 // keep factory "serial" in NVS (if burned) for factory_devices re-use.
 static void performUnclaimNvsPurge() {
   static const char *kUnclaim[] = {
     "prov", "dev_id", "mqtt_u", "mqtt_p", "cmd_key", "qr_code", "zone", "acc_sn",
-    "wifi_sta_ssid", "wifi_sta_pass",
+    "wifi_sta_ssid", "wifi_sta_pass", "wifi_chain",
     "ota_pend", "ota_fail", "ota_tgt", "ota_cid",
     "rb_arm", "rb_ep",
     "boot_cnt", "hb_ms", "st_ms", "sir_ms", "rssi_t", "vbat_t",
@@ -1758,6 +1767,40 @@ void executeCommand(const char *cmd, JsonVariant params) {
     prefs.begin(NVS_NAMESPACE, false);
     prefs.putString("wifi_sta_ssid", ssid);
     prefs.putString("wifi_sta_pass", pass);
+    {
+      JsonVariant chv = params["chain"];
+      if (!chv.isNull() && chv.is<JsonArray>()) {
+        JsonArray cha = chv.as<JsonArray>();
+        StaticJsonDocument<1024> out;
+        JsonArray oa = out.to<JsonArray>();
+        for (JsonVariant v : cha) {
+          JsonObject it = v.as<JsonObject>();
+          if (it.isNull()) continue;
+          const char *c = it["cmd"] | "";
+          if (!wifiChainCmdAllowed(c)) continue;
+          JsonObject no = oa.createNestedObject();
+          no["cmd"] = c;
+          JsonObject srcp = it["params"].as<JsonObject>();
+          JsonObject dstp = no.createNestedObject("params");
+          if (!srcp.isNull()) {
+            for (JsonPair kv : srcp) {
+              dstp[kv.key()] = kv.value();
+            }
+          }
+          if (oa.size() >= 4) break;
+        }
+        if (oa.size() > 0) {
+          String qj;
+          serializeJson(out, qj);
+          prefs.putString("wifi_chain", qj);
+          logLine("[wifi] deferred cmd chain saved to NVS");
+        } else {
+          prefs.remove("wifi_chain");
+        }
+      } else {
+        prefs.remove("wifi_chain");
+      }
+    }
     prefs.end();
     requestRestartWithAck(resolvedCmd, "wifi_config saved");
     return;
@@ -1797,6 +1840,67 @@ void executeCommand(const char *cmd, JsonVariant params) {
   }
 
   publishAck(resolvedCmd, false, "unknown command");
+}
+
+static void processPendingWifiChain() {
+  if (!mqttClient.connected() || !isProvisioned) return;
+  if (millis() < s_mqttCmdGraceUntilMs) return;
+
+  prefs.begin(NVS_NAMESPACE, true);
+  String chain = prefs.getString("wifi_chain", "");
+  prefs.end();
+  if (chain.length() == 0) return;
+
+  StaticJsonDocument<1000> doc;
+  DeserializationError err = deserializeJson(doc, chain);
+  if (err || !doc.is<JsonArray>()) {
+    prefs.begin(NVS_NAMESPACE, false);
+    prefs.remove("wifi_chain");
+    prefs.end();
+    logLine("[wifi_chain] invalid JSON, cleared");
+    return;
+  }
+  JsonArray arr = doc.as<JsonArray>();
+  if (arr.size() == 0) {
+    prefs.begin(NVS_NAMESPACE, false);
+    prefs.remove("wifi_chain");
+    prefs.end();
+    return;
+  }
+
+  JsonObject first = arr[0].as<JsonObject>();
+  const char *cmd = first["cmd"] | "";
+  if (!wifiChainCmdAllowed(cmd)) {
+    prefs.begin(NVS_NAMESPACE, false);
+    prefs.remove("wifi_chain");
+    prefs.end();
+    logLine("[wifi_chain] disallowed cmd, cleared queue");
+    return;
+  }
+
+  arr.remove(0);
+  if (arr.size() > 0) {
+    String out;
+    serializeJson(doc, out);
+    prefs.begin(NVS_NAMESPACE, false);
+    prefs.putString("wifi_chain", out);
+    prefs.end();
+  } else {
+    prefs.begin(NVS_NAMESPACE, false);
+    prefs.remove("wifi_chain");
+    prefs.end();
+  }
+
+  JsonObject pobj = first["params"].as<JsonObject>();
+  static StaticJsonDocument<384> pexec;
+  pexec.clear();
+  if (!pobj.isNull()) {
+    for (JsonPair kv : pobj) {
+      pexec[kv.key()] = kv.value();
+    }
+  }
+  logLine("[wifi_chain] running deferred cmd");
+  executeCommand(cmd, pexec.as<JsonVariant>());
 }
 
 // ═══════════════════════════════════════════════
@@ -2501,6 +2605,7 @@ void loop() {
   if (mqttClient.connected()) {
     mqttClient.loop();
     processPendingMqttCommand();
+    processPendingWifiChain();
     flushOfflineQueue();
     if (s_mqttPostConnectPublish) {
       s_mqttPostConnectPublish = false;
