@@ -35,7 +35,6 @@
       items: [
         { id: "alerts", label: "Siren", ico: "!", path: "#/alerts", min: "user" },
         { id: "activate", label: "Activate device", ico: "+", path: "#/activate", min: "admin" },
-        { id: "ota", label: "OTA", ico: "↑", path: "#/ota", min: "admin" },
       ],
     },
     {
@@ -865,6 +864,78 @@
     bustApiGetCachedPrefix("/devices");
     bustApiGetCachedPrefix("/dashboard/overview");
     scheduleSyncGroupMetaFromServer();
+  }
+
+  function openGlobalFwHintDialog(hint) {
+    if (!hint || !hint.update_available) return;
+    let dlg = document.getElementById("crocFwHintDialog");
+    if (!dlg) {
+      dlg = document.createElement("dialog");
+      dlg.id = "crocFwHintDialog";
+      dlg.className = "croc-fw-hint-dlg";
+      dlg.setAttribute("aria-label", "Firmware update details");
+      dlg.innerHTML = `
+        <form method="dialog" class="croc-fw-hint-dlg__form">
+          <h3 class="croc-fw-hint-dlg__title" id="crocFwHintTitle"></h3>
+          <p class="croc-fw-hint-dlg__file muted" id="crocFwHintFile" style="margin:4px 0 0"></p>
+          <p class="croc-fw-hint-dlg__url" id="crocFwHintUrl" style="margin:6px 0 0"></p>
+          <p class="muted" style="margin:10px 0 4px">Release notes</p>
+          <pre class="croc-fw-hint-dlg__body" id="crocFwHintBody"></pre>
+          <div class="row" style="justify-content:flex-end;margin-top:10px;gap:8px">
+            <button class="btn" type="submit" value="ok">Close</button>
+          </div>
+        </form>`;
+      document.body.appendChild(dlg);
+    }
+    const t = document.getElementById("crocFwHintTitle");
+    const f = document.getElementById("crocFwHintFile");
+    const u = document.getElementById("crocFwHintUrl");
+    const b = document.getElementById("crocFwHintBody");
+    if (t) t.textContent = `New firmware: v${String(hint.to_version || "—")}`;
+    if (f) f.textContent = hint.to_file ? `File: ${String(hint.to_file)}` : "";
+    if (b) b.textContent = (hint.release_notes && String(hint.release_notes).trim()) ? String(hint.release_notes) : "(No release notes .txt / .md next to this .bin on the server.)";
+    if (u) {
+      u.className = "croc-fw-hint-dlg__url";
+      u.replaceChildren();
+      const url = String(hint.download_url || "").trim();
+      if (url && /^https?:\/\//i.test(url)) {
+        const lab = document.createElement("span");
+        lab.className = "muted";
+        lab.textContent = "Download: ";
+        const a = document.createElement("a");
+        a.href = url;
+        a.target = "_blank";
+        a.rel = "noopener";
+        a.className = "mono";
+        a.style.wordBreak = "break-all";
+        a.textContent = url;
+        u.append(lab, a);
+      } else if (url) {
+        u.append(document.createTextNode("Download: "), document.createTextNode(url));
+      } else {
+        const sp = document.createElement("span");
+        sp.className = "muted";
+        sp.textContent = "(Set OTA_PUBLIC_BASE_URL to show public download URL.)";
+        u.appendChild(sp);
+      }
+    }
+    if (typeof dlg.showModal === "function") dlg.showModal();
+  }
+
+  /** All-devices list + device detail: sync Firmware row version + OTA-hint control from API model. */
+  function syncDevicePageFirmwareHint(view, dev) {
+    const hBtn = $("#devFwHintBtn", view);
+    if (hBtn) {
+      const h = dev && dev.firmware_hint;
+      if (h && h.update_available) {
+        hBtn.style.display = "inline-flex";
+        hBtn.onclick = () => openGlobalFwHintDialog(h);
+      } else {
+        hBtn.style.display = "none";
+      }
+    }
+    const vEl = $("#devFwVer", view);
+    if (vEl) vEl.textContent = String(dev && dev.fw != null && dev.fw !== "" ? dev.fw : "—");
   }
 
   async function login(username, password) {
@@ -3173,6 +3244,7 @@
     if (!id) {
       setCrumb("All devices");
       let allItems = [];
+      const hintById = new Map();
       const selectedIds = new Set();
       const filteredItems = () => {
         const inp = $("#allDevFilter", view);
@@ -3210,12 +3282,21 @@
         const primary = escapeHtml(d.display_label || d.device_id || "unknown");
         const subId = d.display_label ? `<div class="device-id-sub mono">${escapeHtml(d.device_id || "")}</div>` : "";
         const letter = escapeHtml((d.display_label || d.device_id || "?").slice(0, 1).toUpperCase());
+        const spLine = d.status_preview && d.status_preview.line ? escapeHtml(String(d.status_preview.line)) : "—";
         let subMeta = "";
         if (state.me && state.me.role === "superadmin" && d.owner_admin) {
           subMeta = `Owner: ${escapeHtml(String(d.owner_admin))}<br/>`;
         } else if (d.is_shared && d.shared_by) {
           subMeta = `Shared: ${escapeHtml(String(d.shared_by))}<br/>`;
         }
+        const fwInline = d.fw
+          ? `<span class="device-fw-inline" style="display:inline-flex;align-items:center;gap:3px;vertical-align:middle">` +
+            `<span class="chip">v${escapeHtml(d.fw)}</span>` +
+            (d.firmware_hint && d.firmware_hint.update_available
+              ? `<button type="button" class="fw-hint-dot js-fw-hint" data-did="${escapeHtml(did)}" title="New firmware on server" aria-label="View firmware release notes"></button>`
+              : "") +
+            `</span>`
+          : "";
         return `<div class="device-card device-card--row-thumb" style="position:relative">` +
           `<label style="position:absolute;right:8px;top:8px;z-index:2;display:flex;align-items:center;gap:6px;font-size:12px">` +
           `<input type="checkbox" class="bulk-dev-pick" data-device-id="${escapeHtml(did)}" ${checked ? "checked" : ""} />` +
@@ -3226,10 +3307,10 @@
           `<h3 style="margin:0"><div class="device-primary-name">${primary}</div>${subId}</h3>` +
           `<div><span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>` +
           (d.zone ? ` <span class="chip">${escapeHtml(d.zone)}</span>` : "") +
-          (d.fw ? ` <span class="chip">v${escapeHtml(d.fw)}</span>` : "") +
+          (fwInline ? ` ${fwInline}` : "") +
           (d.is_shared ? ` <span class="badge accent" title="shared device">shared</span>` : "") +
           `</div>` +
-          `<div class="meta" style="margin-top:4px">${subMeta}Updated: ${escapeHtml(fmtRel(d.updated_at))}</div>` +
+          `<div class="meta" style="margin-top:4px">Live: ${spLine}<br/>${subMeta}Updated: ${escapeHtml(fmtRel(d.updated_at))}</div>` +
           `</div></a></div>`;
       };
       const applyFilter = () => {
@@ -3258,15 +3339,42 @@
         });
         bustDeviceListCaches();
         toast(`Bulk done · ${Number(r.count || ids.length)} devices`, "ok");
-        await load();
+        await loadDevicesAndHints();
       };
-      const load = async () => {
+      const mergeFirmwareHintsObject = (raw) => {
+        const o = raw && typeof raw === "object" ? raw : {};
+        hintById.clear();
+        for (const k of Object.keys(o)) hintById.set(k, o[k]);
+        for (const it of allItems) {
+          const k = String(it.device_id);
+          const h = o[k];
+          it.firmware_hint = h && h.update_available ? h : null;
+        }
+      };
+      const loadDevicesAndHints = async () => {
         if (!isRouteCurrent(routeSeq)) return;
-        const r = await api("/devices", { timeoutMs: 20000, retries: 2 });
+        const [devR, hintR] = await Promise.allSettled([
+          api("/devices", { timeoutMs: 20000, retries: 2 }),
+          api("/devices/firmware-hints", { timeoutMs: 30000, retries: 1 }),
+        ]);
         if (!isRouteCurrent(routeSeq)) return;
+        if (devR.status !== "fulfilled") {
+          if (devR.status === "rejected") toast(String(devR.reason && devR.reason.message) || "Failed to load devices", "err");
+          return;
+        }
+        const r = devR.value;
         allItems = Array.isArray(r.items) ? r.items : [];
         for (const did of Array.from(selectedIds)) {
           if (!allItems.some((x) => String(x.device_id) === did)) selectedIds.delete(did);
+        }
+        if (hintR.status === "fulfilled" && hintR.value) {
+          mergeFirmwareHintsObject(hintR.value.hints);
+        } else {
+          for (const it of allItems) {
+            const k = String(it.device_id);
+            const h = hintById.get(k);
+            it.firmware_hint = h && h.update_available ? h : null;
+          }
         }
         applyFilter();
       };
@@ -3373,8 +3481,17 @@
           } catch (e) { toast(e.message || e, "err"); }
         });
       }
-      await load();
-      scheduleRouteTicker(routeSeq, "devices-list-live", load, 12000);
+      view.addEventListener("click", (ev) => {
+        const t = ev.target && ev.target.closest && ev.target.closest(".js-fw-hint");
+        if (!t) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        const did0 = t.getAttribute("data-did");
+        const h = did0 && hintById.get(did0);
+        if (h) openGlobalFwHintDialog(h);
+      });
+      await loadDevicesAndHints();
+      scheduleRouteTicker(routeSeq, "devices-list-live", loadDevicesAndHints, 12000);
       return;
     }
     const isSuperViewer = !!(state.me && state.me.role === "superadmin");
@@ -3523,7 +3640,13 @@
           <div class="device-hero-card">
             <div class="device-thumb">${escapeHtml((d.display_label || id || "?").slice(0, 1).toUpperCase())}</div>
             <div class="device-hero-meta">
-              <div class="device-hero-line"><span class="muted">Firmware</span><span class="mono">${escapeHtml(d.fw || "—")}</span></div>
+              <div class="device-hero-line device-hero-line--fw">
+                <span class="muted">Firmware</span>
+                <span class="device-hero-fw" style="display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end">
+                  <span class="mono" id="devFwVer">${escapeHtml(d.fw || "—")}</span>
+                  <button type="button" class="fw-hint-pill" id="devFwHintBtn" style="display:${(d.firmware_hint && d.firmware_hint.update_available) ? "inline-flex" : "none"}" title="New firmware on server — view release notes" aria-label="View firmware release notes"><span class="visually-hidden">New firmware on server</span></button>
+                </span>
+              </div>
               <div class="device-hero-line"><span class="muted">Platform</span><span class="mono">${escapeHtml(maskPlatform(`${d.chip_target || ""}/${d.board_profile || ""}`))}</span></div>
               <div class="device-hero-line"><span class="muted">Network</span><span class="mono" id="devNetRow">${escapeHtml(d.net_type || "—")} · ${escapeHtml(dm.s.ip || "—")}</span></div>
               <div class="device-hero-line"><span class="muted">Wi‑Fi</span><span id="devWifiSsid">${dm.wifiSsidDd}</span></div>
@@ -3685,7 +3808,9 @@
       setText("#devUptime", m.s.uptime_s ? `${Math.floor(m.s.uptime_s / 3600)}h ${Math.floor((m.s.uptime_s % 3600) / 60)}m` : "—");
       setText("#devHeap", m.s.free_heap ? `${m.s.free_heap} B (min ${m.s.min_free_heap || "?"} B)` : "—");
       setText("#devUpdated", `${fmtTs(dev.updated_at)} (${fmtRel(dev.updated_at)})`);
+      syncDevicePageFirmwareHint(view, dev);
     };
+    patchDeviceLive(d);
     scheduleRouteTicker(routeSeq, `device-live-${id}`, async () => {
       if (!isRouteCurrent(routeSeq)) return;
       const latest = await apiGetCached(`/devices/${encodeURIComponent(id)}`, { timeoutMs: 16000 }, 2000);
@@ -5654,467 +5779,9 @@
   }
   registerRoute("signals", renderSignalsPage);
 
-  // OTA (superadmin only)
-  function renderOtaCampaignRow(c, me) {
-    const myDec = (c.decisions || []).find((d) => d.admin_username === me.username);
-    const decLabel = myDec ? (
-      { accepted: "Accepted", declined: "Declined", rolled_back: "Rolled back" }[myDec.action] || myDec.action
-    ) : (me.role === "superadmin" ? "—" : "Pending");
-    const co = c.counters || {};
-    const counters = ["pending","dispatched","success","failed","rolled_back"]
-      .filter((k) => co[k])
-      .map((k) => `<span class="badge" title="${k}">${k}:${co[k]}</span>`)
-      .join(" ");
-    return `
-      <tr>
-        <td class="mono">${escapeHtml(c.id)}</td>
-        <td>${escapeHtml(c.fw_version)}</td>
-        <td class="mono" style="max-width:320px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(c.url)}</td>
-        <td><span class="badge ${c.state}">${escapeHtml(c.state)}</span></td>
-        <td>${counters || "<span class='muted'>—</span>"}</td>
-        <td>${escapeHtml(decLabel)}</td>
-        <td>${escapeHtml(fmtTs(c.created_at))}</td>
-        <td>
-          <div class="table-actions">
-            <button class="btn sm secondary js-detail" data-id="${escapeHtml(c.id)}">Detail</button>
-            <details class="toolbar-collapse">
-              <summary>Actions</summary>
-              <div class="table-actions">
-                ${(me.role === "admin" && (!myDec || myDec.action === "declined"))
-                    ? `<button class="btn sm js-accept" data-id="${escapeHtml(c.id)}">Accept</button>
-                       <button class="btn sm secondary js-decline" data-id="${escapeHtml(c.id)}">Decline</button>`
-                    : ""}
-                ${(myDec && myDec.action === "accepted")
-                    ? `<button class="btn sm danger js-rollback" data-id="${escapeHtml(c.id)}">Rollback</button>`
-                    : ""}
-              </div>
-            </details>
-          </div>
-        </td>
-      </tr>`;
-  }
-
-  registerRoute("ota", async (view, _args, routeSeq) => {
-    setCrumb("OTA");
-    const me = state.me || { username: "", role: "" };
-    if (!hasRole("admin")) { mountView(view, `<div class="card"><p class="muted">OTA is available to admin and above.</p></div>`); return; }
-    const isSuper = me.role === "superadmin";
-
-    mountView(view, `
-      ${isSuper ? `
-      <div class="card">
-        <h2>1 · Stage firmware (save only)</h2>
-        <p class="muted">
-          Uploads <strong>.bin</strong> to <code>OTA_FIRMWARE_DIR</code>, builds <code>/fw/…</code> from <strong>OTA_PUBLIC_BASE_URL</strong>, runs <strong>HEAD</strong>.
-          Does <strong>not</strong> notify admins — use step 2 to create the campaign after you are satisfied (or after fixing nginx if HEAD was red).
-        </p>
-        <div class="inline-form" style="margin-top:10px">
-          <label class="field"><span>Firmware file (.bin) *</span><input type="file" id="st_file" accept=".bin,application/octet-stream" /></label>
-          <label class="field"><span>Label for stored filename *</span><input id="st_fw" placeholder="6.6.8" maxlength="40" /></label>
-          <div class="row wide" style="justify-content:flex-end">
-            <button class="btn btn-tap" type="button" id="st_send">Upload &amp; verify (no campaign)</button>
-          </div>
-        </div>
-        <div id="st_result" class="muted" style="margin-top:12px"></div>
-      </div>
-      <div class="card">
-        <h2>2 · Publish campaign from stored file</h2>
-        <p class="muted">
-          Calls <code>POST /ota/campaigns/from-stored</code>. Each admin still must <strong>Accept</strong> before devices pull the URL.
-          Targets: all admins or specific accounts below.
-        </p>
-        <label class="field"><span>Stored file *</span>
-          <select id="pub_pick"><option value="">Loading…</option></select></label>
-        <label class="field"><span>Firmware version (shown to admins) *</span><input id="pub_fw" placeholder="6.6.8" maxlength="40" /></label>
-        <label class="field wide"><span>Notes</span><input id="pub_notes" maxlength="500" /></label>
-        <div class="stack" style="gap:10px;margin-top:8px">
-          <label class="checkbox"><input type="checkbox" id="pub_all_admins" checked /><span>All admins</span></label>
-          <div id="pub_admin_boxes" class="row" style="flex-wrap:wrap;gap:10px"></div>
-        </div>
-        <div class="row wide" style="justify-content:flex-end;margin-top:14px">
-          <button class="btn btn-tap" type="button" id="pub_send">Create campaign</button>
-        </div>
-      </div>
-      <div class="card">
-        <h2>Firmware on disk</h2>
-        <p class="muted">Synced with <code>GET /ota/firmwares</code>. New SCP/rsync binaries appear here — select in step 2.</p>
-        <div id="fwList" class="muted">Loading firmware list…</div>
-      </div>
-      <details class="card">
-        <summary style="cursor:pointer;font-weight:650">Advanced · manual URL or one-step upload</summary>
-        <div class="stack" style="margin-top:12px">
-          <p class="muted">Manual CDN URL, or legacy upload that rolls the file back if HEAD fails.</p>
-          <div class="inline-form">
-            <label class="field"><span>Firmware version *</span><input id="c_fw" placeholder="2.2.0" /></label>
-            <label class="field wide"><span>Download URL *</span><input id="c_url" placeholder="https://cdn.example.com/sentinel-v2.2.0.bin" /></label>
-            <label class="field"><span>SHA-256 (optional)</span><input id="c_sha" placeholder="64 hex chars" /></label>
-            <label class="field wide"><span>Target admins (empty = all)</span>
-              <input id="c_admins" placeholder="admin-a, admin-b or leave blank" />
-            </label>
-            <label class="field wide"><span>Notes</span><input id="c_notes" maxlength="500" /></label>
-            <div class="row wide" style="justify-content:flex-end">
-              <button class="btn btn-tap" id="c_send" type="button">Create campaign (manual URL)</button>
-            </div>
-          </div>
-          <div class="divider"></div>
-          <div class="inline-form">
-            <label class="field"><span>One-step .bin *</span><input type="file" id="uq_file" accept=".bin,application/octet-stream" /></label>
-            <label class="field"><span>Version string *</span><input id="uq_fw" placeholder="6.6.8" maxlength="40" /></label>
-            <label class="field wide"><span>Target admins (blank = all)</span>
-              <input id="uq_admins" placeholder="comma-separated" /></label>
-            <label class="field wide"><span>Notes</span><input id="uq_notes" maxlength="500" /></label>
-            <div class="row wide" style="justify-content:flex-end">
-              <button class="btn secondary btn-tap" type="button" id="uq_send">Upload &amp; create in one step</button>
-            </div>
-          </div>
-        </div>
-      </details>` : ""}
-      <div class="card">
-        <div class="row between">
-          <h2 style="margin:0">Campaigns</h2>
-          <button class="btn sm secondary" id="camp_reload">Refresh</button>
-        </div>
-        <div id="campList" class="muted" style="margin-top:8px">Loading…</div>
-      </div>
-      <div id="campDetail"></div>`);
-
-    async function loadCampaigns() {
-      try {
-        if (!isRouteCurrent(routeSeq)) return;
-        const r = await api("/ota/campaigns", { timeoutMs: 30000 });
-        if (!isRouteCurrent(routeSeq)) return;
-        const list = r.items || [];
-        const campListEl = $("#campList", view);
-        if (!campListEl) return;
-        if (list.length === 0) {
-          setChildMarkup(campListEl, `<p class="muted">No OTA campaigns.</p>`);
-          return;
-        }
-        setChildMarkup(
-          campListEl,
-          `<div class="table-wrap"><table class="t">
-          <thead><tr><th>ID</th><th>Version</th><th>URL</th><th>State</th><th>Progress</th><th>My decision</th><th>Created</th><th></th></tr></thead>
-          <tbody>${list.map((c) => renderOtaCampaignRow(c, me)).join("")}</tbody>
-        </table></div>`,
-        );
-
-        view.querySelectorAll(".js-accept").forEach((b) => b.addEventListener("click", async () => {
-          if (!confirm("Accept upgrade? The server will verify the URL then push to all devices you own.")) return;
-          try {
-            const r2 = await api(`/ota/campaigns/${encodeURIComponent(b.dataset.id)}/accept`, { method: "POST", body: {} });
-            toast(`Dispatched ${r2.dispatched}/${r2.target_count} · verify: ${r2.verify}`, "ok");
-            loadCampaigns();
-          } catch (e) { toast(e.message || e, "err"); }
-        }));
-        view.querySelectorAll(".js-decline").forEach((b) => b.addEventListener("click", async () => {
-          if (!confirm("Decline this upgrade?")) return;
-          try { await api(`/ota/campaigns/${encodeURIComponent(b.dataset.id)}/decline`, { method: "POST", body: {} }); loadCampaigns(); }
-          catch (e) { toast(e.message || e, "err"); }
-        }));
-        view.querySelectorAll(".js-rollback").forEach((b) => b.addEventListener("click", async () => {
-          if (!confirm("Rollback? Upgraded devices will be pushed back to the previous firmware.")) return;
-          try { const r2 = await api(`/ota/campaigns/${encodeURIComponent(b.dataset.id)}/rollback`, { method: "POST", body: {} }); toast(`Rolled back ${r2.rolled_back} device(s)`, "ok"); loadCampaigns(); }
-          catch (e) { toast(e.message || e, "err"); }
-        }));
-        view.querySelectorAll(".js-detail").forEach((b) => b.addEventListener("click", async () => {
-          try {
-            const c = await api(`/ota/campaigns/${encodeURIComponent(b.dataset.id)}`);
-            if (!isRouteCurrent(routeSeq)) return;
-            const campDetailEl = $("#campDetail", view);
-            if (!campDetailEl) return;
-            setChildMarkup(
-              campDetailEl,
-              `<div class="card">
-              <h3>Campaign ${escapeHtml(c.id)}</h3>
-              <p class="muted">FW ${escapeHtml(c.fw_version)} · ${escapeHtml(c.state)} · created ${escapeHtml(fmtTs(c.created_at))}</p>
-              <p class="mono" style="word-break:break-all">${escapeHtml(c.url)}</p>
-              <h4 style="margin:12px 0 4px">Device runs</h4>
-              <div class="table-wrap"><table class="t">
-                <thead><tr><th>admin</th><th>Device</th><th>Prev fw</th><th>Target fw</th><th>State</th><th>Error</th><th>Finished</th></tr></thead>
-                <tbody>${(c.device_runs || []).map((r) => `
-                  <tr>
-                    <td>${escapeHtml(r.admin_username)}</td>
-                    <td class="mono">${escapeHtml(r.device_id)}</td>
-                    <td>${escapeHtml(r.prev_fw || "—")}</td>
-                    <td>${escapeHtml(r.target_fw)}</td>
-                    <td><span class="badge ${r.state}">${escapeHtml(r.state)}</span></td>
-                    <td class="muted" style="max-width:220px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(r.error || "")}</td>
-                    <td>${escapeHtml(fmtTs(r.finished_at || ""))}</td>
-                  </tr>`).join("")}</tbody>
-              </table></div>
-            </div>`,
-            );
-          } catch (e) {
-            if (!isRouteCurrent(routeSeq)) return;
-            toast(e.message || e, "err");
-          }
-        }));
-      } catch (e) {
-        if (!isRouteCurrent(routeSeq)) return;
-        const campListEl = $("#campList", view);
-        if (!campListEl) return;
-        setChildMarkup(campListEl, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
-      }
-    }
-
-    if (isSuper) {
-      let otaFwFingerprint = "";
-
-      function guessFwFromStoredName(name) {
-        const m = /^croc-(.+)-[a-f0-9]{8}\.bin$/i.exec(name || "");
-        if (m) return m[1].replace(/_/g, ".");
-        return String(name || "").replace(/\.bin$/i, "");
-      }
-
-      function syncPubAdminDisabled() {
-        const allCh = $("#pub_all_admins", view);
-        const dis = !!(allCh && allCh.checked);
-        view.querySelectorAll("input[name='pub_admin']").forEach((x) => {
-          x.disabled = dis;
-        });
-      }
-
-      function bindFwUseButtons() {
-        view.querySelectorAll(".js-use").forEach((b) => {
-          b.addEventListener("click", () => {
-            const cUrl = $("#c_url", view);
-            const cFw = $("#c_fw", view);
-            const cSha = $("#c_sha", view);
-            if (cUrl) cUrl.value = b.dataset.url;
-            if (cFw) cFw.value = b.dataset.fw;
-            if (cSha && b.dataset.sha) cSha.value = b.dataset.sha;
-          });
-        });
-      }
-
-      async function refreshOtaInventory(preselectName) {
-        const fw = await api("/ota/firmwares", { timeoutMs: 30000 });
-        if (!isRouteCurrent(routeSeq)) return;
-        const items = fw.items || [];
-        const fp = items.map((x) => `${x.name}:${x.mtime}`).sort().join("|");
-        if (otaFwFingerprint && fp !== otaFwFingerprint) {
-          toast("Firmware folder changed — list updated.", "ok");
-        }
-        otaFwFingerprint = fp;
-
-        const pubPick = $("#pub_pick", view);
-        if (pubPick) {
-          const prevPick = String(pubPick.value || "").trim();
-          pubPick.innerHTML = `<option value="">— choose file —</option>${items.map((it) => `<option value="${escapeHtml(it.name)}">${escapeHtml(it.name)} · ${(it.size / 1024).toFixed(1)} KB</option>`).join("")}`;
-          const restore = preselectName && items.some((x) => x.name === preselectName)
-            ? preselectName
-            : (prevPick && items.some((x) => x.name === prevPick) ? prevPick : "");
-          if (restore) {
-            pubPick.value = restore;
-            const pubFw = $("#pub_fw", view);
-            if (pubFw && !String(pubFw.value || "").trim()) pubFw.value = guessFwFromStoredName(restore);
-          }
-        }
-
-        const fwListEl = $("#fwList", view);
-        if (fwListEl) {
-          setChildMarkup(
-            fwListEl,
-            items.length === 0
-              ? `<p class="muted">No .bin files under ${escapeHtml(fw.dir || "/opt/sentinel/firmware")}.${fw.public_base ? "" : ` <strong>OTA_PUBLIC_BASE_URL</strong> missing — URLs won’t work.`}</p>`
-              : `<p class="muted" style="margin-bottom:8px"><code>${escapeHtml(fw.public_base || "(no OTA_PUBLIC_BASE_URL)")}</code></p><div class="table-wrap"><table class="t">
-              <thead><tr><th>File</th><th>Size</th><th>SHA-256</th><th>Modified</th><th></th></tr></thead>
-              <tbody>${items.map((it) => `
-                <tr>
-                  <td class="mono">${escapeHtml(it.name)}</td>
-                  <td>${(it.size / 1024).toFixed(1)} KB</td>
-                  <td class="mono" style="max-width:280px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(it.sha256 || "—")}</td>
-                  <td>${escapeHtml(fmtTs(it.mtime))}</td>
-                  <td>${it.download_url ? `<button type="button" class="btn sm secondary js-use" data-url="${escapeHtml(it.download_url)}" data-fw="${escapeHtml(guessFwFromStoredName(it.name))}" data-sha="${escapeHtml(it.sha256 || "")}">Fill manual URL form</button>` : ""}</td>
-                </tr>`).join("")}</tbody></table></div>`,
-          );
-          bindFwUseButtons();
-        }
-      }
-
-      try {
-        await refreshOtaInventory();
-      } catch (e) {
-        if (!isRouteCurrent(routeSeq)) return;
-        const fwListEl = $("#fwList", view);
-        const pubPick = $("#pub_pick", view);
-        if (pubPick) pubPick.innerHTML = `<option value="">(failed to load)</option>`;
-        if (fwListEl) setChildMarkup(fwListEl, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
-      }
-
-      try {
-        const ur = await api("/auth/users", { timeoutMs: 30000 });
-        if (!isRouteCurrent(routeSeq)) return;
-        const admins = (ur.items || []).filter((u) => u.role === "admin").map((u) => u.username).sort();
-        const box = $("#pub_admin_boxes", view);
-        if (box) {
-          setChildMarkup(
-            box,
-            admins.length === 0
-              ? `<span class="muted">No admin accounts.</span>`
-              : admins.map((a) => `<label class="checkbox"><input type="checkbox" name="pub_admin" value="${escapeHtml(a)}" /><span>${escapeHtml(a)}</span></label>`).join(""),
-          );
-        }
-        syncPubAdminDisabled();
-        const allCh = $("#pub_all_admins", view);
-        if (allCh) {
-          allCh.addEventListener("change", () => {
-            syncPubAdminDisabled();
-          });
-        }
-        const pubPickEl = $("#pub_pick", view);
-        if (pubPickEl && !pubPickEl.dataset.bound) {
-          pubPickEl.dataset.bound = "1";
-          pubPickEl.addEventListener("change", () => {
-            const pubFw = $("#pub_fw", view);
-            const v = String(pubPickEl.value || "").trim();
-            if (pubFw && v && !String(pubFw.value || "").trim()) pubFw.value = guessFwFromStoredName(v);
-          });
-        }
-      } catch (_) { /* optional */ }
-
-      const stSend = $("#st_send", view);
-      if (stSend) {
-        stSend.addEventListener("click", async () => {
-          const inp = $("#st_file", view);
-          const file = inp && inp.files && inp.files[0];
-          const fw = (($("#st_fw", view) && $("#st_fw", view).value) || "").trim();
-          if (!file) { toast("Choose a .bin file", "err"); return; }
-          if (!fw) { toast("Label / version for filename required", "err"); return; }
-          if (!confirm("Upload and save firmware on server (no campaign yet)?")) return;
-          const fd = new FormData();
-          fd.append("file", file);
-          fd.append("fw_version", fw);
-          const stResult = $("#st_result", view);
-          try {
-            const r = await api("/ota/firmware/upload", { method: "POST", body: fd, timeoutMs: 120000 });
-            if (!isRouteCurrent(routeSeq)) return;
-            const ok = r.head_ok;
-            if (stResult) {
-              setChildMarkup(
-                stResult,
-                `<div class="card" style="box-shadow:none;border-style:dashed;padding:12px">
-                  <div class="row" style="align-items:center;gap:10px;flex-wrap:wrap">
-                    <span class="badge ${ok ? "online" : "offline"}">${ok ? "HEAD OK" : "HEAD failed"}</span>
-                    <span class="mono">${escapeHtml(r.stored_as || "")}</span>
-                  </div>
-                  <p class="muted" style="margin:8px 0 0;font-size:13px">${escapeHtml(r.verify || "")}</p>
-                  <p class="mono" style="word-break:break-all;margin:6px 0 0;font-size:12px">${escapeHtml(r.download_url || "")}</p>
-                  ${ok ? "" : `<p class="muted" style="margin-top:8px">${escapeHtml(r.hint || "Fix reverse-proxy /fw/ then publish in step 2.")}</p>`}
-                </div>`,
-              );
-            }
-            toast(ok ? `Staged ${r.stored_as}` : `Saved ${r.stored_as} but HEAD failed — fix URL then publish`, ok ? "ok" : "err");
-            if (inp) inp.value = "";
-            await refreshOtaInventory(r.stored_as);
-            loadCampaigns();
-          } catch (e) {
-            if (!isRouteCurrent(routeSeq)) return;
-            if (stResult) setChildMarkup(stResult, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
-            toast(e.message || e, "err");
-          }
-        });
-      }
-
-      const pubSend = $("#pub_send", view);
-      if (pubSend) {
-        pubSend.addEventListener("click", async () => {
-          const fn = String(($("#pub_pick", view) && $("#pub_pick", view).value) || "").trim();
-          const pfw = String(($("#pub_fw", view) && $("#pub_fw", view).value) || "").trim();
-          const notes = String(($("#pub_notes", view) && $("#pub_notes", view).value) || "").trim();
-          const allAdm = $("#pub_all_admins", view) && $("#pub_all_admins", view).checked;
-          let target_admins = ["*"];
-          if (!allAdm) {
-            target_admins = Array.from(view.querySelectorAll("input[name='pub_admin']:checked")).map((x) => x.value);
-            if (target_admins.length === 0) {
-              toast("Select at least one admin, or enable “All admins”.", "err");
-              return;
-            }
-          }
-          if (!fn || !pfw) { toast("Pick a file and firmware version.", "err"); return; }
-          if (!confirm(`Create OTA campaign for file ${fn} → admins: ${allAdm ? "ALL" : target_admins.join(", ")}?`)) return;
-          try {
-            const r = await api("/ota/campaigns/from-stored", {
-              method: "POST",
-              body: { filename: fn, fw_version: pfw, notes: notes || undefined, target_admins },
-              timeoutMs: 60000,
-            });
-            if (!isRouteCurrent(routeSeq)) return;
-            toast(`Campaign ${r.campaign_id} · ${r.verify}`, "ok");
-            const pn = $("#pub_notes", view);
-            const pf = $("#pub_fw", view);
-            if (pn) pn.value = "";
-            if (pf) pf.value = "";
-            loadCampaigns();
-          } catch (e) { toast(e.message || e, "err"); }
-        });
-      }
-
-      scheduleRouteTicker(routeSeq, "ota-fw-inventory", async () => {
-        try {
-          await refreshOtaInventory();
-        } catch (_) {}
-      }, 28000);
-
-      const uqSend = $("#uq_send", view);
-      if (uqSend) {
-        uqSend.addEventListener("click", async () => {
-          const inp = $("#uq_file", view);
-          const file = inp && inp.files && inp.files[0];
-          const fw = (($("#uq_fw", view) && $("#uq_fw", view).value) || "").trim();
-          const notes = (($("#uq_notes", view) && $("#uq_notes", view).value) || "").trim();
-          const adminsRaw = (($("#uq_admins", view) && $("#uq_admins", view).value) || "").trim();
-          if (!file) { toast("Choose a .bin file", "err"); return; }
-          if (!fw) { toast("Firmware version required", "err"); return; }
-          if (!confirm("One-step: upload, verify public URL, and create campaign (file removed if HEAD fails)?")) return;
-          const fd = new FormData();
-          fd.append("file", file);
-          fd.append("fw_version", fw);
-          fd.append("notes", notes);
-          fd.append("target_admins", adminsRaw || "*");
-          try {
-            const r = await api("/ota/campaigns/from-upload", { method: "POST", body: fd, timeoutMs: 120000 });
-            if (!isRouteCurrent(routeSeq)) return;
-            toast(`Campaign ${r.campaign_id} · stored ${r.stored_as} · ${r.verify}`, "ok");
-            if (inp) inp.value = "";
-            const uqFw = $("#uq_fw", view);
-            const uqNotes = $("#uq_notes", view);
-            const uqAdmins = $("#uq_admins", view);
-            if (uqFw) uqFw.value = "";
-            if (uqNotes) uqNotes.value = "";
-            if (uqAdmins) uqAdmins.value = "";
-            loadCampaigns();
-            await refreshOtaInventory();
-          } catch (e) { toast(e.message || e, "err"); }
-        });
-      }
-
-      const cSend = $("#c_send", view);
-      if (cSend) cSend.addEventListener("click", async () => {
-        const url = (($("#c_url", view) && $("#c_url", view).value) || "").trim();
-        const fw = (($("#c_fw", view) && $("#c_fw", view).value) || "").trim();
-        const sha = (($("#c_sha", view) && $("#c_sha", view).value) || "").trim();
-        const notes = (($("#c_notes", view) && $("#c_notes", view).value) || "").trim();
-        const adminsRaw = (($("#c_admins", view) && $("#c_admins", view).value) || "").trim();
-        const target_admins = adminsRaw ? adminsRaw.split(/[ ,;\n]+/).filter(Boolean) : ["*"];
-        if (!url || !fw) { toast("Firmware version and URL required", "err"); return; }
-        if (!confirm(`Create OTA campaign? Target admins: ${target_admins.join(", ") || "ALL"}`)) return;
-        try {
-          const r = await api("/ota/campaigns", { method: "POST", body: { fw_version: fw, url, sha256: sha || undefined, notes, target_admins } });
-          if (!isRouteCurrent(routeSeq)) return;
-          toast(`Campaign ${r.campaign_id} · ${r.target_admins.length} admin(s)`, "ok");
-          ["c_url", "c_fw", "c_sha", "c_notes", "c_admins"].forEach((id) => {
-            const el = $(`#${id}`, view);
-            if (el) el.value = "";
-          });
-          loadCampaigns();
-        } catch (e) { toast(e.message || e, "err"); }
-      });
-    }
-
-    const campReload = $("#camp_reload", view);
-    if (campReload) campReload.addEventListener("click", loadCampaigns);
-    loadCampaigns();
+  registerRoute("ota", (view) => {
+    setCrumb("All devices");
+    if (view) { location.hash = "#/devices"; }
   });
 
   function renderPolicyPanel(username, p) {

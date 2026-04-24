@@ -5826,6 +5826,206 @@ def _device_is_online_sql_row(row: dict[str, Any], now_s: int) -> bool:
     )
 
 
+def _row_json_val(raw: str | None) -> dict[str, Any]:
+    if not raw:
+        return {}
+    try:
+        j = json.loads(raw) if isinstance(raw, str) else dict(raw)
+        return j if isinstance(j, dict) else {}
+    except Exception:
+        return {}
+
+
+def _status_preview_from_device_row(d: dict[str, Any]) -> dict[str, Any]:
+    """Compact live hints for the device list (one round-trip, no N+1)."""
+    st = _row_json_val(d.get("last_status_json"))
+    hb = _row_json_val(d.get("last_heartbeat_json"))
+    rssi: int | None = None
+    _w = st.get("wifi")
+    wifi = _w if isinstance(_w, dict) else {}
+    for cand in (st.get("rssi"), wifi.get("rssi") if isinstance(wifi, dict) else None, hb.get("rssi")):
+        if cand is None:
+            continue
+        try:
+            r = int(cand)
+        except (TypeError, ValueError):
+            continue
+        if r != -127:
+            rssi = r
+            break
+    vbat: float | None
+    vbat = None
+    if st.get("vbat") is not None:
+        try:
+            vb = float(st["vbat"])
+            if vb >= 0:
+                vbat = round(vb, 2)
+        except (TypeError, ValueError):
+            vbat = None
+    parts: list[str] = []
+    if rssi is not None:
+        parts.append(f"RSSI {rssi} dBm")
+    if vbat is not None:
+        parts.append(f"{vbat:.2f} V")
+    hb_on = bool(hb.get("online")) if "online" in hb else None
+    if hb_on is True and not parts:
+        parts.append("heartbeat")
+    if hb_on is False and not parts:
+        parts.append("heartbeat lost")
+    line = " · ".join(parts) if parts else "—"
+    return {"line": line, "rssi": rssi, "vbat": vbat}
+
+
+def _parse_fw_version_tuple(s: str) -> tuple[int, ...] | None:
+    t = (s or "").strip()
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)(?:\D|$)", t)
+    if m:
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    m2 = re.search(r"(\d+)\.(\d+)(?:\D|$)", t)
+    if m2:
+        return (int(m2.group(1)), int(m2.group(2)), 0)
+    return None
+
+
+def _fw_version_gt(newer: str, current: str) -> bool:
+    a, b = (newer or "").strip(), (current or "").strip()
+    if not a:
+        return False
+    if not b:
+        return bool(a)
+    ta, tb = _parse_fw_version_tuple(a), _parse_fw_version_tuple(b)
+    if ta and tb:
+        return ta > tb
+    return a > b
+
+
+def _version_str_from_ota_bin_name(name: str) -> str:
+    base = os.path.basename(name)
+    m = re.match(r"^croc-(.+)-[a-f0-9]{8}\.bin$", base, re.I)
+    if m:
+        return m.group(1).replace("_", ".")
+    m2 = re.search(r"(\d+\.\d+\.\d+)", base)
+    if m2:
+        return m2.group(1)
+    m3 = re.search(r"(\d+\.\d+)(?:\D|$)", base)
+    if m3:
+        return m3.group(1) + ".0"
+    if base.lower().endswith(".bin"):
+        return base[:-4] or base
+    return base
+
+
+def _read_ota_release_notes_for_stem(stem: str) -> str:
+    if not stem or ".." in stem or "/" in stem or "\\" in stem:
+        return ""
+    base_dir = os.path.realpath(OTA_FIRMWARE_DIR)
+    for ext in (".txt", ".md", ".notes"):
+        p = os.path.realpath(os.path.join(OTA_FIRMWARE_DIR, stem + ext))
+        if not p.startswith(base_dir + os.sep) or not os.path.isfile(p):
+            continue
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                return f.read(8000)
+        except OSError:
+            continue
+    return ""
+
+
+_OTA_CATALOG_TTL = 45.0
+_OTA_CATALOG_CACHE: tuple[float, list[dict[str, Any]]] | None = None
+
+
+def _invalidate_ota_firmware_catalog_cache() -> None:
+    global _OTA_CATALOG_CACHE
+    _OTA_CATALOG_CACHE = None
+
+
+def _get_ota_firmware_catalog() -> list[dict[str, Any]]:
+    global _OTA_CATALOG_CACHE
+    now = time.time()
+    if _OTA_CATALOG_CACHE and (now - _OTA_CATALOG_CACHE[0]) < _OTA_CATALOG_TTL:
+        return _OTA_CATALOG_CACHE[1]
+    items: list[dict[str, Any]] = []
+    base = OTA_FIRMWARE_DIR
+    if os.path.isdir(base):
+        for name in sorted(os.listdir(base)):
+            if not str(name).endswith(".bin"):
+                continue
+            p = os.path.join(base, name)
+            if not os.path.isfile(p):
+                continue
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            vs = _version_str_from_ota_bin_name(name).strip()
+            if not vs:
+                continue
+            items.append(
+                {
+                    "name": name,
+                    "version_str": vs,
+                    "version_tuple": _parse_fw_version_tuple(vs),
+                    "mtime": int(st.st_mtime),
+                },
+            )
+    _OTA_CATALOG_CACHE = (now, items)
+    return items
+
+
+def _catalog_entry_beats(a: dict[str, Any], b: dict[str, Any] | None) -> bool:
+    """True if `a` is a strictly better upgrade candidate than `b` (newer version, or same version + newer mtime)."""
+    if b is None:
+        return True
+    va, vb = str(a.get("version_str") or "").strip(), str(b.get("version_str") or "").strip()
+    if not va:
+        return False
+    if _fw_version_gt(va, vb):
+        return True
+    if va == vb and int(a.get("mtime", 0)) > int(b.get("mtime", 0)):
+        return True
+    return False
+
+
+def _best_catalog_entry_newer_than_fw(current_fw: str, catalog: list[dict[str, Any]]) -> dict[str, Any] | None:
+    cur = (current_fw or "").strip()
+    if not cur or not catalog:
+        return None
+    best: dict[str, Any] | None = None
+    for ent in catalog:
+        v = str(ent.get("version_str") or "").strip()
+        if not v or not _fw_version_gt(v, cur):
+            continue
+        if _catalog_entry_beats(ent, best):
+            best = ent
+    return best
+
+
+def _firmware_hint_dict_from_entry(best: dict[str, Any]) -> dict[str, Any]:
+    name = str(best["name"])
+    stem = name[:-4] if name.lower().endswith(".bin") else name
+    notes = _read_ota_release_notes_for_stem(stem)
+    dl = ""
+    if OTA_PUBLIC_BASE_URL:
+        dl = f"{OTA_PUBLIC_BASE_URL}/fw/{name}"
+    return {
+        "update_available": True,
+        "to_version": str(best["version_str"]),
+        "to_file": name,
+        "release_notes": notes,
+        "download_url": dl or None,
+    }
+
+
+def _firmware_update_hint_for_current_in_catalog(
+    current_fw: str, catalog: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    best = _best_catalog_entry_newer_than_fw(current_fw, catalog)
+    if not best:
+        return None
+    return _firmware_hint_dict_from_entry(best)
+
+
 @app.get("/dashboard/overview")
 def dashboard_overview(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     assert_min_role(principal, "user")
@@ -5985,6 +6185,7 @@ def list_devices(principal: Principal = Depends(require_principal)) -> dict[str,
         for r in cur.fetchall():
             d = dict(r)
             d["is_online"] = _device_is_online_sql_row(d, now_s)
+            d["status_preview"] = _status_preview_from_device_row(d)
             owner_admin = str(d.get("owner_admin") or "")
             d.pop("last_status_json", None)
             d.pop("last_heartbeat_json", None)
@@ -6003,6 +6204,39 @@ def list_devices(principal: Principal = Depends(require_principal)) -> dict[str,
     out = {"items": rows_out}
     cache_put(cache_key, out)
     return out
+
+
+@app.get("/devices/firmware-hints")
+def list_devices_firmware_hints(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    """Per-device “newer .bin on disk” hint for the signed-in scope (no superadmin OTA UI required)."""
+    assert_min_role(principal, "user")
+    catalog = _get_ota_firmware_catalog()
+    zs, za = zone_sql_suffix(principal, "d.zone")
+    osf, osa = owner_scope_clause_for_device_state(principal, "d")
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT d.device_id, d.fw
+            FROM device_state d
+            LEFT JOIN device_ownership o ON d.device_id = o.device_id
+            WHERE 1=1 {zs} {osf}
+            """,
+            tuple(za + osa),
+        )
+        rows = [dict(x) for x in cur.fetchall()]
+        conn.close()
+    hints: dict[str, Any] = {}
+    for r in rows:
+        did = str(r.get("device_id") or "")
+        if not did:
+            continue
+        cur_fw = str(r.get("fw") or "")
+        h = _firmware_update_hint_for_current_in_catalog(cur_fw, catalog)
+        if h:
+            hints[did] = h
+    return {"hints": hints, "ts": int(time.time())}
 
 
 @app.get("/devices/{device_id}")
@@ -6062,6 +6296,8 @@ def get_device(device_id: str, principal: Principal = Depends(require_principal)
     _redact_notification_group_for_principal(principal, owner_admin, out)
     out["can_view"] = bool(can_view)
     out["can_operate"] = bool(can_operate)
+    cat = _get_ota_firmware_catalog()
+    out["firmware_hint"] = _firmware_update_hint_for_current_in_catalog(str(out.get("fw") or ""), cat)
     return out
 
 
@@ -9700,6 +9936,7 @@ async def _ota_store_uploaded_bin(file: UploadFile, fw_version: str) -> tuple[st
             sf.write(f"{sha_hex}  {fname}\n")
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"failed to save firmware: {exc}") from exc
+    _invalidate_ota_firmware_catalog_cache()
     return fname, sha_hex, len(body)
 
 
