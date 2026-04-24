@@ -14,6 +14,9 @@
     sidebarCollapsed: "croc.sidebar.collapsed",
   };
   const OFFLINE_MS = 90 * 1000;
+  /** Default remote siren / group loud duration (3 min). Panic sibling fan-out default (5 min) matches server. */
+  const DEFAULT_REMOTE_SIREN_MS = 180000;
+  const DEFAULT_PANIC_FANOUT_MS = 300000;
 
   /** Sidebar: grouped by function (paths unchanged). Order: dashboard → live data → fleet actions → integrations & RBAC. */
   const NAV_GROUPS = [
@@ -130,9 +133,18 @@
   function normalizeGroupKeyStr(v) {
     return String(v == null ? "" : v).trim();
   }
+  /** One logical group per string: trim + NFC + collapse internal whitespace (avoids duplicate group cards). */
+  function canonicalGroupKey(v) {
+    let s = normalizeGroupKeyStr(v);
+    if (!s) return "";
+    try {
+      s = s.normalize("NFC");
+    } catch (_) {}
+    return s.replace(/\s+/g, " ");
+  }
   /** Stable localStorage / UI key for a group card; superadmin includes owning admin in the key. */
   function groupCardMetaKey(groupKey, tenantOwner) {
-    const gk = normalizeGroupKeyStr(groupKey);
+    const gk = canonicalGroupKey(groupKey);
     const o = String(tenantOwner || "").trim();
     if (state.me && state.me.role === "superadmin" && o) return `${o}${GROUP_CARD_TENANT_SEP}${gk}`;
     return gk;
@@ -141,9 +153,9 @@
     const mk = String(metaKey || "");
     if (state.me && state.me.role === "superadmin" && mk.includes(GROUP_CARD_TENANT_SEP)) {
       const i = mk.indexOf(GROUP_CARD_TENANT_SEP);
-      return { tenantOwner: mk.slice(0, i).trim(), groupKey: normalizeGroupKeyStr(mk.slice(i + 1)) };
+      return { tenantOwner: mk.slice(0, i).trim(), groupKey: canonicalGroupKey(mk.slice(i + 1)) };
     }
-    return { tenantOwner: "", groupKey: normalizeGroupKeyStr(mk) };
+    return { tenantOwner: "", groupKey: canonicalGroupKey(mk) };
   }
   function groupApiQueryOwner(tenantOwner) {
     const o = String(tenantOwner || "").trim();
@@ -177,7 +189,7 @@
           else delete meta[gk];
         }
       }
-      const ng = String(newGroupKey || "").trim();
+      const ng = canonicalGroupKey(newGroupKey);
       if (ng) {
         const ck = groupCardMetaKey(ng, ownerHint);
         if (!ck) return;
@@ -207,7 +219,7 @@
     const isSuper = state.me && state.me.role === "superadmin";
     const notifMap = new Map();
     for (const d of list) {
-      const g = String(d && d.notification_group != null ? d.notification_group : "").trim();
+      const g = canonicalGroupKey(d && d.notification_group);
       if (!g) continue;
       const ck = groupCardMetaKey(g, isSuper ? d.owner_admin : "");
       if (!notifMap.has(ck)) notifMap.set(ck, []);
@@ -747,10 +759,12 @@
   }
   function groupTriggerPayloadFromSettings(gs) {
     const s = gs || {};
+    const delay_seconds = Number(s.delay_seconds || 0);
+    const trigger_duration_ms = Number(s.trigger_duration_ms || DEFAULT_REMOTE_SIREN_MS);
     return {
-      trigger_mode: String(s.trigger_mode || "continuous"),
-      trigger_duration_ms: Number(s.trigger_duration_ms || 10000),
-      delay_seconds: Number(s.delay_seconds || 0),
+      trigger_mode: delay_seconds > 0 ? "delay" : "continuous",
+      trigger_duration_ms,
+      delay_seconds,
       reboot_self_check: !!s.reboot_self_check,
     };
   }
@@ -2352,14 +2366,9 @@
         <div class="grp-modal-card">
           <h3 style="margin:0 0 8px">Group trigger settings</h3>
           <p class="muted" id="gsKeyLabel" style="margin:0 0 10px"></p>
-          <label class="field"><span>Trigger duration (ms)</span><input id="gsDuration" type="number" min="500" max="300000" step="100" /></label>
-          <label class="field field--spaced"><span>Trigger mode</span>
-            <select id="gsMode">
-              <option value="continuous">Continuous trigger</option>
-              <option value="delay">Delay trigger</option>
-            </select>
-          </label>
-          <label class="field field--spaced"><span>Delay seconds</span><input id="gsDelay" type="number" min="0" max="3600" step="1" /></label>
+          <p class="muted" style="margin:0 0 10px;font-size:12px;line-height:1.45" lang="zh">延迟为 0 表示立即鸣响；鸣响时长以分钟计（与单机远程警报复位策略一致）。<br/><span lang="en">Delay 0 = immediate siren. Duration is in minutes (same idea as remote siren length).</span></p>
+          <label class="field"><span>Siren duration (minutes)</span><input id="gsDurMin" type="number" min="0.5" max="5" step="0.5" /></label>
+          <label class="field field--spaced"><span>Delay before siren (seconds)</span><input id="gsDelay" type="number" min="0" max="3600" step="1" /></label>
           <label class="field field--spaced field--toggle">
             <span class="row field--toggle__row" style="margin:0;align-items:flex-start;gap:10px">
               <input id="gsReboot" type="checkbox" />
@@ -2377,15 +2386,11 @@
         <div class="grp-modal-card grp-modal-card--edit">
           <header class="grp-modal__head">
             <h3 class="grp-modal__title">编辑组卡 / Edit group card</h3>
-            <p class="grp-modal__lede">兄弟机 = 同一租户、同一 <strong>Group key</strong>（= 设备 <strong>Notification group</strong>）且 Zone 规则允许时，由云端做联动；下面勾选要显示在此组卡上的设备。 · Siblings: same tenant + same group key (device <code>notification_group</code>); tick devices to show on this card.</p>
-            <ol class="grp-modal__steps" lang="zh-Hans">
-              <li>为每台设备在「全部设备 / 设备详情」里设好同一组名，或与这里保存时一并写入（见 Save）。</li>
-              <li>空组名 = 不参与同组兄弟联动。</li>
-            </ol>
-            <p class="grp-modal__steps-en muted" lang="en">Empty group = no sibling fan-out. Full rules: <code>docs/GROUP_AND_LINKAGE.md</code> in the repo.</p>
+            <p class="grp-modal__lede muted">填写组标识与展示信息，勾选要出现在此卡上的设备。需要说明时请向管理员索取文档。<br/><span lang="en">Set the group identifier and display fields, then pick devices for this card. Ask your administrator for documentation if needed.</span></p>
           </header>
           <div class="grp-modal__fields">
             <label class="field"><span>Group key</span><input id="gmKey" placeholder="e.g. Warehouse-A" autocomplete="off"/></label>
+            <p class="muted grp-modal__key-hint" style="margin:-2px 0 10px;font-size:11px;line-height:1.45">保存时会自动整理首尾空格与连续空格（Unicode NFC）。<strong>大小写仍区分</strong>；与「设备详情 → Notification group」不一致时会出现多张组卡。<br/><span lang="en">Spaces are normalized on save; <strong>case still matters</strong>. Must match each device&rsquo;s Notification group or you will see multiple cards.</span></p>
             <label class="field"><span>Display name</span><input id="gmName" autocomplete="off"/></label>
             <label class="field"><span>Owner name</span><input id="gmOwner" autocomplete="name"/></label>
             <label class="field"><span>Phone</span><input id="gmPhone" inputmode="tel" autocomplete="tel"/></label>
@@ -2440,12 +2445,12 @@
     let editingGroup = "";
     const normalizeGroupKey = (v) => String(v == null ? "" : v).trim();
     const groupDeviceIdsFromList = (g, tenantOwner) => {
-      const key = normalizeGroupKey(g);
+      const key = canonicalGroupKey(g);
       if (!key) return [];
       const t = String(tenantOwner || "").trim();
       const out = [];
       for (const d of devices) {
-        if (!d || normalizeGroupKey(d.notification_group) !== key) continue;
+        if (!d || canonicalGroupKey(d.notification_group) !== key) continue;
         if (t && String(d.owner_admin || "").trim() !== t) continue;
         const did = String(d.device_id || "").trim();
         if (did) out.push(did);
@@ -2455,7 +2460,7 @@
     const collectGroupSlots = () => {
       const acc = new Map();
       for (const d of devices) {
-        const gk = normalizeGroupKey(d && d.notification_group);
+        const gk = canonicalGroupKey(d && d.notification_group);
         if (!gk) continue;
         const tenant = state.me && state.me.role === "superadmin" ? String(d.owner_admin || "").trim() : "";
         const mk = groupCardMetaKey(gk, tenant);
@@ -2476,9 +2481,9 @@
       return Array.from(sharedFrom);
     };
     const groupSharedByNotificationKey = (gk) => {
-      const key = normalizeGroupKey(gk);
+      const key = canonicalGroupKey(gk);
       if (!key) return [];
-      const rows = devices.filter((d) => normalizeGroupKey(d.notification_group) === key);
+      const rows = devices.filter((d) => canonicalGroupKey(d.notification_group) === key);
       const sharedFrom = new Set(rows.map((d) => String(d.shared_by || "")).filter(Boolean));
       return Array.from(sharedFrom);
     };
@@ -2546,15 +2551,14 @@
       const m = meta[slot.metaKey] || {};
       const gs = groupSettingsMap.get(slot.metaKey) || {
         trigger_mode: "continuous",
-        trigger_duration_ms: 10000,
+        trigger_duration_ms: DEFAULT_REMOTE_SIREN_MS,
         delay_seconds: 0,
         reboot_self_check: false,
       };
       const isSharedGroup = groupSharedBySlot(slot).length > 0;
       const scopeShareHtml = shareScopeBadgesHtml(rows);
-      const modeLabel = String(gs.trigger_mode || "continuous") === "delay"
-        ? `delay ${Number(gs.delay_seconds || 0)}s`
-        : "continuous";
+      const dsec = Number(gs.delay_seconds || 0);
+      const modeLabel = dsec > 0 ? `after ${dsec}s` : "immediate";
       const tenantChip = slot.tenantOwner
         ? `<span class="chip" title="Owning admin">${escapeHtml(slot.tenantOwner)}</span>`
         : "";
@@ -2567,7 +2571,7 @@
         <div class="row" style="gap:6px;flex-wrap:wrap;margin-bottom:8px">${tenantChip}</div>
         <div class="meta" style="margin-bottom:8px">
           Trigger: <span class="mono">${escapeHtml(modeLabel)}</span> ·
-          Duration: <span class="mono">${escapeHtml(String(gs.trigger_duration_ms || 10000))}ms</span> ·
+          Duration: <span class="mono">${escapeHtml(String(Math.round((Number(gs.trigger_duration_ms) || DEFAULT_REMOTE_SIREN_MS) / 60000 * 10) / 10))} min</span> ·
           Reboot+self-check: <span class="mono">${gs.reboot_self_check ? "yes" : "no"}</span>
         </div>
         <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;align-items:center">
@@ -2626,7 +2630,7 @@
       if (!editingSettingsSlot.metaKey) return;
       const gs = groupSettingsMap.get(editingSettingsSlot.metaKey) || {
         trigger_mode: "continuous",
-        trigger_duration_ms: 10000,
+        trigger_duration_ms: DEFAULT_REMOTE_SIREN_MS,
         delay_seconds: 0,
         reboot_self_check: false,
       };
@@ -2634,29 +2638,28 @@
         ? `Group: ${editingSettingsSlot.groupKey} · admin: ${editingSettingsSlot.tenantOwner}`
         : `Group: ${editingSettingsSlot.groupKey}`;
       $("#gsKeyLabel", view).textContent = label;
-      $("#gsDuration", view).value = String(Number(gs.trigger_duration_ms || 10000));
-      $("#gsMode", view).value = String(gs.trigger_mode || "continuous");
+      const durMin = Math.max(0.5, Math.min(5, (Number(gs.trigger_duration_ms) || DEFAULT_REMOTE_SIREN_MS) / 60000));
+      const gdm = $("#gsDurMin", view);
+      if (gdm) gdm.value = String(Math.round(durMin * 10) / 10);
       $("#gsDelay", view).value = String(Number(gs.delay_seconds || 0));
       $("#gsReboot", view).checked = !!gs.reboot_self_check;
       grpSetModalEl.style.display = "flex";
     };
     const closeSettingsModal = () => { grpSetModalEl.style.display = "none"; };
     const collectSettingsPayload = () => {
-      const mode = String($("#gsMode", view).value || "continuous");
-      const duration = parseInt($("#gsDuration", view).value, 10);
+      const durMinEl = $("#gsDurMin", view);
+      const durMin = parseFloat((durMinEl && durMinEl.value) || "3", 10);
       const delay = parseInt($("#gsDelay", view).value, 10);
       const reboot = !!$("#gsReboot", view).checked;
-      if (!Number.isFinite(duration) || duration < 500 || duration > 300000) {
-        throw new Error("Trigger duration must be 500-300000 ms");
+      if (!Number.isFinite(durMin) || durMin < 0.5 || durMin > 5) {
+        throw new Error("Siren duration must be 0.5–5 minutes");
       }
       if (!Number.isFinite(delay) || delay < 0 || delay > 3600) {
         throw new Error("Delay seconds must be 0-3600");
       }
-      if (mode !== "continuous" && mode !== "delay") {
-        throw new Error("Trigger mode invalid");
-      }
+      const duration = Math.round(durMin * 60000);
       return {
-        trigger_mode: mode,
+        trigger_mode: delay > 0 ? "delay" : "continuous",
         trigger_duration_ms: duration,
         delay_seconds: delay,
         reboot_self_check: reboot,
@@ -2699,7 +2702,7 @@
       const ids = groupDeviceIdsFromSlot(slot);
       if (!ids.length) throw new Error("No devices in this group");
       if (!can("can_alert")) throw new Error("No can_alert capability");
-      const durationMs = Number(payload.trigger_duration_ms || 10000);
+      const durationMs = Number(payload.trigger_duration_ms || DEFAULT_REMOTE_SIREN_MS);
       const delaySeconds = Number(payload.delay_seconds || 0);
       const timerKey = slot.metaKey;
       const prevTimer = groupDelayTimers.get(timerKey);
@@ -2707,7 +2710,7 @@
         clearTimeout(prevTimer);
         groupDelayTimers.delete(timerKey);
       }
-      if (String(payload.trigger_mode || "continuous") === "delay" && delaySeconds > 0) {
+      if (delaySeconds > 0) {
         const tid = setTimeout(async () => {
           try {
             await api("/alerts", { method: "POST", body: { action: "on", duration_ms: durationMs, device_ids: ids } });
@@ -2815,7 +2818,7 @@
       const gk = parsed.groupKey || "";
       const m = meta[editingGroup] || { display_name: gk || "", owner_name: "", phone: "", email: "", device_ids: [] };
       const slot = { metaKey: editingGroup, groupKey: gk, tenantOwner: parsed.tenantOwner };
-      $("#gmKey", view).value = gk || "";
+      $("#gmKey", view).value = canonicalGroupKey(gk) || "";
       $("#gmName", view).value = m.display_name || "";
       $("#gmOwner", view).value = m.owner_name || "";
       $("#gmPhone", view).value = m.phone || "";
@@ -3124,7 +3127,7 @@
       });
     }
     $("#gmSave", view).addEventListener("click", async () => {
-      const key = String($("#gmKey", view).value || "").trim();
+      const key = canonicalGroupKey($("#gmKey", view).value || "");
       if (!key) { toast("Group key required", "err"); return; }
       const oldMetaKey = String(editingGroup || "").trim();
       const oldParsed = parseGroupMetaKey(oldMetaKey);
@@ -3249,7 +3252,7 @@
               clearTimeout(prevTimer);
               groupDelayTimers.delete(slot.metaKey);
             }
-            await api("/alerts", { method: "POST", body: { action, duration_ms: 10000, device_ids: ids } });
+            await api("/alerts", { method: "POST", body: { action, duration_ms: DEFAULT_REMOTE_SIREN_MS, device_ids: ids } });
           }
           toast(`${action === "on" ? "Alarm ON" : "Alarm OFF"} · ${ids.length}`, "ok");
         } catch (e) {
@@ -3322,7 +3325,7 @@
   });
 
   registerRoute("group", async (view, args, routeSeq) => {
-    const g = decodeURIComponent(args[0] || "").trim();
+    const g = canonicalGroupKey(decodeURIComponent(args[0] || ""));
     if (!g) { location.hash = "#/overview"; return; }
     const tenantOwner = String((window.__routeQuery && window.__routeQuery.get("owner")) || "").trim();
     const metaKey = groupCardMetaKey(g, tenantOwner);
@@ -3369,7 +3372,7 @@
     try { localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(meta)); } catch (_) {}
     const gm = meta[metaKey] || meta[g] || { display_name: g, owner_name: "", phone: "", email: "", device_ids: [] };
     const rowsByGroup = () => (list.items || []).filter((d) => {
-      if (String(d.notification_group || "").trim() !== g) return false;
+      if (canonicalGroupKey(d.notification_group) !== g) return false;
       if (state.me && state.me.role === "superadmin" && tenantOwner) {
         return String(d.owner_admin || "").trim() === tenantOwner;
       }
@@ -3485,7 +3488,7 @@
       clearFallback: clearGroupByDevicePatchCompat,
     });
     const applyGroupSettingsFallbackCompat = async (_groupKey, _ownerO, payload) => {
-      const durationMs = Number(payload.trigger_duration_ms || 10000);
+      const durationMs = Number(payload.trigger_duration_ms || DEFAULT_REMOTE_SIREN_MS);
       const delaySeconds = Number(payload.delay_seconds || 0);
       const tkey = metaKey;
       const prev = window.__groupDelayTimers.get(tkey);
@@ -3493,7 +3496,7 @@
         clearTimeout(prev);
         window.__groupDelayTimers.delete(tkey);
       }
-      if (String(payload.trigger_mode || "continuous") === "delay" && delaySeconds > 0) {
+      if (delaySeconds > 0) {
         const tid = setTimeout(async () => {
           try { await api("/alerts", { method: "POST", body: { action: "on", duration_ms: durationMs, device_ids: ids } }); } catch {}
         }, delaySeconds * 1000);
@@ -3531,7 +3534,7 @@
           clearTimeout(prev);
           window.__groupDelayTimers.delete(metaKey);
         }
-        await api("/alerts", { method: "POST", body: { action: "off", duration_ms: 10000, device_ids: ids } });
+        await api("/alerts", { method: "POST", body: { action: "off", duration_ms: DEFAULT_REMOTE_SIREN_MS, device_ids: ids } });
       }
       toast(`${action === "on" ? "Alarm ON" : "Alarm OFF"} · ${ids.length}`, "ok");
     };
@@ -3804,7 +3807,8 @@
       const grpBtn = $("#bulkApplyGroup", view);
       if (grpBtn) {
         grpBtn.addEventListener("click", async () => {
-          const grpVal = String($("#bulkGroupValue", view)?.value || "").trim();
+          const rawG = String($("#bulkGroupValue", view)?.value || "").trim();
+          const grpVal = rawG ? canonicalGroupKey(rawG) : "";
           const promptTxt = grpVal
             ? `Apply group "${grpVal}" to ${selectedIds.size} selected device(s)?`
             : `Clear group for ${selectedIds.size} selected device(s)?`;
@@ -4131,18 +4135,19 @@
           <span class="device-drawer__hint muted">Server · group scope · expand</span>
         </summary>
         <div class="device-drawer__body">
-          <p class="muted" style="margin:0 0 10px">Scope: owner account + group <span class="mono">${escapeHtml(d.notification_group || "(default)")}</span>. Siblings = same tenant + same <span class="mono">notification_group</span> (+ zone match). Remote #1 = silent linkage; #2 = loud to siblings only; panic = local siren + optional sibling fan-out.</p>
+          <p class="muted" style="margin:0 0 10px">Scope: owner account + group <span class="mono">${escapeHtml(d.notification_group || "(default)")}</span>. Siblings = same tenant + same <span class="mono">notification_group</span> (server normalizes spacing/case). Remote #1 = silent; #2 = loud to siblings; panic = local + optional sibling siren.</p>
           ${can("can_send_command") && canOperateThisDevice ? `
-          <div class="inline-form" style="margin-top:4px;gap:12px;flex-wrap:wrap">
-            <label class="field"><span>Panic local siren</span><input type="checkbox" id="tpPanicLocal" /></label>
-            <label class="field"><span>Panic sibling link</span><input type="checkbox" id="tpPanicLink" /></label>
+          <div class="inline-form" style="margin-top:4px;gap:12px;flex-wrap:wrap;align-items:flex-end">
+            <label class="field"><span>Panic local</span><input type="checkbox" id="tpPanicLocal" title="Sound on device that pressed panic" /></label>
+            <label class="field"><span>Panic → siblings</span><input type="checkbox" id="tpPanicLink" title="MQTT siren to same-group devices" /></label>
             <label class="field"><span>Remote silent link</span><input type="checkbox" id="tpSilentLink" /></label>
             <label class="field"><span>Remote loud link</span><input type="checkbox" id="tpLoudLink" /></label>
             <label class="field"><span>Exclude self</span><input type="checkbox" id="tpExcludeSelf" /></label>
-            <label class="field"><span>Loud duration (ms)</span><input id="tpLoudDur" type="number" min="500" max="300000" value="10000" /></label>
-            <div class="row wide" style="justify-content:flex-end">
-              <button class="btn secondary btn-tap" type="button" id="tpRefresh">Refresh policy</button>
-              <button class="btn btn-tap" type="button" id="tpSave">Save policy</button>
+            <label class="field"><span>Loud (min)</span><input id="tpLoudMin" type="number" min="0.5" max="5" step="0.5" value="3" title="Remote / #2 sibling siren length" /></label>
+            <label class="field"><span>Panic sibling (min)</span><input id="tpPanicMin" type="number" min="0.5" max="10" step="0.5" value="5" title="Panic MQTT sibling siren length" /></label>
+            <div class="row wide" style="justify-content:flex-end;flex-basis:100%">
+              <button class="btn secondary btn-tap" type="button" id="tpRefresh">Refresh</button>
+              <button class="btn btn-tap" type="button" id="tpSave">Save</button>
             </div>
           </div>
           <p class="muted" id="tpStatus" style="margin-top:8px;min-height:1.3em"></p>` : `<p class="muted">Requires <span class="mono">can_send_command</span> and <strong>operate</strong> access on this device.</p>`}
@@ -4209,7 +4214,7 @@
       try {
         const body = { display_label: ($("#dispLabel").value || "").trim() };
         if (!d.is_shared) {
-          body.notification_group = ($("#notifGroup") && $("#notifGroup").value || "").trim();
+          body.notification_group = canonicalGroupKey(($("#notifGroup") && $("#notifGroup").value) || "");
         }
         await api(`/devices/${encodeURIComponent(id)}/profile`, {
           method: "PATCH",
@@ -4228,7 +4233,7 @@
     };
 
     $("#alertOn").addEventListener("click", withDev(() =>
-      api(`/devices/${encodeURIComponent(id)}/alert/on?duration_ms=10000`, { method: "POST" })));
+      api(`/devices/${encodeURIComponent(id)}/alert/on?duration_ms=${DEFAULT_REMOTE_SIREN_MS}`, { method: "POST" })));
     $("#alertOff").addEventListener("click", withDev(() =>
       api(`/devices/${encodeURIComponent(id)}/alert/off`, { method: "POST" })));
     $("#selfTest").addEventListener("click", withDev(() =>
@@ -4365,10 +4370,11 @@
     const tpSilentLink = $("#tpSilentLink");
     const tpLoudLink = $("#tpLoudLink");
     const tpExcludeSelf = $("#tpExcludeSelf");
-    const tpLoudDur = $("#tpLoudDur");
+    const tpLoudMin = $("#tpLoudMin");
+    const tpPanicMin = $("#tpPanicMin");
     const tpStatus = $("#tpStatus");
     const loadTriggerPolicy = async () => {
-      if (!tpPanicLocal || !tpPanicLink || !tpSilentLink || !tpLoudLink || !tpExcludeSelf || !tpLoudDur) return;
+      if (!tpPanicLocal || !tpPanicLink || !tpSilentLink || !tpLoudLink || !tpExcludeSelf || !tpLoudMin || !tpPanicMin) return;
       try {
         if (tpStatus) tpStatus.textContent = "Loading policy…";
         const r = await api(`/devices/${encodeURIComponent(id)}/trigger-policy`, { timeoutMs: 16000 });
@@ -4378,7 +4384,10 @@
         tpSilentLink.checked = !!p.remote_silent_link_enabled;
         tpLoudLink.checked = !!p.remote_loud_link_enabled;
         tpExcludeSelf.checked = !!p.fanout_exclude_self;
-        tpLoudDur.value = String(Number(p.remote_loud_duration_ms || 10000));
+        const loudMs = Number(p.remote_loud_duration_ms || DEFAULT_REMOTE_SIREN_MS);
+        const panicMs = Number(p.panic_fanout_duration_ms || DEFAULT_PANIC_FANOUT_MS);
+        tpLoudMin.value = String(Math.round(Math.max(0.5, Math.min(5, loudMs / 60000)) * 10) / 10);
+        tpPanicMin.value = String(Math.round(Math.max(0.5, Math.min(10, panicMs / 60000)) * 10) / 10);
         if (tpStatus) tpStatus.textContent = `Loaded for group ${r.scope_group || "(default)"}`;
       } catch (e) {
         if (tpStatus) tpStatus.textContent = String(e.message || e);
@@ -4390,10 +4399,12 @@
     if (tpSave) {
       tpSave.addEventListener("click", async () => {
         try {
-          const duration = parseInt((tpLoudDur && tpLoudDur.value) || "10000", 10);
-          if (!Number.isFinite(duration) || duration < 500 || duration > 300000) {
-            throw new Error("Loud duration must be 500-300000 ms");
-          }
+          const lm = parseFloat((tpLoudMin && tpLoudMin.value) || "3", 10);
+          const pm = parseFloat((tpPanicMin && tpPanicMin.value) || "5", 10);
+          if (!Number.isFinite(lm) || lm < 0.5 || lm > 5) throw new Error("Loud duration must be 0.5–5 minutes");
+          if (!Number.isFinite(pm) || pm < 0.5 || pm > 10) throw new Error("Panic sibling duration must be 0.5–10 minutes");
+          const remote_loud_duration_ms = Math.round(lm * 60000);
+          const panic_fanout_duration_ms = Math.round(pm * 60000);
           if (tpStatus) tpStatus.textContent = "Saving policy…";
           await api(`/devices/${encodeURIComponent(id)}/trigger-policy`, {
             method: "PUT",
@@ -4403,7 +4414,8 @@
               remote_silent_link_enabled: !!(tpSilentLink && tpSilentLink.checked),
               remote_loud_link_enabled: !!(tpLoudLink && tpLoudLink.checked),
               fanout_exclude_self: !!(tpExcludeSelf && tpExcludeSelf.checked),
-              remote_loud_duration_ms: duration,
+              remote_loud_duration_ms,
+              panic_fanout_duration_ms,
             },
           });
           if (tpStatus) tpStatus.textContent = "Policy saved";
@@ -4513,7 +4525,7 @@
             <select id="action"><option value="on">ON</option><option value="off">OFF</option></select>
           </label>
           <label class="field"><span>Duration (ms)</span>
-            <input id="dur" type="number" value="10000" min="500" max="300000" />
+            <input id="dur" type="number" value="${DEFAULT_REMOTE_SIREN_MS}" min="500" max="300000" step="1000" />
           </label>
           <label class="field wide"><span>Targets (empty = all visible)</span>
             <select id="targets" multiple size="6"></select>
@@ -4535,7 +4547,7 @@
 
     $("#fire").addEventListener("click", async () => {
       const action = $("#action").value;
-      const dur = parseInt($("#dur").value, 10) || 10000;
+      const dur = parseInt($("#dur").value, 10) || DEFAULT_REMOTE_SIREN_MS;
       const ids = Array.from(sel.selectedOptions).map((o) => o.value);
       if (action === "on" && !confirm(`Siren ON for ${ids.length === 0 ? "ALL visible devices" : ids.length + " device(s)"}?`)) return;
       try {

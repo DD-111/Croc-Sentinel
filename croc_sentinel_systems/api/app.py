@@ -9,6 +9,7 @@ import secrets
 import sqlite3
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -127,7 +128,9 @@ OTA_MAX_FIRMWARE_BINS = max(1, int(os.getenv("OTA_MAX_FIRMWARE_BINS", "10")))
 OTA_VERIFY_BASE_URL = os.getenv("OTA_VERIFY_BASE_URL", "").rstrip("/")
 OTA_TOKEN = os.getenv("OTA_TOKEN", "")
 MAX_OTA_UPLOAD_BYTES = int(os.getenv("MAX_OTA_UPLOAD_BYTES", str(16 * 1024 * 1024)))
-ALARM_FANOUT_DURATION_MS = int(os.getenv("ALARM_FANOUT_DURATION_MS", "8000"))
+DEFAULT_REMOTE_FANOUT_MS = int(os.getenv("DEFAULT_REMOTE_FANOUT_MS", "180000"))
+DEFAULT_PANIC_FANOUT_MS = int(os.getenv("DEFAULT_PANIC_FANOUT_MS", "300000"))
+ALARM_FANOUT_DURATION_MS = int(os.getenv("ALARM_FANOUT_DURATION_MS", str(DEFAULT_REMOTE_FANOUT_MS)))
 ALARM_FANOUT_MAX_TARGETS = int(os.getenv("ALARM_FANOUT_MAX_TARGETS", "200"))
 ALARM_FANOUT_SELF = os.getenv("ALARM_FANOUT_SELF", "0") == "1"
 # Per-IP login lockout (replaces old sliding-window LOGIN_RATE_* on /auth/login only).
@@ -968,6 +971,7 @@ def init_db() -> None:
         ensure_column(conn, "role_policies", "tg_test_single", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "role_policies", "tg_test_bulk", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "trigger_policies", "panic_link_enabled", "INTEGER NOT NULL DEFAULT 1")
+        ensure_column(conn, "trigger_policies", "panic_fanout_duration_ms", f"INTEGER NOT NULL DEFAULT {DEFAULT_PANIC_FANOUT_MS}")
         cur.execute("UPDATE dashboard_users SET status='active' WHERE status IS NULL OR status = ''")
         cur.execute("SELECT mac_nocolon, COUNT(*) AS c FROM provisioned_credentials GROUP BY mac_nocolon HAVING c > 1")
         dup = cur.fetchone()
@@ -1677,6 +1681,11 @@ def assert_device_view_access(principal: Principal, device_id: str) -> None:
         raise HTTPException(status_code=403, detail="device not in your scope")
 
 
+def assert_device_siren_access(principal: Principal, device_id: str) -> None:
+    """Remote siren ON/OFF: same visibility as dashboard device view + role ``can_alert`` (checked on route)."""
+    assert_device_view_access(principal, device_id)
+
+
 def assert_device_operate_access(principal: Principal, device_id: str) -> None:
     _, can_operate = _device_access_flags(principal, device_id)
     if not can_operate:
@@ -1981,6 +1990,22 @@ def on_disconnect(_client: mqtt.Client, _userdata: Any, _disconnect_flags: Any, 
     logger.warning("MQTT disconnected reason=%s", mqtt_last_disconnect_reason)
 
 
+def _sibling_group_norm(raw: str) -> str:
+    """Normalize notification_group for sibling matching (case-fold + NFC + whitespace)."""
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    try:
+        s = unicodedata.normalize("NFC", s)
+    except Exception:
+        pass
+    s = " ".join(s.split())
+    try:
+        return s.casefold()
+    except Exception:
+        return s.lower()
+
+
 def _lookup_owner_admin(device_id: str) -> Optional[str]:
     with db_lock:
         conn = get_conn()
@@ -2004,70 +2029,67 @@ def _tenant_siblings(
     """Devices that receive group fan-out commands ("siblings") for this source_id.
 
     Selection: same ``owner_admin``, not revoked, optional matching ``source_zone``
-    (unless zone is ``all``/``*``), and **must match** ``notification_group`` on
-    ``device_state`` when the triggering device belongs to a non-empty group.
+    (unless zone is ``all``/``*``), and **normalized match** on ``notification_group``
+    (NFC, collapse whitespace, case-fold) so minor string drift does not break linkage.
 
-    Non-siblings (other tenants, empty/wrong group string, revoked) are never targeted.
+    Non-siblings (other tenants, empty group, revoked) are never targeted.
 
-    ``include_source``: when False (default), the originating ``source_id`` is omitted
-    from the list (typical for remote loud / panic where the originator uses local GPIO
-    or silent-only behaviour).
+    ``include_source``: when False (default), the originating ``source_id`` is omitted.
 
-    If ``notification_group`` is empty for the source device, there are **no** siblings:
-    dashboard / API fan-out must not target other devices (``无联动``). Group linkage is
-    opt-in via a non-empty ``device_state.notification_group`` string.
+    If the source group's normalized key is empty, there are **no** siblings.
     """
     zone_filter = source_zone.strip()
-    group_filter = source_group.strip()
-    if not group_filter:
+    norm_source = _sibling_group_norm(source_group)
+    if not norm_source:
         return []
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
         if owner_admin:
             sql = """
-                SELECT d.device_id, d.zone
+                SELECT d.device_id, d.zone, IFNULL(d.notification_group,'') AS notification_group
                 FROM device_state d
                 JOIN device_ownership o ON o.device_id = d.device_id
                 LEFT JOIN revoked_devices r ON r.device_id = d.device_id
                 WHERE o.owner_admin = ? AND r.device_id IS NULL
+                  AND TRIM(IFNULL(d.notification_group,'')) != ''
             """
             args: list[Any] = [owner_admin]
             if zone_filter and zone_filter.lower() not in ("all", "*"):
                 sql += " AND IFNULL(d.zone,'') = ?"
                 args.append(zone_filter)
-            sql += " AND IFNULL(d.notification_group,'') = ?"
-            args.append(group_filter)
-            cur.execute(
-                sql,
-                args,
-            )
+            cur.execute(sql, args)
         else:
-            # No owner: treat as legacy-unowned pool. Only fan out to other
-            # legacy-unowned devices to avoid leaking into tenants.
             sql = """
-                SELECT d.device_id, d.zone
+                SELECT d.device_id, d.zone, IFNULL(d.notification_group,'') AS notification_group
                 FROM device_state d
                 LEFT JOIN device_ownership o ON o.device_id = d.device_id
                 LEFT JOIN revoked_devices r ON r.device_id = d.device_id
                 WHERE o.device_id IS NULL AND r.device_id IS NULL
+                  AND TRIM(IFNULL(d.notification_group,'')) != ''
             """
-            args = []
+            args: list[Any] = []
             if zone_filter and zone_filter.lower() not in ("all", "*"):
                 sql += " AND IFNULL(d.zone,'') = ?"
                 args.append(zone_filter)
-            sql += " AND IFNULL(d.notification_group,'') = ?"
-            args.append(group_filter)
             cur.execute(sql, args)
         rows = cur.fetchall()
         conn.close()
     out: list[tuple[str, str]] = []
+    seen: set[str] = set()
     for r in rows:
+        if _sibling_group_norm(str(r["notification_group"] or "")) != norm_source:
+            continue
         did = str(r["device_id"])
         if did == source_id and not include_source:
             continue
+        if did in seen:
+            continue
+        seen.add(did)
         out.append((did, str(r["zone"] or "")))
-    return out[:ALARM_FANOUT_MAX_TARGETS]
+        if len(out) >= ALARM_FANOUT_MAX_TARGETS:
+            break
+    return out
 
 
 def _recipients_for_admin(owner_admin: Optional[str]) -> list[str]:
@@ -2186,6 +2208,7 @@ def _trigger_policy_defaults() -> dict[str, Any]:
         "panic_local_siren": True,
         # MQTT fan-out of panic_button to same-group siblings (independent of remote loud link).
         "panic_link_enabled": True,
+        "panic_fanout_duration_ms": int(DEFAULT_PANIC_FANOUT_MS),
         "remote_silent_link_enabled": True,
         "remote_loud_link_enabled": True,
         "remote_loud_duration_ms": int(ALARM_FANOUT_DURATION_MS),
@@ -2205,7 +2228,7 @@ def _trigger_policy_for(owner_admin: Optional[str], scope_group: str) -> dict[st
             """
             SELECT panic_local_siren, remote_silent_link_enabled, remote_loud_link_enabled,
                    remote_loud_duration_ms, fanout_exclude_self,
-                   panic_link_enabled
+                   panic_link_enabled, panic_fanout_duration_ms
             FROM trigger_policies
             WHERE owner_admin = ? AND scope_group = ?
             """,
@@ -2221,6 +2244,7 @@ def _trigger_policy_for(owner_admin: Optional[str], scope_group: str) -> dict[st
     base["remote_loud_duration_ms"] = int(row["remote_loud_duration_ms"] or ALARM_FANOUT_DURATION_MS)
     base["fanout_exclude_self"] = bool(row["fanout_exclude_self"])
     base["panic_link_enabled"] = bool(row["panic_link_enabled"])
+    base["panic_fanout_duration_ms"] = int(row["panic_fanout_duration_ms"] or DEFAULT_PANIC_FANOUT_MS)
     return base
 
 
@@ -2833,29 +2857,44 @@ def _fan_out_alarm(device_id: str, payload: dict[str, Any]) -> None:
     ) if should_fanout else []
     sent = 0
     failures: list[str] = []
+    loud_ms = int(policy.get("remote_loud_duration_ms", ALARM_FANOUT_DURATION_MS))
+    panic_ms = int(policy.get("panic_fanout_duration_ms", DEFAULT_PANIC_FANOUT_MS))
+
+    def _fanout_publish_one(did: str) -> None:
+        if triggered_by == "remote_silent_button":
+            cmd, params = "alarm_signal", {"kind": "silent"}
+        elif triggered_by == "remote_pause_button":
+            cmd, params = "siren_off", {}
+        else:
+            dur_ms = panic_ms if triggered_by == "panic_button" else loud_ms
+            cmd, params = "siren_on", {"duration_ms": dur_ms}
+        publish_command(
+            topic=f"{TOPIC_ROOT}/{did}/cmd",
+            cmd=cmd,
+            params=params,
+            target_id=did,
+            proto=CMD_PROTO,
+            cmd_key=get_cmd_key_for_device(did),
+        )
+
     if should_fanout:
         for did, _z in targets:
             try:
-                cmd = "siren_on"
-                params: dict[str, Any] = {"duration_ms": int(policy.get("remote_loud_duration_ms", ALARM_FANOUT_DURATION_MS))}
-                # Remote silent button: link to sibling devices without siren sound.
-                if triggered_by == "remote_silent_button":
-                    cmd = "alarm_signal"
-                    params = {"kind": "silent"}
-                elif triggered_by == "remote_pause_button":
-                    cmd = "siren_off"
-                    params = {}
-                publish_command(
-                    topic=f"{TOPIC_ROOT}/{did}/cmd",
-                    cmd=cmd,
-                    params=params,
-                    target_id=did,
-                    proto=CMD_PROTO,
-                    cmd_key=get_cmd_key_for_device(did),
-                )
+                _fanout_publish_one(did)
                 sent += 1
             except Exception as exc:
                 failures.append(f"{did}:{exc}")
+        if failures:
+            retry_ids = [x.split(":", 1)[0] for x in failures if ":" in x and x.split(":", 1)[0]]
+            if retry_ids:
+                time.sleep(0.4)
+                failures.clear()
+                for did in retry_ids:
+                    try:
+                        _fanout_publish_one(did)
+                        sent += 1
+                    except Exception as exc:
+                        failures.append(f"{did}:{exc}")
 
     email_sent = False
     email_detail = ""
@@ -3125,7 +3164,7 @@ class ScheduleRebootRequest(BaseModel):
 
 class BulkAlertRequest(BaseModel):
     action: str = Field(pattern="^(on|off)$")
-    duration_ms: int = Field(default=8000, ge=500, le=300000)
+    duration_ms: int = Field(default=int(DEFAULT_REMOTE_FANOUT_MS), ge=500, le=300000)
     device_ids: list[str] = Field(default_factory=list)
 
 
@@ -3148,9 +3187,10 @@ class ProvisionWifiTaskRequest(BaseModel):
 class TriggerPolicyBody(BaseModel):
     panic_local_siren: bool = True
     panic_link_enabled: bool = True
+    panic_fanout_duration_ms: int = Field(default=DEFAULT_PANIC_FANOUT_MS, ge=500, le=600000)
     remote_silent_link_enabled: bool = True
     remote_loud_link_enabled: bool = True
-    remote_loud_duration_ms: int = Field(default=10000, ge=500, le=300000)
+    remote_loud_duration_ms: int = Field(default=DEFAULT_REMOTE_FANOUT_MS, ge=500, le=300000)
     fanout_exclude_self: bool = True
 
 
@@ -6461,7 +6501,7 @@ class DeviceBulkProfileBody(BaseModel):
 
 class GroupCardSettingsBody(BaseModel):
     trigger_mode: str = Field(default="continuous", pattern="^(continuous|delay)$")
-    trigger_duration_ms: int = Field(default=10000, ge=500, le=300000)
+    trigger_duration_ms: int = Field(default=DEFAULT_REMOTE_FANOUT_MS, ge=500, le=300000)
     delay_seconds: int = Field(default=0, ge=0, le=3600)
     reboot_self_check: bool = False
     # Superadmin only: which tenant's group_card_settings row / device slice to target.
@@ -6619,7 +6659,7 @@ def _group_settings_defaults(group_key: str) -> dict[str, Any]:
     return {
         "group_key": group_key,
         "trigger_mode": "continuous",
-        "trigger_duration_ms": 10000,
+        "trigger_duration_ms": int(DEFAULT_REMOTE_FANOUT_MS),
         "delay_seconds": 0,
         "reboot_self_check": False,
         "updated_by": "",
@@ -6700,7 +6740,7 @@ def list_group_card_settings(principal: Principal = Depends(require_principal)) 
                 "owner_admin": str(r.get("owner_admin") or ""),
                 "group_key": str(r.get("group_key") or ""),
                 "trigger_mode": str(r.get("trigger_mode") or "continuous"),
-                "trigger_duration_ms": int(r.get("trigger_duration_ms") or 10000),
+                "trigger_duration_ms": int(r.get("trigger_duration_ms") or DEFAULT_REMOTE_FANOUT_MS),
                 "delay_seconds": int(r.get("delay_seconds") or 0),
                 "reboot_self_check": bool(int(r.get("reboot_self_check") or 0)),
                 "updated_by": str(r.get("updated_by") or ""),
@@ -6784,7 +6824,7 @@ def get_group_card_settings(
         "owner_admin": str(r.get("owner_admin") or ""),
         "group_key": g,
         "trigger_mode": str(r.get("trigger_mode") or "continuous"),
-        "trigger_duration_ms": int(r.get("trigger_duration_ms") or 10000),
+        "trigger_duration_ms": int(r.get("trigger_duration_ms") or DEFAULT_REMOTE_FANOUT_MS),
         "delay_seconds": int(r.get("delay_seconds") or 0),
         "reboot_self_check": bool(int(r.get("reboot_self_check") or 0)),
         "updated_by": str(r.get("updated_by") or ""),
@@ -6840,6 +6880,7 @@ def save_group_card_settings(
             if o and o != owner_scope:
                 raise HTTPException(status_code=403, detail="shared group settings are managed by owner")
     now = utc_now_iso()
+    resolved_mode = "delay" if int(body.delay_seconds) > 0 else "continuous"
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -6861,7 +6902,7 @@ def save_group_card_settings(
             (
                 owner_scope,
                 g,
-                body.trigger_mode,
+                resolved_mode,
                 int(body.trigger_duration_ms),
                 int(body.delay_seconds),
                 1 if body.reboot_self_check else 0,
@@ -6876,7 +6917,7 @@ def save_group_card_settings(
         "group.settings.save",
         g,
         {
-            "trigger_mode": body.trigger_mode,
+            "trigger_mode": resolved_mode,
             "trigger_duration_ms": int(body.trigger_duration_ms),
             "delay_seconds": int(body.delay_seconds),
             "reboot_self_check": bool(body.reboot_self_check),
@@ -6887,7 +6928,7 @@ def save_group_card_settings(
         "ok": True,
         "owner_admin": owner_scope,
         "group_key": g,
-        "trigger_mode": body.trigger_mode,
+        "trigger_mode": resolved_mode,
         "trigger_duration_ms": int(body.trigger_duration_ms),
         "delay_seconds": int(body.delay_seconds),
         "reboot_self_check": bool(body.reboot_self_check),
@@ -6965,7 +7006,7 @@ def apply_group_card_settings(
             for r in cur.fetchall():
                 settings_by_owner[str(r["owner_admin"])] = {
                     "trigger_mode": str(r["trigger_mode"] or "continuous"),
-                    "trigger_duration_ms": int(r["trigger_duration_ms"] or 10000),
+                    "trigger_duration_ms": int(r["trigger_duration_ms"] or DEFAULT_REMOTE_FANOUT_MS),
                     "delay_seconds": int(r["delay_seconds"] or 0),
                     "reboot_self_check": bool(int(r["reboot_self_check"] or 0)),
                 }
@@ -6982,10 +7023,10 @@ def apply_group_card_settings(
         owner_for_cfg = owner_real or owner_scope
         cfg = settings_by_owner.get(owner_for_cfg, _group_settings_defaults(g))
         mode = str(cfg.get("trigger_mode") or "continuous")
-        dur_ms = int(cfg.get("trigger_duration_ms") or 10000)
+        dur_ms = int(cfg.get("trigger_duration_ms") or DEFAULT_REMOTE_FANOUT_MS)
         delay_seconds = int(cfg.get("delay_seconds") or 0)
         reboot_self_check = bool(cfg.get("reboot_self_check"))
-        if mode == "delay" and delay_seconds > 0:
+        if delay_seconds > 0:
             enqueue_scheduled_command(
                 device_id=did,
                 cmd="siren_on",
@@ -7035,7 +7076,7 @@ def apply_group_card_settings(
     first_owner = str(device_owner_map.get(targets[0]) or owner_scope) if targets else owner_scope
     first_cfg = settings_by_owner.get(first_owner, _group_settings_defaults(g))
     mode = str(first_cfg.get("trigger_mode") or "continuous")
-    dur_ms = int(first_cfg.get("trigger_duration_ms") or 10000)
+    dur_ms = int(first_cfg.get("trigger_duration_ms") or DEFAULT_REMOTE_FANOUT_MS)
     delay_seconds = int(first_cfg.get("delay_seconds") or 0)
     reboot_self_check = bool(first_cfg.get("reboot_self_check"))
     _log_signal_trigger(
@@ -7710,7 +7751,8 @@ def resolve_target_devices(device_ids: list[str], principal: Optional[Principal]
                 " AND ("
                 "o.owner_admin = ? "
                 "OR EXISTS (SELECT 1 FROM device_acl a WHERE a.device_id=d.device_id "
-                "AND a.grantee_username=? AND a.revoked_at IS NULL AND a.can_operate=1)"
+                "AND a.grantee_username=? AND a.revoked_at IS NULL "
+                "AND (a.can_operate=1 OR a.can_view=1))"
                 ") "
             )
             osa = [principal.username, principal.username]
@@ -7724,7 +7766,8 @@ def resolve_target_devices(device_ids: list[str], principal: Optional[Principal]
                     " AND ("
                     "o.owner_admin = ? "
                     "OR EXISTS (SELECT 1 FROM device_acl a WHERE a.device_id=d.device_id "
-                    "AND a.grantee_username=? AND a.revoked_at IS NULL AND a.can_operate=1)"
+                    "AND a.grantee_username=? AND a.revoked_at IS NULL "
+                    "AND (a.can_operate=1 OR a.can_view=1))"
                     ") "
                 )
                 osa = [manager, principal.username]
@@ -8297,8 +8340,8 @@ def save_device_trigger_policy(
             INSERT INTO trigger_policies (
                 owner_admin, scope_group, panic_local_siren, remote_silent_link_enabled,
                 remote_loud_link_enabled, remote_loud_duration_ms, fanout_exclude_self,
-                panic_link_enabled, updated_by, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                panic_link_enabled, panic_fanout_duration_ms, updated_by, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(owner_admin, scope_group) DO UPDATE SET
                 panic_local_siren=excluded.panic_local_siren,
                 remote_silent_link_enabled=excluded.remote_silent_link_enabled,
@@ -8306,6 +8349,7 @@ def save_device_trigger_policy(
                 remote_loud_duration_ms=excluded.remote_loud_duration_ms,
                 fanout_exclude_self=excluded.fanout_exclude_self,
                 panic_link_enabled=excluded.panic_link_enabled,
+                panic_fanout_duration_ms=excluded.panic_fanout_duration_ms,
                 updated_by=excluded.updated_by,
                 updated_at=excluded.updated_at
             """,
@@ -8318,6 +8362,7 @@ def save_device_trigger_policy(
                 int(body.remote_loud_duration_ms),
                 1 if body.fanout_exclude_self else 0,
                 1 if body.panic_link_enabled else 0,
+                int(body.panic_fanout_duration_ms),
                 principal.username,
                 now,
             ),
@@ -8469,14 +8514,14 @@ def get_wifi_provision_task(
 @app.post("/devices/{device_id}/alert/on")
 def device_alert_on(
     device_id: str,
-    duration_ms: int = Query(default=8000, ge=500, le=300000),
+    duration_ms: int = Query(default=DEFAULT_REMOTE_FANOUT_MS, ge=500, le=300000),
     request: Request = None,
     principal: Principal = Depends(require_principal),
 ) -> dict[str, Any]:
     assert_min_role(principal, "user")
     require_capability(principal, "can_alert")
     ensure_not_revoked(device_id)
-    assert_device_owner(principal, device_id)
+    assert_device_siren_access(principal, device_id)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -8535,7 +8580,7 @@ def device_alert_off(device_id: str, request: Request, principal: Principal = De
     assert_min_role(principal, "user")
     require_capability(principal, "can_alert")
     ensure_not_revoked(device_id)
-    assert_device_owner(principal, device_id)
+    assert_device_siren_access(principal, device_id)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -9530,7 +9575,7 @@ def _telegram_cmd_handle_text(principal: Principal, text: str) -> str:
     if lower.startswith("siren on"):
         parts = raw.split()
         target_token = "all" if len(parts) < 3 else parts[2]
-        duration_ms = 10000
+        duration_ms = DEFAULT_REMOTE_FANOUT_MS
         if len(parts) >= 4 and parts[3].isdigit():
             duration_ms = int(parts[3])
         duration_ms = max(500, min(duration_ms, 300000))

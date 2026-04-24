@@ -1240,6 +1240,47 @@ body[data-layout="auth"] .site-footer__row--auth .site-footer__legal {
   width: 100%;
 }
 .grp-pick-hint { font-size: 12.5px; }
+/* Group + device cards: owning tenant tag (top-right cluster) */
+.device-card__corner-tr {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 3;
+  display: flex;
+  flex-direction: row-reverse;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  max-width: min(240px, calc(100% - 20px));
+  pointer-events: none;
+}
+.device-card__corner-tr > * {
+  pointer-events: auto;
+}
+.device-card__corner-tr .group-del-ico {
+  position: static;
+}
+.card-owner-tag {
+  display: inline-flex;
+  align-items: center;
+  max-width: 160px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-elev));
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  box-shadow: 0 1px 0 color-mix(in srgb, var(--border) 80%, transparent);
+}
+html[data-theme="dark"] .card-owner-tag {
+  background: color-mix(in srgb, var(--accent) 18%, var(--bg-muted));
+}
 .group-del-ico {
   position: absolute;
   top: 8px;
