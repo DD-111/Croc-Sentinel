@@ -1011,6 +1011,61 @@ def init_db() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS ix_events_category_ts ON events(category, ts_epoch_ms DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_events_level_ts ON events(level, ts_epoch_ms DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_events_device_ts ON events(device_id, ts_epoch_ms DESC)")
+
+        # ── cmd_queue: persistent /cmd pending queue ────────────────────────
+        # Every `publish_command` call writes a row here keyed on the
+        # generated ``cmd_id``. MQTT remains primary: the row is purely a
+        # ledger that survives a disconnected device so we can:
+        #   * Replay unacked commands via HTTP pull (firmware backup channel)
+        #   * Audit delivery ("was this ACK'd?")
+        #   * Re-deliver to a sibling that was offline at fan-out time when
+        #     it comes back (see group offline-replay below)
+        # Fields:
+        #   cmd_id        — UUID matching the MQTT payload / ACK correlation
+        #   device_id     — target device id (one row per target, not per command)
+        #   cmd           — verb (siren_on / alarm_signal / ota_update / ...)
+        #   params_json   — JSON-encoded params{}
+        #   target_id     — original target_id for signed key check
+        #   proto         — CMD_PROTO at publish time
+        #   cmd_key       — cmd_key snapshot used by the MQTT payload
+        #   created_at    — ISO UTC when enqueued
+        #   expires_at    — ISO UTC when the row stops being retry-able (null = default TTL)
+        #   delivered_via — 'mqtt' on initial publish; 'http' if backup pull served it
+        #   delivered_at  — ISO UTC when paho reported publish accepted (or HTTP returned it)
+        #   acked_at      — ISO UTC when the device ACK landed (via any channel)
+        #   ack_ok        — 1/0 per ack payload
+        #   ack_detail    — free-text ack reason; 'bad key' / 'unknown cmd' / ''
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cmd_queue (
+                cmd_id TEXT PRIMARY KEY,
+                device_id TEXT NOT NULL,
+                cmd TEXT NOT NULL,
+                params_json TEXT,
+                target_id TEXT,
+                proto INTEGER,
+                cmd_key TEXT,
+                created_at TEXT NOT NULL,
+                expires_at TEXT,
+                delivered_via TEXT,
+                delivered_at TEXT,
+                acked_at TEXT,
+                ack_ok INTEGER,
+                ack_detail TEXT
+            )
+            """
+        )
+        # Hot-path indexes: per-device "what is pending now" (HTTP pull and
+        # group offline-replay) is the common read; acked_at IS NULL is the
+        # dominant filter.
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS ix_cmd_queue_dev_pending "
+            "ON cmd_queue(device_id, acked_at, created_at DESC)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS ix_cmd_queue_created "
+            "ON cmd_queue(created_at DESC)"
+        )
         # Hot-path indexes added in the post-mortem debug pass — these queries all
         # showed up in slow-log sampling under load.
         #
@@ -1052,6 +1107,39 @@ def init_db() -> None:
         ensure_column(conn, "role_policies", "tg_test_bulk", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "trigger_policies", "panic_link_enabled", "INTEGER NOT NULL DEFAULT 1")
         ensure_column(conn, "trigger_policies", "panic_fanout_duration_ms", f"INTEGER NOT NULL DEFAULT {DEFAULT_PANIC_FANOUT_MS}")
+
+        # One-shot migration: collapse trigger_policies rows that differ only
+        # in group-string casing/whitespace so they match the sibling match
+        # normalization (_sibling_group_norm). Newest updated_at wins, older
+        # variants are deleted. Runs cheaply on every startup because it
+        # only works on rows that would actually collide.
+        try:
+            cur.execute(
+                "SELECT rowid, owner_admin, scope_group, updated_at "
+                "FROM trigger_policies"
+            )
+            rows = cur.fetchall()
+            buckets: dict[tuple[str, str], list[sqlite3.Row]] = {}
+            for r in rows:
+                key = (str(r["owner_admin"] or ""), _sibling_group_norm(str(r["scope_group"] or "")))
+                buckets.setdefault(key, []).append(r)
+            for (owner, norm_key), group_rows in buckets.items():
+                if len(group_rows) <= 1 and (len(group_rows) == 0 or str(group_rows[0]["scope_group"] or "") == norm_key):
+                    continue
+                winner = max(group_rows, key=lambda x: str(x["updated_at"] or ""))
+                winner_rowid = int(winner["rowid"])
+                for r in group_rows:
+                    if int(r["rowid"]) == winner_rowid:
+                        continue
+                    cur.execute("DELETE FROM trigger_policies WHERE rowid = ?", (int(r["rowid"]),))
+                if str(winner["scope_group"] or "") != norm_key:
+                    cur.execute(
+                        "UPDATE trigger_policies SET scope_group = ? WHERE rowid = ?",
+                        (norm_key, winner_rowid),
+                    )
+            conn.commit()
+        except Exception as exc:
+            logger.warning("trigger_policies normalization migration skipped: %s", exc)
         cur.execute("UPDATE dashboard_users SET status='active' WHERE status IS NULL OR status = ''")
         cur.execute("SELECT mac_nocolon, COUNT(*) AS c FROM provisioned_credentials GROUP BY mac_nocolon HAVING c > 1")
         dup = cur.fetchone()
@@ -2104,7 +2192,11 @@ def upsert_pending_claim(payload: dict[str, Any]) -> None:
     cache_invalidate("overview")
 
 
-def upsert_device_state(device_id: str, channel: str, payload: dict[str, Any]) -> None:
+def upsert_device_state(device_id: str, channel: str, payload: dict[str, Any]) -> Optional[str]:
+    """Persist the latest MQTT frame for ``device_id`` and return the
+    previous ``updated_at`` value (ISO string) so callers can detect
+    offline→online transitions. Returns ``None`` for brand-new devices.
+    """
     now = utc_now_iso()
     fw = str(payload.get("fw", ""))
     chip_target = str(payload.get("chip_target", ""))
@@ -2118,6 +2210,8 @@ def upsert_device_state(device_id: str, channel: str, payload: dict[str, Any]) -
     zone = str(payload.get("zone", ""))
     payload_str = json.dumps(payload, ensure_ascii=True)
 
+    prev_updated_at: Optional[str] = None
+
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -2125,8 +2219,11 @@ def upsert_device_state(device_id: str, channel: str, payload: dict[str, Any]) -
         zov = cur.fetchone()
         if zov and zov["zone"] is not None:
             zone = str(zov["zone"])
-        cur.execute("SELECT device_id FROM device_state WHERE device_id = ?", (device_id,))
-        exists = cur.fetchone() is not None
+        cur.execute("SELECT device_id, updated_at FROM device_state WHERE device_id = ?", (device_id,))
+        existing_row = cur.fetchone()
+        exists = existing_row is not None
+        if exists:
+            prev_updated_at = str(existing_row["updated_at"] or "") or None
 
         if not exists:
             cur.execute(
@@ -2181,6 +2278,8 @@ def upsert_device_state(device_id: str, channel: str, payload: dict[str, Any]) -
         )
         conn.commit()
         conn.close()
+
+    return prev_updated_at
 
 
 def _extract_zone_from_device_state_row(row: Any) -> str:
@@ -2672,7 +2771,11 @@ def _trigger_policy_for(owner_admin: Optional[str], scope_group: str) -> dict[st
     base = _trigger_policy_defaults()
     if not owner_admin:
         return base
-    group_key = scope_group.strip()
+    # Match-path normalization: siblings are resolved via _sibling_group_norm
+    # (case-fold + NFC + whitespace), so the policy lookup MUST use the same
+    # normalization — otherwise "Warehouse" and "warehouse" branch into
+    # different policies for what is the same sibling set.
+    group_key = _sibling_group_norm(scope_group)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -3529,8 +3632,19 @@ def _dispatch_mqtt_payload(topic: str, payload: dict[str, Any]) -> None:
         return
 
     insert_message(topic, channel, device_id, payload)
+    prev_updated_at: Optional[str] = None
     if device_id:
-        upsert_device_state(device_id, channel, payload)
+        prev_updated_at = upsert_device_state(device_id, channel, payload)
+
+    # Offline→online replay: if the device was silent for longer than
+    # CMD_QUEUE_REPLAY_GAP_S and we have unacked queue entries, push them
+    # again over MQTT. Runs inline on the ingest worker because it is a
+    # cheap SELECT + a few publishes; truly heavy cases are debounced.
+    if device_id and channel in ("heartbeat", "status") and prev_updated_at:
+        try:
+            _maybe_replay_queue_on_reconnect(device_id, prev_updated_at)
+        except Exception:
+            logger.debug("cmd_queue replay failed for %s", device_id, exc_info=True)
 
     # Flow EVERY device channel into the unified event stream (at debug
     # level so subscribers can opt in). This gives the superadmin a true
@@ -3588,6 +3702,20 @@ def _dispatch_mqtt_payload(topic: str, payload: dict[str, Any]) -> None:
 
     if channel == "ack" and device_id and _is_ack_key_mismatch(payload):
         _enqueue_auto_reconcile(device_id, "ack_key_mismatch")
+
+    # Settle the persistent cmd_queue entry for this cmd_id regardless of
+    # which channel actually delivered the command (MQTT primary vs HTTP
+    # pull fallback). Missing cmd_id is fine — older payloads or raw
+    # publishes never hit the queue.
+    if channel == "ack" and device_id:
+        cid = str(payload.get("cmd_id") or "").strip()
+        if cid:
+            ok = bool(payload.get("ok", True))
+            detail = str(payload.get("detail") or payload.get("error") or "")
+            try:
+                _cmd_queue_mark_acked(cid, ok=ok, detail=detail)
+            except Exception:
+                logger.debug("cmd_queue ack settle failed dev=%s cid=%s", device_id, cid, exc_info=True)
 
     if channel in ("heartbeat", "status", "ack", "event") and device_id:
         try:
@@ -5642,6 +5770,95 @@ def device_ota_report(body: DeviceOtaReportRequest) -> dict[str, Any]:
     return {"ok": True, "status": "recorded"}
 
 
+class DeviceCommandsPendingRequest(BaseModel):
+    """Backup command-channel pull. The firmware only calls this when MQTT
+    has been offline longer than its fallback arm window (≥120s) so we
+    don't compete with the live MQTT path."""
+
+    device_id: str = Field(min_length=3, max_length=40)
+    mac_nocolon: str = Field(min_length=12, max_length=24)
+    cmd_key: str = Field(min_length=16, max_length=32)
+    limit: int = Field(default=8, ge=1, le=32)
+
+
+class DeviceCommandAckRequest(BaseModel):
+    """HTTP ACK for commands pulled from the backup channel."""
+
+    device_id: str = Field(min_length=3, max_length=40)
+    mac_nocolon: str = Field(min_length=12, max_length=24)
+    cmd_key: str = Field(min_length=16, max_length=32)
+    cmd_id: str = Field(min_length=8, max_length=64)
+    ok: bool = True
+    detail: str = Field(default="", max_length=240)
+
+
+def _auth_device_http(device_id: str, mac_nocolon: str, cmd_key: str) -> sqlite3.Row:
+    """Shared device-HTTP authenticator. Matches MAC+device_id to a
+    provisioned row and verifies the 16-hex cmd_key (same credential the
+    firmware uses to sign MQTT /cmd payloads). Any mismatch is a 403 —
+    we deliberately do not leak whether the device or the key was wrong."""
+    mac = _norm_mac_nocolon12(mac_nocolon)
+    if len(mac) != 12:
+        raise HTTPException(status_code=400, detail="invalid mac_nocolon")
+    row = _provision_row_for_device_mac(device_id, mac)
+    if not row:
+        raise HTTPException(status_code=404, detail="device not provisioned")
+    db_key = str(row["cmd_key"] or "").strip().upper()
+    rep = (cmd_key or "").strip().upper()
+    if not rep or not is_hex_16(rep) or rep != db_key:
+        raise HTTPException(status_code=403, detail="cmd_key mismatch")
+    return row
+
+
+@app.post("/device/commands/pending")
+def device_commands_pending(body: DeviceCommandsPendingRequest) -> dict[str, Any]:
+    """HTTP backup command pull. Returns unacked commands queued for the
+    device. This is deliberately a POST (not GET) so cmd_key auth rides
+    in the body, not in a querystring that could show up in access logs.
+
+    Contract (so firmware and server stay in lockstep):
+      * Server returns ``{"commands": [...]}`` — oldest first.
+      * Each entry is the exact /cmd payload the device would have seen
+        over MQTT (cmd, cmd_id, target_id, proto, params, cmd_key). The
+        firmware handler must be idempotent per cmd_id because the same
+        entry can be served again on the next pull until ACK'd.
+      * The server does NOT mark anything delivered on pull. Delivery is
+        confirmed only when the device POSTs /device/commands/ack — MQTT
+        remains the source of truth for delivery semantics.
+    """
+    row = _auth_device_http(body.device_id, body.mac_nocolon, body.cmd_key)
+    did = str(row["device_id"])
+    rows = _cmd_queue_pending_for_device(did, limit=int(body.limit))
+    # Shape mirrors the MQTT /cmd payload exactly so the firmware can
+    # pass each entry straight to handleCmdFromBody() without any
+    # transformation layer. ``key`` is the 16-hex cmd_key the device
+    # would have seen on MQTT, enabling the same auth check offline.
+    commands = []
+    for r in rows:
+        commands.append({
+            "proto": int(r["proto"] or CMD_PROTO),
+            "key": r["cmd_key"] or "",
+            "target_id": r["target_id"] or did,
+            "cmd": r["cmd"],
+            "params": r["params"] or {},
+            "cmd_id": r["cmd_id"],
+            "enqueued_at": r["created_at"],
+        })
+    return {"commands": commands, "count": len(commands)}
+
+
+@app.post("/device/commands/ack")
+def device_commands_ack(body: DeviceCommandAckRequest) -> dict[str, Any]:
+    """HTTP ACK for backup-channel commands. The device should still
+    publish its normal MQTT /ack when MQTT comes back; this endpoint
+    exists so an unack'd queue entry can be drained purely over HTTP
+    when the MQTT link never recovers."""
+    row = _auth_device_http(body.device_id, body.mac_nocolon, body.cmd_key)
+    did = str(row["device_id"])
+    updated = _cmd_queue_mark_acked(body.cmd_id, ok=bool(body.ok), detail=body.detail or "")
+    return {"ok": True, "settled": bool(updated), "device_id": did}
+
+
 @app.get("/auth/me")
 def auth_me(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     assert_min_role(principal, "user")
@@ -7011,6 +7228,51 @@ def _row_json_val(raw: str | None) -> dict[str, Any]:
         return {}
 
 
+def _net_health_from_status(last_status: Any) -> dict[str, Any]:
+    """Extract the firmware's net_health ledger block.
+
+    Accepts either a parsed status dict (from `get_device`) or a raw
+    ``last_status_json`` column value (from the list query).
+
+    Returns ``{}`` for firmware that doesn't emit it — older builds only
+    publish the flat rssi/online fields.
+
+    Fields (all integers, monotonic since the device's last boot):
+        wifi_reconnects       — successful Wi-Fi rejoins since boot
+        mqtt_reconnects       — successful MQTT reconnects since boot
+        mqtt_last_down_code   — PubSubClient state() at last drop (-4..5)
+        mqtt_last_conn_code   — PubSubClient state() at last connect fail
+        mqtt_longest_gap_ms   — longest continuous MQTT offline span
+        wifi_longest_gap_ms   — longest continuous Wi-Fi offline span
+        roam_attempts         — signal-driven AP switches
+        mqtt_fail_streak      — consecutive connect failures right now
+    """
+    if isinstance(last_status, dict):
+        st = last_status
+    else:
+        st = _row_json_val(last_status)
+    raw = st.get("net_health") if isinstance(st, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key in (
+        "wifi_reconnects",
+        "mqtt_reconnects",
+        "mqtt_last_down_code",
+        "mqtt_last_conn_code",
+        "mqtt_longest_gap_ms",
+        "wifi_longest_gap_ms",
+        "roam_attempts",
+        "mqtt_fail_streak",
+    ):
+        if key in raw:
+            try:
+                out[key] = int(raw[key])
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
 def _status_preview_from_device_row(d: dict[str, Any]) -> dict[str, Any]:
     """Compact live hints for the device list (one round-trip, no N+1)."""
     st = _row_json_val(d.get("last_status_json"))
@@ -7389,6 +7651,7 @@ def list_devices(principal: Principal = Depends(require_principal)) -> dict[str,
             d = dict(r)
             d["is_online"] = _device_is_online_sql_row(d, now_s)
             d["status_preview"] = _status_preview_from_device_row(d)
+            d["net_health"] = _net_health_from_status(d.get("last_status_json"))
             d.update(
                 _device_presence_ages(
                     _row_json_val(d.get("last_status_json")),
@@ -7490,6 +7753,10 @@ def get_device(device_id: str, principal: Principal = Depends(require_principal)
             now_s,
         )
     )
+    # Firmware net_health (Wi-Fi/MQTT reconnect counters, longest offline
+    # gaps, last disconnect reason code). Surfaced here so the device detail
+    # page can render a "connectivity stability" card. Empty {} on older fw.
+    out["net_health"] = _net_health_from_status(out.get("last_status_json") or {})
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -8838,6 +9105,248 @@ def _publish_dedupe_set(key: str, cmd_id: str, ttl_s: float) -> None:
         _publish_dedupe_cache[key] = (cmd_id, time.time() + max(1.0, ttl_s))
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# cmd_queue helpers
+# MQTT is ALWAYS the primary delivery channel. These functions persist a
+# ledger row per published command so that:
+#   * Offline devices can pick up unacked commands via an HTTP GET pull
+#     (see /device-http/*/commands/pending). Firmware uses this only when
+#     MQTT has been disconnected past COMMAND_HTTP_FALLBACK_ARM_MS seconds —
+#     it does not compete with MQTT for live connections.
+#   * The ACK flow can mark rows acked regardless of which channel delivered
+#     or which channel the ACK came back on.
+#   * Sibling fan-out can be replayed to a device that came online after
+#     the fan-out happened (see group offline replay).
+# TTL default is 24h so a device that was offline overnight still gets its
+# commands on reconnect, but ancient commands don't pile up.
+# ─────────────────────────────────────────────────────────────────────────
+CMD_QUEUE_TTL_S = int(os.getenv("CROC_CMD_QUEUE_TTL_S", "86400"))
+# Commands we never persist (would balloon the table without offline semantics):
+#   presence probes — transient per-device keepalive only
+#   debug / dev-only — no offline retry value
+_CMD_QUEUE_SKIP_VERBS = {"presence_probe"}
+
+
+def _cmd_queue_enqueue(
+    *,
+    cmd_id: str,
+    device_id: str,
+    cmd: str,
+    params: dict[str, Any],
+    target_id: str,
+    proto: int,
+    cmd_key: str,
+    delivered_via: str,
+    delivered_at: Optional[str],
+) -> None:
+    """Insert a row into cmd_queue right after a publish. Best-effort: any
+    DB error is logged and swallowed so a hiccup in the queue never blocks
+    the MQTT publish that already succeeded."""
+    if cmd in _CMD_QUEUE_SKIP_VERBS:
+        return
+    if not device_id:
+        return
+    now = utc_now_iso()
+    try:
+        expires_at = (
+            datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=CMD_QUEUE_TTL_S)
+        ).isoformat(timespec="seconds")
+    except Exception:
+        expires_at = None
+    try:
+        payload = json.dumps(params or {}, ensure_ascii=True)
+    except Exception:
+        payload = "{}"
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO cmd_queue (
+                    cmd_id, device_id, cmd, params_json, target_id, proto, cmd_key,
+                    created_at, expires_at, delivered_via, delivered_at, acked_at, ack_ok, ack_detail
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+                """,
+                (
+                    cmd_id, device_id, cmd, payload, target_id, int(proto or 0), cmd_key or "",
+                    now, expires_at, delivered_via, delivered_at,
+                ),
+            )
+            conn.commit()
+        except Exception as exc:
+            logger.warning("cmd_queue enqueue failed cmd=%s device=%s err=%s", cmd, device_id, exc)
+        finally:
+            conn.close()
+
+
+def _cmd_queue_mark_acked(cmd_id: str, *, ok: bool, detail: str = "") -> bool:
+    """Clear the pending row for ``cmd_id`` on ACK arrival (from ANY channel).
+    Returns True if a row was actually updated. No-op and False if cmd_id
+    wasn't in the queue (older/expired cmd, or from a sender that bypassed
+    the queue — e.g. legacy code paths that publish raw)."""
+    if not cmd_id:
+        return False
+    now = utc_now_iso()
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "UPDATE cmd_queue SET acked_at = ?, ack_ok = ?, ack_detail = ? "
+                "WHERE cmd_id = ? AND acked_at IS NULL",
+                (now, 1 if ok else 0, str(detail or "")[:200], cmd_id),
+            )
+            updated = cur.rowcount
+            conn.commit()
+            return bool(updated)
+        except Exception as exc:
+            logger.warning("cmd_queue ack update failed cmd_id=%s err=%s", cmd_id, exc)
+            return False
+        finally:
+            conn.close()
+
+
+def _cmd_queue_pending_for_device(device_id: str, limit: int = 32) -> list[dict[str, Any]]:
+    """Return un-acked, un-expired commands for ``device_id`` (oldest first).
+    This is what the HTTP backup pull endpoint returns. Rows with
+    ``expires_at < now`` are silently filtered — the cleanup pass handles
+    their removal on a slower cadence."""
+    if not device_id:
+        return []
+    now = utc_now_iso()
+    out: list[dict[str, Any]] = []
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT cmd_id, device_id, cmd, params_json, target_id, proto, cmd_key,
+                       created_at, delivered_via, delivered_at
+                FROM cmd_queue
+                WHERE device_id = ?
+                  AND acked_at IS NULL
+                  AND (expires_at IS NULL OR expires_at > ?)
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                (device_id, now, int(limit)),
+            )
+            for r in cur.fetchall():
+                try:
+                    params = json.loads(r["params_json"] or "{}")
+                except Exception:
+                    params = {}
+                out.append({
+                    "cmd_id": r["cmd_id"],
+                    "device_id": r["device_id"],
+                    "cmd": r["cmd"],
+                    "params": params,
+                    "target_id": r["target_id"] or "",
+                    "proto": int(r["proto"] or 0),
+                    "cmd_key": r["cmd_key"] or "",
+                    "created_at": r["created_at"],
+                    "delivered_via": r["delivered_via"] or "",
+                    "delivered_at": r["delivered_at"] or "",
+                })
+        except Exception as exc:
+            logger.warning("cmd_queue pending scan failed device=%s err=%s", device_id, exc)
+        finally:
+            conn.close()
+    return out
+
+
+# Gap past which a device is treated as "came back from offline" — a
+# fresh heartbeat after this much silence triggers a replay of its
+# unacked cmd_queue entries. Tuned to cover a typical Wi-Fi drop
+# (30–60s) without firing on every ordinary heartbeat skew.
+CMD_QUEUE_REPLAY_GAP_S = int(os.getenv("CROC_CMD_QUEUE_REPLAY_GAP_S", "60"))
+# Per-device debounce so a noisy flap-up does not trigger replay on every
+# status frame. ``device_id -> epoch_s`` of last replay.
+_cmd_queue_replay_last: dict[str, float] = {}
+_cmd_queue_replay_lock = threading.Lock()
+
+
+def _maybe_replay_queue_on_reconnect(device_id: str, prev_updated_at: Optional[str]) -> None:
+    """Called when a fresh heartbeat/status lands. If the device was
+    silent for longer than CMD_QUEUE_REPLAY_GAP_S, re-publish any
+    unacked cmd_queue entries over MQTT so a sibling that was offline
+    during fan-out actually receives the broadcast."""
+    if not device_id or not prev_updated_at:
+        return
+    try:
+        prev = _parse_iso(prev_updated_at)
+    except Exception:
+        return
+    if not prev:
+        return
+    gap_s = (datetime.datetime.now(datetime.UTC) - prev).total_seconds()
+    if gap_s < float(CMD_QUEUE_REPLAY_GAP_S):
+        return
+    now_epoch = time.time()
+    with _cmd_queue_replay_lock:
+        last = _cmd_queue_replay_last.get(device_id, 0.0)
+        if now_epoch - last < 15.0:
+            return
+        _cmd_queue_replay_last[device_id] = now_epoch
+    pending = _cmd_queue_pending_for_device(device_id, limit=16)
+    if not pending:
+        return
+    logger.info(
+        "cmd_queue replay: device=%s gap=%.1fs pending=%d",
+        device_id, gap_s, len(pending),
+    )
+    for entry in pending:
+        try:
+            publish_command(
+                topic=f"{TOPIC_ROOT}/{device_id}/cmd",
+                cmd=str(entry["cmd"]),
+                params=entry.get("params") or {},
+                target_id=str(entry.get("target_id") or device_id),
+                proto=int(entry.get("proto") or CMD_PROTO),
+                cmd_key=str(entry.get("cmd_key") or ""),
+                wait_publish=False,
+                persist=False,
+            )
+        except Exception as exc:
+            logger.warning(
+                "cmd_queue replay publish failed device=%s cmd_id=%s err=%s",
+                device_id, entry.get("cmd_id"), exc,
+            )
+
+
+def _cmd_queue_cleanup_expired(max_rows: int = 500) -> int:
+    """Periodic purge of expired + stale acked rows. Called from the
+    scheduled_commands worker tick so we don't add another thread."""
+    now = utc_now_iso()
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        try:
+            # Drop expired-and-unacked first (true queue items).
+            cur.execute(
+                "DELETE FROM cmd_queue WHERE expires_at IS NOT NULL AND expires_at < ?",
+                (now,),
+            )
+            # Drop acked rows older than the TTL — at some point the ledger
+            # stops being useful and just bloats the table.
+            cur.execute(
+                "DELETE FROM cmd_queue WHERE acked_at IS NOT NULL AND created_at < ?",
+                ((
+                    datetime.datetime.now(datetime.UTC) - datetime.timedelta(seconds=CMD_QUEUE_TTL_S)
+                ).isoformat(timespec="seconds"),),
+            )
+            deleted = cur.rowcount
+            conn.commit()
+            return int(deleted or 0)
+        except Exception as exc:
+            logger.warning("cmd_queue cleanup failed: %s", exc)
+            return 0
+        finally:
+            conn.close()
+
+
 def publish_command(
     topic: str,
     cmd: str,
@@ -8849,6 +9358,7 @@ def publish_command(
     wait_publish: bool = True,
     dedupe_key: Optional[str] = None,
     dedupe_ttl_s: Optional[float] = None,
+    persist: bool = True,
 ) -> str:
     """Publish a /cmd frame. Returns generated ``cmd_id`` (so callers can wait on ACK by id).
 
@@ -8889,13 +9399,39 @@ def publish_command(
         raise HTTPException(status_code=502, detail=f"mqtt publish error: {exc}")
     if getattr(info, "rc", 0) not in (0, None):
         raise HTTPException(status_code=502, detail=f"mqtt publish rc={info.rc}")
+    publish_delivered_at: Optional[str] = None
     if wait_publish and MQTT_PUBLISH_WAIT_MS > 0:
         try:
             info.wait_for_publish(timeout=max(0.05, MQTT_PUBLISH_WAIT_MS / 1000.0))
+            publish_delivered_at = utc_now_iso()
         except Exception:
             pass
     if dedupe_key:
         _publish_dedupe_set(dedupe_key, cmd_id, float(dedupe_ttl_s or PUBLISH_DEDUPE_TTL_S))
+    # Ledger-only (does not gate success). target_id is the device the
+    # cmd_key binds to, which equals device_id for single-target commands;
+    # topic parsing keeps it honest for future indirect paths.
+    if persist:
+        dev_id_from_topic = ""
+        try:
+            # Topic shape: <TOPIC_ROOT>/<device_id>/cmd → device_id is the
+            # second-to-last segment. Cheap and robust against topic churn.
+            parts = topic.split("/")
+            if len(parts) >= 2 and parts[-1] == "cmd":
+                dev_id_from_topic = parts[-2]
+        except Exception:
+            dev_id_from_topic = ""
+        _cmd_queue_enqueue(
+            cmd_id=cmd_id,
+            device_id=dev_id_from_topic or target_id,
+            cmd=cmd,
+            params=params or {},
+            target_id=target_id,
+            proto=proto,
+            cmd_key=cmd_key or "",
+            delivered_via="mqtt",
+            delivered_at=publish_delivered_at,
+        )
     return cmd_id
 
 
@@ -9050,6 +9586,10 @@ def scheduler_loop() -> None:
             _auto_reconcile_tick()
         except Exception as exc:
             logger.warning("auto reconcile tick failed: %s", exc)
+        try:
+            _cmd_queue_cleanup_expired()
+        except Exception as exc:
+            logger.warning("cmd_queue cleanup tick failed: %s", exc)
 
         now = time.time()
         if now >= next_cleanup_at:
@@ -9502,9 +10042,11 @@ def get_device_trigger_policy(device_id: str, principal: Principal = Depends(req
             status_code=403,
             detail="trigger policy is managed by the owning tenant only (device share does not include group policy)",
         )
-    group_key = str(row.get("notification_group") or "")
-    pol = _trigger_policy_for(owner, group_key)
-    return {"ok": True, "device_id": device_id, "scope_group": group_key, "policy": pol}
+    # Return the raw group string for display, but use the normalized form
+    # for policy lookup so siblings and policy always agree.
+    group_display = str(row.get("notification_group") or "")
+    pol = _trigger_policy_for(owner, group_display)
+    return {"ok": True, "device_id": device_id, "scope_group": group_display, "policy": pol}
 
 
 @app.put("/devices/{device_id}/trigger-policy")
@@ -9521,7 +10063,11 @@ def save_device_trigger_policy(
             status_code=403,
             detail="trigger policy is managed by the owning tenant only (device share does not include group policy)",
         )
-    group_key = str(row.get("notification_group") or "")
+    group_display = str(row.get("notification_group") or "")
+    # Single canonical storage key. Writing the normalized form guarantees
+    # that any two devices whose groups sibling-match ("warehouse",
+    # "Warehouse", "  warehouse  ") end up sharing one policy row.
+    group_key = _sibling_group_norm(group_display)
     now = utc_now_iso()
     with db_lock:
         conn = get_conn()
@@ -9560,8 +10106,8 @@ def save_device_trigger_policy(
         )
         conn.commit()
         conn.close()
-    audit_event(principal.username, "trigger.policy.save", target=device_id, detail={"group": group_key, "owner_admin": owner or ""})
-    return {"ok": True, "device_id": device_id, "scope_group": group_key}
+    audit_event(principal.username, "trigger.policy.save", target=device_id, detail={"group": group_display, "group_key": group_key, "owner_admin": owner or ""})
+    return {"ok": True, "device_id": device_id, "scope_group": group_display, "scope_group_key": group_key}
 
 
 @app.post("/devices/{device_id}/provision/wifi-task")

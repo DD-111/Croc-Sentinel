@@ -31,6 +31,30 @@
 #ifndef DEVICE_SYNC_OTA_PATH
 #define DEVICE_SYNC_OTA_PATH "/api/device/ota/report"
 #endif
+// Backup command channel paths. Used only when MQTT has been down past the
+// arm threshold (see COMMAND_HTTP_FALLBACK_ARM_MS). Firmware never competes
+// with a healthy MQTT link — the pull loop self-disables the moment MQTT
+// reconnects. Mirrors the server routes in croc_sentinel_systems/api/app.py.
+#ifndef DEVICE_SYNC_CMD_PENDING_PATH
+#define DEVICE_SYNC_CMD_PENDING_PATH "/api/device/commands/pending"
+#endif
+#ifndef DEVICE_SYNC_CMD_ACK_PATH
+#define DEVICE_SYNC_CMD_ACK_PATH "/api/device/commands/ack"
+#endif
+#ifndef COMMAND_HTTP_FALLBACK_ARM_MS
+// How long MQTT must be unhappy before HTTP command-pull arms. 120s is
+// long enough that a normal reconnect (~5-30s) never triggers HTTP, but
+// short enough that a multi-minute outage gets useful command delivery.
+#define COMMAND_HTTP_FALLBACK_ARM_MS (120UL * 1000UL)
+#endif
+#ifndef COMMAND_HTTP_FALLBACK_POLL_MS
+// Pull interval while armed. Conservative to keep the API load low even
+// if a whole fleet loses MQTT at once. Exposed so a deployment can tune.
+#define COMMAND_HTTP_FALLBACK_POLL_MS (30UL * 1000UL)
+#endif
+#ifndef COMMAND_HTTP_FALLBACK_MAX_PER_POLL
+#define COMMAND_HTTP_FALLBACK_MAX_PER_POLL 4
+#endif
 #ifndef DEVICE_SYNC_HTTP_TIMEOUT_MS
 #define DEVICE_SYNC_HTTP_TIMEOUT_MS 15000
 #endif
@@ -670,6 +694,27 @@ unsigned long bootAtMs = 0;
 // Last time a heap low-water-mark was logged, so publishStatus bursts don't
 // spam the serial log with free-heap warnings.
 unsigned long s_lastHeapLowLogAtMs = 0;
+
+// ── Connectivity health ledger (surfaced in publishStatus.net_health) ────────
+// These are counters / timestamps since boot so the server-side dashboard can
+// tell "this device re-associates 10× an hour" from "this device is steady".
+// Keep types narrow (uint16_t) to stay well under MQTT status buffer size.
+uint16_t s_wifiReconnectCount = 0;          // successful WiFi rejoins since boot
+uint16_t s_mqttReconnectCount = 0;          // successful MQTT reconnects since boot
+uint16_t s_roamAttemptCount   = 0;          // times WIFI_ROAM_* fired a switch
+int16_t  s_lastMqttDownCode   = 0;          // PubSubClient::state() at last drop (-4..5)
+int16_t  s_lastMqttConnCode   = 0;          // PubSubClient::state() at last connect fail
+unsigned long s_mqttLastDownAtMs     = 0;   // millis when MQTT last transitioned up→down
+unsigned long s_mqttLongestGapMs     = 0;   // longest continuous offline span since boot
+unsigned long s_mqttLastUpAtMs       = 0;   // last millis MQTT was seen connected (for gap calc)
+unsigned long s_wifiLongestGapMs     = 0;   // longest continuous wifi-down span since boot
+unsigned long s_wifiLastUpAtMs       = 0;   // last millis WiFi was seen connected
+// Previous connectivity samples so we can detect edges once per loop.
+bool s_prevMqttConnected = false;
+bool s_prevNetConnected  = false;
+// RSSI roaming bookkeeping.
+unsigned long s_rssiWeakSinceMs = 0;        // 0 = signal healthy right now
+unsigned long s_lastRoamAtMs    = 0;        // rate-limit roam attempts
 
 unsigned long sirenStartAt = 0;
 unsigned long sirenDurationMs = 0;
@@ -1473,7 +1518,9 @@ void publishStatus() {
   float vbat = readBatteryVoltage();
   int   rssi = netIf->rssi();
 
-  StaticJsonDocument<1024> doc;
+  // Bumped from 1024 → 1152 when net_health sub-object was added (see below).
+  // ~120B headroom covers 8 keys × ~14B average plus JSON overhead.
+  StaticJsonDocument<1152> doc;
   doc["device_id"]          = deviceId;
   doc["mac"]                = deviceMac;
   doc["qr_code"]            = deviceQrCode;
@@ -1518,8 +1565,20 @@ void publishStatus() {
   doc["scheduled_reboot"]   = scheduledRebootArmed;
   doc["scheduled_reboot_ts"]= scheduledRebootEpoch;
   doc["last_error"]         = lastError;
+  // Connectivity health ledger — dashboard surfaces these under `net_health`
+  // so operators can tell "this unit flaps" from "this unit is stable". All
+  // counters are monotonic since boot; reset on reboot along with bootCount.
+  JsonObject netHealth = doc.createNestedObject("net_health");
+  netHealth["wifi_reconnects"]     = s_wifiReconnectCount;
+  netHealth["mqtt_reconnects"]     = s_mqttReconnectCount;
+  netHealth["mqtt_last_down_code"] = s_lastMqttDownCode;
+  netHealth["mqtt_last_conn_code"] = s_lastMqttConnCode;
+  netHealth["mqtt_longest_gap_ms"] = (uint32_t)s_mqttLongestGapMs;
+  netHealth["wifi_longest_gap_ms"] = (uint32_t)s_wifiLongestGapMs;
+  netHealth["roam_attempts"]       = s_roamAttemptCount;
+  netHealth["mqtt_fail_streak"]    = s_mqttConnFails;
 
-  char buf[1024];
+  char buf[1152];
   serializeJson(doc, buf, sizeof(buf));
   publishRaw(topicStatus, buf, true);
 }
@@ -2476,6 +2535,102 @@ void postDeviceOtaReportHttp(bool otaOk, const char *campaignId, const char *tar
   snprintf(line, sizeof(line), "[ota-http] report status=%d", code);
   logLine(line);
 }
+
+// ── HTTP backup command channel (non-competitive with MQTT) ──────────────
+//
+// Only called from pumpCommandHttpFallback() while the arm-gate is open
+// (MQTT visibly down past COMMAND_HTTP_FALLBACK_ARM_MS). Returns true if
+// it delivered at least one command; false on network/auth failure or an
+// empty queue. The caller is responsible for rate-limiting.
+//
+// Response shape matches the MQTT /cmd envelope exactly, so each command
+// is fed straight into handleCmdFromBody() — the same verification path
+// used for MQTT-delivered commands. That in turn calls executeCommand()
+// and publishes a normal MQTT /ack if connected. Regardless, we POST an
+// HTTP ACK back so the server cmd_queue is settled even if the MQTT link
+// never recovers.
+static bool postDeviceCommandAckHttp(const char *cmdId, bool ok, const char *detail) {
+  if (strlen(DEVICE_SYNC_API_BASE) < 8) return false;
+  if (!isProvisioned || !netIf->connected()) return false;
+  if (!cmdId || !*cmdId) return false;
+  char url[192];
+  snprintf(url, sizeof(url), "%s%s", DEVICE_SYNC_API_BASE, DEVICE_SYNC_CMD_ACK_PATH);
+  StaticJsonDocument<384> doc;
+  doc["device_id"] = deviceId;
+  doc["mac_nocolon"] = deviceMacNoColon;
+  doc["cmd_key"] = cmdAuthKey;
+  doc["cmd_id"] = cmdId;
+  doc["ok"] = ok;
+  doc["detail"] = detail ? detail : "";
+  char payload[420];
+  size_t nw = serializeJson(doc, payload, sizeof(payload));
+  if (nw == 0 || nw >= sizeof(payload)) return false;
+  int code = -1;
+  String resp;
+  if (!deviceSyncHttpPost(url, payload, &code, &resp, (uint32_t)DEVICE_SYNC_HTTP_QUICK_TIMEOUT_MS)) return false;
+  return code == 200;
+}
+
+static bool pullDeviceCommandsHttp(uint8_t maxCmds) {
+  if (strlen(DEVICE_SYNC_API_BASE) < 8) return false;
+  if (!isProvisioned || !netIf->connected()) return false;
+  char url[192];
+  snprintf(url, sizeof(url), "%s%s", DEVICE_SYNC_API_BASE, DEVICE_SYNC_CMD_PENDING_PATH);
+  StaticJsonDocument<256> req;
+  req["device_id"] = deviceId;
+  req["mac_nocolon"] = deviceMacNoColon;
+  req["cmd_key"] = cmdAuthKey;
+  req["limit"] = (int)maxCmds;
+  char payload[300];
+  size_t nw = serializeJson(req, payload, sizeof(payload));
+  if (nw == 0 || nw >= sizeof(payload)) return false;
+  int code = -1;
+  String resp;
+  if (!deviceSyncHttpPost(url, payload, &code, &resp, (uint32_t)DEVICE_SYNC_HTTP_QUICK_TIMEOUT_MS)) {
+    logLine("[cmd-pull] HTTP failed");
+    return false;
+  }
+  if (code != 200) {
+    char line[96];
+    snprintf(line, sizeof(line), "[cmd-pull] HTTP status=%d", code);
+    logLine(line);
+    return false;
+  }
+  // Use DynamicJsonDocument for the response: a full pull can easily be
+  // over the StaticJsonDocument<MQTT_JSON_DOC_BYTES> budget, and we only
+  // hold it on the stack briefly. Size cap: ~2 KB keeps heap modest.
+  DynamicJsonDocument ans(2048);
+  if (deserializeJson(ans, resp)) {
+    logLine("[cmd-pull] bad JSON");
+    return false;
+  }
+  JsonArray commands = ans["commands"].as<JsonArray>();
+  if (commands.isNull() || commands.size() == 0) return false;
+  int delivered = 0;
+  for (JsonVariant v : commands) {
+    // Serialize each entry back to a compact JSON string and feed it
+    // through the same handler the MQTT path uses. This guarantees auth,
+    // idempotency and ACK emission stay bit-identical across channels.
+    char frame[MQTT_RX_BUFFER_BYTES];
+    size_t fn = serializeJson(v, frame, sizeof(frame));
+    if (fn == 0 || fn >= sizeof(frame)) continue;
+    frame[fn] = '\0';
+    const char *cid = v["cmd_id"] | "";
+    handleCmdFromBody(frame);
+    // HTTP ACK regardless of success — the server cares about settling
+    // the queue row, and executeCommand already publishes an MQTT ack if
+    // we happen to reconnect in the middle of this pull.
+    postDeviceCommandAckHttp(cid, true, "http_backup_delivered");
+    delivered++;
+    esp_task_wdt_reset();
+  }
+  if (delivered > 0) {
+    char line[80];
+    snprintf(line, sizeof(line), "[cmd-pull] delivered=%d", delivered);
+    logLine(line);
+  }
+  return delivered > 0;
+}
 #endif  // DEVICE_SYNC_HTTP_ENABLED
 
 // ═══════════════════════════════════════════════
@@ -2487,6 +2642,100 @@ void postDeviceOtaReportHttp(bool otaOk, const char *campaignId, const char *tar
 static bool s_netHadLink = false;
 // Monotonic millis when we first observed link down after s_netHadLink became true.
 static unsigned long s_linkDownSinceMs = 0;
+
+// Track MQTT + WiFi edge transitions so we can:
+//   * count successful reconnects (publish-visible in net_health)
+//   * record the longest offline gap since boot
+//   * capture the PubSubClient state code at the moment of disconnect
+// Called every loop iteration before ensureWiFi/ensureMqtt.
+static void updateConnectivityLedger(unsigned long now) {
+#if !defined(CONFIG_IDF_TARGET_ESP32P4)
+  bool netUp  = (netIf != nullptr && netIf->connected());
+#else
+  bool netUp  = (netIf != nullptr && netIf->connected());
+#endif
+  bool mqttUp = mqttClient.connected();
+
+  // WiFi/net edges.
+  if (!s_prevNetConnected && netUp) {
+    // Rising edge. Not counted as a "reconnect" on the very first join.
+    if (s_wifiLastUpAtMs != 0) {
+      unsigned long gap = now - s_wifiLastUpAtMs;
+      if (gap > s_wifiLongestGapMs) s_wifiLongestGapMs = gap;
+      s_wifiReconnectCount++;
+    }
+    s_wifiLastUpAtMs = now;
+  } else if (netUp) {
+    s_wifiLastUpAtMs = now;
+  }
+  s_prevNetConnected = netUp;
+
+  // MQTT edges. Count transitions after the first success.
+  if (!s_prevMqttConnected && mqttUp) {
+    // Rising edge. If we had a prior up-time, this is a reconnect.
+    if (s_mqttLastUpAtMs != 0) {
+      unsigned long gap = (s_mqttLastDownAtMs && now >= s_mqttLastDownAtMs) ? (now - s_mqttLastDownAtMs) : 0;
+      if (gap > s_mqttLongestGapMs) s_mqttLongestGapMs = gap;
+      s_mqttReconnectCount++;
+    }
+    s_mqttLastUpAtMs = now;
+    s_mqttLastDownAtMs = 0;
+  } else if (s_prevMqttConnected && !mqttUp) {
+    // Falling edge — capture the reason code while it's still fresh.
+    s_mqttLastDownAtMs = now;
+    s_lastMqttDownCode = (int16_t)mqttClient.state();
+    {
+      char _md[64];
+      snprintf(_md, sizeof(_md), "[mqtt] link down rc=%d", (int)s_lastMqttDownCode);
+      logLine(_md);
+    }
+  } else if (mqttUp) {
+    s_mqttLastUpAtMs = now;
+  }
+  s_prevMqttConnected = mqttUp;
+}
+
+// Signal-driven AP switch. Pure ESP-IDF STA does NOT roam automatically — if
+// the initial join was a distant AP, the device will stay glued to it even
+// when a closer registered AP is available. Here we watch RSSI; once it has
+// been sustained below WIFI_ROAM_RSSI_DBM for WIFI_ROAM_SUSTAIN_MS and we
+// haven't just roamed, release the association so WiFiMulti re-picks the best
+// candidate. Effect: no disruption when signal is fine; a short
+// disconnect/rejoin window (a few hundred ms) when a weaker AP is replaced.
+#if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
+    !defined(CONFIG_IDF_TARGET_ESP32P4)
+static void maybeRoamToStrongerAp(unsigned long now) {
+#if !WIFI_ROAM_ENABLED
+  return;
+#else
+  if (WiFi.status() != WL_CONNECTED) { s_rssiWeakSinceMs = 0; return; }
+  g_wifiMultiRegisterAps();
+  if (g_wifiMultiApCount < 2) { s_rssiWeakSinceMs = 0; return; }
+  long r = WiFi.RSSI();
+  if (r == 0) { s_rssiWeakSinceMs = 0; return; }  // RSSI not yet available after association
+  if (r >= (long)WIFI_ROAM_RSSI_DBM) {
+    s_rssiWeakSinceMs = 0;
+    return;
+  }
+  if (s_rssiWeakSinceMs == 0) { s_rssiWeakSinceMs = now; return; }
+  if ((now - s_rssiWeakSinceMs) < (unsigned long)WIFI_ROAM_SUSTAIN_MS) return;
+  if (s_lastRoamAtMs != 0 && (now - s_lastRoamAtMs) < (unsigned long)WIFI_ROAM_MIN_GAP_MS) return;
+  {
+    char _rl[80];
+    snprintf(_rl, sizeof(_rl), "[wifi] roam: RSSI=%ld sustained below %d dBm, re-scanning", r, (int)WIFI_ROAM_RSSI_DBM);
+    logLine(_rl);
+  }
+  s_lastRoamAtMs = now;
+  s_rssiWeakSinceMs = 0;
+  s_roamAttemptCount++;
+  // disconnect(false) = keep credentials; WiFiMulti::run will re-pick the best AP
+  // from our registered list (the strongest one wins, which is the whole point).
+  WiFi.disconnect(false);
+  // Short dwell so the radio can return a new scan before the next loop iter.
+  g_wifiMultiConnectBlocking(5000UL);
+#endif
+}
+#endif
 
 void ensureWiFi() {
   unsigned long now = millis();
@@ -2596,7 +2845,10 @@ void ensureMqtt() {
   char willBuf[256];
   serializeJson(willDoc, willBuf, sizeof(willBuf));
 
-  mqttClient.setSocketTimeout(10);
+  // Use a longer socket timeout for the connect (TLS handshake can need 10–15s
+  // on marginal links) and a shorter one for steady-state loop reads so a dead
+  // TCP doesn't hold the whole main loop.
+  mqttClient.setSocketTimeout(MQTT_CONNECT_SOCKET_TIMEOUT_S);
   twdtFeedMaybe();
   bool ok = mqttClient.connect(
       deviceId, mqttUser, mqttPass,
@@ -2606,9 +2858,10 @@ void ensureMqtt() {
 
   if (!ok) {
     strlcpy(lastError, "mqtt_conn_fail", sizeof(lastError));
+    s_lastMqttConnCode = (int16_t)mqttClient.state();
     {
       char _mf[48];
-      snprintf(_mf, sizeof(_mf), "[mqtt] fail rc=%d", mqttClient.state());
+      snprintf(_mf, sizeof(_mf), "[mqtt] fail rc=%d", (int)s_lastMqttConnCode);
       logLine(_mf);
     }
 #if MQTT_USE_TLS
@@ -2662,7 +2915,10 @@ void ensureMqtt() {
 
   s_mqttConnFails = 0;
   s_mqttSelfHealAtMs = 0;
+  s_lastMqttConnCode = 0;
   logLine("[mqtt] connected");
+  // Shorten steady-state socket timeout so a broken TCP doesn't stall the loop.
+  mqttClient.setSocketTimeout(MQTT_LOOP_SOCKET_TIMEOUT_S);
   s_mqttCmdGraceUntilMs = millis() + (unsigned long)MQTT_POST_CONNECT_CMD_GRACE_MS;
   if (isProvisioned) {
     mqttClient.subscribe(topicCmd, 1);
@@ -3042,7 +3298,17 @@ void loop() {
     mqttClient.loop();
   }
 
+  // Edge-detect WiFi/MQTT transitions for the connectivity ledger surfaced
+  // via publishStatus.net_health. Cheap; no network I/O.
+  updateConnectivityLedger(now);
+
   ensureWiFi();
+#if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
+    !defined(CONFIG_IDF_TARGET_ESP32P4)
+  // Proactive AP switch on sustained weak signal. Skipped during OTA (WDT
+  // already suspended) and while the provisioning portal is running (above).
+  maybeRoamToStrongerAp(now);
+#endif
   ensureMqtt();
 
   if (mqttClient.connected()) {
@@ -3083,6 +3349,31 @@ void loop() {
       publishBootstrapRegister();
     }
   }
+#if DEVICE_SYNC_HTTP_ENABLED
+  // Backup command channel: only active when MQTT has been visibly down
+  // past COMMAND_HTTP_FALLBACK_ARM_MS. Disarms the moment MQTT is back
+  // up, so the HTTP pull never competes with live MQTT delivery — the
+  // broker's persistent session plus server cmd_queue replay covers the
+  // reconnect case without our help.
+  {
+    static unsigned long s_lastCmdHttpPullAtMs = 0;
+    bool mqttUp = mqttClient.connected();
+    bool armed = !mqttUp
+                 && isProvisioned
+                 && netIf->connected()
+                 && s_mqttLastDownAtMs != 0
+                 && (now - s_mqttLastDownAtMs) >= (unsigned long)COMMAND_HTTP_FALLBACK_ARM_MS;
+    if (armed && (now - s_lastCmdHttpPullAtMs) >= (unsigned long)COMMAND_HTTP_FALLBACK_POLL_MS) {
+      s_lastCmdHttpPullAtMs = now;
+      // The pull body runs handleCmdFromBody + HTTP ACK per entry; kick
+      // the watchdog around the slow bits so a large backlog can't trip
+      // it. Per-call HTTP uses QUICK_TIMEOUT (~4.5 s) so bounded latency.
+      esp_task_wdt_reset();
+      pullDeviceCommandsHttp((uint8_t)COMMAND_HTTP_FALLBACK_MAX_PER_POLL);
+      esp_task_wdt_reset();
+    }
+  }
+#endif
 
 #if ENABLE_WS_LOG
   wsClient.loop();

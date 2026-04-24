@@ -330,6 +330,62 @@
   /** Cleared when leaving Events; used to resume SSE when tab visible again. */
   window.__eventsStreamResume = null;
 
+  /**
+   * Central live-stream health flag used across all transports.
+   * Set by WS/SSE open+close hooks and consumed by:
+   *   - armHealthPoll (slows /health polling when stream is delivering)
+   *   - scheduleRouteTicker (slows per-route /devices etc. refresh)
+   *   - any ad-hoc code that wants to ask "is a live push channel open?"
+   *
+   * Shape:
+   *   { healthy: bool, transport: "ws"|"sse"|"", sinceMs: number, lastEventMs: number }
+   *
+   * healthy becomes true once OPEN + first real event arrives (stream.hello
+   * or any pushed event). It flips back to false on close/stall.
+   *
+   * The cross-tab consistency is deliberately loose — each tab keeps its own
+   * flag based on its own socket; this is about reducing pressure from THIS
+   * tab, not coordinating fleet-wide.
+   */
+  window.__streamHealth = window.__streamHealth || {
+    healthy: false,
+    transport: "",
+    sinceMs: 0,
+    lastEventMs: 0,
+  };
+  /** Mark the live stream as healthy (OPEN + first payload received). */
+  function markStreamHealthy(transport) {
+    const s = window.__streamHealth;
+    const now = Date.now();
+    const wasHealthy = !!s.healthy;
+    s.healthy = true;
+    s.transport = String(transport || s.transport || "");
+    if (!s.sinceMs) s.sinceMs = now;
+    s.lastEventMs = now;
+    if (!wasHealthy) {
+      // Re-arm dependent timers so they pick up the slower cadence immediately.
+      try { armHealthPoll(); } catch (_) {}
+      try { rearmVisibleRouteTickersForStreamHealth(); } catch (_) {}
+    }
+  }
+  /** Mark stream unhealthy (close / error / stall). */
+  function markStreamUnhealthy() {
+    const s = window.__streamHealth;
+    if (!s.healthy && !s.sinceMs) return;
+    const wasHealthy = !!s.healthy;
+    s.healthy = false;
+    s.sinceMs = 0;
+    if (wasHealthy) {
+      // Speed up pollers so the UI doesn't go stale while we reconnect.
+      try { armHealthPoll(); } catch (_) {}
+      try { rearmVisibleRouteTickersForStreamHealth(); } catch (_) {}
+    }
+  }
+  /** Called on each pushed event so staleness checks can use lastEventMs. */
+  function noteStreamActivity() {
+    window.__streamHealth.lastEventMs = Date.now();
+  }
+
   let healthPollTimer = null;
   /** Overview device search debounce. */
   let overviewFilterDebounce = null;
@@ -344,15 +400,26 @@
     loadHealth();
   }
 
-  /** When MQTT is down, poll faster so the green dot tracks reality (not a stale snapshot). */
+  /**
+   * /health polling cadences.
+   *   IDLE  = stream is healthy and MQTT is up → only a sanity check
+   *   SLOW  = default when stream unknown or just opened
+   *   FAST  = MQTT is DOWN → track green-dot reality (don't coast on stale)
+   * Stream being healthy is the "we already know live-state in real time" signal.
+   */
+  const HEALTH_POLL_IDLE_MS = 20000;
   const HEALTH_POLL_SLOW_MS = 8000;
   const HEALTH_POLL_FAST_MS = 3000;
 
   function armHealthPoll() {
     clearHealthPollTimer();
     if (!state.me) return;
-    const fast = state.mqttConnected === false;
-    const ms = fast ? HEALTH_POLL_FAST_MS : HEALTH_POLL_SLOW_MS;
+    const mqttDown = state.mqttConnected === false;
+    const streamOk = !!(window.__streamHealth && window.__streamHealth.healthy);
+    let ms;
+    if (mqttDown) ms = HEALTH_POLL_FAST_MS;
+    else if (streamOk) ms = HEALTH_POLL_IDLE_MS;
+    else ms = HEALTH_POLL_SLOW_MS;
     healthPollTimer = setInterval(tickHealthIfVisible, ms);
   }
 
@@ -1539,39 +1606,161 @@
   function clearRouteTickers() {
     const ticks = window.__routeTickers;
     if (!ticks) return;
-    for (const t of ticks.values()) {
-      try { clearTimeout(t); } catch (_) {}
+    for (const entry of ticks.values()) {
+      // Entries are {tid, debounceTid, baseMs, fn, run, routeSeq, unsub}
+      // post-refactor. Legacy code paths might still put a raw timer id in
+      // the map; handle both. The unsub also tears down the stream-bus
+      // subscription so events arriving after a route change don't fire into
+      // a stale closure and schedule work against the old routeSeq.
+      try {
+        if (entry && typeof entry === "object" && entry.tid !== undefined) {
+          clearTimeout(entry.tid);
+          if (entry.debounceTid) clearTimeout(entry.debounceTid);
+          if (typeof entry.unsub === "function") entry.unsub();
+        } else {
+          clearTimeout(entry);
+        }
+      } catch (_) {}
     }
     ticks.clear();
   }
-  function scheduleRouteTicker(routeSeq, key, fn, intervalMs) {
+  /**
+   * Tiny stream event bus. Populated by the WS/SSE read loops below (every
+   * decoded event is emitted here). Route handlers subscribe via
+   * `scheduleRouteTicker(..., { triggers: [...] })` to get an immediate refresh
+   * on matching events. This complements the slow periodic ticker: the ticker
+   * catches drift, the bus catches real changes (device.state, alarm, group).
+   */
+  window.__streamBus = window.__streamBus || (() => {
+    const subs = new Set();
+    return {
+      subscribe(fn) { subs.add(fn); return () => subs.delete(fn); },
+      emit(ev) {
+        if (!ev) return;
+        for (const fn of Array.from(subs)) {
+          try { fn(ev); } catch (_) {}
+        }
+      },
+      clear() { subs.clear(); },
+    };
+  })();
+  /** Test whether an event matches any of a list of prefix or wildcard patterns. */
+  function eventMatchesAny(ev, patterns) {
+    if (!patterns || !patterns.length) return false;
+    const t = String((ev && ev.event_type) || "");
+    const c = String((ev && ev.category) || "");
+    for (const p of patterns) {
+      if (!p) continue;
+      if (p === "*") return true;
+      if (p.endsWith(".*")) {
+        const head = p.slice(0, -2);
+        if (t === head || t.startsWith(head + ".")) return true;
+      } else if (p.startsWith("cat:")) {
+        if (c === p.slice(4)) return true;
+      } else if (t === p) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Multiplier applied to every route ticker's base interval when the live
+   * stream is healthy. The stream pushes real-time deltas, so re-pulling the
+   * same REST endpoint every 10-22s is redundant — we slow to a "drift
+   * correction" cadence instead. Flips back to 1× the instant the stream
+   * drops or a tab-focus triggers a recheck.
+   */
+  const ROUTE_TICKER_STREAM_SLOWDOWN = 3;
+  function effectiveRouteInterval(baseMs) {
+    const streamOk = !!(window.__streamHealth && window.__streamHealth.healthy);
+    if (!streamOk) return baseMs;
+    return Math.max(baseMs, Math.floor(baseMs * ROUTE_TICKER_STREAM_SLOWDOWN));
+  }
+  /**
+   * @param {number} routeSeq  Current route sequence (timers auto-cancel on route change)
+   * @param {string} key       Unique key per (route, view)
+   * @param {Function} fn      Async loader
+   * @param {number} intervalMs Base periodic interval
+   * @param {Object} [options]
+   *   options.triggers  — array of event_type patterns that trigger an
+   *                       immediate (debounced) refresh. Supports exact match,
+   *                       "*" for any, "device.*" prefix wildcards, and
+   *                       "cat:auth" to match by event.category.
+   *   options.triggerDebounceMs — debounce coalesce window (default 400ms).
+   */
+  function scheduleRouteTicker(routeSeq, key, fn, intervalMs, options) {
     window.__routeTickers = window.__routeTickers || new Map();
     const ticks = window.__routeTickers;
     const k = String(key || "");
     let running = false;
+    const baseMs = Math.max(1000, intervalMs);
+    const opts = options || {};
+    const triggers = Array.isArray(opts.triggers) ? opts.triggers : null;
+    const debounceMs = Math.max(100, opts.triggerDebounceMs || 400);
+    const entry = { baseMs, fn, run: null, routeSeq, tid: null, debounceTid: null, unsub: null };
+
     const run = async () => {
       if (!isRouteCurrent(routeSeq)) return;
       if (document.visibilityState !== "visible") {
-        const tid = setTimeout(run, intervalMs);
-        ticks.set(k, tid);
+        entry.tid = setTimeout(run, effectiveRouteInterval(baseMs));
+        ticks.set(k, entry);
         return;
       }
       if (running) {
-        const tid = setTimeout(run, intervalMs);
-        ticks.set(k, tid);
+        entry.tid = setTimeout(run, effectiveRouteInterval(baseMs));
+        ticks.set(k, entry);
         return;
       }
       running = true;
       try { await fn(); } catch (_) {}
       running = false;
       if (!isRouteCurrent(routeSeq)) return;
-      const tid = setTimeout(run, intervalMs);
-      ticks.set(k, tid);
+      entry.tid = setTimeout(run, effectiveRouteInterval(baseMs));
+      ticks.set(k, entry);
     };
+    entry.run = run;
+
     const old = ticks.get(k);
-    if (old) { try { clearTimeout(old); } catch (_) {} }
-    const first = setTimeout(run, intervalMs);
-    ticks.set(k, first);
+    if (old && typeof old === "object") {
+      try { clearTimeout(old.tid); } catch (_) {}
+      try { clearTimeout(old.debounceTid); } catch (_) {}
+      try { if (typeof old.unsub === "function") old.unsub(); } catch (_) {}
+    } else if (old) {
+      try { clearTimeout(old); } catch (_) {}
+    }
+    entry.tid = setTimeout(run, effectiveRouteInterval(baseMs));
+
+    if (triggers && triggers.length && window.__streamBus) {
+      entry.unsub = window.__streamBus.subscribe((ev) => {
+        if (!isRouteCurrent(routeSeq)) return;
+        if (document.visibilityState !== "visible") return;
+        if (!eventMatchesAny(ev, triggers)) return;
+        // Debounce coalesces bursts (e.g. 20 alarm.fanout events in one tick).
+        if (entry.debounceTid) return;
+        entry.debounceTid = setTimeout(() => {
+          entry.debounceTid = null;
+          try { clearTimeout(entry.tid); } catch (_) {}
+          entry.tid = setTimeout(run, 0);
+        }, debounceMs);
+      });
+    }
+
+    ticks.set(k, entry);
+  }
+  /**
+   * Recompute all visible route tickers' next-fire time based on the current
+   * stream health. Called from markStreamHealthy / markStreamUnhealthy so the
+   * new cadence takes effect without waiting a full old interval.
+   */
+  function rearmVisibleRouteTickersForStreamHealth() {
+    const ticks = window.__routeTickers;
+    if (!ticks) return;
+    for (const entry of ticks.values()) {
+      if (!entry || typeof entry !== "object" || !entry.run) continue;
+      try { clearTimeout(entry.tid); } catch (_) {}
+      entry.tid = setTimeout(entry.run, effectiveRouteInterval(entry.baseMs));
+    }
   }
 
   async function renderRoute() {
@@ -3525,7 +3714,11 @@
         renderGroups();
       } catch (_) {}
     };
-    scheduleRouteTicker(routeSeq, "overview-live", refreshOverviewLive, OVERVIEW_LIVE_MS);
+    scheduleRouteTicker(routeSeq, "overview-live", refreshOverviewLive, OVERVIEW_LIVE_MS, {
+      // Overview shows device presence + group counts — refresh on any
+      // device/alarm/group transition so the cards don't lag behind reality.
+      triggers: ["device.*", "alarm.*", "group.*", "device_state.*"],
+    });
     const ovOwnerInp = $("#ovOwnerFilter", view);
     const ovOwnerClr = $("#ovOwnerClear", view);
     if (ovOwnerInp && state.me && state.me.role === "superadmin") {
@@ -3877,7 +4070,9 @@
       ids = rows.map((d) => String(d.device_id || "")).filter(Boolean);
       renderGroupDevices();
     };
-    scheduleRouteTicker(routeSeq, `group-live-${g}`, refreshGroupLive, 10000);
+    scheduleRouteTicker(routeSeq, `group-live-${g}`, refreshGroupLive, 10000, {
+      triggers: ["device.*", "alarm.*", "device_state.*", "group.*"],
+    });
   });
 
   // Device list (no id) + device detail
@@ -4165,7 +4360,11 @@
       requestAnimationFrame(() => {
         setTimeout(() => { void loadDevicesAndHints(); }, 0);
       });
-      scheduleRouteTicker(routeSeq, "devices-list-live", loadDevicesAndHints, 22000);
+      scheduleRouteTicker(routeSeq, "devices-list-live", loadDevicesAndHints, 22000, {
+        // Devices list needs to pick up claims, ownership, profile, and
+        // presence edges in near-real-time while still throttling via ticker.
+        triggers: ["device.*", "alarm.*", "ota.*", "device_state.*"],
+      });
       return;
     }
     const isSuperViewer = !!(state.me && state.me.role === "superadmin");
@@ -4510,7 +4709,14 @@
       if (!isRouteCurrent(routeSeq) || !latest) return;
       d = latest;
       patchDeviceLive(latest);
-    }, 12000);
+    }, 12000, {
+      // Device detail refreshes on any relevant event for THIS device id;
+      // the bus filter is additional — the trigger list matches broadly
+      // because event-type nomenclature has drifted over releases. The
+      // per-device match is the ticker's own cache key, so other devices'
+      // events just trigger a cheap (no-op when cache still warm) pull.
+      triggers: ["device.*", "alarm.*", "ota.*", "ack.*", "device_state.*"],
+    });
     if (isSuperViewer) {
       const det = $("#mqttMsgDetails", view);
       const box = $("#devMsgsList", view);
@@ -5435,6 +5641,7 @@
         try { window.__evFetchAbort.abort(); } catch (_) {}
         window.__evFetchAbort = null;
       }
+      markStreamUnhealthy();
       const live = $("#evLive");
       if (live) { live.textContent = "Offline"; live.className = "badge offline"; }
     }
@@ -5500,6 +5707,7 @@
             }
             evReconnectBackoffMs = 500;
             shim.readyState = EventSource.OPEN;
+            markStreamHealthy("sse");
             const liveOn = $("#evLive");
             if (liveOn) {
               liveOn.textContent = "Live";
@@ -5527,8 +5735,12 @@
                 if (!isRouteCurrent(navTok)) return;
                 try {
                   const ev = JSON.parse(payload);
+                  noteStreamActivity();
                   if (ev.event_type === "stream.hello") return;
                   pushEvent(ev);
+                  // Fan out to the stream bus so route handlers can do
+                  // targeted refreshes (see scheduleRouteTicker triggers).
+                  try { window.__streamBus && window.__streamBus.emit(ev); } catch (_) {}
                 } catch (_) {}
               },
               () => {
@@ -5541,6 +5753,7 @@
             }
             if (ac.signal.aborted || !isRouteCurrent(navTok)) return;
             shim.readyState = EventSource.CLOSED;
+            markStreamUnhealthy();
             if (!paused && isRouteCurrent(navTok)) {
               evReconnectBackoffMs = 500;
               const live = $("#evLive");
@@ -5555,9 +5768,16 @@
               try { clearInterval(evStallTimer); } catch (_) {}
               evStallTimer = null;
             }
-            if (e && e.name === "AbortError") return;
-            if (!isRouteCurrent(navTok)) return;
+            if (e && e.name === "AbortError") {
+              markStreamUnhealthy();
+              return;
+            }
+            if (!isRouteCurrent(navTok)) {
+              markStreamUnhealthy();
+              return;
+            }
             shim.readyState = EventSource.CLOSED;
+            markStreamUnhealthy();
             const live = $("#evLive");
             if (live && isRouteCurrent(navTok)) {
               live.textContent = "Reconnecting…";
@@ -5595,6 +5815,7 @@
           wsOpened = true;
           evReconnectBackoffMs = 500;
           shimWs.readyState = EventSource.OPEN;
+          markStreamHealthy("ws");
           const liveOn = $("#evLive");
           if (liveOn) {
             liveOn.textContent = "Live";
@@ -5615,6 +5836,7 @@
         };
         ws.onmessage = (mev) => {
           lastChunkAt = Date.now();
+          noteStreamActivity();
           let j;
           try {
             j = JSON.parse(mev.data);
@@ -5625,10 +5847,14 @@
           if (j.type === "ping" || j.type === "hello") return;
           if (j.type === "event" && j.ev) {
             pushEvent(j.ev);
+            try { window.__streamBus && window.__streamBus.emit(j.ev); } catch (_) {}
             return;
           }
           if (j.event_type === "stream.hello") return;
-          if (j.summary || j.event_type) pushEvent(j);
+          if (j.summary || j.event_type) {
+            pushEvent(j);
+            try { window.__streamBus && window.__streamBus.emit(j); } catch (_) {}
+          }
         };
         ws.onclose = () => {
           clearTimeout(wsTimer);
@@ -5638,6 +5864,7 @@
           }
           window.__evWS = null;
           shimWs.readyState = EventSource.CLOSED;
+          markStreamUnhealthy();
           if (!wsOpened) {
             window.__evSSE = null;
             if (!isRouteCurrent(navTok) || paused) return;

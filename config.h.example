@@ -323,6 +323,40 @@
 #define VBAT_LOW_THRESHOLD 3.30f
 #define RSSI_WEAK_THRESHOLD -75
 
+// ── Wi-Fi roaming (signal-driven AP switch) ──
+// When RSSI stays below WIFI_ROAM_RSSI_DBM for WIFI_ROAM_SUSTAIN_MS and at
+// least one other registered AP is configured, we call WiFi.disconnect(false)
+// + WiFiMulti::run to let the radio pick the strongest available AP. Pure
+// ESP-IDF STA has no automatic roaming and otherwise sticks to the first AP
+// it associated with — which is often a distant router with weak link.
+//   rssi threshold: dBm; set <= -90 to effectively disable roaming
+//   sustain:        ms the weak reading must hold before we switch (avoids
+//                   flapping on momentary fading)
+//   min_gap:        ms between two roam attempts (rate-limit)
+#ifndef WIFI_ROAM_ENABLED
+#define WIFI_ROAM_ENABLED 1
+#endif
+#ifndef WIFI_ROAM_RSSI_DBM
+#define WIFI_ROAM_RSSI_DBM -80
+#endif
+#ifndef WIFI_ROAM_SUSTAIN_MS
+#define WIFI_ROAM_SUSTAIN_MS (30UL * 1000UL)
+#endif
+#ifndef WIFI_ROAM_MIN_GAP_MS
+#define WIFI_ROAM_MIN_GAP_MS (3UL * 60UL * 1000UL)
+#endif
+
+// ── MQTT hardened timeouts (visible knobs for marginal links) ──
+// PubSubClient defaults to 15s socket timeout for both connect and inflight
+// read. Too long and a dead TCP stalls the whole loop; too short and TLS
+// handshake on a loaded cellular/Wi-Fi link fails before keys complete.
+#ifndef MQTT_CONNECT_SOCKET_TIMEOUT_S
+#define MQTT_CONNECT_SOCKET_TIMEOUT_S 15
+#endif
+#ifndef MQTT_LOOP_SOCKET_TIMEOUT_S
+#define MQTT_LOOP_SOCKET_TIMEOUT_S 5
+#endif
+
 // ── ADC calibration ──
 #define ADC_MAX 4095.0f
 #define ADC_VREF 3.30f
