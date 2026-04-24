@@ -6023,6 +6023,10 @@ def _firmware_update_hint_for_current_in_catalog(
     best = _best_catalog_entry_newer_than_fw(current_fw, catalog)
     if not best:
         return None
+    cur = (current_fw or "").strip().lower()
+    tgt = str(best.get("version_str") or "").strip().lower()
+    if cur and tgt and cur == tgt:
+        return None
     return _firmware_hint_dict_from_entry(best)
 
 

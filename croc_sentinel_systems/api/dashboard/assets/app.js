@@ -11,6 +11,7 @@
     role: "croc.role",
     zones: "croc.zones",
     theme: "croc.theme",
+    sidebarCollapsed: "croc.sidebar.collapsed",
   };
   const OFFLINE_MS = 90 * 1000;
 
@@ -91,6 +92,7 @@
     const c = m[kind] || m.login;
     return `
       <aside class="auth-surface__side" aria-label="ESA">
+        <div class="auth-surface__side-main">
         <div class="auth-surface__side-content">
           <div class="auth-surface__company" lang="en">
             <p class="auth-surface__company-eyebrow">Secured platform provider</p>
@@ -103,6 +105,14 @@
           <ul class="auth-surface__bullets" role="list">
             ${c.items.map((x) => `<li>${x}</li>`).join("")}
           </ul>
+        </div>
+        </div>
+        <div class="auth-surface__side-foot" role="group" aria-label="Partners">
+          <div class="auth-surface__partner-logos">
+            <img class="auth-surface__partner-logo" src="assets/partners/partner-1.png" alt="" data-partner-slot="1" loading="lazy" decoding="async" onerror="this.style.display='none'" />
+            <img class="auth-surface__partner-logo" src="assets/partners/partner-2.png" alt="" data-partner-slot="2" loading="lazy" decoding="async" onerror="this.style.display='none'" />
+            <img class="auth-surface__partner-logo" src="assets/partners/partner-3.png" alt="" data-partner-slot="3" loading="lazy" decoding="async" onerror="this.style.display='none'" />
+          </div>
         </div>
       </aside>`;
   }
@@ -867,14 +877,46 @@
     scheduleSyncGroupMetaFromServer();
   }
 
-  const FW_HINT_DLG_VER = "3";
-  function fwChangelogStorageKey(toFile) {
-    return "croc.fwChangelog.v1:" + String(toFile || "").replace(/[^\w.\-]/g, "_");
+  function normalizeFwLabel(s) {
+    return String(s == null ? "" : s)
+      .trim()
+      .toLowerCase()
+      .replace(/^v+/, "");
+  }
+  function firmwareHintStillValid(devFw, hint) {
+    if (!hint || !hint.update_available) return false;
+    const t = normalizeFwLabel(hint.to_version);
+    const c = normalizeFwLabel(devFw);
+    if (c && t && c === t) return false;
+    return true;
   }
 
-  function openGlobalFwHintDialog(hint, ctx) {
+  const FW_HINT_DLG_VER = "4";
+  async function openGlobalFwHintDialog(hint, ctx) {
     ctx = ctx || {};
     if (!hint || !hint.update_available) return;
+    if (ctx.deviceId) {
+      try {
+        const row = await api(`/devices/${encodeURIComponent(ctx.deviceId)}`, { timeoutMs: 16000 });
+        if (row && row.fw != null) ctx = Object.assign({}, ctx, { currentFw: String(row.fw) });
+        const h2 = row && row.firmware_hint;
+        if (!h2 || !h2.update_available || !firmwareHintStillValid(row && row.fw, h2)) {
+          toast("Firmware is up to date.", "ok");
+          try { bustDeviceListCaches(); } catch (_) {}
+          return;
+        }
+        hint = h2;
+      } catch (_) {
+        if (!firmwareHintStillValid(ctx.currentFw, hint)) {
+          toast("Firmware is up to date.", "ok");
+          return;
+        }
+      }
+    } else if (!firmwareHintStillValid(ctx.currentFw, hint)) {
+      toast("Firmware is up to date.", "ok");
+      return;
+    }
+
     let dlg = document.getElementById("crocFwHintDialog");
     if (!dlg || dlg.dataset.crocFwDlgVer !== FW_HINT_DLG_VER) {
       if (dlg) dlg.remove();
@@ -885,18 +927,14 @@
       dlg.setAttribute("aria-label", "Firmware update");
       dlg.innerHTML = `
         <div class="croc-fw-hint-dlg__form">
-          <h3 class="croc-fw-hint-dlg__title">固件更新 / Firmware update</h3>
+          <h3 class="croc-fw-hint-dlg__title">Firmware update</h3>
           <div class="croc-fw-hint-dlg__compare" id="crocFwHintCompare" aria-live="polite"></div>
-          <label class="croc-fw-hint-dlg__changelog-label" for="crocFwHintChangelog">本次更新 / What this update fixes</label>
-          <textarea id="crocFwHintChangelog" class="croc-fw-hint-dlg__changelog" rows="5" maxlength="8000" readonly spellcheck="true" placeholder="在此填写或粘贴说明（仅保存在本浏览器）… / Notes for your team (saved in this browser only)…"></textarea>
-          <div class="row croc-fw-hint-dlg__note-actions" style="margin-top:6px;flex-wrap:wrap;gap:8px">
-            <button type="button" class="btn secondary btn-tap" id="crocFwHintEditNote">编辑说明 / Edit</button>
-            <button type="button" class="btn btn-tap" id="crocFwHintSaveNote">保存说明 / Save notes</button>
-          </div>
+          <p class="croc-fw-hint-dlg__release-label" id="crocFwHintRelLabel" style="display:none">Package notes (from .bin / sidecar)</p>
+          <pre class="croc-fw-hint-dlg__release" id="crocFwHintRelease" style="display:none"></pre>
           <p class="croc-fw-hint-dlg__preflight muted" id="crocFwHintPreflight" style="margin:10px 0 0;min-height:1.2em"></p>
           <div class="row" style="justify-content:flex-end;margin-top:14px;gap:8px;flex-wrap:wrap">
-            <button type="button" class="btn secondary btn-tap" id="crocFwHintClose">关闭 / Close</button>
-            <button type="button" class="btn btn-tap" id="crocFwHintDoOta" style="display:none">发送 OTA / Send OTA</button>
+            <button type="button" class="btn secondary btn-tap" id="crocFwHintClose">Close</button>
+            <button type="button" class="btn btn-tap" id="crocFwHintDoOta" style="display:none">Send OTA</button>
           </div>
         </div>`;
       document.body.appendChild(dlg);
@@ -905,65 +943,37 @@
     const curFw = String(ctx.currentFw != null ? ctx.currentFw : "").trim() || "—";
     const newFw = String(hint.to_version || "—").trim() || "—";
     const toFile = String(hint.to_file || "").trim();
-    const lsKey = fwChangelogStorageKey(toFile);
-    let savedLocal = "";
-    try { savedLocal = localStorage.getItem(lsKey) || ""; } catch (_) {}
     const serverNotes = String(hint.release_notes || "").trim();
-    const mergedDefault = (savedLocal && savedLocal.trim()) ? savedLocal : serverNotes;
+    const relEl = document.getElementById("crocFwHintRelease");
+    const relLab = document.getElementById("crocFwHintRelLabel");
+    if (relEl) {
+      relEl.textContent = serverNotes || "No release notes for this build (add .txt / .md next to the .bin on the server).";
+      relEl.style.display = "block";
+    }
+    if (relLab) relLab.style.display = "block";
 
     const cmp = document.getElementById("crocFwHintCompare");
     if (cmp) {
       cmp.innerHTML =
-        `<span class="croc-fw-hint-dlg__ver mono" title="Current firmware">${escapeHtml(curFw)}</span>` +
+        `<span class="croc-fw-hint-dlg__ver mono" title="Current">${escapeHtml(curFw)}</span>` +
         `<span class="croc-fw-hint-dlg__ver-arrow" aria-hidden="true">→</span>` +
-        `<span class="croc-fw-hint-dlg__ver mono croc-fw-hint-dlg__ver--new" title="Target firmware">${escapeHtml(newFw)}</span>`;
-    }
-
-    const ta = document.getElementById("crocFwHintChangelog");
-    if (ta) {
-      ta.value = mergedDefault;
-      ta.readOnly = true;
+        `<span class="croc-fw-hint-dlg__ver mono croc-fw-hint-dlg__ver--new" title="New">${escapeHtml(newFw)}</span>`;
     }
 
     const pre = document.getElementById("crocFwHintPreflight");
     if (pre) {
       if (!ctx.deviceId || !can("can_send_command")) {
-        pre.textContent =
-          "在设备详情页且具备命令权限时，可一键下发 OTA。/ Open device detail with command permission for one-tap OTA.";
+        pre.textContent = "Open a device with command permission to send OTA in one step.";
       } else if (ctx.canOperateThisDevice === false) {
-        pre.textContent =
-          "当前账号对此设备无 Operate 权限，无法下发 OTA。/ No operate permission on this device — OTA disabled.";
+        pre.textContent = "No operate permission on this device — OTA disabled.";
       } else {
-        pre.textContent =
-          "「发送 OTA」将校验：登录 token、固件 URL（服务端 OTA token 探测）、设备 Operate 权限。/ Send OTA checks session, firmware URL (server-side token probe), and operate permission.";
+        pre.textContent = "Send OTA verifies your session, firmware URL (server probe with OTA token), and operate access.";
       }
     }
 
     const closeBtn = document.getElementById("crocFwHintClose");
     if (closeBtn) {
       closeBtn.onclick = () => { try { dlg.close(); } catch (_) {} };
-    }
-
-    const editBtn = document.getElementById("crocFwHintEditNote");
-    const saveBtn = document.getElementById("crocFwHintSaveNote");
-    if (editBtn) {
-      editBtn.onclick = () => {
-        if (!ta) return;
-        ta.readOnly = false;
-        ta.focus();
-      };
-    }
-    if (saveBtn) {
-      saveBtn.onclick = () => {
-        if (!ta || !toFile) return;
-        try {
-          localStorage.setItem(lsKey, ta.value);
-          ta.readOnly = true;
-          toast("说明已保存到本机 / Notes saved locally", "ok");
-        } catch (e) {
-          toast(e.message || "save failed", "err");
-        }
-      };
     }
 
     const did = String(ctx.deviceId || "").trim();
@@ -977,15 +987,28 @@
         const url = String(hint.download_url || "").trim();
         const fw = String(hint.to_version || "").trim();
         if (!did || !url || !fw) {
-          toast("缺少设备或下载信息 / Missing device or download info", "err");
+          toast("Missing device or download information.", "err");
           return;
         }
-        if (!confirm(`向设备发送 OTA？\nSend OTA to device?\n\n${did}\n${curFw} → ${fw}`)) return;
+        let fresh = null;
+        try {
+          fresh = await api(`/devices/${encodeURIComponent(did)}`, { timeoutMs: 16000 });
+        } catch (_) { /* use hint */ }
+        if (fresh) {
+          const h3 = fresh.firmware_hint;
+          if (!firmwareHintStillValid(fresh.fw, h3) || !h3 || !h3.update_available) {
+            toast("Firmware is already up to date.", "ok");
+            try { bustDeviceListCaches(); } catch (_) {}
+            try { dlg.close(); } catch (_) {}
+            return;
+          }
+        }
+        if (!confirm(`Send OTA to this device?\n\n${did}\n\n${curFw} → ${fw}`)) return;
         otaBtn.disabled = true;
-        if (pre) pre.textContent = "检查中… / Checking…";
+        if (pre) pre.textContent = "Checking…";
         try {
           if (!getToken()) {
-            throw new Error("未登录或会话已过期 / Not signed in or session expired");
+            throw new Error("Not signed in or session expired");
           }
           let canOp = true;
           if (ctx.canOperateThisDevice !== true) {
@@ -995,22 +1018,19 @@
             canOp = true;
           }
           if (!canOp) {
-            throw new Error("无此设备的操作权限（需 Operate）/ No operate permission on this device");
+            throw new Error("No operate permission on this device");
           }
           const probe = await api(`/ota/firmware-reachability?name=${encodeURIComponent(toFile)}`, { timeoutMs: 25000 });
           if (!probe || !probe.ok) {
             const det = probe && probe.detail ? String(probe.detail) : "probe failed";
-            throw new Error(`固件 URL 探测失败 / Firmware probe failed: ${det}`);
+            throw new Error(`Firmware URL probe failed: ${det}`);
           }
-          if (pre) {
-            pre.textContent =
-              "探测通过，正在下发 OTA 命令… / Probe OK, sending ota command…";
-          }
+          if (pre) pre.textContent = "Sending OTA command…";
           await api(`/devices/${encodeURIComponent(did)}/commands`, {
             method: "POST",
             body: { cmd: "ota", params: { url, fw } },
           });
-          toast("OTA 命令已发送 / OTA command sent", "ok");
+          toast("OTA command sent", "ok");
           try { bustDeviceListCaches(); } catch (_) {}
           dlg.close();
         } catch (e) {
@@ -1031,7 +1051,7 @@
     const hBtn = $("#devFwHintBtn", view);
     if (hBtn) {
       const h = dev && dev.firmware_hint;
-      if (h && h.update_available) {
+      if (h && h.update_available && firmwareHintStillValid(dev && dev.fw, h)) {
         hBtn.style.display = "inline-flex";
         const did = String(deviceIdForOta || (dev && dev.device_id) || "");
         const operate = !!(dev && dev.can_operate);
@@ -1126,6 +1146,7 @@
     }
     renderNav();
     renderHealthPills();
+    try { applySidebarRail(); } catch (_) {}
   }
 
   function renderNav() {
@@ -1146,7 +1167,7 @@
           ? ` aria-current="page"`
           : "";
         coreParts.push(
-          `<a href="${n.path}"${active}><span class="nav-ico">${n.ico}</span>${escapeHtml(n.label)}</a>`,
+          `<a href="${n.path}"${active} title="${escapeHtml(n.label)}"><span class="nav-ico" aria-hidden="true">${n.ico}</span><span class="nav-label">${escapeHtml(n.label)}</span></a>`,
         );
       }
     }
@@ -1216,6 +1237,38 @@
     document.body.dataset.nav = open ? "open" : "";
   }
 
+  function applySidebarRail() {
+    const m = window.matchMedia && window.matchMedia("(min-width: 901px)");
+    if (!m || !m.matches) {
+      try { document.body.removeAttribute("data-sidebar"); } catch (_) {}
+    } else {
+      try {
+        const c = localStorage.getItem(LS.sidebarCollapsed) === "1";
+        if (c) document.body.setAttribute("data-sidebar", "collapsed");
+        else document.body.removeAttribute("data-sidebar");
+      } catch (_) {
+        try { document.body.removeAttribute("data-sidebar"); } catch (_) {}
+      }
+    }
+    const btn = document.getElementById("sidebarRailToggle");
+    if (btn) {
+      const isCol = document.body.getAttribute("data-sidebar") === "collapsed";
+      btn.setAttribute("aria-label", isCol ? "Expand sidebar" : "Collapse sidebar");
+      btn.setAttribute("aria-expanded", isCol ? "false" : "true");
+      btn.setAttribute("title", isCol ? "Expand sidebar" : "Collapse sidebar");
+      const svgL = "<svg class=\"sidebar-rail-toggle__icon\" viewBox=\"0 0 24 24\" width=\"18\" height=\"18\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M15 6l-6 6 6 6\"/></svg>";
+      const svgR = "<svg class=\"sidebar-rail-toggle__icon\" viewBox=\"0 0 24 24\" width=\"18\" height=\"18\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M9 6l6 6-6 6\"/></svg>";
+      btn.innerHTML = isCol ? svgR : svgL;
+    }
+  }
+
+  function toggleSidebarRail() {
+    if (!window.matchMedia("(min-width: 901px)").matches) return;
+    const cur = localStorage.getItem(LS.sidebarCollapsed) === "1";
+    try { localStorage.setItem(LS.sidebarCollapsed, cur ? "0" : "1"); } catch (_) {}
+    applySidebarRail();
+  }
+
   /** Collapse drawer when viewport is desktop width (e.g. rotate phone / resize). */
   function syncNavForViewport() {
     try {
@@ -1223,6 +1276,7 @@
         document.body.dataset.nav = "";
       }
     } catch (_) {}
+    try { applySidebarRail(); } catch (_) {}
   }
 
   // ------------------------------------------------------------------ router
@@ -1319,6 +1373,7 @@
     }
     const routeId = id === "alarm-log" ? "signals" : id;
     document.body.dataset.layout = publicRoutes.has(routeId) ? "auth" : "app";
+    try { applySidebarRail(); } catch (_) {}
     const handler = routes[routeId] || routes["overview"];
     try {
       mountView(view, `<div class="route-loading card" aria-busy="true" role="status">
@@ -3402,7 +3457,7 @@
         const fwInline = d.fw
           ? `<span class="device-fw-inline" style="display:inline-flex;align-items:center;gap:3px;vertical-align:middle">` +
             `<span class="chip">v${escapeHtml(d.fw)}</span>` +
-            (d.firmware_hint && d.firmware_hint.update_available
+            (d.firmware_hint && d.firmware_hint.update_available && firmwareHintStillValid(d.fw, d.firmware_hint)
               ? `<button type="button" class="fw-hint-badge fw-hint-badge--sm js-fw-hint" data-did="${escapeHtml(did)}" title="New firmware on server" aria-label="Firmware update: view release notes">` +
                 `<span class="fw-hint-badge__shell"><span class="fw-hint-badge__arrow" aria-hidden="true">↑</span><span class="fw-hint-badge__dot" aria-hidden="true"></span></span>` +
                 `</button>`
@@ -3429,6 +3484,10 @@
         const items = filteredItems();
         const grid = $("#allDevicesGrid", view);
         if (!grid) return;
+        try {
+          grid.classList.remove("device-grid--skeleton");
+          grid.removeAttribute("aria-busy");
+        } catch (_) {}
         if (allItems.length === 0) {
           setChildMarkup(grid, `<p class="muted" style="padding:8px 0">No devices in your scope.</p>`);
           bulkBarState();
@@ -3460,35 +3519,35 @@
         for (const it of allItems) {
           const k = String(it.device_id);
           const h = o[k];
-          it.firmware_hint = h && h.update_available ? h : null;
+          it.firmware_hint = h && h.update_available && firmwareHintStillValid(it.fw, h) ? h : null;
         }
       };
       const loadDevicesAndHints = async () => {
         if (!isRouteCurrent(routeSeq)) return;
-        const [devR, hintR] = await Promise.allSettled([
-          api("/devices", { timeoutMs: 20000, retries: 2 }),
-          api("/devices/firmware-hints", { timeoutMs: 30000, retries: 1 }),
-        ]);
-        if (!isRouteCurrent(routeSeq)) return;
-        if (devR.status !== "fulfilled") {
-          if (devR.status === "rejected") toast(String(devR.reason && devR.reason.message) || "Failed to load devices", "err");
+        let r;
+        try {
+          r = await api("/devices", { timeoutMs: 20000, retries: 2 });
+        } catch (e) {
+          if (isRouteCurrent(routeSeq)) toast(String(e && e.message) || "Failed to load devices", "err");
           return;
         }
-        const r = devR.value;
+        if (!isRouteCurrent(routeSeq)) return;
         allItems = Array.isArray(r.items) ? r.items : [];
         for (const did of Array.from(selectedIds)) {
           if (!allItems.some((x) => String(x.device_id) === did)) selectedIds.delete(did);
         }
-        if (hintR.status === "fulfilled" && hintR.value) {
-          mergeFirmwareHintsObject(hintR.value.hints);
-        } else {
-          for (const it of allItems) {
-            const k = String(it.device_id);
-            const h = hintById.get(k);
-            it.firmware_hint = h && h.update_available ? h : null;
-          }
+        for (const it of allItems) {
+          it.firmware_hint = null;
         }
         applyFilter();
+        try {
+          const hintRes = await api("/devices/firmware-hints", { timeoutMs: 25000, retries: 0 });
+          if (!isRouteCurrent(routeSeq)) return;
+          mergeFirmwareHintsObject((hintRes && hintRes.hints) || {});
+        } catch (_) {
+          /* list already visible; hints are optional */
+        }
+        if (isRouteCurrent(routeSeq)) applyFilter();
       };
       mountView(view, `
         <div class="card" style="margin:0 0 12px">
@@ -3524,8 +3583,8 @@
             </details>
           </div>
         </div>
-        <div id="allDevicesGrid" class="device-grid">
-          <p class="muted">Loading…</p>
+        <div id="allDevicesGrid" class="device-grid device-grid--skeleton" aria-busy="true">
+          ${[1, 2, 3, 4, 5, 6].map(() => `<div class="device-card device-card--skeleton" role="presentation"><div class="device-card--skeleton__thumb"></div><div class="device-card--skeleton__body"><div class="device-card--skeleton__line device-card--skeleton__line--w80"></div><div class="device-card--skeleton__line device-card--skeleton__line--w40"></div><div class="device-card--skeleton__line device-card--skeleton__line--w90"></div></div></div>`).join("")}
         </div>
       `);
       const f = $("#allDevFilter", view);
@@ -3609,8 +3668,10 @@
           });
         }
       });
-      await loadDevicesAndHints();
-      scheduleRouteTicker(routeSeq, "devices-list-live", loadDevicesAndHints, 12000);
+      requestAnimationFrame(() => {
+        setTimeout(() => { void loadDevicesAndHints(); }, 0);
+      });
+      scheduleRouteTicker(routeSeq, "devices-list-live", loadDevicesAndHints, 22000);
       return;
     }
     const isSuperViewer = !!(state.me && state.me.role === "superadmin");
@@ -3754,7 +3815,7 @@
             <span class="badge ${dm.on ? "online" : "offline"}" id="devOnlineBadge">${dm.on ? "online" : "offline"}</span>
             <span class="chip" id="devReasonChip">${escapeHtml(reasonEn[dm.reason] || dm.reason)}</span>
             ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
-            <a href="#/overview" class="btn ghost right">← Overview</a>
+            <a href="#/devices" class="btn ghost right">← All devices</a>
           </div>
           <div class="device-hero-card">
             <div class="device-thumb">${escapeHtml((d.display_label || id || "?").slice(0, 1).toUpperCase())}</div>
@@ -3763,7 +3824,7 @@
                 <span class="muted">Firmware</span>
                 <span class="device-hero-fw" style="display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end">
                   <span class="mono" id="devFwVer">${escapeHtml(d.fw || "—")}</span>
-                  <button type="button" class="fw-hint-badge" id="devFwHintBtn" style="display:${(d.firmware_hint && d.firmware_hint.update_available) ? "inline-flex" : "none"}" title="New firmware on server — view release notes" aria-label="Firmware update: view release notes"><span class="fw-hint-badge__shell"><span class="fw-hint-badge__arrow" aria-hidden="true">↑</span><span class="fw-hint-badge__dot" aria-hidden="true"></span></span><span class="visually-hidden">New firmware on server</span></button>
+                  <button type="button" class="fw-hint-badge" id="devFwHintBtn" style="display:${(d.firmware_hint && d.firmware_hint.update_available && firmwareHintStillValid(d.fw, d.firmware_hint)) ? "inline-flex" : "none"}" title="New firmware on server" aria-label="Firmware update"><span class="fw-hint-badge__shell"><span class="fw-hint-badge__arrow" aria-hidden="true">↑</span><span class="fw-hint-badge__dot" aria-hidden="true"></span></span><span class="visually-hidden">New firmware on server</span></button>
                 </span>
               </div>
               <div class="device-hero-line"><span class="muted">Platform</span><span class="mono">${escapeHtml(maskPlatform(`${d.chip_target || ""}/${d.board_profile || ""}`))}</span></div>
@@ -3932,11 +3993,11 @@
     patchDeviceLive(d);
     scheduleRouteTicker(routeSeq, `device-live-${id}`, async () => {
       if (!isRouteCurrent(routeSeq)) return;
-      const latest = await apiGetCached(`/devices/${encodeURIComponent(id)}`, { timeoutMs: 16000 }, 2000);
+      const latest = await apiGetCached(`/devices/${encodeURIComponent(id)}`, { timeoutMs: 16000 }, 5000);
       if (!isRouteCurrent(routeSeq) || !latest) return;
       d = latest;
       patchDeviceLive(latest);
-    }, 8000);
+    }, 12000);
     if (isSuperViewer) {
       const det = $("#mqttMsgDetails", view);
       const box = $("#devMsgsList", view);
@@ -4015,7 +4076,7 @@
             `Device removed from account.${ackNv ? " Device confirmed unclaim_reset (WiFi+claim cleared, rebooting)." : (sentNv ? " Command was dispatched but device ack not confirmed before unlink." : " Command dispatch failed/offline.")} Re-add from Activate.`,
             ackNv ? "ok" : "err",
           );
-          location.hash = "#/overview";
+          location.hash = "#/devices";
         } catch (e) { toast(e.message || e, "err"); }
       });
     }
@@ -4709,7 +4770,8 @@
             `<div class="audit-extra-row"><span class="audit-k">${escapeHtml(row.k)}</span><span class="audit-v mono">${escapeHtml(row.v)}</span></div>`,
         ).join("")}</div>`
         : "";
-      return `<article class="audit-item" data-level="${escapeHtml(e.level || "")}">
+      return `<details class="audit-item audit-item--foldable" data-level="${escapeHtml(e.level || "")}">
+        <summary class="audit-item__fold-sum">
         <div class="audit-item-top">
           <div class="audit-time">
             <span class="audit-ts mono">${escapeHtml(tsShort)}</span>
@@ -4718,7 +4780,9 @@
           <span class="badge ${badgeClass(e.level)}">${escapeHtml(e.level || "")}</span>
           <span class="badge ${catClass(e.category)}">${escapeHtml(e.category || "")}</span>
         </div>
-        <div class="audit-item-line" style="font-weight:600">${escapeHtml(primary)}${typeTag}</div>
+        <div class="audit-item-line audit-item__fold-primary" style="font-weight:600;margin-top:8px">${escapeHtml(primary)}${typeTag}</div>
+        </summary>
+        <div class="audit-item__fold-body">
         <div class="audit-item-line" style="font-size:12.5px;flex-wrap:wrap">
           <span class="audit-actor">${e.actor ? escapeHtml(e.actor) : "—"}</span>
           ${targetStr ? ` <span class="audit-arrow">→</span> <span class="mono audit-target">${escapeHtml(targetStr)}</span>` : ""}
@@ -4726,7 +4790,8 @@
           ${e.owner_admin ? ` <span class="chip" title="owner_admin">@${escapeHtml(e.owner_admin)}</span>` : ""}
         </div>
         ${extraBlock}
-      </article>`;
+        </div>
+      </details>`;
     }
     function flushEvRender() {
       evRenderTimer = 0;
@@ -6056,8 +6121,9 @@
     initTheme();
 
     $("#menuBtn").addEventListener("click", () => toggleNav());
-    $("#sidebarClose").addEventListener("click", () => toggleNav(false));
     $("#sidebarBackdrop").addEventListener("click", () => toggleNav(false));
+    const railT = document.getElementById("sidebarRailToggle");
+    if (railT) railT.addEventListener("click", () => toggleSidebarRail());
     window.addEventListener("resize", syncNavForViewport);
     window.addEventListener("orientationchange", syncNavForViewport);
     $("#themeBtn").addEventListener("click", () => {
@@ -6083,6 +6149,7 @@
 
     await (getToken() ? loadMe() : Promise.resolve());
     syncNavForViewport();
+    try { applySidebarRail(); } catch (_) {}
     if (!location.hash) location.hash = state.me ? "#/overview" : "#/login";
     else renderRoute();
     await loadHealth().catch(() => {});
