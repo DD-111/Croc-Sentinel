@@ -25,6 +25,7 @@
       items: [
         { id: "overview", label: "Overview", ico: "◎", path: "#/overview", min: "user" },
         { id: "devices", label: "All devices", ico: "▢", path: "#/devices", min: "user" },
+        { id: "site", label: "Site", ico: "⌁", path: "#/site", min: "superadmin" },
       ],
     },
     {
@@ -142,20 +143,41 @@
     } catch (_) {}
     return s.replace(/\s+/g, " ");
   }
-  /** Stable localStorage / UI key for a group card; superadmin includes owning admin in the key. */
+  /** Stable localStorage / UI key for a group card; superadmin always prefixes owning admin (avoids duplicate cards vs plain group key). */
   function groupCardMetaKey(groupKey, tenantOwner) {
     const gk = canonicalGroupKey(groupKey);
-    const o = String(tenantOwner || "").trim();
-    if (state.me && state.me.role === "superadmin" && o) return `${o}${GROUP_CARD_TENANT_SEP}${gk}`;
+    if (!gk) return "";
+    if (state.me && state.me.role === "superadmin") {
+      const o = String(tenantOwner || "").trim();
+      return `${o || "__unowned__"}${GROUP_CARD_TENANT_SEP}${gk}`;
+    }
     return gk;
   }
   function parseGroupMetaKey(metaKey) {
     const mk = String(metaKey || "");
     if (state.me && state.me.role === "superadmin" && mk.includes(GROUP_CARD_TENANT_SEP)) {
       const i = mk.indexOf(GROUP_CARD_TENANT_SEP);
-      return { tenantOwner: mk.slice(0, i).trim(), groupKey: canonicalGroupKey(mk.slice(i + 1)) };
+      let tenantOwner = mk.slice(0, i).trim();
+      if (tenantOwner === "__unowned__") tenantOwner = "";
+      return { tenantOwner, groupKey: canonicalGroupKey(mk.slice(i + 1)) };
     }
     return { tenantOwner: "", groupKey: canonicalGroupKey(mk) };
+  }
+  /** Group card slots from a device list (Overview / Site). */
+  function buildGroupSlotsFromDeviceList(devList) {
+    const acc = new Map();
+    const isSuper = state.me && state.me.role === "superadmin";
+    for (const d of (Array.isArray(devList) ? devList : [])) {
+      const gk = canonicalGroupKey(d && d.notification_group);
+      if (!gk) continue;
+      const tenant = isSuper ? String(d.owner_admin || "").trim() : "";
+      const mk = groupCardMetaKey(gk, tenant);
+      if (!acc.has(mk)) acc.set(mk, { metaKey: mk, groupKey: gk, tenantOwner: tenant });
+    }
+    return Array.from(acc.values()).sort((a, b) => {
+      const c = a.groupKey.localeCompare(b.groupKey);
+      return c !== 0 ? c : a.tenantOwner.localeCompare(b.tenantOwner);
+    });
   }
   function groupApiQueryOwner(tenantOwner) {
     const o = String(tenantOwner || "").trim();
@@ -1233,7 +1255,9 @@
       for (const n of items) {
         const active = (n.path === "#/devices"
           ? hashNoQuery === "#/devices"
-          : hash.startsWith(n.path))
+          : n.path === "#/site"
+            ? hashNoQuery === "#/site"
+            : hash.startsWith(n.path))
           ? ` aria-current="page"`
           : "";
         coreParts.push(
@@ -2311,6 +2335,17 @@
           <h2 style="margin:0">Group cards</h2>
           <button class="btn sm secondary right" id="grpNew">New group</button>
         </div>
+        ${state.me && state.me.role === "superadmin" ? `
+        <div class="row" style="flex-wrap:wrap;gap:10px;align-items:flex-end;margin:10px 0 4px">
+          <label class="field" style="margin:0;min-width:220px;flex:1">
+            <span>Filter by owner / 按租户筛选组卡</span>
+            <input type="search" id="ovOwnerFilter" list="ovOwnerDatalist" placeholder="username substring…" autocomplete="off" />
+            <datalist id="ovOwnerDatalist"></datalist>
+          </label>
+          <button type="button" class="btn sm secondary btn-tap" id="ovOwnerClear">Clear</button>
+        </div>
+        <p class="muted" style="margin:0 0 8px;font-size:12px">Each tenant gets one card per notification group (unassigned devices use the <span class="mono">__unowned__</span> bucket). Use Site for a full owner-centric view.</p>
+        ` : ""}
         ${state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_manage_users"))) ? `
         <div class="share-global-panel">
           <div class="share-global-head">
@@ -2425,6 +2460,13 @@
     const shareModalEl = $("#shareModal", view);
     if (!groupCardsEl || !grpModalEl || !grpSetModalEl) return;
 
+    const repopOvOwnerDatalist = () => {
+      const dl = $("#ovOwnerDatalist", view);
+      if (!dl || !(state.me && state.me.role === "superadmin")) return;
+      const owners = [...new Set(devices.map((d) => String(d.owner_admin || "").trim()).filter(Boolean))].sort();
+      setChildMarkup(dl, owners.map((o) => `<option value="${escapeHtml(o)}"></option>`).join(""));
+    };
+
     const groupDeviceRow = (d, { checked, disabled } = {}) => {
       const did = String(d && d.device_id != null ? d.device_id : "").trim();
       if (!did) return "";
@@ -2444,33 +2486,37 @@
 
     let editingGroup = "";
     const normalizeGroupKey = (v) => String(v == null ? "" : v).trim();
+    let ownerFilterQ = "";
+    const devicesForGroups = () => {
+      if (!(state.me && state.me.role === "superadmin")) return devices;
+      const q = ownerFilterQ.trim().toLowerCase();
+      if (!q) return devices;
+      return devices.filter((d) => String(d.owner_admin || "").toLowerCase().includes(q));
+    };
     const groupDeviceIdsFromList = (g, tenantOwner) => {
       const key = canonicalGroupKey(g);
       if (!key) return [];
       const t = String(tenantOwner || "").trim();
+      const isSuper = state.me && state.me.role === "superadmin";
       const out = [];
       for (const d of devices) {
         if (!d || canonicalGroupKey(d.notification_group) !== key) continue;
-        if (t && String(d.owner_admin || "").trim() !== t) continue;
+        if (isSuper) {
+          const o = String(d.owner_admin || "").trim();
+          if (t === "") {
+            if (o) continue;
+          } else if (o !== t) {
+            continue;
+          }
+        } else if (t && String(d.owner_admin || "").trim() !== t) {
+          continue;
+        }
         const did = String(d.device_id || "").trim();
         if (did) out.push(did);
       }
       return out;
     };
-    const collectGroupSlots = () => {
-      const acc = new Map();
-      for (const d of devices) {
-        const gk = canonicalGroupKey(d && d.notification_group);
-        if (!gk) continue;
-        const tenant = state.me && state.me.role === "superadmin" ? String(d.owner_admin || "").trim() : "";
-        const mk = groupCardMetaKey(gk, tenant);
-        if (!acc.has(mk)) acc.set(mk, { metaKey: mk, groupKey: gk, tenantOwner: tenant });
-      }
-      return Array.from(acc.values()).sort((a, b) => {
-        const c = a.groupKey.localeCompare(b.groupKey);
-        return c !== 0 ? c : a.tenantOwner.localeCompare(b.tenantOwner);
-      });
-    };
+    const collectGroupSlots = () => buildGroupSlotsFromDeviceList(devicesForGroups());
     const groupDeviceIdsFromSlot = (slot) => {
       const ids = groupDeviceIdsFromList(slot.groupKey, slot.tenantOwner);
       return ids.filter((x) => byId.has(String(x)));
@@ -2567,9 +2613,13 @@
       const shareBtn = state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_manage_users")))
         ? `<button class="group-del-ico js-share-group" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button" title="Share devices in this card (device ACL only — not group secrets)">⇪</button>`
         : "";
-      const hasCorner = !!(slot.tenantOwner || shareBtn);
+      const unassignedSuper = state.me && state.me.role === "superadmin" && !slot.tenantOwner;
+      const hasCorner = !!(slot.tenantOwner || shareBtn || unassignedSuper);
+      const ownerPill = slot.tenantOwner
+        ? `<span class="card-owner-tag" title="Owning admin / 所属租户">${escapeHtml(slot.tenantOwner)}</span>`
+        : (unassignedSuper ? `<span class="card-owner-tag" title="No owner_admin on devices in this card">Unassigned</span>` : "");
       const cornerHtml = hasCorner
-        ? `<div class="device-card__corner-tr" role="group" aria-label="Tenant">${slot.tenantOwner ? `<span class="card-owner-tag" title="Owning admin / 所属租户">${escapeHtml(slot.tenantOwner)}</span>` : ""}${shareBtn}</div>`
+        ? `<div class="device-card__corner-tr" role="group" aria-label="Tenant">${ownerPill}${shareBtn}</div>`
         : "";
       return `<article class="device-card js-group-card ${hasCorner ? "js-group-card--has-corner " : ""}${selectedGroup === slot.metaKey ? "is-selected" : ""}" data-meta-key="${escapeHtml(slot.metaKey)}" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" style="cursor:pointer;position:relative">
         ${cornerHtml}
@@ -3319,14 +3369,119 @@
         });
         syncGroupMetaWithDevices(meta, devices);
         saveGroupMeta(meta);
+        repopOvOwnerDatalist();
         renderGroups();
       } catch (_) {}
     };
     scheduleRouteTicker(routeSeq, "overview-live", refreshOverviewLive, OVERVIEW_LIVE_MS);
+    const ovOwnerInp = $("#ovOwnerFilter", view);
+    const ovOwnerClr = $("#ovOwnerClear", view);
+    if (ovOwnerInp && state.me && state.me.role === "superadmin") {
+      repopOvOwnerDatalist();
+      const onOwnerFilt = () => {
+        ownerFilterQ = String(ovOwnerInp.value || "");
+        renderGroups();
+      };
+      ovOwnerInp.addEventListener("input", onOwnerFilt);
+      ovOwnerInp.addEventListener("change", onOwnerFilt);
+      if (ovOwnerClr) {
+        ovOwnerClr.addEventListener("click", () => {
+          ovOwnerInp.value = "";
+          ownerFilterQ = "";
+          renderGroups();
+        });
+      }
+    }
     renderGroups();
     if (state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_manage_users")))) {
       loadOverviewShareGrants();
     }
+  });
+
+  registerRoute("site", async (view, _args, routeSeq) => {
+    setCrumb("Site · owners & groups / 站点");
+    if (!(state.me && state.me.role === "superadmin")) {
+      mountView(view, `<div class="card"><p class="muted">Superadmin only.</p></div>`);
+      return;
+    }
+    let ownerQ = String((window.__routeQuery && window.__routeQuery.get("owner")) || "").trim();
+    let allDevs = [];
+    try {
+      const r = await api("/devices", { timeoutMs: 20000 });
+      if (!isRouteCurrent(routeSeq)) return;
+      allDevs = Array.isArray(r.items) ? r.items.slice() : [];
+    } catch (e) {
+      if (!isRouteCurrent(routeSeq)) return;
+      mountView(view, `<div class="card"><p class="badge offline">${escapeHtml(e.message || e)}</p></div>`);
+      return;
+    }
+    const applyFilter = (list, q) => {
+      const s = String(q || "").trim().toLowerCase();
+      if (!s) return list;
+      return list.filter((d) => String(d.owner_admin || "").toLowerCase().includes(s));
+    };
+    const filtered = () => applyFilter(allDevs, ownerQ);
+    const ownersU = [...new Set(allDevs.map((d) => String(d.owner_admin || "").trim()).filter(Boolean))].sort();
+    const fd = filtered();
+    const slots = buildGroupSlotsFromDeviceList(fd);
+    const rows = fd.map((d) => {
+      const on = isOnline(d);
+      const did = encodeURIComponent(d.device_id);
+      return `<tr><td class="mono"><a href="#/devices/${did}">${escapeHtml(d.device_id)}</a></td><td class="mono">${escapeHtml(d.owner_admin || "—")}</td><td>${escapeHtml(d.notification_group || "—")}</td><td>${escapeHtml(d.zone || "")}</td><td><span class="badge ${on ? "online" : "offline"}">${on ? "on" : "off"}</span></td></tr>`;
+    }).join("");
+    const grpRows = slots.map((s) => {
+      const owq = s.tenantOwner ? `?owner=${encodeURIComponent(s.tenantOwner)}` : "";
+      return `<tr><td class="mono"><a href="#/group/${encodeURIComponent(s.groupKey)}${owq}">${escapeHtml(s.groupKey)}</a></td><td class="mono">${escapeHtml(s.tenantOwner || "—")}</td><td class="mono muted">${escapeHtml(s.metaKey)}</td></tr>`;
+    }).join("");
+    mountView(view, `
+      <section class="card">
+        <h2 class="ui-section-title" style="margin:0">Site / 站点</h2>
+        <p class="muted" style="margin:8px 0 0">Search <strong>owner admin</strong> username (substring). Lists devices and <strong>notification groups</strong> under that filter — same slot keys as Overview group cards.</p>
+        <div class="inline-form" style="margin-top:12px;flex-wrap:wrap;gap:10px;align-items:flex-end">
+          <label class="field grow"><span>Owner contains</span>
+            <input type="search" id="siteOwnerQ" value="${escapeHtml(ownerQ)}" placeholder="e.g. dan" list="siteOwnerDl" autocomplete="off" />
+            <datalist id="siteOwnerDl">${ownersU.map((o) => `<option value="${escapeHtml(o)}"></option>`).join("")}</datalist>
+          </label>
+          <button type="button" class="btn sm secondary btn-tap" id="siteOwnerClear">Clear</button>
+          <button type="button" class="btn btn-tap" id="siteOwnerApply">Apply</button>
+        </div>
+      </section>
+      <section class="card">
+        <h3 style="margin:0 0 8px">Owners in fleet (${ownersU.length})</h3>
+        <p class="muted" style="margin:0;font-size:12px">Unique <span class="mono">owner_admin</span> from API. Click a chip to filter.</p>
+        <div class="row" style="gap:6px;flex-wrap:wrap;margin-top:10px">
+          ${ownersU.map((o) => `<button type="button" class="chip js-site-owner-chip" data-o="${escapeHtml(o)}" style="cursor:pointer">${escapeHtml(o)}</button>`).join("")}
+        </div>
+      </section>
+      <section class="card">
+        <h3 style="margin:0 0 8px">Devices (${fd.length})</h3>
+        <div class="table-wrap"><table class="t">
+          <thead><tr><th>Device</th><th>Owner</th><th>Notification group</th><th>Zone</th><th>Presence</th></tr></thead>
+          <tbody>${rows || `<tr><td colspan="5" class="muted">No devices match.</td></tr>`}</tbody>
+        </table></div>
+      </section>
+      <section class="card">
+        <h3 style="margin:0 0 8px">Groups (${slots.length})</h3>
+        <div class="table-wrap"><table class="t">
+          <thead><tr><th>Group key</th><th>Tenant (slot)</th><th>Card meta-key</th></tr></thead>
+          <tbody>${grpRows || `<tr><td colspan="3" class="muted">No groups in filter.</td></tr>`}</tbody>
+        </table></div>
+      </section>
+    `);
+    $("#siteOwnerApply", view).addEventListener("click", () => {
+      ownerQ = String($("#siteOwnerQ", view)?.value || "").trim();
+      location.hash = ownerQ ? `#/site?owner=${encodeURIComponent(ownerQ)}` : "#/site";
+    });
+    $("#siteOwnerClear", view).addEventListener("click", () => { location.hash = "#/site"; });
+    $("#siteOwnerQ", view).addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") { ev.preventDefault(); $("#siteOwnerApply", view).click(); }
+    });
+    $$(".js-site-owner-chip", view).forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const o = btn.getAttribute("data-o") || "";
+        location.hash = o ? `#/site?owner=${encodeURIComponent(o)}` : "#/site";
+      });
+    });
   });
 
   registerRoute("group", async (view, args, routeSeq) => {
@@ -6217,7 +6372,7 @@
     const superCard = `
       <div class="card">
         <h2 class="ui-section-title">Superadmin · Upload & campaign</h2>
-        <p class="muted" style="margin:0 0 8px">Stage <code>.bin</code> to <code>OTA_FIRMWARE_DIR</code> (default repo <code>croc_sentinel_systems/firmware</code>) with the server <strong>upload password</strong> (<code>OTA_UPLOAD_PASSWORD</code> env). The server keeps at most 10 <code>.bin</code> files, dropping the <strong>oldest</strong> (by file mtime) when a new one is added. Then create a campaign from a stored filename (<code>POST /ota/campaigns/from-stored</code>).</p>
+        <p class="muted" style="margin:0 0 8px">Upload stages a <code>.bin</code> under <code>OTA_FIRMWARE_DIR</code> (upload password <code>OTA_UPLOAD_PASSWORD</code>). The API keeps at most <strong id="otaMaxBinsLbl">10</strong> <code>.bin</code> files and deletes the <strong>oldest by file mtime</strong> (and sidecars) when over limit — same rule as <code>POST /ota/firmware/upload</code>. The list below is <strong>fetched from this server</strong> (<code>GET /ota/firmwares</code>); click <strong>Refresh list</strong> after upload or if you copied files in by hand.</p>
         <div class="inline-form">
           <label class="field wide"><span>Upload password *</span><input type="password" id="otaStUploadPwd" autocomplete="off" placeholder="Server OTA_UPLOAD_PASSWORD" /></label>
           <label class="field"><span>Firmware file (.bin)</span><input type="file" id="otaStFile" accept=".bin,application/octet-stream" /></label>
@@ -6229,9 +6384,12 @@
         <p class="muted" id="otaRetentionInfo" style="margin-top:8px;min-height:1.2em"></p>
         <p class="muted" id="otaStResult" style="margin-top:4px;min-height:1.2em"></p>
         <div class="divider"></div>
-        <h3 style="margin:0 0 6px">Publish from stored file</h3>
-        <p class="muted" style="margin:0 0 8px;font-size:12.5px">Select which staged <code>.bin</code> to offer in the campaign. The <strong>version string</strong> is read from the server (upload-time <code>.version</code> or filename) — not hand-typed. It should match the firmware&rsquo;s <code>FW_VERSION</code> for that build.</p>
-        <label class="field wide"><span>Firmware to deploy *</span><select id="otaFromSel"><option value="">Loading…</option></select></label>
+        <h3 style="margin:0 0 6px">Publish from server-staged firmware / 使用服务器上的固件</h3>
+        <p class="muted" style="margin:0 0 8px;font-size:12.5px">The dropdown is populated by <strong>pulling the current directory listing from the API</strong> (not from your PC). Pick a <code>.bin</code> already on the server, then create a campaign. <strong>Version</strong> is resolved on the server (<code>.version</code> sidecar or filename) — not hand-typed; it should match that build&rsquo;s <code>FW_VERSION</code>.</p>
+        <div class="row wide" style="align-items:flex-end;flex-wrap:wrap;gap:10px;margin-bottom:6px">
+          <label class="field wide" style="flex:1;min-width:220px;margin:0"><span>Firmware on server *</span><select id="otaFromSel"><option value="">Loading…</option></select></label>
+          <button type="button" class="btn secondary btn-tap sm" id="otaFwListRefresh">Refresh list</button>
+        </div>
         <label class="field wide"><span>Version (from server, read-only)</span><input type="text" id="otaFromResolvedVer" class="mono" readonly tabindex="-1" value="—" style="background:var(--bg-muted);cursor:default" aria-live="polite" /></label>
         <label class="field wide"><span>Notes</span><input id="otaFromNotes" maxlength="500" /></label>
         <label class="checkbox"><input type="checkbox" id="otaFromAllAd" checked /><span>Target all admins</span></label>
@@ -6267,12 +6425,24 @@
         if (!isRouteCurrent(routeSeq)) return;
         const items = r.items || [];
         const ret = r.retention;
+        const mx = $("#otaMaxBinsLbl", view);
+        if (mx && ret && ret.max_bins != null) mx.textContent = String(ret.max_bins);
         const inf = $("#otaRetentionInfo", view);
         if (inf) {
           inf.textContent = ret
-            ? `Staged .bin: ${ret.stored_count} / max ${ret.max_bins}. Upload password: ${ret.upload_password_configured ? "configured" : "not set on server"}.`
+            ? `Server directory: ${ret.stored_count || 0} / max ${ret.max_bins} .bin files (oldest mtime removed when over limit). Upload password: ${ret.upload_password_configured ? "configured" : "not set on server"}.`
             : "";
         }
+        const fmtM = (ts) => {
+          const t = Number(ts);
+          if (!Number.isFinite(t) || t <= 0) return "";
+          try {
+            const d = new Date(t * 1000);
+            return d.toLocaleString(undefined, { dateStyle: "short", timeStyle: "short" });
+          } catch {
+            return "";
+          }
+        };
         sel.innerHTML = items.length
           ? items.map((it) => {
             const vRaw = (it.fw_version && String(it.fw_version).trim()) || "";
@@ -6280,7 +6450,9 @@
             const fv = vRaw
               ? ` · v${escapeHtml(vRaw)}`
               : "";
-            return `<option value="${escapeHtml(it.name)}" data-fw-version="${dv}">${escapeHtml(it.name)}${fv} (${Math.round(Number(it.size || 0) / 1024)} KB)</option>`;
+            const mt = fmtM(it.mtime);
+            const mtS = mt ? ` · ${escapeHtml(mt)}` : "";
+            return `<option value="${escapeHtml(it.name)}" data-fw-version="${dv}">${escapeHtml(it.name)}${fv} (${Math.round(Number(it.size || 0) / 1024)} KB${mtS})</option>`;
           }).join("")
           : "<option value=\"\">(no .bin in folder)</option>";
         otaSyncFromStoredVersion();
@@ -6295,6 +6467,17 @@
     };
 
     await refreshFirmwareSelect();
+    const otaFwListRefresh = $("#otaFwListRefresh", view);
+    if (otaFwListRefresh) {
+      otaFwListRefresh.addEventListener("click", async () => {
+        otaFwListRefresh.disabled = true;
+        try {
+          await refreshFirmwareSelect();
+          toast("Firmware list refreshed from server", "ok");
+        } catch (_) {}
+        finally { otaFwListRefresh.disabled = false; }
+      });
+    }
     const stBtn = $("#otaStBtn", view);
     if (stBtn) {
       stBtn.addEventListener("click", async () => {

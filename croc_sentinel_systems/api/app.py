@@ -20,7 +20,7 @@ import hmac
 import re
 import ssl
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
@@ -186,6 +186,11 @@ PRESENCE_PROBE_COOLDOWN_SECONDS = int(os.getenv("PRESENCE_PROBE_COOLDOWN_SECONDS
 # After N consecutive failed probes, the device is flagged offline and we back
 # off to stop spamming the broker for obviously dead hardware.
 PRESENCE_PROBE_MAX_CONSECUTIVE = int(os.getenv("PRESENCE_PROBE_MAX_CONSECUTIVE", "3"))
+# A probe row stays outcome=sent until any device channel counts as an ack; if
+# still sent after this many seconds, mark timeout (clears the outstanding row).
+PRESENCE_PROBE_ACK_TIMEOUT_SEC = int(os.getenv("PRESENCE_PROBE_ACK_TIMEOUT_SEC", "480"))
+# scheduled_commands still pending this long after execute_at_ts → mark failed.
+SCHEDULED_CMD_STALE_PENDING_SEC = int(os.getenv("SCHEDULED_CMD_STALE_PENDING_SEC", "480"))
 
 # --- OTA campaigns (superadmin -> admin approve -> per-device rollout) ---
 # Per-device URL HEAD check timeout.
@@ -2025,7 +2030,7 @@ def _tenant_siblings(
     source_zone: str = "",
     source_group: str = "",
     include_source: bool = False,
-) -> list[tuple[str, str]]:
+) -> tuple[list[tuple[str, str]], int]:
     """Devices that receive group fan-out commands ("siblings") for this source_id.
 
     Selection: same ``owner_admin``, not revoked, optional matching ``source_zone``
@@ -2037,11 +2042,15 @@ def _tenant_siblings(
     ``include_source``: when False (default), the originating ``source_id`` is omitted.
 
     If the source group's normalized key is empty, there are **no** siblings.
+
+    Returns ``(targets, eligible_total)``: ``targets`` is capped at
+    ``ALARM_FANOUT_MAX_TARGETS``, sorted by ``device_id`` for stable ordering;
+    ``eligible_total`` is how many devices matched before the cap.
     """
     zone_filter = source_zone.strip()
     norm_source = _sibling_group_norm(source_group)
     if not norm_source:
-        return []
+        return [], 0
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -2075,7 +2084,7 @@ def _tenant_siblings(
             cur.execute(sql, args)
         rows = cur.fetchall()
         conn.close()
-    out: list[tuple[str, str]] = []
+    candidates: list[tuple[str, str]] = []
     seen: set[str] = set()
     for r in rows:
         if _sibling_group_norm(str(r["notification_group"] or "")) != norm_source:
@@ -2086,10 +2095,11 @@ def _tenant_siblings(
         if did in seen:
             continue
         seen.add(did)
-        out.append((did, str(r["zone"] or "")))
-        if len(out) >= ALARM_FANOUT_MAX_TARGETS:
-            break
-    return out
+        candidates.append((did, str(r["zone"] or "")))
+    candidates.sort(key=lambda t: t[0])
+    eligible_total = len(candidates)
+    out = candidates[:ALARM_FANOUT_MAX_TARGETS]
+    return out, eligible_total
 
 
 def _recipients_for_admin(owner_admin: Optional[str]) -> list[str]:
@@ -2454,6 +2464,59 @@ def _presence_probe_tick() -> None:
         return
     for device_id, owner_admin, idle_seconds in stale:
         _send_presence_probe(device_id, owner_admin, idle_seconds)
+
+
+def _expire_presence_probes_waiting_ack() -> None:
+    """Mark long-running ``sent`` probes as ``timeout`` so they do not appear stuck."""
+    if PRESENCE_PROBE_ACK_TIMEOUT_SEC <= 0:
+        return
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=PRESENCE_PROBE_ACK_TIMEOUT_SEC)
+    cutoff_iso = cutoff.isoformat()
+    now_iso = utc_now_iso()
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE presence_probes
+            SET outcome='timeout', updated_at=?, detail=COALESCE(detail, '') || ' | ack_timeout'
+            WHERE outcome='sent' AND probe_ts < ?
+            """,
+            (now_iso, cutoff_iso),
+        )
+        n = cur.rowcount or 0
+        conn.commit()
+        conn.close()
+    if n:
+        logger.info("presence_probes: marked %d sent row(s) as timeout (>%ss)", n, PRESENCE_PROBE_ACK_TIMEOUT_SEC)
+
+
+def _fail_stale_scheduled_commands(now_ts: int) -> None:
+    """Pending jobs whose execute_at is far in the past should not hang forever."""
+    if SCHEDULED_CMD_STALE_PENDING_SEC <= 0:
+        return
+    boundary = int(now_ts) - SCHEDULED_CMD_STALE_PENDING_SEC
+    now_iso = utc_now_iso()
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE scheduled_commands
+            SET status='failed', executed_at=?
+            WHERE status='pending' AND execute_at_ts < ?
+            """,
+            (now_iso, boundary),
+        )
+        n = cur.rowcount or 0
+        conn.commit()
+        conn.close()
+    if n:
+        logger.warning(
+            "scheduled_commands: marked %d stale pending row(s) failed (execute_at >%ss ago)",
+            n,
+            SCHEDULED_CMD_STALE_PENDING_SEC,
+        )
 
 
 # ═══════════════════════════════════════════════
@@ -2848,19 +2911,26 @@ def _fan_out_alarm(device_id: str, payload: dict[str, Any]) -> None:
     if triggered_by in ("remote_button", "remote_loud_button", "remote_silent_button", "remote_pause_button", "panic_button"):
         include_source = False
 
-    targets = _tenant_siblings(
-        owner_admin,
-        device_id,
-        source_zone=source_zone,
-        source_group=source_group,
-        include_source=include_source,
-    ) if should_fanout else []
+    targets, eligible_total = (
+        _tenant_siblings(
+            owner_admin,
+            device_id,
+            source_zone=source_zone,
+            source_group=source_group,
+            include_source=include_source,
+        )
+        if should_fanout
+        else ([], 0)
+    )
+    fanout_capped = bool(should_fanout and eligible_total > len(targets))
     sent = 0
     failures: list[str] = []
     loud_ms = int(policy.get("remote_loud_duration_ms", ALARM_FANOUT_DURATION_MS))
     panic_ms = int(policy.get("panic_fanout_duration_ms", DEFAULT_PANIC_FANOUT_MS))
+    default_cmd_key = str(CMD_AUTH_KEY or "").strip().upper()
+    cmd_key_map = get_cmd_keys_for_devices([did for did, _ in targets]) if targets else {}
 
-    def _fanout_publish_one(did: str) -> None:
+    def _fanout_publish_one(did: str, ckey: str) -> None:
         if triggered_by == "remote_silent_button":
             cmd, params = "alarm_signal", {"kind": "silent"}
         elif triggered_by == "remote_pause_button":
@@ -2874,13 +2944,14 @@ def _fan_out_alarm(device_id: str, payload: dict[str, Any]) -> None:
             params=params,
             target_id=did,
             proto=CMD_PROTO,
-            cmd_key=get_cmd_key_for_device(did),
+            cmd_key=ckey,
         )
 
     if should_fanout:
         for did, _z in targets:
+            ck = cmd_key_map.get(did.strip().upper(), default_cmd_key)
             try:
-                _fanout_publish_one(did)
+                _fanout_publish_one(did, ck)
                 sent += 1
             except Exception as exc:
                 failures.append(f"{did}:{exc}")
@@ -2890,8 +2961,9 @@ def _fan_out_alarm(device_id: str, payload: dict[str, Any]) -> None:
                 time.sleep(0.4)
                 failures.clear()
                 for did in retry_ids:
+                    ck = cmd_key_map.get(did.strip().upper(), default_cmd_key)
                     try:
-                        _fanout_publish_one(did)
+                        _fanout_publish_one(did, ck)
                         sent += 1
                     except Exception as exc:
                         failures.append(f"{did}:{exc}")
@@ -2933,6 +3005,9 @@ def _fan_out_alarm(device_id: str, payload: dict[str, Any]) -> None:
                 "triggered_by": triggered_by,
                 "fanout_count": sent,
                 "target_total": len(targets),
+                "eligible_total": eligible_total,
+                "fanout_capped": fanout_capped,
+                "fanout_max": ALARM_FANOUT_MAX_TARGETS,
                 "failures": failures[:5],
                 "email": email_detail,
             },
@@ -6460,7 +6535,7 @@ def preview_device_siblings(
             status_code=403,
             detail="sibling preview is available to the owning tenant only",
         )
-    targets = _tenant_siblings(
+    targets, eligible_total = _tenant_siblings(
         owner_admin,
         device_id,
         source_zone=zone,
@@ -6474,6 +6549,9 @@ def preview_device_siblings(
         "notification_group": group_key,
         "fanout_enabled": bool(group_key),
         "target_count": len(targets),
+        "eligible_total": eligible_total,
+        "fanout_capped": eligible_total > len(targets),
+        "fanout_max": ALARM_FANOUT_MAX_TARGETS,
         "targets": [{"device_id": did, "zone": z} for did, z in targets],
     }
     if principal.role == "superadmin":
@@ -7659,6 +7737,28 @@ def get_cmd_key_for_device(device_id: str) -> str:
     return str(CMD_AUTH_KEY or "").strip().upper()
 
 
+def get_cmd_keys_for_devices(device_ids: list[str]) -> dict[str, str]:
+    """Batch-resolve MQTT /cmd signing keys. Keys are ``UPPER(device_id)`` → cmd_key."""
+    ids = sorted({str(x or "").strip().upper() for x in device_ids if str(x or "").strip()})
+    if not ids:
+        return {}
+    out: dict[str, str] = {}
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        ph = ",".join(["?"] * len(ids))
+        cur.execute(
+            f"SELECT UPPER(device_id) AS u, cmd_key FROM provisioned_credentials WHERE UPPER(device_id) IN ({ph})",
+            tuple(ids),
+        )
+        for r in cur.fetchall():
+            ck = str(r["cmd_key"] or "").strip().upper()
+            if ck:
+                out[str(r["u"])] = ck
+        conn.close()
+    return out
+
+
 def publish_bootstrap_claim(
     mac_nocolon: str,
     claim_nonce: str,
@@ -7866,6 +7966,15 @@ def scheduler_loop() -> None:
                     )
                     conn.commit()
                     conn.close()
+
+        try:
+            _fail_stale_scheduled_commands(now_ts)
+        except Exception as exc:
+            logger.warning("stale scheduled_commands cleanup failed: %s", exc)
+        try:
+            _expire_presence_probes_waiting_ack()
+        except Exception as exc:
+            logger.warning("presence probe ack expiry failed: %s", exc)
 
         now = time.time()
         if now >= next_cleanup_at:
