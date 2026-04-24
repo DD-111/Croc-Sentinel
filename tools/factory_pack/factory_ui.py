@@ -437,7 +437,12 @@ class FactoryApp(tk.Tk):
                     qr0 = str(items[0].get("qr_code") or "")
                     base = api.rstrip("/")
                     qparam = urllib.parse.quote(qr0 if qr0 else first, safe="")
-                    dash = f"{base}/dashboard/#/activate?q={qparam}"
+                    # Match api/app.py DASHBOARD_PATH (default /console)
+                    _dp = (os.environ.get("DASHBOARD_PATH") or "/console").strip() or "/console"
+                    if not _dp.startswith("/"):
+                        _dp = "/" + _dp
+                    _dp = _dp.rstrip("/") or "/console"
+                    dash = f"{base}{_dp}/#/activate?q={qparam}"
                     ui(self._line, "[push] ok=1")
                     ui(self._line, f"[link] activate_url={dash}")
                     ui(self._set_status, f"已登记 · {api}")

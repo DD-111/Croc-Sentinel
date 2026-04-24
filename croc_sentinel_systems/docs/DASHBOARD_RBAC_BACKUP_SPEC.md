@@ -2,13 +2,15 @@
 
 This document matches the **implemented** server behavior in `api/app.py` + static UI under `api/dashboard/`.
 
-## 1) Dashboard UI (static)
+## 1) Dashboard UI (static SPA)
 
-| Page | URL | Purpose |
-|------|-----|---------|
-| Device grid | `/dashboard/` or `/dashboard/index.html` | Unified cards: `device_id`, online/offline (heuristic from `updated_at`), fw, chip, board, net, zone |
-| Red alerts | `/dashboard/alerts.html` | Bulk `/alerts` (empty list = all devices **visible to your role**) |
-| Activate | `/dashboard/activate.html` | Search pending (`GET /provision/pending?q=`), manual claim (`POST /provision/claim`) |
+Static files live under `api/dashboard/` and are served at **`${DASHBOARD_PATH}/`** (default **`/console/`**; see `.env` `DASHBOARD_PATH`). There is a **single** `index.html`; all views are **client routes** in `assets/app.js` (hash after `#`).
+
+| View | Example URL | Purpose |
+|------|-------------|---------|
+| Device grid | `${DASHBOARD_PATH}/#/overview` | Unified cards: `device_id`, online/offline (heuristic from `updated_at`), fw, chip, board, net, zone |
+| Red alerts | `${DASHBOARD_PATH}/#/alerts` | Bulk `/alerts` (empty list = all devices **visible to your role**) |
+| Activate | `${DASHBOARD_PATH}/#/activate` | Search pending (`GET /provision/pending?q=`), manual claim (`POST /provision/claim`) |
 
 **QR scan in browser:** use phone camera → paste decoded string into “搜索” or MAC field. True in-app `getUserMedia` barcode decode is **not** bundled (add e.g. QuaggaJS / ZXing in a later SPA build).
 
@@ -34,7 +36,7 @@ This document matches the **implemented** server behavior in `api/app.py` + stat
 
 ### New in this iteration
 
-- **Static dashboard** (mounted at `/dashboard`)
+- **Static dashboard** (mounted at `DASHBOARD_PATH`, default `/console`)
 - **JWT login** `POST /auth/login`, `GET /auth/me`
 - **User CRUD** `GET|POST /auth/users`, `DELETE /auth/users/{username}` (**superadmin**)
 - **RBAC** on all fleet routes (see §3)
@@ -51,7 +53,7 @@ This document matches the **implemented** server behavior in `api/app.py` + stat
 | **Organization / site** hierarchy | Multi-tenant separation beyond `zone` |
 | **Automated restore** without container stop | SQLite file swap while process running is unsafe; current import writes `*.restored` |
 | **Redis hot state** | Optional scale-out for presence (see prior architecture note) |
-| **Real SPA build** + camera QR | Better UX than static pages |
+| **Bundled build (e.g. Vite) + camera QR** | Smaller assets / DX; in-app `getUserMedia` decode still optional |
 
 ## 3) Roles & permissions (implemented)
 

@@ -55,16 +55,12 @@
     return `
       <footer class="site-footer site-footer--auth" aria-label="Page footer">
         <div class="site-footer__row site-footer__row--auth">
-          <div class="site-footer__brand">
-            <span class="site-footer__name">Croc Sentinel</span>
-            <span class="site-footer__tagline">Fleet console · 舰队控制台</span>
+          <div class="site-footer__brand" role="group" aria-label="Croc ESA">
+            <span class="site-footer__name">Croc</span>
+            <span class="site-footer__sep" aria-hidden="true">·</span>
+            <span class="site-footer__esa">ESA</span>
           </div>
-          <nav class="site-footer__nav" aria-label="Sign-in help">
-            <a class="site-footer__a" href="#/login">Sign in</a>
-            <a class="site-footer__a" href="#/register">Register</a>
-            <a class="site-footer__a" href="#/forgot-password">Forgot password</a>
-            <a class="site-footer__a" href="#/account-activate">Activate</a>
-          </nav>
+          <p class="site-footer__legal">© 2026 · Private operations</p>
         </div>
       </footer>`;
   }

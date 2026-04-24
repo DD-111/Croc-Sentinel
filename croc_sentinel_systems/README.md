@@ -151,7 +151,8 @@ docker compose ps
 - API base（默认 compose）: `http://<your-domain>:18999`（无 `/api` 前缀；同一端口提供控制台静态页与 REST）
 - **Operations Console (SPA)**: `http://<your-domain>:18999${DASHBOARD_PATH}/`  
   Default is `http://<your-domain>:18999/console/` — total refresh: 侧边栏 + 移动端汉堡菜单 + 浅色/暗色主题 + 单页路由。  
-  旧路径 `/ui`、`/dashboard` 会被 301 到 `DASHBOARD_PATH`；你可以改 `.env` 里的 `DASHBOARD_PATH`（建议自选一个不常见路径用于轻度混淆，例如 `/app`、`/c`、`/ops`、`/manage`）。
+  旧路径 `/ui`、`/dashboard` 会被 301 到 `DASHBOARD_PATH`；你可以改 `.env` 里的 `DASHBOARD_PATH`（建议自选一个不常见路径用于轻度混淆，例如 `/app`、`/c`、`/ops`、`/manage`）。  
+  **唯一 Web 资产目录**（不要另起一套页面）：[`api/dashboard/README.md`](api/dashboard/README.md)。
 
 **Subpath UI + root API (e.g. `https://esasecure.com:8088/Croc_Sentinel_systems/`)**  
 - **一步步生产部署（Docker、`docker-compose.override`、rsync 静态、Nginx、`/events/stream`、验收）**：[`docs/SERVER_DEPLOY_SUBPATH.md`](docs/SERVER_DEPLOY_SUBPATH.md)  
