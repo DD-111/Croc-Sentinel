@@ -327,9 +327,11 @@ body[data-layout="auth"].app-shell {
   overflow: auto;
 }
 body[data-layout="auth"] .main {
-  min-height: 100vh;
   min-height: 100dvh;
-  overflow: visible;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 body[data-layout="auth"] .site-footer--shell {
   display: none !important;
@@ -343,8 +345,13 @@ body[data-layout="auth"] .view {
   width: 100%;
   margin: 0;
   padding: 0;
-  flex: 1;
+  flex: 1 1 auto;
   min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow-x: hidden;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 .topbar {
@@ -1087,15 +1094,19 @@ body[data-layout="auth"] .site-footer__esa {
   font-family: var(--font-display);
 }
 
-/* Auth v2 — centered card (login / register / activate / forgot) */
+/* Auth v2 — card + footer: single scroll in #view; avoid grid 1fr vertical centering (jumps when errors appear) */
 .auth-page {
-  flex: 1;
-  min-height: min(100vh, 100dvh);
-  padding-top: max(clamp(14px, 3.5vw, 36px), env(safe-area-inset-top, 0px));
-  padding-right: max(clamp(14px, 3.5vw, 36px), env(safe-area-inset-right, 0px));
-  padding-bottom: max(clamp(14px, 3.5vw, 36px), env(safe-area-inset-bottom, 0px));
-  padding-left: max(clamp(14px, 3.5vw, 36px), env(safe-area-inset-left, 0px));
+  flex: 1 0 auto;
+  width: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
   box-sizing: border-box;
+  padding-top: max(clamp(20px, 4vh, 40px), env(safe-area-inset-top, 0px));
+  padding-right: max(clamp(14px, 3.5vw, 36px), env(safe-area-inset-right, 0px));
+  padding-bottom: max(clamp(18px, 3.5vw, 32px), env(safe-area-inset-bottom, 0px));
+  padding-left: max(clamp(14px, 3.5vw, 36px), env(safe-area-inset-left, 0px));
   background:
     radial-gradient(ellipse 100% 70% at 15% -15%, color-mix(in srgb, var(--accent) 14%, transparent), transparent 52%),
     radial-gradient(ellipse 90% 55% at 92% 108%, color-mix(in srgb, var(--accent) 8%, transparent), transparent 48%),
@@ -1131,24 +1142,25 @@ html[data-theme="dark"] body[data-layout="auth"] .auth-page {
 .auth-page--solo > .auth-card {
   width: 100%;
 }
-.auth-page:not(.auth-page-pro) {
-  display: grid;
-  grid-template-rows: 1fr auto;
-  justify-items: center;
-}
 .auth-page:not(.auth-page-pro) > .auth-card {
-  align-self: center;
+  width: 100%;
+  max-width: min(520px, 100%);
+  flex: 0 0 auto;
 }
 .auth-page:not(.auth-page-pro) > .site-footer--auth {
   width: 100%;
   max-width: min(560px, 100%);
+  margin-top: auto;
+  flex: 0 0 auto;
+  padding-top: 8px;
 }
 .auth-page.auth-page-pro {
   display: grid;
   grid-template-columns: minmax(280px, 460px) minmax(340px, 560px);
-  grid-template-rows: auto auto;
-  align-items: center;
+  grid-template-rows: auto;
+  align-items: start;
   justify-content: center;
+  align-content: start;
   gap: clamp(18px, 4vw, 40px);
 }
 /* Login — narrower columns, align top for denser fold */
@@ -1945,8 +1957,7 @@ body.comfort-ui .brand-sub {
   font-size: 12px;
 }
 
-body.comfort-ui .login-wrap,
-body.comfort-ui .auth-page {
+body.comfort-ui .login-wrap {
   min-height: 100vh;
   min-height: 100dvh;
 }

@@ -229,7 +229,7 @@ See `docs/MESH_AND_OTA.md` for:
 - `AutoNetIf` behaviour on ETH boards (prefer Ethernet, fall back to WiFi) and per-board defaults,
 - presence / disconnect-reason semantics surfaced in the dashboard overview,
 - SMTP notifier queue + `admin_alert_recipients`,
-- login rate-limit knobs (`LOGIN_RATE_MAX_FAILS`, `LOGIN_RATE_WINDOW_SECONDS`),
+- per-IP login lockout knobs (`LOGIN_LOCK_TIER0_FAILS` / `LOGIN_LOCK_TIER0_SECONDS`, etc., see `.env.example`),
 - the OTA firmware directory layout and `OTA_PUBLIC_BASE_URL` contract.
 
 ## 4.1 API quick test

@@ -122,8 +122,14 @@ MAX_OTA_UPLOAD_BYTES = int(os.getenv("MAX_OTA_UPLOAD_BYTES", str(16 * 1024 * 102
 ALARM_FANOUT_DURATION_MS = int(os.getenv("ALARM_FANOUT_DURATION_MS", "8000"))
 ALARM_FANOUT_MAX_TARGETS = int(os.getenv("ALARM_FANOUT_MAX_TARGETS", "200"))
 ALARM_FANOUT_SELF = os.getenv("ALARM_FANOUT_SELF", "0") == "1"
-LOGIN_RATE_MAX_FAILS = int(os.getenv("LOGIN_RATE_MAX_FAILS", "5"))
-LOGIN_RATE_WINDOW_SECONDS = int(os.getenv("LOGIN_RATE_WINDOW_SECONDS", "900"))
+# Per-IP login lockout (replaces old sliding-window LOGIN_RATE_* on /auth/login only).
+# Tier 0: FAILS wrong → lock LOCK0 s; tier 1: FAILS → lock LOCK1; tier 2+: FAILS → lock LOCK2. Success clears IP state.
+LOGIN_LOCK_TIER0_FAILS = max(1, int(os.getenv("LOGIN_LOCK_TIER0_FAILS", "5")))
+LOGIN_LOCK_TIER0_SECONDS = max(1, int(os.getenv("LOGIN_LOCK_TIER0_SECONDS", "60")))
+LOGIN_LOCK_TIER1_FAILS = max(1, int(os.getenv("LOGIN_LOCK_TIER1_FAILS", "3")))
+LOGIN_LOCK_TIER1_SECONDS = max(1, int(os.getenv("LOGIN_LOCK_TIER1_SECONDS", "180")))
+LOGIN_LOCK_TIER2_FAILS = max(1, int(os.getenv("LOGIN_LOCK_TIER2_FAILS", "3")))
+LOGIN_LOCK_TIER2_SECONDS = max(1, int(os.getenv("LOGIN_LOCK_TIER2_SECONDS", "600")))
 
 # --- Signup / user activation ---
 # If 1, a superadmin must approve each admin signup before they can log in. Default 0: self-serve.
@@ -748,6 +754,16 @@ def init_db() -> None:
         )
         cur.execute("CREATE INDEX IF NOT EXISTS ix_login_failures_ip_ts ON login_failures(ip, ts_epoch)")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_login_failures_user_ts ON login_failures(username, ts_epoch)")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS login_ip_state (
+                ip TEXT PRIMARY KEY,
+                fail_count INTEGER NOT NULL DEFAULT 0,
+                phase INTEGER NOT NULL DEFAULT 0,
+                lock_until INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS password_reset_tokens (
@@ -3526,42 +3542,94 @@ def _client_context(request: Request) -> dict[str, str]:
     return out
 
 
-def _check_login_rate(ip: str, username: str) -> None:
-    """Raise 429 if the ip OR username has too many recent failures."""
-    cutoff = int(time.time()) - LOGIN_RATE_WINDOW_SECONDS
+def _check_login_ip_lockout(ip: str, username: str) -> None:
+    """Raise 429 if this client IP is in an active post-failure lock window."""
+    now = int(time.time())
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute("DELETE FROM login_failures WHERE ts_epoch < ?", (cutoff,))
+        cur.execute("SELECT fail_count, phase, lock_until FROM login_ip_state WHERE ip = ?", (ip,))
+        row = cur.fetchone()
+        conn.close()
+    if not row:
+        return
+    lock_until = int(row["lock_until"] or 0)
+    if lock_until <= now:
+        return
+    remaining = max(1, lock_until - now)
+    phase = int(row["phase"] or 0)
+    fail_count = int(row["fail_count"] or 0)
+    emit_event(
+        level="error",
+        category="auth",
+        event_type="auth.login.rate_limited",
+        summary=f"login locked {username}@{ip}",
+        actor=f"ip:{ip}",
+        target=username,
+        detail={
+            "remaining_s": remaining,
+            "phase": phase,
+            "fail_count": fail_count,
+        },
+    )
+    raise HTTPException(
+        status_code=429,
+        detail=f"too many login attempts — try again in {remaining}s",
+        headers={"Retry-After": str(remaining)},
+    )
+
+
+def _record_login_failure_ip(ip: str) -> None:
+    """Increment per-IP failure count; at threshold apply timed lock and advance phase."""
+    now = int(time.time())
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT fail_count, phase, lock_until FROM login_ip_state WHERE ip = ?", (ip,))
+        row = cur.fetchone()
+        if row:
+            fail_count = int(row["fail_count"] or 0)
+            phase = int(row["phase"] or 0)
+        else:
+            fail_count, phase = 0, 0
+        fail_count += 1
+        if phase == 0:
+            th = LOGIN_LOCK_TIER0_FAILS
+        elif phase == 1:
+            th = LOGIN_LOCK_TIER1_FAILS
+        else:
+            th = LOGIN_LOCK_TIER2_FAILS
+        new_fail = fail_count
+        new_phase = phase
+        new_lock = 0
+        if new_fail >= th:
+            if phase == 0:
+                new_lock = now + LOGIN_LOCK_TIER0_SECONDS
+                new_phase = 1
+            elif phase == 1:
+                new_lock = now + LOGIN_LOCK_TIER1_SECONDS
+                new_phase = 2
+            else:
+                new_lock = now + LOGIN_LOCK_TIER2_SECONDS
+                new_phase = 2
+            new_fail = 0
         cur.execute(
-            "SELECT COUNT(*) AS c FROM login_failures WHERE ip = ? AND ts_epoch >= ?",
-            (ip, cutoff),
+            """
+            INSERT INTO login_ip_state (ip, fail_count, phase, lock_until)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(ip) DO UPDATE SET
+              fail_count = excluded.fail_count,
+              phase = excluded.phase,
+              lock_until = excluded.lock_until
+            """,
+            (ip, new_fail, new_phase, new_lock),
         )
-        ip_fails = int(cur.fetchone()["c"])
-        cur.execute(
-            "SELECT COUNT(*) AS c FROM login_failures WHERE username = ? AND ts_epoch >= ?",
-            (username, cutoff),
-        )
-        user_fails = int(cur.fetchone()["c"])
         conn.commit()
         conn.close()
-    if ip_fails >= LOGIN_RATE_MAX_FAILS or user_fails >= LOGIN_RATE_MAX_FAILS:
-        emit_event(
-            level="error",
-            category="auth",
-            event_type="auth.login.rate_limited",
-            summary=f"rate-limit {username}@{ip}",
-            actor=f"ip:{ip}",
-            target=username,
-            detail={"ip_fails": ip_fails, "user_fails": user_fails},
-        )
-        raise HTTPException(
-            status_code=429,
-            detail=f"too many login attempts — locked for up to {LOGIN_RATE_WINDOW_SECONDS}s",
-        )
 
 
 def _record_login_failure(ip: str, username: str) -> None:
+    """Keep append-only failure log + update per-IP lockout state."""
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -3569,6 +3637,16 @@ def _record_login_failure(ip: str, username: str) -> None:
             "INSERT INTO login_failures (ip, username, ts_epoch) VALUES (?, ?, ?)",
             (ip, username, int(time.time())),
         )
+        conn.commit()
+        conn.close()
+    _record_login_failure_ip(ip)
+
+
+def _clear_login_ip_state(ip: str) -> None:
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM login_ip_state WHERE ip = ?", (ip,))
         conn.commit()
         conn.close()
 
@@ -4335,6 +4413,7 @@ def auth_forgot_email_complete(body: ForgotEmailCompleteRequest, request: Reques
         conn.close()
     _clear_login_failures(username)
     ip = _client_ip(request)
+    _clear_login_ip_state(ip)
     audit_event(username, "auth.password_reset.email_code.ok", "", {"ip": ip, "email": email})
     emit_event(
         level="warn",
@@ -4501,6 +4580,7 @@ def auth_forgot_complete(body: ForgotCompleteRequest, request: Request) -> dict[
         conn.commit()
         conn.close()
     _clear_login_failures(un)
+    _clear_login_ip_state(ip)
     audit_event(un, "auth.password_reset.ok", "", {"ip": ip})
     emit_event(
         level="warn",
@@ -4519,7 +4599,7 @@ def auth_forgot_complete(body: ForgotCompleteRequest, request: Request) -> dict[
 def auth_login(body: LoginRequest, request: Request) -> dict[str, Any]:
     ctx = _client_context(request)
     ip = ctx["ip"]
-    _check_login_rate(ip, body.username)
+    _check_login_ip_lockout(ip, body.username)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -4548,6 +4628,7 @@ def auth_login(body: LoginRequest, request: Request) -> dict[str, Any]:
     if status == "awaiting_approval":
         raise HTTPException(status_code=403, detail="account awaiting superadmin approval")
     _clear_login_failures(body.username)
+    _clear_login_ip_state(ip)
     zones = zones_from_json(str(row["allowed_zones_json"]))
     token = issue_jwt(str(row["username"]), str(row["role"]), zones)
     ok_detail = dict(ctx)

@@ -835,8 +835,23 @@
       },
       DEFAULT_API_TIMEOUT_MS,
     );
-    if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
-    const j = await r.json();
+    const text = await r.text();
+    if (!r.ok) {
+      if (r.status === 429) {
+        const ra = r.headers.get("Retry-After");
+        let detail = "Too many sign-in attempts. Please wait and try again.";
+        try {
+          const j = JSON.parse(text);
+          if (j && j.detail) detail = String(j.detail);
+        } catch {
+          if (text) detail = text;
+        }
+        if (ra && /^\d+$/.test(ra)) detail = `${detail} (retry after ${ra}s)`;
+        throw new Error(detail);
+      }
+      throw new Error(`${r.status} ${text}`);
+    }
+    const j = JSON.parse(text);
     setToken(j.access_token || "");
     localStorage.setItem(LS.user, username);
     localStorage.setItem(LS.role, j.role || "");
@@ -1125,6 +1140,7 @@
       const l = s.toLowerCase();
       if (l.includes("401")) return "Username or password is incorrect.";
       if (l.includes("invalid credentials")) return "Username or password is incorrect.";
+      if (l.includes("too many login attempts")) return s; /* 429: server already has seconds */
       if (l.includes("session expired")) return "Session expired. Please sign in again.";
       if (l.includes("networkerror") || l.includes("failed to fetch")) return "Network error. Please check server/API.";
       return s.replace(/^error:\s*/i, "");

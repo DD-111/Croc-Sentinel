@@ -238,18 +238,15 @@ for local dev) — alarm rows are still written, they just show
 
 ---
 
-## 8. Login rate‑limit
+## 8. Login lockout (per IP)
 
-`auth_login` uses a sliding window against the `login_failures` table:
+`POST /auth/login` enforces a **per client IP** lockout in `login_ip_state`:
 
-* reject when either `ip` **or** `username` accumulates ≥
-  `LOGIN_RATE_MAX_FAILS` failures within `LOGIN_RATE_WINDOW_SECONDS`.
-* successful logins clear the username counter (not the IP one — IPs
-  that just brute‑forced a dozen usernames still need to cool off).
-* rows older than the window are GC'd lazily on every login attempt.
+* **Tier 0:** after `LOGIN_LOCK_TIER0_FAILS` bad passwords, lock for `LOGIN_LOCK_TIER0_SECONDS` (default 5 → 60s).
+* **Tier 1:** then after `LOGIN_LOCK_TIER1_FAILS` bad passwords, lock for `LOGIN_LOCK_TIER1_SECONDS` (default 3 → 180s).
+* **Tier 2+:** then after `LOGIN_LOCK_TIER2_FAILS` bad passwords, lock for `LOGIN_LOCK_TIER2_SECONDS` (default 3 → 600s).
 
-This is intentionally kept in SQLite so a single API container doesn't
-leak rate‑limit state across restarts but also doesn't require Redis.
+Successful login **or** successful password reset clears **`login_ip_state` for that IP**; `login_failures` rows may still be appended for audit. HTTP **429** includes a **`Retry-After`** header (seconds).
 
 ---
 
