@@ -2272,6 +2272,7 @@
 
     let selectedGroup = "";
     const hh = state.health || {};
+    const httpOk = !!(hh.ok ?? true);
     const mqConnected = !!(hh.mqtt_connected ?? ov.mqtt_connected);
     const mqQDepth = Number(hh.mqtt_ingest_queue_depth || 0);
     const mqDropped = Number(hh.mqtt_ingest_dropped || 0);
@@ -2315,7 +2316,7 @@
 
     mountView(view, `
       <section class="stats">
-        <div class="stat"><div class="k">Server</div><div class="v" id="ovServerV">—</div><div class="sub">MQTT broker link</div></div>
+        <div class="stat"><div class="k">Server</div><div class="v" id="ovServerV">—</div><div class="sub">HTTP + MQTT realtime</div></div>
         <div class="stat"><div class="k">Devices</div><div class="v" id="ovDevicesV">—</div><div class="sub">total in scope</div></div>
         <div class="stat"><div class="k">Online</div><div class="v" id="ovOnlineV">—</div><div class="sub">active now</div></div>
         <div class="stat"><div class="k">Offline</div><div class="v" id="ovOfflineV">—</div><div class="sub">inactive now</div></div>
@@ -2442,7 +2443,7 @@
         </div>
       </div>`);
     patchOverviewHeader({
-      server: mqConnected ? "Connected" : "Disconnected",
+      server: `${httpOk ? "HTTP OK" : "HTTP DOWN"} · ${mqConnected ? "MQTT UP" : "MQTT DOWN"}`,
       devices: totalDevices,
       online: onlineDevices,
       offline: offlineDevices,
@@ -2487,13 +2488,6 @@
     let editingGroup = "";
     const normalizeGroupKey = (v) => String(v == null ? "" : v).trim();
     let ownerFilterQ = "";
-    const ownerBucketOf = (d) => String((d && d.owner_admin) || "").trim();
-    const slotOwnsDevice = (tenantOwner, d) => {
-      if (!(state.me && state.me.role === "superadmin")) return true;
-      const slotOwner = String(tenantOwner || "").trim();
-      const devOwner = ownerBucketOf(d);
-      return slotOwner ? devOwner === slotOwner : devOwner === "";
-    };
     const devicesForGroups = () => {
       if (!(state.me && state.me.role === "superadmin")) return devices;
       const q = ownerFilterQ.trim().toLowerCase();
@@ -2765,23 +2759,13 @@
       if (!ids.length) throw new Error("No devices in this group");
       if (!can("can_alert")) throw new Error("No can_alert capability");
       const durationMs = Number(payload.trigger_duration_ms || DEFAULT_REMOTE_SIREN_MS);
-      const delaySeconds = Number(payload.delay_seconds || 0);
       const timerKey = slot.metaKey;
       const prevTimer = groupDelayTimers.get(timerKey);
       if (prevTimer) {
         clearTimeout(prevTimer);
         groupDelayTimers.delete(timerKey);
       }
-      if (delaySeconds > 0) {
-        const tid = setTimeout(async () => {
-          try {
-            await api("/alerts", { method: "POST", body: { action: "on", duration_ms: durationMs, device_ids: ids } });
-          } catch {}
-        }, delaySeconds * 1000);
-        groupDelayTimers.set(timerKey, tid);
-      } else {
-        await api("/alerts", { method: "POST", body: { action: "on", duration_ms: durationMs, device_ids: ids } });
-      }
+      await api("/alerts", { method: "POST", body: { action: "on", duration_ms: durationMs, device_ids: ids } });
       let rebootJobs = 0;
       let selfTests = 0;
       if (payload.reboot_self_check) {
@@ -2789,9 +2773,9 @@
         for (const did of ids) {
           await api(`/devices/${encodeURIComponent(did)}/self-test`, { method: "POST" });
           selfTests += 1;
-          await api(`/devices/${encodeURIComponent(did)}/schedule-reboot`, {
+          await api(`/devices/${encodeURIComponent(did)}/commands`, {
             method: "POST",
-            body: { delay_s: Math.max(5, delaySeconds + 5) },
+            body: { cmd: "reboot", params: {} },
           });
           rebootJobs += 1;
         }
@@ -2880,7 +2864,6 @@
       const gk = parsed.groupKey || "";
       const m = meta[editingGroup] || { display_name: gk || "", owner_name: "", phone: "", email: "", device_ids: [] };
       const slot = { metaKey: editingGroup, groupKey: gk, tenantOwner: parsed.tenantOwner };
-      const lockedOwnerSlot = !!(state.me && state.me.role === "superadmin" && slot.metaKey);
       $("#gmKey", view).value = canonicalGroupKey(gk) || "";
       $("#gmName", view).value = m.display_name || "";
       $("#gmOwner", view).value = m.owner_name || "";
@@ -2893,10 +2876,7 @@
         setChildMarkup(
           pick,
           devices
-            .map((d) => groupDeviceRow(d, {
-              checked: sel.has(String(d.device_id)),
-              disabled: isSharedGroup || (lockedOwnerSlot && !slotOwnsDevice(slot.tenantOwner, d)),
-            }))
+            .map((d) => groupDeviceRow(d, { checked: sel.has(String(d.device_id)), disabled: isSharedGroup }))
             .filter(Boolean)
             .join(""),
         );
@@ -2904,13 +2884,6 @@
           prependChildMarkup(
             pick,
             `<p class="grp-pick-hint muted" style="margin:0 0 8px">Shared group: 成员只读。 · Device membership is read-only.</p>`,
-          );
-        }
-        if (lockedOwnerSlot) {
-          const ownerTxt = slot.tenantOwner || "Unassigned";
-          prependChildMarkup(
-            pick,
-            `<p class="grp-pick-hint muted" style="margin:0 0 8px">Owner bucket locked: <span class="mono">${escapeHtml(ownerTxt)}</span>. Superadmin cannot mix owners inside one group card.</p>`,
           );
         }
       }
@@ -3212,20 +3185,10 @@
       const picks = Array.from($$("#gmDevices input[type='checkbox']", view)).filter((x) => x.checked).map((x) => String(x.value || "").trim());
       let tenantForMeta = oldParsed.tenantOwner || "";
       if (state.me && state.me.role === "superadmin") {
-        const ownerBuckets = new Set();
         for (const id of picks) {
           const dev = byId.get(String(id));
-          if (!dev) continue;
-          ownerBuckets.add(ownerBucketOf(dev));
-        }
-        if (ownerBuckets.size > 1) {
-          toast("Superadmin group card cannot mix multiple owners. Please keep one owner bucket per card.", "err");
-          return;
-        }
-        if (ownerBuckets.size === 1) {
-          tenantForMeta = Array.from(ownerBuckets)[0];
-        } else {
-          tenantForMeta = oldParsed.tenantOwner || "";
+          const o = dev && String(dev.owner_admin || "").trim();
+          if (o) { tenantForMeta = o; break; }
         }
       }
       const newMetaKey = groupCardMetaKey(key, tenantForMeta);
@@ -3367,6 +3330,7 @@
         devices = Array.isArray(list.items) ? list.items.slice() : [];
         byId = new Map(devices.map((d) => [String(d.device_id), d]));
         const hh = state.health || {};
+        const httpOk = !!(hh.ok ?? true);
         const mqConnected = !!(hh.mqtt_connected ?? ov.mqtt_connected);
         const mqQDepth = Number(hh.mqtt_ingest_queue_depth || 0);
         const mqDropped = Number(hh.mqtt_ingest_dropped || 0);
@@ -3384,7 +3348,7 @@
         const mqStatus = !mqConnected ? "Disconnected" : (mqDropped > 0 || mqQDepth >= 300 ? "Warning" : "Healthy");
         const mqClass = !mqConnected ? "revoked" : (mqStatus === "Warning" ? "offline" : "online");
         patchOverviewHeader({
-          server: mqConnected ? "Connected" : "Disconnected",
+          server: `${httpOk ? "HTTP OK" : "HTTP DOWN"} · ${mqConnected ? "MQTT UP" : "MQTT DOWN"}`,
           devices: totalDevices,
           online: onlineDevices,
           offline: offlineDevices,
@@ -3679,21 +3643,13 @@
     });
     const applyGroupSettingsFallbackCompat = async (_groupKey, _ownerO, payload) => {
       const durationMs = Number(payload.trigger_duration_ms || DEFAULT_REMOTE_SIREN_MS);
-      const delaySeconds = Number(payload.delay_seconds || 0);
       const tkey = metaKey;
       const prev = window.__groupDelayTimers.get(tkey);
       if (prev) {
         clearTimeout(prev);
         window.__groupDelayTimers.delete(tkey);
       }
-      if (delaySeconds > 0) {
-        const tid = setTimeout(async () => {
-          try { await api("/alerts", { method: "POST", body: { action: "on", duration_ms: durationMs, device_ids: ids } }); } catch {}
-        }, delaySeconds * 1000);
-        window.__groupDelayTimers.set(tkey, tid);
-      } else {
-        await api("/alerts", { method: "POST", body: { action: "on", duration_ms: durationMs, device_ids: ids } });
-      }
+      await api("/alerts", { method: "POST", body: { action: "on", duration_ms: durationMs, device_ids: ids } });
       return { ok: true, fallback: true, device_count: ids.length };
     };
     const tryApplyRouteCompat = async (groupKey, ownerO) => {

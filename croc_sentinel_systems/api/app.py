@@ -1627,7 +1627,7 @@ def require_capability(principal: Principal, capability: str) -> None:
 
 
 def _device_access_flags(principal: Principal, device_id: str) -> tuple[bool, bool]:
-    """Return (can_view, can_operate) after ownership + sharing ACL checks."""
+    """Return (can_view, can_operate) with strict tenant ownership isolation."""
     if principal.role == "superadmin":
         return True, True
     manager = get_manager_admin(principal.username) if principal.role == "user" else ""
@@ -1636,31 +1636,21 @@ def _device_access_flags(principal: Principal, device_id: str) -> tuple[bool, bo
         cur = conn.cursor()
         cur.execute("SELECT owner_admin FROM device_ownership WHERE device_id = ?", (device_id,))
         own = cur.fetchone()
-        cur.execute(
-            """
-            SELECT can_view, can_operate
-            FROM device_acl
-            WHERE device_id = ? AND grantee_username = ? AND revoked_at IS NULL
-            LIMIT 1
-            """,
-            (device_id, principal.username),
-        )
-        acl = cur.fetchone()
         conn.close()
     owner = str(own["owner_admin"]) if own and own["owner_admin"] is not None else ""
-    acl_view = bool(int(acl["can_view"])) if acl else False
-    acl_operate = bool(int(acl["can_operate"])) if acl else False
     if principal.role == "admin":
         owner_view = bool(owner) and owner == principal.username
         if not owner and _legacy_unowned_device_scope(principal):
             owner_view = True
         owner_operate = bool(owner) and owner == principal.username
-        return (owner_view or acl_view or acl_operate), (owner_operate or acl_operate)
+        # Strict isolation mode: admin cannot view/operate cross-tenant shared devices.
+        return owner_view, owner_operate
     owner_view = bool(owner) and bool(manager) and owner == manager
     if not owner and _legacy_unowned_device_scope(principal) and bool(manager):
         owner_view = True
     owner_operate = bool(owner) and bool(manager) and owner == manager
-    return (owner_view or acl_view or acl_operate), (owner_operate or acl_operate)
+    # Tenant user follows manager tenant only; shared ACL does not cross tenant boundary.
+    return owner_view, owner_operate
 
 
 def _principal_tenant_owns_device(principal: Principal, owner_admin: Optional[str]) -> bool:
@@ -1735,40 +1725,28 @@ def owner_scope_clause_for_device_state(principal: Principal, device_alias: str 
     if principal.role == "superadmin":
         return "", []
     if principal.role == "admin":
-        acl_clause = (
-            f"EXISTS (SELECT 1 FROM device_acl a WHERE a.device_id={device_alias}.device_id "
-            "AND a.grantee_username=? AND a.revoked_at IS NULL AND (a.can_view=1 OR a.can_operate=1))"
-        )
         if _legacy_unowned_device_scope(principal):
             return (
                 f" AND ((EXISTS (SELECT 1 FROM device_ownership o WHERE o.device_id={device_alias}.device_id AND o.owner_admin=?)) "
-                "OR (" + acl_clause + ") "
                 f"OR (NOT EXISTS (SELECT 1 FROM device_ownership o2 WHERE o2.device_id={device_alias}.device_id))) ",
-                [principal.username, principal.username],
+                [principal.username],
             )
         return (
-            f" AND ((EXISTS (SELECT 1 FROM device_ownership o WHERE o.device_id={device_alias}.device_id AND o.owner_admin=?)) "
-            "OR (" + acl_clause + ")) ",
-            [principal.username, principal.username],
+            f" AND (EXISTS (SELECT 1 FROM device_ownership o WHERE o.device_id={device_alias}.device_id AND o.owner_admin=?)) ",
+            [principal.username],
         )
     manager = get_manager_admin(principal.username)
     if not manager:
         return " AND 1=0 ", []
-    acl_clause = (
-        f"EXISTS (SELECT 1 FROM device_acl a WHERE a.device_id={device_alias}.device_id "
-        "AND a.grantee_username=? AND a.revoked_at IS NULL AND (a.can_view=1 OR a.can_operate=1))"
-    )
     if _legacy_unowned_device_scope(principal):
         return (
             f" AND ((EXISTS (SELECT 1 FROM device_ownership o WHERE o.device_id={device_alias}.device_id AND o.owner_admin=?)) "
-            "OR (" + acl_clause + ") "
             f"OR (NOT EXISTS (SELECT 1 FROM device_ownership o2 WHERE o2.device_id={device_alias}.device_id))) ",
-            [manager, principal.username],
+            [manager],
         )
     return (
-        f" AND ((EXISTS (SELECT 1 FROM device_ownership o WHERE o.device_id={device_alias}.device_id AND o.owner_admin=?)) "
-        "OR (" + acl_clause + ")) ",
-        [manager, principal.username],
+        f" AND (EXISTS (SELECT 1 FROM device_ownership o WHERE o.device_id={device_alias}.device_id AND o.owner_admin=?)) ",
+        [manager],
     )
 
 
@@ -7136,7 +7114,6 @@ def apply_group_card_settings(
                 }
             conn.close()
 
-    now_ts = int(time.time())
     siren_sent = 0
     siren_scheduled = 0
     reboot_jobs = 0
@@ -7146,30 +7123,18 @@ def apply_group_card_settings(
         owner_real = str(device_owner_map.get(did) or "")
         owner_for_cfg = owner_real or owner_scope
         cfg = settings_by_owner.get(owner_for_cfg, _group_settings_defaults(g))
-        mode = str(cfg.get("trigger_mode") or "continuous")
         dur_ms = int(cfg.get("trigger_duration_ms") or DEFAULT_REMOTE_FANOUT_MS)
-        delay_seconds = int(cfg.get("delay_seconds") or 0)
         reboot_self_check = bool(cfg.get("reboot_self_check"))
-        if delay_seconds > 0:
-            enqueue_scheduled_command(
-                device_id=did,
-                cmd="siren_on",
-                params={"duration_ms": dur_ms},
-                target_id=did,
-                proto=CMD_PROTO,
-                execute_at_ts=now_ts + delay_seconds,
-            )
-            siren_scheduled += 1
-        else:
-            publish_command(
-                topic=f"{TOPIC_ROOT}/{did}/cmd",
-                cmd="siren_on",
-                params={"duration_ms": dur_ms},
-                target_id=did,
-                proto=CMD_PROTO,
-                cmd_key=get_cmd_key_for_device(did),
-            )
-            siren_sent += 1
+        # Delay is config-only for UI visibility; execution is immediate.
+        publish_command(
+            topic=f"{TOPIC_ROOT}/{did}/cmd",
+            cmd="siren_on",
+            params={"duration_ms": dur_ms},
+            target_id=did,
+            proto=CMD_PROTO,
+            cmd_key=get_cmd_key_for_device(did),
+        )
+        siren_sent += 1
 
         if reboot_self_check:
             require_capability(principal, "can_send_command")
@@ -7185,13 +7150,13 @@ def apply_group_card_settings(
                 cmd_key=get_cmd_key_for_device(did),
             )
             self_tests += 1
-            enqueue_scheduled_command(
-                device_id=did,
+            publish_command(
+                topic=f"{TOPIC_ROOT}/{did}/cmd",
                 cmd="reboot",
                 params={},
                 target_id=did,
                 proto=CMD_PROTO,
-                execute_at_ts=now_ts + max(5, delay_seconds + 5),
+                cmd_key=get_cmd_key_for_device(did),
             )
             reboot_jobs += 1
 
@@ -7199,9 +7164,9 @@ def apply_group_card_settings(
     # Report the first owner's effective setting for compact response fields.
     first_owner = str(device_owner_map.get(targets[0]) or owner_scope) if targets else owner_scope
     first_cfg = settings_by_owner.get(first_owner, _group_settings_defaults(g))
-    mode = str(first_cfg.get("trigger_mode") or "continuous")
+    mode = "continuous"
     dur_ms = int(first_cfg.get("trigger_duration_ms") or DEFAULT_REMOTE_FANOUT_MS)
-    delay_seconds = int(first_cfg.get("delay_seconds") or 0)
+    delay_seconds = 0
     reboot_self_check = bool(first_cfg.get("reboot_self_check"))
     _log_signal_trigger(
         "group_card_apply",
@@ -7893,30 +7858,16 @@ def resolve_target_devices(device_ids: list[str], principal: Optional[Principal]
     osf, osa = ("", [])
     if principal and not principal.is_superadmin():
         if principal.role == "admin":
-            osf = (
-                " AND ("
-                "o.owner_admin = ? "
-                "OR EXISTS (SELECT 1 FROM device_acl a WHERE a.device_id=d.device_id "
-                "AND a.grantee_username=? AND a.revoked_at IS NULL "
-                "AND (a.can_operate=1 OR a.can_view=1))"
-                ") "
-            )
-            osa = [principal.username, principal.username]
+            osf = " AND o.owner_admin = ? "
+            osa = [principal.username]
         else:
             manager = get_manager_admin(principal.username)
             if not manager:
                 osf = " AND 1=0 "
                 osa = []
             else:
-                osf = (
-                    " AND ("
-                    "o.owner_admin = ? "
-                    "OR EXISTS (SELECT 1 FROM device_acl a WHERE a.device_id=d.device_id "
-                    "AND a.grantee_username=? AND a.revoked_at IS NULL "
-                    "AND (a.can_operate=1 OR a.can_view=1))"
-                    ") "
-                )
-                osa = [manager, principal.username]
+                osf = " AND o.owner_admin = ? "
+                osa = [manager]
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()

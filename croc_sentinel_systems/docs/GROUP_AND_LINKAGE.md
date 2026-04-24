@@ -88,7 +88,8 @@
 | **共享设备（ACL）** | 被 share 的设备仍属 **原 owner** 的 `notification_group`；**策略**仅 **属主** 可改。兄弟 fan-out **仍按 owner + 组** 计算，与「谁能点 Dashboard」是两条权限线。 |
 | **策略键与归一化不一致** | 兄弟可因归一化合并；**策略**按 **原始 strip 字符串** 键控——请 **统一组名字符串** 或接受默认策略。 |
 | **Dashboard 组卡「Alarm ON」** | 多为 **`/alerts` 或组 apply** 直接对所选 `device_id` 发 MQTT，**不是**走「某台先报 `alarm.trigger` 再兄弟 fan-out」那条链。 |
-| **Superadmin 组卡 owner 混选** | 现实现为**单卡单 owner bucket**：一个组卡内不允许混选多个 `owner_admin`（含 unassigned），否则会被拒绝保存，避免“同组多卡重叠统计”。 |
+| **Delay 配置语义** | `delay_seconds` 仅保留为网页配置字段（用于可视化与策略档案）；实际组卡 apply 按**立即下发**执行，不再在服务端排队延迟执行。 |
+| **Superadmin 组卡 owner 混选** | 允许 superadmin 跨 owner 自由编排组卡；组卡统计按当前设备 `owner_admin + notification_group` 真实切片显示。admin / user 仅可见和操作自己租户设备（严格数据隔离，不透传跨租户 ACL 视图）。 |
 | **仅改浏览器本地** | 组卡展示用 `localStorage` 可丢；**数据库组名不变**。 |
 
 ---
