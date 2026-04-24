@@ -1517,7 +1517,29 @@ table.t tr.sub td { background: var(--bg-muted); }
     background: var(--bg-muted);
   }
 }
-.device-card { background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px; display: flex; flex-direction: column; gap: 8px; transition: transform var(--transition), box-shadow var(--transition); cursor: pointer; }
+.device-card { position: relative; background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px; display: flex; flex-direction: column; gap: 8px; transition: transform var(--transition), box-shadow var(--transition); cursor: pointer; }
+/* Overview / grid: title clears owner pill */
+.device-card--has-owner-tag > h3 {
+  padding-right: min(42%, 140px);
+}
+.js-group-card--has-corner > h3 {
+  padding-right: min(48%, 200px);
+}
+.device-card__corner-tr--list-bulk {
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+}
+.device-card__pick-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.device-card--row-thumb.device-card--row-thumb--wide-pad .device-card--row-body {
+  padding-right: 120px;
+}
 .device-card:hover { transform: translateY(-1px); box-shadow: var(--shadow-lg); border-color: var(--border-strong); }
 .device-card h3 { margin: 0; font-size: 14.5px; font-weight: 600; line-height: 1.25; }
 .device-card .device-primary-name { font-size: 1.05rem; font-weight: 650; letter-spacing: -0.01em; }
@@ -1534,7 +1556,7 @@ table.t tr.sub td { background: var(--bg-muted); }
 .device-card--row-thumb .device-card--row-body {
   flex: 1;
   min-width: 0;
-  padding-right: 52px;
+  padding-right: 76px;
   box-sizing: border-box;
   display: flex;
   flex-direction: column;

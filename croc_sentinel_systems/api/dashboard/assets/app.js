@@ -2527,7 +2527,12 @@
       const on = isOnline(d);
       const primary = escapeHtml(d.display_label || d.device_id || "unknown");
       const subId = d.display_label ? `<div class="device-id-sub mono">${escapeHtml(d.device_id || "")}</div>` : "";
-      return `<a class="device-card" href="#/devices/${encodeURIComponent(d.device_id)}" style="text-decoration:none;color:inherit">
+      const showOwnerTag = !!(d.owner_admin && state.me && (state.me.role === "superadmin" || d.is_shared));
+      const ownerCorner = showOwnerTag
+        ? `<div class="device-card__corner-tr device-card__corner-tr--solo"><span class="card-owner-tag" title="Owning admin / 租户">${escapeHtml(String(d.owner_admin))}</span></div>`
+        : "";
+      return `<a class="device-card${showOwnerTag ? " device-card--has-owner-tag" : ""}" href="#/devices/${encodeURIComponent(d.device_id)}" style="text-decoration:none;color:inherit">
+        ${ownerCorner}
         <h3><div class="device-primary-name">${primary}</div>${subId}</h3>
         <div><span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>
           ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
@@ -2559,16 +2564,16 @@
       const scopeShareHtml = shareScopeBadgesHtml(rows);
       const dsec = Number(gs.delay_seconds || 0);
       const modeLabel = dsec > 0 ? `after ${dsec}s` : "immediate";
-      const tenantChip = slot.tenantOwner
-        ? `<span class="chip" title="Owning admin">${escapeHtml(slot.tenantOwner)}</span>`
-        : "";
       const shareBtn = state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_manage_users")))
-        ? `<button class="group-del-ico js-share-group" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button" title="Share devices in this card (device ACL only — not group secrets)" style="right:32px">⇪</button>`
+        ? `<button class="group-del-ico js-share-group" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button" title="Share devices in this card (device ACL only — not group secrets)">⇪</button>`
         : "";
-      return `<article class="device-card js-group-card ${selectedGroup === slot.metaKey ? "is-selected" : ""}" data-meta-key="${escapeHtml(slot.metaKey)}" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" style="cursor:pointer;position:relative">
-        ${shareBtn}
+      const hasCorner = !!(slot.tenantOwner || shareBtn);
+      const cornerHtml = hasCorner
+        ? `<div class="device-card__corner-tr" role="group" aria-label="Tenant">${slot.tenantOwner ? `<span class="card-owner-tag" title="Owning admin / 所属租户">${escapeHtml(slot.tenantOwner)}</span>` : ""}${shareBtn}</div>`
+        : "";
+      return `<article class="device-card js-group-card ${hasCorner ? "js-group-card--has-corner " : ""}${selectedGroup === slot.metaKey ? "is-selected" : ""}" data-meta-key="${escapeHtml(slot.metaKey)}" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" style="cursor:pointer;position:relative">
+        ${cornerHtml}
         <h3><div class="device-primary-name">${escapeHtml(m.display_name || g)}</div><div class="device-id-sub mono">${escapeHtml(g)}</div></h3>
-        <div class="row" style="gap:6px;flex-wrap:wrap;margin-bottom:8px">${tenantChip}</div>
         <div class="meta" style="margin-bottom:8px">
           Trigger: <span class="mono">${escapeHtml(modeLabel)}</span> ·
           Duration: <span class="mono">${escapeHtml(String(Math.round((Number(gs.trigger_duration_ms) || DEFAULT_REMOTE_SIREN_MS) / 60000 * 10) / 10))} min</span> ·
@@ -3386,9 +3391,12 @@
     setCrumb(`Group · ${gm.display_name || g}`);
     mountView(view, `
       <section class="card">
-        <div class="row">
-          <h2 style="margin:0">${escapeHtml(gm.display_name || g)}</h2>
-          <a href="#/overview" class="btn ghost right">← Back</a>
+        <div class="row" style="align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap">
+          <h2 style="margin:0;flex:1;min-width:0">${escapeHtml(gm.display_name || g)}</h2>
+          <div class="row" style="gap:8px;align-items:center;flex-shrink:0;margin-left:auto">
+            ${tenantOwner ? `<span class="card-owner-tag" title="Owning admin / 所属租户">${escapeHtml(tenantOwner)}</span>` : ""}
+            <a href="#/overview" class="btn ghost right">← Back</a>
+          </div>
         </div>
         <div class="divider"></div>
         <div class="row" style="gap:6px;flex-wrap:wrap">
@@ -3396,7 +3404,6 @@
           <span class="badge online">online <span id="grpOnline">${online}</span></span>
           <span class="badge offline">offline <span id="grpOffline">${offline}</span></span>
           <span class="chip">${escapeHtml(g)}</span>
-          ${tenantOwner ? `<span class="chip" title="Owning admin">${escapeHtml(tenantOwner)}</span>` : ""}
         </div>
         <p class="muted" style="margin-top:8px">Owner: ${escapeHtml(gm.owner_name || "—")} · ${escapeHtml(gm.phone || "—")} · ${escapeHtml(gm.email || "—")}</p>
         <div class="row" style="margin-top:8px;gap:8px;justify-content:flex-end">
@@ -3626,12 +3633,11 @@
             `</div>`;
         const letter = escapeHtml((d.display_label || d.device_id || "?").slice(0, 1).toUpperCase());
         const spLine = d.status_preview && d.status_preview.line ? escapeHtml(String(d.status_preview.line)) : "—";
+        const showOwnerTag = !!(d.owner_admin && state.me && (state.me.role === "superadmin" || d.is_shared));
         const scopeLead =
-          state.me && state.me.role === "superadmin" && d.owner_admin
-            ? `<span class="device-card__meta-k">Owner</span><span class="device-card__meta-scope">${escapeHtml(String(d.owner_admin))}</span><span class="device-card__meta-sep" aria-hidden="true"> · </span>`
-            : d.is_shared && d.shared_by
-              ? `<span class="device-card__meta-k">Shared</span><span class="device-card__meta-scope">${escapeHtml(String(d.shared_by))}</span><span class="device-card__meta-sep" aria-hidden="true"> · </span>`
-              : "";
+          d.is_shared && d.shared_by
+            ? `<span class="device-card__meta-k">Shared</span><span class="device-card__meta-scope">${escapeHtml(String(d.shared_by))}</span><span class="device-card__meta-sep" aria-hidden="true"> · </span>`
+            : "";
         const needFw = !!(d.firmware_hint && d.firmware_hint.update_available && firmwareHintStillValid(d.fw, d.firmware_hint));
         const fwBlock = d.fw
           ? `<div class="device-card__firmware">` +
@@ -3643,10 +3649,13 @@
               : "") +
             `</span></div>`
           : "";
-        return `<div class="device-card device-card--row-thumb" style="position:relative">` +
-          `<label style="position:absolute;right:8px;top:8px;z-index:2;display:flex;align-items:center;gap:6px;font-size:12px">` +
+        const listCorner = `<div class="device-card__corner-tr device-card__corner-tr--list-bulk" role="group" aria-label="Selection">` +
+          (showOwnerTag ? `<span class="card-owner-tag" title="Owning admin / 租户">${escapeHtml(String(d.owner_admin))}</span>` : "") +
+          `<label class="device-card__pick-wrap muted">` +
           `<input type="checkbox" class="bulk-dev-pick" data-device-id="${escapeHtml(did)}" ${checked ? "checked" : ""} />` +
-          `<span class="muted">Pick</span></label>` +
+          `<span>Pick</span></label></div>`;
+        return `<div class="device-card device-card--row-thumb${showOwnerTag ? " device-card--row-thumb--wide-pad" : ""}" style="position:relative">` +
+          listCorner +
           `<a href="#/devices/${encodeURIComponent(d.device_id)}" style="display:flex;gap:10px;text-decoration:none;color:inherit;flex:1;min-width:0">` +
           `<div class="device-thumb device-thumb--list" aria-hidden="true">${letter}</div>` +
           `<div class="device-card--row-body">` +
