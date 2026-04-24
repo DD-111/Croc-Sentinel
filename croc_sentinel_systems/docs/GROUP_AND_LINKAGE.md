@@ -33,6 +33,7 @@
 5. 对每条候选的 `notification_group` 再做 **`_sibling_group_norm`**，与源的 norm **相等** 才计入兄弟。  
 6. **去掉源设备自身**（报警路径上 `include_source` 对遥控/静音/暂停/恐慌均为 false）。  
 7. **去重**；按 **`device_id` 字典序** 排序后取前 **`ALARM_FANOUT_MAX_TARGETS`**（默认 **200**，环境变量 `ALARM_FANOUT_MAX_TARGETS`）台，顺序稳定、便于复现与分批策略。实际命中数 **`eligible_total`**、是否触顶 **`fanout_capped`** 写入审计 `alarm.fanout` 与 **`GET /devices/{id}/siblings-preview`**。
+8. **重复事件抑制**：同一设备在短时间内重复上报同一 `alarm.trigger`（优先 `nonce`，回退 `ts+trigger_kind+source_zone`）会被抑制，避免 QoS1 重投导致兄弟重复鸣响；窗口由 **`ALARM_EVENT_DEDUP_WINDOW_SEC`**（默认 8 秒）控制。  
 
 ### 2.3 兄弟收到什么 MQTT？（`_fan_out_alarm`）
 
@@ -87,6 +88,7 @@
 | **共享设备（ACL）** | 被 share 的设备仍属 **原 owner** 的 `notification_group`；**策略**仅 **属主** 可改。兄弟 fan-out **仍按 owner + 组** 计算，与「谁能点 Dashboard」是两条权限线。 |
 | **策略键与归一化不一致** | 兄弟可因归一化合并；**策略**按 **原始 strip 字符串** 键控——请 **统一组名字符串** 或接受默认策略。 |
 | **Dashboard 组卡「Alarm ON」** | 多为 **`/alerts` 或组 apply** 直接对所选 `device_id` 发 MQTT，**不是**走「某台先报 `alarm.trigger` 再兄弟 fan-out」那条链。 |
+| **Superadmin 组卡 owner 混选** | 现实现为**单卡单 owner bucket**：一个组卡内不允许混选多个 `owner_admin`（含 unassigned），否则会被拒绝保存，避免“同组多卡重叠统计”。 |
 | **仅改浏览器本地** | 组卡展示用 `localStorage` 可丢；**数据库组名不变**。 |
 
 ---

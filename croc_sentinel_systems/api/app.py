@@ -133,6 +133,9 @@ DEFAULT_PANIC_FANOUT_MS = int(os.getenv("DEFAULT_PANIC_FANOUT_MS", "300000"))
 ALARM_FANOUT_DURATION_MS = int(os.getenv("ALARM_FANOUT_DURATION_MS", str(DEFAULT_REMOTE_FANOUT_MS)))
 ALARM_FANOUT_MAX_TARGETS = int(os.getenv("ALARM_FANOUT_MAX_TARGETS", "200"))
 ALARM_FANOUT_SELF = os.getenv("ALARM_FANOUT_SELF", "0") == "1"
+# QoS1 can redeliver duplicate event frames after reconnect; suppress repeated
+# sibling fan-out for the same logical alarm event in this short window.
+ALARM_EVENT_DEDUP_WINDOW_SEC = int(os.getenv("ALARM_EVENT_DEDUP_WINDOW_SEC", "8"))
 # Per-IP login lockout (replaces old sliding-window LOGIN_RATE_* on /auth/login only).
 # Tier 0: FAILS wrong → lock LOCK0 s; tier 1: FAILS → lock LOCK1; tier 2+: FAILS → lock LOCK2. Success clears IP state.
 LOGIN_LOCK_TIER0_FAILS = max(1, int(os.getenv("LOGIN_LOCK_TIER0_FAILS", "5")))
@@ -266,6 +269,8 @@ mqtt_ingest_dropped = 0
 mqtt_last_connect_at = ""
 mqtt_last_disconnect_at = ""
 mqtt_last_disconnect_reason = ""
+alarm_event_dedup_lock = threading.Lock()
+alarm_event_dedup_seen: dict[str, float] = {}
 # Deferred bootstrap: ASGI binds immediately; heavy IO runs on api-bootstrap thread.
 api_ready_event = threading.Event()
 api_bootstrap_error: Optional[str] = None
@@ -2011,6 +2016,31 @@ def _sibling_group_norm(raw: str) -> str:
         return s.lower()
 
 
+def _alarm_event_is_duplicate(device_id: str, payload: dict[str, Any]) -> bool:
+    """Best-effort dedup for repeated `alarm.trigger` payloads in a short window."""
+    win = max(0, int(ALARM_EVENT_DEDUP_WINDOW_SEC))
+    if win <= 0:
+        return False
+    nonce = str(payload.get("nonce") or "").strip()
+    ts_raw = str(payload.get("ts") or "").strip()
+    trig = str(payload.get("trigger_kind") or "").strip()
+    zone = str(payload.get("source_zone") or "").strip()
+    # Prefer nonce when present; fall back to ts+kind+zone signature.
+    sig = nonce or f"ts={ts_raw}|kind={trig}|zone={zone}"
+    key = f"{device_id}|{sig}"
+    now = time.time()
+    cutoff = now - win
+    with alarm_event_dedup_lock:
+        stale = [k for k, exp in alarm_event_dedup_seen.items() if exp < cutoff]
+        for k in stale:
+            alarm_event_dedup_seen.pop(k, None)
+        last = alarm_event_dedup_seen.get(key)
+        if last and (now - last) <= win:
+            return True
+        alarm_event_dedup_seen[key] = now
+    return False
+
+
 def _lookup_owner_admin(device_id: str) -> Optional[str]:
     with db_lock:
         conn = get_conn()
@@ -2863,6 +2893,22 @@ def _fan_out_alarm(device_id: str, payload: dict[str, Any]) -> None:
       4. Publish per-target ``siren_on`` / ``siren_off`` / ``alarm_signal``, insert alarm row,
          queue email.
     """
+    if _alarm_event_is_duplicate(device_id, payload):
+        emit_event(
+            level="debug",
+            category="alarm",
+            event_type="alarm.trigger.duplicate",
+            summary=f"duplicate alarm.trigger ignored for {device_id}",
+            actor=f"device:{device_id}",
+            device_id=device_id,
+            detail={
+                "nonce": str(payload.get("nonce") or ""),
+                "ts": payload.get("ts"),
+                "dedup_window_sec": ALARM_EVENT_DEDUP_WINDOW_SEC,
+            },
+        )
+        return
+
     source_zone = str(payload.get("source_zone") or "all")
     local_trigger = bool(payload.get("local_trigger"))
     triggered_by = str(payload.get("trigger_kind") or ("remote_button" if local_trigger else "network"))

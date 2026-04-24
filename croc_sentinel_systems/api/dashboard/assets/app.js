@@ -2487,6 +2487,13 @@
     let editingGroup = "";
     const normalizeGroupKey = (v) => String(v == null ? "" : v).trim();
     let ownerFilterQ = "";
+    const ownerBucketOf = (d) => String((d && d.owner_admin) || "").trim();
+    const slotOwnsDevice = (tenantOwner, d) => {
+      if (!(state.me && state.me.role === "superadmin")) return true;
+      const slotOwner = String(tenantOwner || "").trim();
+      const devOwner = ownerBucketOf(d);
+      return slotOwner ? devOwner === slotOwner : devOwner === "";
+    };
     const devicesForGroups = () => {
       if (!(state.me && state.me.role === "superadmin")) return devices;
       const q = ownerFilterQ.trim().toLowerCase();
@@ -2873,6 +2880,7 @@
       const gk = parsed.groupKey || "";
       const m = meta[editingGroup] || { display_name: gk || "", owner_name: "", phone: "", email: "", device_ids: [] };
       const slot = { metaKey: editingGroup, groupKey: gk, tenantOwner: parsed.tenantOwner };
+      const lockedOwnerSlot = !!(state.me && state.me.role === "superadmin" && slot.metaKey);
       $("#gmKey", view).value = canonicalGroupKey(gk) || "";
       $("#gmName", view).value = m.display_name || "";
       $("#gmOwner", view).value = m.owner_name || "";
@@ -2885,7 +2893,10 @@
         setChildMarkup(
           pick,
           devices
-            .map((d) => groupDeviceRow(d, { checked: sel.has(String(d.device_id)), disabled: isSharedGroup }))
+            .map((d) => groupDeviceRow(d, {
+              checked: sel.has(String(d.device_id)),
+              disabled: isSharedGroup || (lockedOwnerSlot && !slotOwnsDevice(slot.tenantOwner, d)),
+            }))
             .filter(Boolean)
             .join(""),
         );
@@ -2893,6 +2904,13 @@
           prependChildMarkup(
             pick,
             `<p class="grp-pick-hint muted" style="margin:0 0 8px">Shared group: 成员只读。 · Device membership is read-only.</p>`,
+          );
+        }
+        if (lockedOwnerSlot) {
+          const ownerTxt = slot.tenantOwner || "Unassigned";
+          prependChildMarkup(
+            pick,
+            `<p class="grp-pick-hint muted" style="margin:0 0 8px">Owner bucket locked: <span class="mono">${escapeHtml(ownerTxt)}</span>. Superadmin cannot mix owners inside one group card.</p>`,
           );
         }
       }
@@ -3194,10 +3212,20 @@
       const picks = Array.from($$("#gmDevices input[type='checkbox']", view)).filter((x) => x.checked).map((x) => String(x.value || "").trim());
       let tenantForMeta = oldParsed.tenantOwner || "";
       if (state.me && state.me.role === "superadmin") {
+        const ownerBuckets = new Set();
         for (const id of picks) {
           const dev = byId.get(String(id));
-          const o = dev && String(dev.owner_admin || "").trim();
-          if (o) { tenantForMeta = o; break; }
+          if (!dev) continue;
+          ownerBuckets.add(ownerBucketOf(dev));
+        }
+        if (ownerBuckets.size > 1) {
+          toast("Superadmin group card cannot mix multiple owners. Please keep one owner bucket per card.", "err");
+          return;
+        }
+        if (ownerBuckets.size === 1) {
+          tenantForMeta = Array.from(ownerBuckets)[0];
+        } else {
+          tenantForMeta = oldParsed.tenantOwner || "";
         }
       }
       const newMetaKey = groupCardMetaKey(key, tenantForMeta);
