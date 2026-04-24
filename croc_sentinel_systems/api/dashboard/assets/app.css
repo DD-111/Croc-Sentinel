@@ -120,10 +120,7 @@ body[data-layout="auth"] {
 
 /* Signed-in: compact footer and chrome */
 body[data-layout="app"] .site-footer--shell {
-  padding: 6px 14px 8px;
-  padding-left: max(14px, env(safe-area-inset-left, 0px));
-  padding-right: max(14px, env(safe-area-inset-right, 0px));
-  padding-bottom: max(6px, env(safe-area-inset-bottom, 0px));
+  padding: 6px max(var(--gap), env(safe-area-inset-right, 0px)) max(6px, env(safe-area-inset-bottom, 0px)) max(var(--gap), env(safe-area-inset-left, 0px));
   font-size: 0.6875rem;
   line-height: 1.32;
 }
@@ -142,12 +139,10 @@ body[data-layout="app"] .site-footer__legal {
   line-height: 1.3;
   opacity: 0.9;
 }
+/* Align with #view: same horizontal inset as main content (see .view) */
 body[data-layout="app"] .topbar {
   min-height: var(--topbar-h);
-  padding: 8px 16px;
-  padding-left: max(16px, env(safe-area-inset-left, 0px));
-  padding-right: max(16px, env(safe-area-inset-right, 0px));
-  padding-top: max(8px, env(safe-area-inset-top, 0px));
+  padding: max(8px, env(safe-area-inset-top, 0px)) max(var(--gap), env(safe-area-inset-right, 0px)) 8px max(var(--gap), env(safe-area-inset-left, 0px));
   gap: 8px;
 }
 body[data-layout="app"] .crumb {
@@ -187,7 +182,8 @@ body[data-layout="app"] .sidebar-actions .btn {
   min-height: 34px;
 }
 body[data-layout="app"] .view {
-  padding: var(--gap);
+  /* Match .topbar / .site-footer--shell horizontal box so crump + cards + footer share one column */
+  padding: var(--gap) max(var(--gap), env(safe-area-inset-right, 0px)) max(var(--gap), env(safe-area-inset-bottom, 0px)) max(var(--gap), env(safe-area-inset-left, 0px));
   width: 100%;
   max-width: var(--app-content-max);
   margin-left: auto;
@@ -566,6 +562,47 @@ body[data-auth="ok"] .health-pills {
   box-shadow: 0 6px 16px color-mix(in srgb, var(--accent) 32%, transparent);
   user-select: none;
 }
+.who-card__avatar--photo {
+  display: block;
+  padding: 0;
+  overflow: hidden;
+  line-height: 0;
+  background: var(--bg-muted);
+}
+.who-card__avatar--photo img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 12px;
+  vertical-align: top;
+}
+/* Account → profile picture preview */
+.account-avatar-preview {
+  width: 48px;
+  height: 48px;
+  border-radius: 12px;
+  flex-shrink: 0;
+  overflow: hidden;
+  background: var(--bg-muted);
+  border: 1px solid var(--border);
+  display: grid;
+  place-items: center;
+}
+.account-avatar-preview img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.account-avatar-fallback {
+  font-size: 1.1rem;
+  font-weight: 800;
+  font-family: var(--font-display);
+  color: var(--text-muted);
+  line-height: 1;
+}
+.account-avatar-fallback--err { color: var(--warn, #b45309); }
 .who-card__body {
   min-width: 0;
   flex: 1 1 auto;
@@ -1042,6 +1079,10 @@ body[data-layout="auth"] .site-footer__row--auth .site-footer__legal {
   box-shadow: var(--shadow-lg);
   padding: 14px;
 }
+/* Modals: stack label.field; .field--spaced margin is auth-scoped so space siblings here */
+.grp-modal-card > label.field + label.field {
+  margin-top: 8px;
+}
 .grp-modal-card--edit {
   padding: 0;
   display: flex;
@@ -1312,12 +1353,34 @@ body[data-layout="auth"] .site-footer__row--auth .site-footer__legal {
 /* Forms */
 label.field { display: flex; flex-direction: column; gap: 5px; font-size: var(--text-sm); color: var(--text-muted); }
 label.field > span { line-height: 1.3; }
+label.field.field--toggle { gap: 0; }
+label.field .field--toggle__text { color: var(--text); line-height: 1.45; }
 input, select, textarea {
   width: 100%;
   background: var(--bg-elev); color: var(--text);
   border: 1px solid var(--border); border-radius: var(--radius-sm);
   padding: 8px 10px; font: inherit; font-size: var(--text-sm);
   transition: border-color var(--transition), box-shadow var(--transition);
+}
+/* Do not style native toggles like text fields (avoids 100% width + tall min-height in .field) */
+input[type="checkbox"],
+input[type="radio"] {
+  width: 1.125em;
+  height: 1.125em;
+  min-width: 0;
+  max-width: none;
+  min-height: 0;
+  margin: 0 0.4em 0 0;
+  padding: 0;
+  flex-shrink: 0;
+  align-self: center;
+  vertical-align: middle;
+  cursor: pointer;
+  accent-color: var(--accent, #38bdf8);
+  border-radius: 4px;
+}
+input[type="radio"] {
+  border-radius: 50%;
 }
 input:focus, select:focus, textarea:focus {
   outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--ring);
@@ -1423,10 +1486,110 @@ table.t tr.sub td { background: var(--bg-muted); }
 .device-card--row-thumb {
   flex-direction: row;
   align-items: flex-start;
-  gap: 12px;
+  gap: 10px;
   text-align: left;
+  padding: 10px 11px;
 }
-.device-card--row-thumb .device-card--row-body { flex: 1; min-width: 0; }
+.device-card--row-thumb .device-card--row-body {
+  flex: 1;
+  min-width: 0;
+  padding-right: 52px;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+.device-card--row-thumb .device-card__h3 {
+  margin: 0;
+  font-size: inherit;
+  font-weight: inherit;
+  line-height: 1.2;
+}
+/* Title + serial on one line; SN smaller and truncated */
+.device-card--row-thumb .device-card__title-row {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px 10px;
+  min-width: 0;
+}
+.device-card--row-thumb .device-card__title-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 1.02rem;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+.device-card--row-thumb .device-card__sn {
+  flex: 0 1 auto;
+  max-width: 46%;
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.2;
+  opacity: 0.9;
+}
+.device-card--row-thumb .device-card__title-row--mono {
+  flex-wrap: wrap;
+}
+.device-card--row-thumb .device-card__title-row--mono .device-card__sn {
+  flex: 1 1 100%;
+  max-width: 100%;
+  text-align: left;
+  font-size: 10px;
+  white-space: normal;
+  word-break: break-all;
+}
+/* Two-line meta so card heights stay even when Owner/Shared is absent */
+.device-card--row-thumb .device-card__meta-compact {
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+.device-card--row-thumb .device-card__meta-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 6px;
+  min-width: 0;
+}
+.device-card--row-thumb .device-card__meta-k {
+  flex: 0 0 auto;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.device-card--row-thumb .device-card__meta-v {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text-muted);
+}
+.device-card--row-thumb .device-card__meta-scope {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.device-card--row-thumb .device-card__meta-sep {
+  color: var(--text-dim);
+  font-weight: 500;
+}
 /* All devices — one status row: presence/zone (left) + firmware block (right, or wraps neatly) */
 .device-card--row-thumb .device-card__status {
   display: flex;
@@ -1527,6 +1690,11 @@ details.card.device-drawer[open] > summary.device-drawer__summary {
 /* Inline forms in cards */
 .inline-form { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); align-items: end; }
 .inline-form .wide { grid-column: 1 / -1; }
+/* Siren /alerts: two equal top columns; full-width multiselect + action row line up to same card edges as #view column */
+.inline-form--bulk-siren { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+@media (max-width: 480px) {
+  .inline-form--bulk-siren { grid-template-columns: 1fr; }
+}
 .action-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .danger-zone {
   border: 1px solid color-mix(in srgb, var(--danger) 28%, var(--border));
@@ -2890,8 +3058,7 @@ pre.code { background: var(--bg-muted); border: 1px solid var(--border); border-
     padding-bottom: max(12px, env(safe-area-inset-bottom, 0px));
   }
   body[data-layout="app"] .site-footer--shell {
-    padding: 6px 12px 8px;
-    padding-bottom: max(6px, env(safe-area-inset-bottom, 0px));
+    padding: 6px max(var(--gap), env(safe-area-inset-right, 0px)) max(6px, env(safe-area-inset-bottom, 0px)) max(var(--gap), env(safe-area-inset-left, 0px));
   }
   .site-footer.site-footer--auth {
     padding-left: max(8px, env(safe-area-inset-left, 0px));
@@ -3059,7 +3226,7 @@ body.comfort-ui .btn.sm {
   font-size: 14px;
 }
 
-body.comfort-ui .field input,
+body.comfort-ui .field input:not([type="checkbox"]):not([type="radio"]),
 body.comfort-ui .field select,
 body.comfort-ui .field textarea {
   min-height: 48px;

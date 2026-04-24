@@ -960,6 +960,7 @@ def init_db() -> None:
         ensure_column(conn, "dashboard_users", "status", "TEXT")
         ensure_column(conn, "dashboard_users", "welcome_email_sent", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "dashboard_users", "alarm_push_style", "TEXT NOT NULL DEFAULT 'fullscreen'")
+        ensure_column(conn, "dashboard_users", "avatar_url", "TEXT")
         ensure_column(conn, "role_policies", "tg_view_logs", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "role_policies", "tg_view_devices", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "role_policies", "tg_siren_on", "INTEGER NOT NULL DEFAULT 0")
@@ -3206,6 +3207,31 @@ class NotificationPrefsPatchRequest(BaseModel):
     alarm_push_style: str = Field(pattern="^(fullscreen|heads_up)$")
 
 
+class MeProfilePatchRequest(BaseModel):
+    """User-editable console profile (sidebar avatar, etc.)."""
+
+    avatar_url: str = Field(default="", max_length=800)
+
+
+def _validate_avatar_url(raw: str) -> str:
+    """Empty clears. Otherwise require https: URL suitable for <img src>."""
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    if len(s) > 800:
+        raise HTTPException(status_code=400, detail="avatar_url too long")
+    from urllib.parse import urlparse
+
+    u = urlparse(s)
+    if u.scheme != "https":
+        raise HTTPException(status_code=400, detail="avatar_url must be https or empty")
+    if not (u.netloc and str(u.netloc).strip()):
+        raise HTTPException(status_code=400, detail="avatar_url has no host")
+    if u.username is not None or u.password is not None:
+        raise HTTPException(status_code=400, detail="avatar_url must not contain credentials")
+    return s
+
+
 class AdminTenantCloseRequest(BaseModel):
     """Superadmin closes another admin tenant; optional device transfer instead of unclaim."""
 
@@ -4669,17 +4695,19 @@ def auth_login(body: LoginRequest, request: Request) -> dict[str, Any]:
 def auth_me(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     assert_min_role(principal, "user")
     alarm_push_style = "fullscreen"
+    avatar_url = ""
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
         cur.execute(
-            "SELECT IFNULL(alarm_push_style,'fullscreen') AS s FROM dashboard_users WHERE username = ?",
+            "SELECT IFNULL(alarm_push_style,'fullscreen') AS s, IFNULL(avatar_url,'') AS a FROM dashboard_users WHERE username = ?",
             (principal.username,),
         )
         row = cur.fetchone()
         conn.close()
     if row:
         alarm_push_style = str(row["s"] or "fullscreen").strip() or "fullscreen"
+        avatar_url = str(row["a"] or "").strip()
     return {
         "username": principal.username,
         "role": principal.role,
@@ -4687,6 +4715,7 @@ def auth_me(principal: Principal = Depends(require_principal)) -> dict[str, Any]
         "policy": get_effective_policy(principal),
         "manager_admin": get_manager_admin(principal.username) if principal.role == "user" else "",
         "alarm_push_style": alarm_push_style,
+        "avatar_url": avatar_url,
     }
 
 
@@ -4784,6 +4813,31 @@ def auth_me_notification_prefs_patch(
         {"alarm_push_style": body.alarm_push_style},
     )
     return {"ok": True, "alarm_push_style": body.alarm_push_style}
+
+
+@app.patch("/auth/me/profile")
+def auth_me_profile_patch(
+    body: MeProfilePatchRequest,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    assert_min_role(principal, "user")
+    val = _validate_avatar_url(body.avatar_url)
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("UPDATE dashboard_users SET avatar_url = ? WHERE username = ?", (val or None, principal.username))
+        if cur.rowcount == 0:
+            conn.close()
+            raise HTTPException(status_code=404, detail="user not found")
+        conn.commit()
+        conn.close()
+    audit_event(
+        principal.username,
+        "auth.profile.patch",
+        principal.username,
+        {"avatar_set": bool(val)},
+    )
+    return {"ok": True, "avatar_url": val}
 
 
 @app.patch("/auth/me/password")

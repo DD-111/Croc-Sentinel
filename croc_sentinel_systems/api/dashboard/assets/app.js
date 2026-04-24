@@ -1154,10 +1154,14 @@
       const role = String(state.me.role || "").trim() || "—";
       const zt = (state.me.zones || []).map((z) => String(z)).filter(Boolean).join(", ") || "—";
       const initial = (u[0] || "?").toUpperCase();
+      const av = String(state.me.avatar_url || "").trim();
+      const avatarEl = av
+        ? `<div class="who-card__avatar who-card__avatar--photo" aria-hidden="true"><img src="${escapeHtml(av)}" alt="" width="40" height="40" loading="lazy" decoding="async" referrerpolicy="no-referrer" /></div>`
+        : `<div class="who-card__avatar" aria-hidden="true">${escapeHtml(initial)}</div>`;
       setChildMarkup(
         who,
         `<div class="who-card" title="${escapeHtml(u)}">` +
-          `<div class="who-card__avatar" aria-hidden="true">${escapeHtml(initial)}</div>` +
+          avatarEl +
           `<div class="who-card__body">` +
             `<div class="who-card__name">${escapeHtml(u)}</div>` +
             `<div class="who-card__meta">` +
@@ -1167,6 +1171,21 @@
           `</div>` +
         `</div>`,
       );
+      const im = who && who.querySelector(".who-card__avatar--photo img");
+      if (im) {
+        im.addEventListener(
+          "error",
+          function onAvErr() {
+            im.removeEventListener("error", onAvErr);
+            const w = im.closest(".who-card__avatar");
+            if (w) {
+              w.classList.remove("who-card__avatar--photo");
+              w.textContent = initial;
+            }
+          },
+          { once: true },
+        );
+      }
       if (who) {
         who.className = "who who--authed";
         who.setAttribute("role", "group");
@@ -1897,6 +1916,8 @@
     setCrumb("Account");
     if (!hasRole("user")) { mountView(view, `<div class="card"><p class="muted">Sign in required.</p></div>`); return; }
     const me = state.me || { username: "", role: "" };
+    const avStored = String(me.avatar_url || "").trim();
+    const uname0 = (String(me.username || "?").trim() || "?")[0].toUpperCase();
     const roleNorm = String(me.role || "").trim().toLowerCase();
     const deleteSection = (() => {
       if (roleNorm === "superadmin") {
@@ -1945,10 +1966,27 @@
         </div>
       </details>`;
     })();
+    const previewInner = avStored
+      ? `<img src="${escapeHtml(avStored)}" alt="" width="48" height="48" loading="lazy" decoding="async" referrerpolicy="no-referrer" />`
+      : `<span class="account-avatar-fallback" aria-hidden="true">${escapeHtml(uname0)}</span>`;
     mountView(view, `
       <div class="card">
         <h2>My account</h2>
         <p class="muted">User: <span class="mono">${escapeHtml(me.username)}</span> · Role: <span class="mono">${escapeHtml(me.role)}</span></p>
+      </div>
+      <div class="card">
+        <h3>Profile picture</h3>
+        <p class="muted" style="margin:0 0 10px">Use an <strong>https</strong> image link you control (square works best). Shown in the left sidebar. If the image cannot load, your initial is used.</p>
+        <div class="row" style="align-items:flex-end;flex-wrap:wrap;gap:12px">
+          <label class="field" style="flex:1;min-width:200px;max-width:100%"><span>Image URL</span>
+            <input id="accAvatarUrl" type="url" inputmode="url" placeholder="https://…" value="${escapeHtml(avStored)}" autocomplete="off" />
+          </label>
+          <div class="account-avatar-preview" id="accAvatarPreview" aria-hidden="true">${previewInner}</div>
+        </div>
+        <div class="row" style="justify-content:flex-end;margin-top:10px;gap:8px;flex-wrap:wrap">
+          <button class="btn secondary" type="button" id="accAvatarClear">Use initial only</button>
+          <button class="btn" type="button" id="accAvatarSave">Save</button>
+        </div>
       </div>
       <div class="card">
         <h3>Change password</h3>
@@ -1961,6 +1999,52 @@
       </div>
       ${deleteSection}
     `);
+    const accPre = $("#accAvatarPreview", view);
+    const accUrl = $("#accAvatarUrl", view);
+    const setAccPreview = () => {
+      if (!accPre) return;
+      const v = (accUrl && accUrl.value ? accUrl.value : "").trim();
+      if (!v) {
+        setChildMarkup(accPre, `<span class="account-avatar-fallback" aria-hidden="true">${escapeHtml(uname0)}</span>`);
+        return;
+      }
+      setChildMarkup(
+        accPre,
+        `<img src="${escapeHtml(v)}" alt="" width="48" height="48" loading="lazy" decoding="async" referrerpolicy="no-referrer" />`,
+      );
+      const g = accPre.querySelector("img");
+      if (g) {
+        g.addEventListener(
+          "error",
+          () => {
+            setChildMarkup(
+              accPre,
+              `<span class="account-avatar-fallback account-avatar-fallback--err" title="Image failed to load" aria-hidden="true">${escapeHtml(uname0)}</span>`,
+            );
+          },
+          { once: true },
+        );
+      }
+    };
+    if (accUrl) {
+      accUrl.addEventListener("input", () => setAccPreview());
+      accUrl.addEventListener("change", () => setAccPreview());
+    }
+    $("#accAvatarClear", view).addEventListener("click", () => {
+      if (accUrl) accUrl.value = "";
+      setAccPreview();
+    });
+    $("#accAvatarSave", view).addEventListener("click", async () => {
+      const v = (accUrl && accUrl.value ? accUrl.value : "").trim();
+      try {
+        const r = await api("/auth/me/profile", { method: "PATCH", body: { avatar_url: v } });
+        if (state.me) state.me.avatar_url = r && r.avatar_url != null ? r.avatar_url : v;
+        renderAuthState();
+        toast(v ? "Profile picture saved" : "Using initial letter", "ok");
+      } catch (e) {
+        toast(e.message || e, "err");
+      }
+    });
     const accChangePwBtn = $("#accChangePw", view);
     if (accChangePwBtn) {
       accChangePwBtn.addEventListener("click", async () => {
@@ -2276,7 +2360,12 @@
             </select>
           </label>
           <label class="field field--spaced"><span>Delay seconds</span><input id="gsDelay" type="number" min="0" max="3600" step="1" /></label>
-          <label class="field field--spaced"><span><input id="gsReboot" type="checkbox" /> Reboot + self-check this group after trigger</span></label>
+          <label class="field field--spaced field--toggle">
+            <span class="row field--toggle__row" style="margin:0;align-items:flex-start;gap:10px">
+              <input id="gsReboot" type="checkbox" />
+              <span class="field--toggle__text">Reboot + self-check this group after trigger</span>
+            </span>
+          </label>
           <div class="row" style="justify-content:flex-end;gap:8px;margin-top:10px">
             <button class="btn sm secondary" id="gsCancel" type="button">Cancel</button>
             <button class="btn sm secondary" id="gsApply" type="button">Apply now</button>
@@ -3523,16 +3612,23 @@
         const on = isOnline(d);
         const did = String(d.device_id || "");
         const checked = selectedIds.has(did);
-        const primary = escapeHtml(d.display_label || d.device_id || "unknown");
-        const subId = d.display_label ? `<div class="device-id-sub mono">${escapeHtml(d.device_id || "")}</div>` : "";
+        const hasLabel = !!(d.display_label && String(d.display_label).trim());
+        const titleHtml = hasLabel
+          ? `<div class="device-card__title-row">` +
+            `<span class="device-primary-name device-card__title-name">${escapeHtml(String(d.display_label).trim())}</span>` +
+            `<span class="device-card__sn mono" title="${escapeHtml(did)}">${escapeHtml(did)}</span>` +
+            `</div>`
+          : `<div class="device-card__title-row device-card__title-row--mono">` +
+            `<span class="device-primary-name mono device-card__sn" title="${escapeHtml(did)}">${escapeHtml(did || "unknown")}</span>` +
+            `</div>`;
         const letter = escapeHtml((d.display_label || d.device_id || "?").slice(0, 1).toUpperCase());
         const spLine = d.status_preview && d.status_preview.line ? escapeHtml(String(d.status_preview.line)) : "—";
-        let subMeta = "";
-        if (state.me && state.me.role === "superadmin" && d.owner_admin) {
-          subMeta = `Owner: ${escapeHtml(String(d.owner_admin))}<br/>`;
-        } else if (d.is_shared && d.shared_by) {
-          subMeta = `Shared: ${escapeHtml(String(d.shared_by))}<br/>`;
-        }
+        const scopeLead =
+          state.me && state.me.role === "superadmin" && d.owner_admin
+            ? `<span class="device-card__meta-k">Owner</span><span class="device-card__meta-scope">${escapeHtml(String(d.owner_admin))}</span><span class="device-card__meta-sep" aria-hidden="true"> · </span>`
+            : d.is_shared && d.shared_by
+              ? `<span class="device-card__meta-k">Shared</span><span class="device-card__meta-scope">${escapeHtml(String(d.shared_by))}</span><span class="device-card__meta-sep" aria-hidden="true"> · </span>`
+              : "";
         const needFw = !!(d.firmware_hint && d.firmware_hint.update_available && firmwareHintStillValid(d.fw, d.firmware_hint));
         const fwBlock = d.fw
           ? `<div class="device-card__firmware">` +
@@ -3550,8 +3646,8 @@
           `<span class="muted">Pick</span></label>` +
           `<a href="#/devices/${encodeURIComponent(d.device_id)}" style="display:flex;gap:10px;text-decoration:none;color:inherit;flex:1;min-width:0">` +
           `<div class="device-thumb device-thumb--list" aria-hidden="true">${letter}</div>` +
-          `<div class="device-card--row-body" style="padding-right:56px">` +
-          `<h3 style="margin:0"><div class="device-primary-name">${primary}</div>${subId}</h3>` +
+          `<div class="device-card--row-body">` +
+          `<h3 class="device-card__h3">${titleHtml}</h3>` +
           `<div class="device-card__status">` +
           `<div class="device-card__pills">` +
           `<span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>` +
@@ -3560,7 +3656,10 @@
           `</div>` +
           `${fwBlock}` +
           `</div>` +
-          `<div class="meta" style="margin-top:6px">Live: ${spLine}<br/>${subMeta}Updated: ${escapeHtml(fmtRel(d.updated_at))}</div>` +
+          `<div class="device-card__meta-compact meta">` +
+          `<div class="device-card__meta-row"><span class="device-card__meta-k">Live</span><span class="device-card__meta-v">${spLine}</span></div>` +
+          `<div class="device-card__meta-row">${scopeLead}<span class="device-card__meta-k">Updated</span><span class="device-card__meta-v">${escapeHtml(fmtRel(d.updated_at))}</span></div>` +
+          `</div>` +
           `</div></a></div>`;
       };
       const applyFilter = () => {
@@ -4409,7 +4508,7 @@
         <p class="muted">MQTT <span class="mono">siren_on</span> / <span class="mono">siren_off</span>. Requires <span class="mono">can_alert</span>.</p>
         ${enabled ? "" : `<p class="badge revoked">No can_alert — ask admin (Policies).</p>`}
         ${devicesLoadErr ? `<p class="badge offline">Device list fallback: ${escapeHtml(devicesLoadErr)}</p>` : ""}
-        <div class="inline-form" style="margin-top:12px">
+        <div class="inline-form inline-form--bulk-siren" style="margin-top:12px">
           <label class="field"><span>Action</span>
             <select id="action"><option value="on">ON</option><option value="off">OFF</option></select>
           </label>
