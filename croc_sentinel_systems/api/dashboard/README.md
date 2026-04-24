@@ -4,7 +4,7 @@
 
 | File | Role |
 |------|------|
-| `index.html` | Shell; loads `assets/app.css` + `assets/app.js` |
+| `index.html` | Shell; loads `assets/app.css` + `assets/app.js` (add `?v=…` on those URLs to force browsers to pick up a new build) |
 | `assets/app.css` | Layout, tokens, responsive + auth marketing surface |
 | `assets/app.js` | Routes, API calls, templates (all “screens” live here) |
 

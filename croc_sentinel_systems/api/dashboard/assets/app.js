@@ -65,6 +65,44 @@
       </footer>`;
   }
 
+  /** Public auth: left story panel + right form (v3 layout) */
+  function authAsideHtml(kind) {
+    const m = {
+      login: {
+        t: "Operations console",
+        d: "Role-scoped monitoring, OTA, and device control in one place.",
+        items: ["Audit-ready events", "Per-tenant device boundaries", "Real-time health"],
+      },
+      register: {
+        t: "Admin workspace",
+        d: "Email verification, then sign in to manage your fleet.",
+        items: ["Isolated tenant data", "Verification + cooldown", "No shared MQTT bleed"],
+      },
+      recovery: {
+        t: "Account recovery",
+        d: "We send a one-time code to the email on file for this account.",
+        items: ["Match username to email", "Code from your inbox", "Set a new password here"],
+      },
+      activate: {
+        t: "Activate access",
+        d: "An administrator created your user — confirm with the email we sent you.",
+        items: ["One-time code", "Same inbox as the invite", "Then use Sign in"],
+      },
+    };
+    const c = m[kind] || m.login;
+    return `
+      <aside class="auth-surface__side" aria-label="Croc ESA">
+        <div class="auth-surface__side-content">
+          <p class="auth-surface__badge">Croc <span class="auth-surface__dot">·</span> ESA</p>
+          <h2 class="auth-surface__headline">${c.t}</h2>
+          <p class="auth-surface__lede">${c.d}</p>
+          <ul class="auth-surface__bullets" role="list">
+            ${c.items.map((x) => `<li>${x}</li>`).join("")}
+          </ul>
+        </div>
+      </aside>`;
+  }
+
   // ------------------------------------------------------------------ state
   const state = {
     me: null,
@@ -1146,47 +1184,38 @@
       return s.replace(/^error:\s*/i, "");
     };
     mountView(view, `
-      <div class="auth-page auth-page-pro auth-page--login" role="main">
-        <details class="auth-hero-fold" open>
-          <summary class="auth-hero-fold__summary"><span class="auth-hero-fold__label">About this console</span></summary>
-          <section class="auth-hero auth-hero--compact">
-            <div class="auth-hero__tag">ESA Secure Platform</div>
-            <h2>Fleet security console</h2>
-            <p>Monitoring, roles, and device control in one place.</p>
-            <ul class="auth-hero__bullets">
-              <li>Role-scoped live visibility</li>
-              <li>Secure commands & triggers</li>
-              <li>Audit-ready operations</li>
-            </ul>
-          </section>
-        </details>
-        <div class="auth-card auth-card--surface auth-card--login" data-auth-card>
-          <header class="auth-card__head">
-            <div class="auth-card__logo" aria-hidden="true"></div>
-            <h1 class="auth-card__title">Sign in</h1>
-            <p class="auth-card__lead">Welcome back — pick up where you left off.</p>
-          </header>
-          <form class="auth-card__body" id="loginForm" autocomplete="on">
-            <label class="field">
-              <span>Username</span>
-              <input name="username" autocomplete="username" required placeholder="e.g. dan" />
-            </label>
-            <label class="field field--spaced">
-              <span>Password</span>
-              <input name="password" type="password" autocomplete="current-password" required placeholder="••••••••" />
-            </label>
-            <div class="auth-card__submit">
-              <button class="btn btn-tap btn-block auth-btn-primary" type="submit" id="loginSubmit">Sign in</button>
+      <div class="auth-surface" role="main">
+        ${authAsideHtml("login")}
+        <div class="auth-surface__body">
+          <div class="auth-surface__inner">
+            <div class="auth-card auth-card--panel auth-card--auth-main" data-auth-card>
+              <header class="auth-card__head">
+                <h1 class="auth-card__title">Sign in</h1>
+                <p class="auth-card__lead">Use the credentials your administrator provided.</p>
+              </header>
+              <form class="auth-card__body" id="loginForm" autocomplete="on">
+                <label class="field">
+                  <span>Username</span>
+                  <input name="username" autocomplete="username" required placeholder="e.g. dan" />
+                </label>
+                <label class="field field--spaced">
+                  <span>Password</span>
+                  <input name="password" type="password" autocomplete="current-password" required placeholder="••••••••" />
+                </label>
+                <div class="auth-card__submit">
+                  <button class="btn btn-tap btn-block auth-btn-primary" type="submit" id="loginSubmit">Sign in</button>
+                </div>
+                <p class="auth-card__msg auth-card__msg--fixed muted" id="loginMsg" aria-live="polite"></p>
+                <nav class="auth-card__links auth-card__links--grid" aria-label="Other sign-in options">
+                  <a class="auth-link" href="#/register">Register admin</a>
+                  <a class="auth-link" href="#/account-activate">Activate account</a>
+                  <a class="auth-link" href="#/forgot-password">Forgot password</a>
+                </nav>
+              </form>
             </div>
-            <p class="auth-card__msg muted" id="loginMsg" aria-live="polite"></p>
-            <nav class="auth-card__links auth-card__links--grid" aria-label="Other sign-in options">
-              <a class="auth-link" href="#/register">Register admin</a>
-              <a class="auth-link" href="#/account-activate">Activate account</a>
-              <a class="auth-link" href="#/forgot-password">Forgot password</a>
-            </nav>
-          </form>
+            ${authSiteFooterHtml()}
+          </div>
         </div>
-        ${authSiteFooterHtml()}
       </div>`);
     const form = $("#loginForm", view);
     const card = view.querySelector("[data-auth-card]");
@@ -1234,10 +1263,12 @@
       enabled = !!j.enabled;
     } catch { enabled = false; }
     mountView(view, `
-      <div class="auth-page auth-page--solo" role="main">
-        <div class="auth-card auth-card--surface auth-card--wide auth-card--prose" data-auth-card>
+      <div class="auth-surface" role="main">
+        ${authAsideHtml("recovery")}
+        <div class="auth-surface__body">
+          <div class="auth-surface__inner auth-surface__inner--wide">
+        <div class="auth-card auth-card--panel auth-card--wide auth-card--prose" data-auth-card>
           <header class="auth-card__head">
-            <div class="auth-card__logo" aria-hidden="true"></div>
             <h1 class="auth-card__title">Account recovery</h1>
             <p class="auth-card__lead">Reset via email verification code</p>
           </header>
@@ -1273,6 +1304,8 @@
           </div>
         </div>
         ${authSiteFooterHtml()}
+          </div>
+        </div>
       </div>`);
     const m1 = $("#fp_msg1"), m2 = $("#fp_msg2");
     let fpCooldown = 0;
@@ -1417,23 +1450,12 @@
       return s.replace(/^error:\s*/i, "");
     };
     mountView(view, `
-      <div class="auth-page auth-page-pro" role="main">
-        <details class="auth-hero-fold" open>
-          <summary class="auth-hero-fold__summary"><span class="auth-hero-fold__label">Admin onboarding</span></summary>
-          <section class="auth-hero auth-hero--compact">
-            <div class="auth-hero__tag">Admin Onboarding</div>
-            <h2>Create your admin workspace</h2>
-            <p>Verify by email, then manage your fleet.</p>
-            <ul class="auth-hero__bullets">
-              <li>No superadmin approval</li>
-              <li>Email verification & cooldown</li>
-              <li>Tenant-isolated workspace</li>
-            </ul>
-          </section>
-        </details>
-        <div class="auth-card auth-card--surface auth-card--wide" data-auth-card>
+      <div class="auth-surface" role="main">
+        ${authAsideHtml("register")}
+        <div class="auth-surface__body">
+          <div class="auth-surface__inner">
+        <div class="auth-card auth-card--panel auth-card--wide" data-auth-card>
           <header class="auth-card__head">
-            <div class="auth-card__logo" aria-hidden="true"></div>
             <h1 class="auth-card__title">Create admin</h1>
             <p class="auth-card__lead">Email verification, then sign in.</p>
           </header>
@@ -1466,6 +1488,8 @@
           </div>
         </div>
         ${authSiteFooterHtml()}
+          </div>
+        </div>
       </div>`);
     const m1 = $("#r_msg1"), m2 = $("#r_msg2");
     $("#r_start").addEventListener("click", async () => {
@@ -1533,10 +1557,12 @@
     setCrumb("Activate account");
     document.body.dataset.auth = "none";
     mountView(view, `
-      <div class="auth-page auth-page--solo" role="main">
-        <div class="auth-card auth-card--surface auth-card--wide" data-auth-card>
+      <div class="auth-surface" role="main">
+        ${authAsideHtml("activate")}
+        <div class="auth-surface__body">
+          <div class="auth-surface__inner">
+        <div class="auth-card auth-card--panel auth-card--wide" data-auth-card>
           <header class="auth-card__head">
-            <div class="auth-card__logo" aria-hidden="true"></div>
             <h1 class="auth-card__title">Activate account</h1>
             <p class="auth-card__lead">Use the code from your invitation email</p>
           </header>
@@ -1553,6 +1579,8 @@
           </div>
         </div>
         ${authSiteFooterHtml()}
+          </div>
+        </div>
       </div>`);
     const msg = $("#a_msg");
     $("#a_submit").addEventListener("click", async () => {
