@@ -55,10 +55,9 @@
     return `
       <footer class="site-footer site-footer--auth" aria-label="Page footer">
         <div class="site-footer__row site-footer__row--auth">
-          <div class="site-footer__brand" role="group" aria-label="Croc ESA">
-            <span class="site-footer__name">Croc</span>
-            <span class="site-footer__sep" aria-hidden="true">·</span>
-            <span class="site-footer__esa">ESA</span>
+          <div class="site-footer__brand site-footer__brand--company" role="group" aria-label="ESA · Croc Sentinel">
+            <div class="site-footer__wordmark" lang="en">ESA</div>
+            <p class="site-footer__product">Croc Sentinel <span class="site-footer__product-pill">console</span></p>
           </div>
           <p class="site-footer__legal">© 2026 · Private operations</p>
         </div>
@@ -91,9 +90,14 @@
     };
     const c = m[kind] || m.login;
     return `
-      <aside class="auth-surface__side" aria-label="Croc ESA">
+      <aside class="auth-surface__side" aria-label="ESA">
         <div class="auth-surface__side-content">
-          <p class="auth-surface__badge">Croc <span class="auth-surface__dot">·</span> ESA</p>
+          <div class="auth-surface__company" lang="en">
+            <p class="auth-surface__company-eyebrow">Secured platform provider</p>
+            <p class="auth-surface__wordmark" translate="no">ESA</p>
+            <p class="auth-surface__company-line" lang="en">Private, secured operations and tenant-safe edge access — one platform.</p>
+            <p class="auth-surface__product-line" translate="no"><span class="auth-surface__product-name">Croc Sentinel</span> <span class="auth-surface__product-role">fleet console</span></p>
+          </div>
           <h2 class="auth-surface__headline">${c.t}</h2>
           <p class="auth-surface__lede">${c.d}</p>
           <ul class="auth-surface__bullets" role="list">
