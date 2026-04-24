@@ -3745,6 +3745,10 @@ def _blocking_api_bootstrap_inner() -> None:
     global mqtt_client, scheduler_thread, mqtt_worker_thread, mqtt_ingest_dropped
     validate_production_env()
     init_db()
+    try:
+        _ota_enforce_max_stored_bins()
+    except Exception:
+        logger.exception("OTA firmware retention prune at startup failed")
     notifier.start()
     try:
         from telegram_notify import start_telegram_worker
@@ -10516,16 +10520,25 @@ class OtaBroadcastRequest(BaseModel):
     device_ids: list[str] = Field(default_factory=list)
 
 
-def _sha256_for(path: str) -> Optional[str]:
+def _sha256_sidecar_only(path: str) -> Optional[str]:
+    """Fast path for listings: use .sha256 sidecar only (no full-file read)."""
     sidecar = path + ".sha256"
-    if os.path.isfile(sidecar):
-        try:
-            with open(sidecar, "r", encoding="utf-8", errors="ignore") as f:
-                line = f.readline().strip()
-            if line:
-                return line.split()[0]
-        except Exception:
-            return None
+    if not os.path.isfile(sidecar):
+        return None
+    try:
+        with open(sidecar, "r", encoding="utf-8", errors="ignore") as f:
+            line = f.readline().strip()
+        if line:
+            return line.split()[0]
+    except Exception:
+        return None
+    return None
+
+
+def _sha256_for(path: str) -> Optional[str]:
+    hit = _sha256_sidecar_only(path)
+    if hit:
+        return hit
     try:
         h = hashlib.sha256()
         with open(path, "rb") as f:
@@ -10615,7 +10628,7 @@ def list_firmwares(principal: Principal = Depends(require_principal)) -> dict[st
                 "fw_version": fw_label,
                 "size": st.st_size,
                 "mtime": int(st.st_mtime),
-                "sha256": _sha256_for(path),
+                "sha256": _sha256_sidecar_only(path),
                 "download_url": url,
             })
     return {

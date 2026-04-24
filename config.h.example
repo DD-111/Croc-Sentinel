@@ -360,9 +360,10 @@
 #ifndef DEVICE_SYNC_TLS_INSECURE
 #define DEVICE_SYNC_TLS_INSECURE 0
 #endif
-// Milliseconds between HTTP boot-sync retries (cmd_key resync, server-as-source-of-truth). 0 = boot only.
+// Milliseconds between HTTP boot-sync retries (cmd_key resync, sibling/remote reliability). 0 = boot + MQTT reconnect only.
+// 5–15 min typical; also runs once every time MQTT connects (not only after OTA flash).
 #ifndef DEVICE_SYNC_BOOT_INTERVAL_MS
-#define DEVICE_SYNC_BOOT_INTERVAL_MS (15UL * 60UL * 1000UL)
+#define DEVICE_SYNC_BOOT_INTERVAL_MS (10UL * 60UL * 1000UL)
 #endif
 
 #endif

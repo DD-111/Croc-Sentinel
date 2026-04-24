@@ -2889,6 +2889,13 @@ void loop() {
       s_mqttPostConnectPublish = false;
       publishStatus();
       publishHeartbeatEvent("mqtt_connected");
+#if DEVICE_SYNC_HTTP_ENABLED
+      // After flash or reconnect, re-align cmd_key with server before sibling/remote cmds.
+      if (isProvisioned) {
+        performDeviceBootSyncHttp();
+        s_lastBootSyncHttpAtMs = millis();
+      }
+#endif
     }
     if (!isProvisioned && now - lastBootstrapRegisterAt >= BOOTSTRAP_REGISTER_INTERVAL_MS) {
       lastBootstrapRegisterAt = now;
