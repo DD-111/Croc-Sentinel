@@ -1975,6 +1975,8 @@
       if (!s) return "Request failed. Please try again.";
       const l = s.toLowerCase();
       if (l.includes("401")) return "Username or password is incorrect.";
+      if (l.includes("404") || s.startsWith("404"))
+        return "Not found: API path mismatch. Set meta croc-api-base to \"\" for API at the site root (e.g. :18999) or to \"/api\" when Traefik strips that prefix. Redeploy the dashboard file after changing.";
       if (l.includes("invalid credentials")) return "Username or password is incorrect.";
       if (l.includes("too many login attempts")) return s; /* 429: server already has seconds */
       if (l.includes("session expired")) return "Session expired. Please sign in again.";
@@ -1982,7 +1984,7 @@
       return s.replace(/^error:\s*/i, "");
     };
     mountView(view, `
-      <div class="auth-surface" role="main">
+      <div class="auth-surface auth-surface--with-aside" role="main">
         ${authAsideHtml("login")}
         <div class="auth-surface__body">
           <div class="auth-surface__inner">
@@ -2061,7 +2063,7 @@
       enabled = !!j.enabled;
     } catch { enabled = false; }
     mountView(view, `
-      <div class="auth-surface" role="main">
+      <div class="auth-surface auth-surface--with-aside" role="main">
         ${authAsideHtml("recovery")}
         <div class="auth-surface__body">
           <div class="auth-surface__inner auth-surface__inner--wide">
@@ -2248,7 +2250,7 @@
       return s.replace(/^error:\s*/i, "");
     };
     mountView(view, `
-      <div class="auth-surface" role="main">
+      <div class="auth-surface auth-surface--with-aside" role="main">
         ${authAsideHtml("register")}
         <div class="auth-surface__body">
           <div class="auth-surface__inner">
@@ -2355,7 +2357,7 @@
     setCrumb("Activate account");
     document.body.dataset.auth = "none";
     mountView(view, `
-      <div class="auth-surface" role="main">
+      <div class="auth-surface auth-surface--with-aside" role="main">
         ${authAsideHtml("activate")}
         <div class="auth-surface__body">
           <div class="auth-surface__inner">

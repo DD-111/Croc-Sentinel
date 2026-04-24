@@ -169,7 +169,7 @@ GET /events/stream?min_level=warn&category=alarm&backlog=100&token=<jwt>
 
 - 每条事件 SSE 格式：`id: <rowid>` / `event: <event_type>` / `data: <json>`。
 - 服务端每 `EVENT_SSE_KEEPALIVE_SECONDS` 秒发送 `: keepalive` 注释，防止
-  反向代理（Nginx / Cloudflare）掐断空闲连接。
+  反向代理（Traefik、Cloudflare 等）掐断空闲连接。
 - 客户端慢 → 服务端队列满 → 丢弃最老事件并在 `keepalive` 行里带
   `dropped=N`，客户端可在 UI 上提示。
 - 断线重连：浏览器的 `EventSource` 自动带上 `Last-Event-ID`；当前版本

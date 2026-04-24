@@ -13,7 +13,7 @@ ESP32 firmware in the repo root: copy [`../config.h.example`](../config.h.exampl
 This folder contains a production-oriented server stack for your ESP32 fleet:
 
 - MQTT broker (Mosquitto)
-- OTA firmware file hosting (Nginx)
+- OTA firmware file serving (`ota-nginx` 容器，固件直链 `/fw/…`；公网可经 Traefik/任意网关 443 反代)
 - Dashboard API service (FastAPI + SQLite + MQTT subscriber/publisher)
 
 ## 1) Quick start on Ubuntu VPS
@@ -147,16 +147,16 @@ docker compose ps
 ## 2) Service map
 
 - MQTT broker (TLS): `tls://<your-vps>:8883`
-- OTA file URL: `https://<ota-subdomain>/fw/<firmware>.bin?token=<OTA_TOKEN>` (public **443** via host Nginx; container binds **127.0.0.1:9231** only)
+- OTA file URL: `https://<ota-subdomain>/fw/<firmware>.bin?token=<OTA_TOKEN>` (public **443** via your edge proxy; `ota-nginx` binds **127.0.0.1:9231** in compose)
 - API base（默认 compose）: `http://<your-domain>:18999`（无 `/api` 前缀；同一端口提供控制台静态页与 REST）
 - **Operations Console (SPA)**: `http://<your-domain>:18999${DASHBOARD_PATH}/`  
   Default is `http://<your-domain>:18999/console/` — total refresh: 侧边栏 + 移动端汉堡菜单 + 浅色/暗色主题 + 单页路由。  
   旧路径 `/ui`、`/dashboard` 会被 301 到 `DASHBOARD_PATH`；你可以改 `.env` 里的 `DASHBOARD_PATH`（建议自选一个不常见路径用于轻度混淆，例如 `/app`、`/c`、`/ops`、`/manage`）。  
   **唯一 Web 资产目录**（不要另起一套页面）：[`api/dashboard/README.md`](api/dashboard/README.md)。
 
-**Subpath UI + root API (e.g. `https://esasecure.com:8088/Croc_Sentinel_systems/`)**  
-- **一步步生产部署（Docker、`docker-compose.override`、rsync 静态、Nginx、`/events/stream`、验收）**：[`docs/SERVER_DEPLOY_SUBPATH.md`](docs/SERVER_DEPLOY_SUBPATH.md)  
-- **设计说明与 API 前缀表（简版）**：[`docs/NGINX_SUBPATH_UI.md`](docs/NGINX_SUBPATH_UI.md)  
+**子路径 / Traefik 生产部署**  
+- **生产部署（Docker + Traefik、`StripPrefix` `/api`、WS `/events/ws`、SSE 验收）**：[`docs/SERVER_DEPLOY_SUBPATH.md`](docs/SERVER_DEPLOY_SUBPATH.md)  
+- **子路径、API 前缀、Factory 基址（简版）**：[`docs/REVERSE_PROXY_SUBPATH_UI.md`](docs/REVERSE_PROXY_SUBPATH_UI.md)  
 - **API 仅绑定回环示例**：[`docker-compose.override.example.yml`](docker-compose.override.example.yml) → 复制为同目录 `docker-compose.override.yml`  
 
 The SPA uses `<meta name="croc-api-base" content="/api">`; on direct published ports (**8088**, **18088**, **18999**) `apiBase()` uses same-origin root (no `/api` prefix).  
@@ -368,7 +368,7 @@ Recommended rollout:
 Open only needed ports:
 
 - `8883/tcp` MQTT TLS
-- `9231/tcp` on **loopback** (host Nginx `proxy_pass` to OTA); do not expose 9231 publicly if you use HTTPS on 443
+- `9231/tcp` on **loopback** (edge proxy → `ota-nginx` for `/fw/…`); do not expose 9231 publicly if you use HTTPS on 443
 - `8088/tcp` API
 
 Example (UFW):

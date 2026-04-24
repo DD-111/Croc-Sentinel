@@ -1227,11 +1227,44 @@ body[data-layout="auth"] .main #view {
   overflow: auto;
 }
 
+/* Auth: aside + form are siblings. Without a two-col grid, `place-items: center`
+   stacks them in one column and the marketing column reads "below the form" on desktop. */
 .auth-surface {
   min-height: 100dvh;
   padding: var(--sp-5);
   display: grid;
-  place-items: center;
+  grid-template-columns: 1fr;
+  place-items: start;
+  justify-items: stretch;
+  align-content: start;
+  gap: var(--sp-5);
+  width: 100%;
+  max-width: 1200px;
+  margin-inline: auto;
+  box-sizing: border-box;
+}
+/* Desktop / tablet: marketing column | form column */
+@media (min-width: 768px) {
+  .auth-surface--with-aside {
+    grid-template-columns: minmax(0, 1.08fr) minmax(0, 0.92fr);
+    place-items: stretch;
+    align-items: stretch;
+  }
+  .auth-surface--with-aside .auth-surface__body {
+    min-width: 0;
+  }
+  .auth-surface--with-aside .auth-surface__side {
+    min-width: 0;
+  }
+}
+/* Phone: form first, marketing under */
+@media (max-width: 767.98px) {
+  .auth-surface--with-aside .auth-surface__body {
+    order: 1;
+  }
+  .auth-surface--with-aside .auth-surface__side {
+    order: 2;
+  }
 }
 .auth-surface__inner {
   width: min(960px, 100%);
@@ -1273,7 +1306,20 @@ body[data-layout="auth"] .main #view {
   letter-spacing: 0.04em;
   color: var(--text-dim);
 }
-.auth-surface__body { display: flex; justify-content: center; }
+.auth-surface__body {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  width: 100%;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+@media (min-width: 768px) {
+  .auth-surface--with-aside .auth-surface__body {
+    justify-content: center;
+  }
+}
 
 .auth-card {
   width: 100%;
@@ -2149,7 +2195,7 @@ body[data-boot-error="1"] .static-boot__retry { display: inline-block; }
   .device-focus-right { position: static; }
   .device-hero-line .device-primary-name { font-size: var(--text-xl); }
   .auth-surface__inner--wide { grid-template-columns: 1fr; }
-  .auth-surface__side { order: 2; padding: var(--sp-4); }
+  .auth-surface--with-aside .auth-surface__side { padding: var(--sp-4); }
   :root {
     --sp-gutter: 14px;
     --sidebar-w: 100vw;

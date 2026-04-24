@@ -1,7 +1,7 @@
 # Croc Sentinel —— 白话总览（一页看懂）
 
 写给：运营 / 项目经理 / 非工程师。想看细节请看 `README.md` 与 `docs/MESH_AND_OTA.md`。  
-**子路径控制台 + 宿主机 Nginx 整站部署**（运维照着做）：`docs/SERVER_DEPLOY_SUBPATH.md`。
+**子路径控制台 + Traefik 整站部署**（运维照着做）：`docs/SERVER_DEPLOY_SUBPATH.md`。
 
 ---
 
@@ -31,7 +31,7 @@
 
 - **不会**自动给你搞定工厂贴标签。工厂端要把 `(serial, MAC, QR)` 上传到 `/factory/devices`，或者开关 `ENFORCE_FACTORY_REGISTRATION=0` 走简化模式。
 - **不会**自动给你一台短信网关。默认 `SMS_PROVIDER=none`，手机号只是存起来；开关 `REQUIRE_PHONE_VERIFICATION` 默认 0。要接 Twilio / 阿里云 / 腾讯云，要自己实现 `notifier_sms.py`。
-- **不会**替你发 OTA 文件。`/ota/firmwares` 读的是服务器磁盘目录 `OTA_FIRMWARE_DIR`，你要用 CI 或手动把编译好的 `.bin` 扔进去。固件真正下载是走 Nginx/CDN。
+- **不会**替你发 OTA 文件。`/ota/firmwares` 读的是服务器磁盘目录 `OTA_FIRMWARE_DIR`，你要用 CI 或手动把编译好的 `.bin` 扔进去。固件真正下载是走对外的 HTTPS（Traefik/网关/ CDN）到 `ota-nginx` 的 `/fw/` 路径。
 - **不会**自己创建 superadmin。superadmin 是启动时从 `.env` 里的 `BOOTSTRAP_DASHBOARD_SUPERADMIN_PASSWORD` 种出来的，只种一次；之后任何 API 都拒绝把角色设成 superadmin。
 - **不会**让你跳过邮箱验证注册 admin。除非你把 `REQUIRE_EMAIL_VERIFICATION=0`（不建议生产用）。
 
@@ -107,7 +107,7 @@ cp .env.example .env
 #   - FACTORY_API_TOKEN (供流水线上传序列号)
 #   - ENFORCE_FACTORY_REGISTRATION=1  (正式上线前建议打开)
 
-# 2) 启服务（API + Mosquitto + Nginx 在 docker-compose 里）
+# 2) 启服务（API + Mosquitto + ota-nginx 在 docker-compose 里；边缘入口用你本机的 Traefik）
 docker compose up -d
 
 # 3) 首次登录 superadmin → 改默认密码 → 把 BOOTSTRAP_DASHBOARD_SUPERADMIN_PASSWORD 从 .env 清空
