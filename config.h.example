@@ -249,12 +249,17 @@
 #define HEARTBEAT_MODE_EVENT 1
 #define HEARTBEAT_MODE_HYBRID 2
 #ifndef HEARTBEAT_MODE
-#define HEARTBEAT_MODE HEARTBEAT_MODE_EVENT
+// HYBRID keeps event-driven heartbeats AND a slow keepalive so the server
+// sees "still alive" within OFFLINE_THRESHOLD_SECONDS (90s default) even when
+// the device is idle. EVENT-only was the old default and caused false-offline.
+#define HEARTBEAT_MODE HEARTBEAT_MODE_HYBRID
 #endif
 // Used only when HEARTBEAT_MODE == HEARTBEAT_MODE_PERIODIC.
 #define HEARTBEAT_INTERVAL_MS 2000
 // Used only when HEARTBEAT_MODE == HEARTBEAT_MODE_HYBRID.
-#define HEARTBEAT_IDLE_KEEPALIVE_MS 900000UL   // 15 min
+// 60s fits inside server OFFLINE_THRESHOLD_SECONDS=90. If you raise this,
+// raise the server threshold at least as much.
+#define HEARTBEAT_IDLE_KEEPALIVE_MS 60000UL    // 60 s
 // Minimum gap between two heartbeats regardless of mode — guards against
 // event storms (e.g. flaky switch on TRIGGER_GPIO) melting the broker.
 #define HEARTBEAT_MIN_INTERVAL_MS 1000
@@ -263,6 +268,39 @@
 #define WIFI_RECONNECT_BASE_MS 2000
 #define MQTT_RECONNECT_BASE_MS 2000
 #define RECONNECT_MAX_MS 60000
+
+// ── MQTT self-heal ──
+// After N consecutive MQTT connect failures the firmware reboots to recover
+// stale TLS/DNS state. The grace-window defers this during power-on so slow
+// DHCP / DNS doesn't reboot-loop a freshly booted device.
+#ifndef MQTT_SELF_HEAL_FAILS
+#define MQTT_SELF_HEAL_FAILS 30
+#endif
+#ifndef MQTT_SELF_HEAL_GRACE_MS
+#define MQTT_SELF_HEAL_GRACE_MS (10UL * 60UL * 1000UL)
+#endif
+
+// ── Heap panic / warn thresholds ──
+#ifndef MIN_FREE_HEAP_PANIC_BYTES
+#define MIN_FREE_HEAP_PANIC_BYTES 4096
+#endif
+#ifndef MIN_FREE_HEAP_WARN_BYTES
+#define MIN_FREE_HEAP_WARN_BYTES 12000
+#endif
+
+// ── OTA hardening ──
+#ifndef OTA_MIN_FREE_PARTITION_BYTES
+#define OTA_MIN_FREE_PARTITION_BYTES (512U * 1024U)
+#endif
+#ifndef OTA_MIN_FREE_HEAP_BYTES
+#define OTA_MIN_FREE_HEAP_BYTES 40000U
+#endif
+#ifndef OTA_CONNECT_TIMEOUT_MS
+#define OTA_CONNECT_TIMEOUT_MS 15000
+#endif
+#ifndef OTA_MAX_ATTEMPTS
+#define OTA_MAX_ATTEMPTS 2
+#endif
 
 // ── Offline event queue (cap RAM when MQTT is down; oldest dropped when full) ──
 #define OFFLINE_QUEUE_MAX 12

@@ -111,6 +111,18 @@ JWT_COOKIE_SECURE = os.getenv("JWT_COOKIE_SECURE", "0") == "1"
 _ss = (os.getenv("JWT_COOKIE_SAMESITE", "lax") or "lax").strip().lower()
 JWT_COOKIE_SAMESITE: str = "strict" if _ss == "strict" else "lax"
 JWT_RETURN_BODY_TOKEN = os.getenv("JWT_RETURN_BODY_TOKEN", "0") == "1"
+# CSRF protection (double-submit token). Turned ON by default whenever the
+# session lives in an HttpOnly cookie — a cross-site request that sneaks the
+# cookie along still can't guess the CSRF token because the browser won't let
+# the other origin read `document.cookie` for our host. When auth is done via
+# Authorization: Bearer (e.g., mobile apps, CI), CSRF is not applicable and
+# the guard skips automatically.
+CSRF_PROTECTION = os.getenv("CSRF_PROTECTION", "1") == "1"
+CSRF_COOKIE_NAME = (os.getenv("CSRF_COOKIE_NAME", "sentinel_csrf").strip() or "sentinel_csrf")
+CSRF_HEADER_NAME = (os.getenv("CSRF_HEADER_NAME", "X-CSRF-Token").strip() or "X-CSRF-Token")
+# Match JWT session lifetime so the CSRF cookie doesn't expire while the user
+# is still signed in (would force a silent re-login). Falls back to 1 day.
+CSRF_TOKEN_TTL_S = int(os.getenv("CSRF_TOKEN_TTL_S", str(int(JWT_EXPIRE_S) if int(JWT_EXPIRE_S) > 0 else 86400)))
 # SSE: ?token= leaks via logs; disable unless legacy clients need it.
 SSE_ALLOW_QUERY_TOKEN = os.getenv("SSE_ALLOW_QUERY_TOKEN", "0") == "1"
 # Public /health: set 1 only if load balancers need broker/smtp detail without auth.
@@ -208,16 +220,20 @@ TELEGRAM_COMMAND_MAX_DEVICES = int(os.getenv("TELEGRAM_COMMAND_MAX_DEVICES", "30
 TELEGRAM_BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "").strip().lstrip("@")
 TELEGRAM_LINK_TOKEN_TTL_SECONDS = int(os.getenv("TELEGRAM_LINK_TOKEN_TTL_SECONDS", "900"))
 
-# --- Presence probe (replaces firmware-side periodic heartbeat) ---
-# Devices in EVENT mode only publish heartbeats on state change. If we haven't
-# heard from a device in IDLE_SECONDS, the API publishes a single `ping`
-# command. Every probe (outgoing + ack) is recorded in presence_probes so ops
-# can audit "why is device X marked offline?".
-PRESENCE_PROBE_IDLE_SECONDS = int(os.getenv("PRESENCE_PROBE_IDLE_SECONDS", str(12 * 3600)))
-# How often the background worker scans for stale devices.
-PRESENCE_PROBE_SCAN_SECONDS = int(os.getenv("PRESENCE_PROBE_SCAN_SECONDS", "300"))
+# --- Presence probe (last-resort liveness check) ---
+# Devices in HYBRID mode should publish a keepalive every ~60s (see firmware
+# HEARTBEAT_IDLE_KEEPALIVE_MS). OFFLINE_THRESHOLD_SECONDS (90s) marks a device
+# offline in the UI. If the device is still silent after IDLE_SECONDS the
+# server publishes a single `ping` so we can distinguish "TCP quietly dropped"
+# from "device genuinely dead". Keep this >> OFFLINE_THRESHOLD_SECONDS so we
+# don't probe-spam devices that are merely momentarily late with a keepalive.
+# Default 600s (10 min) = 10 missed keepalives, which is clearly abnormal.
+PRESENCE_PROBE_IDLE_SECONDS = int(os.getenv("PRESENCE_PROBE_IDLE_SECONDS", "600"))
+# How often the background worker scans for stale devices. Keep moderate so
+# we don't hammer the DB; 120s is comfortably < IDLE_SECONDS/4.
+PRESENCE_PROBE_SCAN_SECONDS = int(os.getenv("PRESENCE_PROBE_SCAN_SECONDS", "120"))
 # Rate limit: don't probe the same device more than once per this window.
-PRESENCE_PROBE_COOLDOWN_SECONDS = int(os.getenv("PRESENCE_PROBE_COOLDOWN_SECONDS", "1800"))
+PRESENCE_PROBE_COOLDOWN_SECONDS = int(os.getenv("PRESENCE_PROBE_COOLDOWN_SECONDS", "900"))
 # After N consecutive failed probes, the device is flagged offline and we back
 # off to stop spamming the broker for obviously dead hardware.
 PRESENCE_PROBE_MAX_CONSECUTIVE = int(os.getenv("PRESENCE_PROBE_MAX_CONSECUTIVE", "3"))
@@ -995,6 +1011,22 @@ def init_db() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS ix_events_category_ts ON events(category, ts_epoch_ms DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_events_level_ts ON events(level, ts_epoch_ms DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_events_device_ts ON events(device_id, ts_epoch_ms DESC)")
+        # Hot-path indexes added in the post-mortem debug pass — these queries all
+        # showed up in slow-log sampling under load.
+        #
+        # scheduled_commands worker: `WHERE status='pending' AND execute_at_ts <= ?`
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_scheduled_cmds_status_ts ON scheduled_commands(status, execute_at_ts)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_scheduled_cmds_device ON scheduled_commands(device_id)")
+        # device_state: fleet listings filter by zone + freshness, presence scan by provisioned.
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_device_state_zone ON device_state(zone)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_device_state_updated ON device_state(updated_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_device_state_provisioned ON device_state(provisioned)")
+        # audit_events: superadmin history view orders by created_at and filters by actor/target.
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_audit_created ON audit_events(created_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_audit_actor_created ON audit_events(actor, created_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_audit_target_created ON audit_events(target, created_at DESC)")
+        # provisioned_credentials: MAC lookups during bootstrap/claim.
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_provcreds_mac ON provisioned_credentials(mac_nocolon)")
         ensure_column(conn, "device_state", "chip_target", "TEXT")
         ensure_column(conn, "device_state", "board_profile", "TEXT")
         ensure_column(conn, "device_state", "net_type", "TEXT")
@@ -1239,6 +1271,14 @@ _redis_listener_thread: Optional[threading.Thread] = None
 _superadmin_cache: set[str] = set()
 _superadmin_cache_ts = 0.0
 
+# Cached list of Telegram chat_ids bound to a superadmin dashboard user. Used
+# to fan EVERY event out to superadmin Telegram (filters on env chats still
+# apply normally — see telegram_notify.maybe_enqueue). Cached briefly so we
+# don't hit sqlite once per event on a hot emit_event path.
+_superadmin_tg_chats_cache: list[str] = []
+_superadmin_tg_chats_ts: float = 0.0
+_superadmin_tg_chats_ttl_s: float = 20.0
+
 
 def _is_superadmin_username(username: str) -> bool:
     u = str(username or "").strip()
@@ -1260,6 +1300,51 @@ def _is_superadmin_username(username: str) -> bool:
             db_lock.release()
         _superadmin_cache_ts = now
     return u in _superadmin_cache
+
+
+def _superadmin_telegram_chat_ids() -> list[str]:
+    """All enabled Telegram chat_ids bound to a superadmin dashboard user.
+
+    Returns an empty list on any DB/config error; callers treat it as
+    "no extras" which is safe. Result is cached for ~20s to avoid hitting
+    sqlite on every emit_event.
+    """
+    global _superadmin_tg_chats_cache, _superadmin_tg_chats_ts
+    now = time.time()
+    if _superadmin_tg_chats_cache and (now - _superadmin_tg_chats_ts) < _superadmin_tg_chats_ttl_s:
+        return list(_superadmin_tg_chats_cache)
+    # Best-effort non-blocking lock to avoid starving the emit_event hot path.
+    if not db_lock.acquire(blocking=False):
+        return list(_superadmin_tg_chats_cache)
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT b.chat_id
+            FROM telegram_chat_bindings b
+            JOIN dashboard_users u ON u.username = b.username
+            WHERE b.enabled = 1 AND u.role = 'superadmin'
+            """
+        )
+        chats = [str(r["chat_id"]) for r in cur.fetchall() if r["chat_id"]]
+        conn.close()
+    except Exception as exc:
+        logger.warning("superadmin telegram chat lookup failed: %s", exc)
+        chats = list(_superadmin_tg_chats_cache)
+    finally:
+        db_lock.release()
+    _superadmin_tg_chats_cache = chats
+    _superadmin_tg_chats_ts = now
+    return list(chats)
+
+
+def _invalidate_superadmin_telegram_chats_cache() -> None:
+    """Reset the cached superadmin->chat mapping so the next emit_event
+    picks up a fresh bind/unbind/toggle immediately instead of after TTL."""
+    global _superadmin_tg_chats_cache, _superadmin_tg_chats_ts
+    _superadmin_tg_chats_cache = []
+    _superadmin_tg_chats_ts = 0.0
 
 
 def _insert_event_row(ev: dict[str, Any]) -> int:
@@ -1346,7 +1431,13 @@ def emit_event(
     try:
         from telegram_notify import maybe_notify_telegram
 
-        maybe_notify_telegram(ev)
+        # Superadmin bindings get the firehose; env TELEGRAM_CHAT_IDS stays
+        # filtered as before (signal hygiene for operators).
+        try:
+            sa_chats = _superadmin_telegram_chat_ids()
+        except Exception:
+            sa_chats = []
+        maybe_notify_telegram(ev, extra_chat_ids=sa_chats)
     except Exception as exc:
         # Avoid silent failures when Telegram module/env is misconfigured (default log level INFO).
         logger.warning("telegram_notify skipped: %s", exc)
@@ -1559,6 +1650,33 @@ def _maybe_dispatch_fcm_for_ev(ev: dict[str, Any]) -> None:
         enqueue_alarm_payloads(out)
 
 
+# Actions that are *irreversible* or *security-sensitive* and deserve a warn-level
+# event → Telegram/email notification even when the action itself succeeded.
+# Matched as prefixes so e.g. "device.unclaim" and "device.unclaim_reset" both hit.
+_HIGH_RISK_AUDIT_PREFIXES: tuple[str, ...] = (
+    "device.unclaim",
+    "device.factory_unregister",
+    "device.factory_unlink",
+    "device.revoke",
+    "device.delete",
+    "user.delete",
+    "user.deactivate",
+    "admin.close",
+    "admin.hard_close",
+    "admin.suspend",
+    "admin.delete",
+    "ota.rollback",
+    "ota.force_rollback",
+    "bootstrap.unblock",
+    "security.key_rotate",
+)
+
+
+def _audit_action_is_high_risk(action: str) -> bool:
+    a = (action or "").lower()
+    return any(a.startswith(p) for p in _HIGH_RISK_AUDIT_PREFIXES)
+
+
 def audit_event(actor: str, action: str, target: str = "", detail: Optional[dict[str, Any]] = None) -> None:
     """Legacy audit log helper — kept for compatibility but now ALSO mirrors
     the entry into the unified event center so the superadmin sees it live.
@@ -1596,6 +1714,10 @@ def audit_event(actor: str, action: str, target: str = "", detail: Optional[dict
         level = "error"
     else:
         level = "info"
+    # Escalate irreversible / security-sensitive actions to warn so Telegram /
+    # email fan-out notifies the superadmin even on a clean success path.
+    if level == "info" and _audit_action_is_high_risk(action):
+        level = "warn"
     owner_admin = None
     device_id = None
     if isinstance(detail, dict):
@@ -2970,6 +3092,8 @@ def _dispatch_ota_to_device(campaign_id: str, device_id: str, target_fw: str, ta
         target_id=device_id,
         proto=CMD_PROTO,
         cmd_key=get_cmd_key_for_device(device_id),
+        dedupe_key=f"ota:{device_id}:{campaign_id or target_fw or target_url}",
+        dedupe_ttl_s=60.0,
     )
 
 
@@ -3903,6 +4027,107 @@ async def _security_headers_middleware(request: Request, call_next):
         "connect-src 'self'",
     )
     return resp
+
+
+# ----------------------------------------------------------------- CSRF guard
+# Double-submit token (cookie + header). Written to the client alongside the
+# JWT cookie at login; every state-changing request must echo the value via
+# the CSRF_HEADER_NAME header. Because the cookie is NOT HttpOnly, first-party
+# JS can read it; a cross-origin attacker can't — that's the security property.
+
+def _issue_csrf_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def _set_csrf_cookie(response: Response, token: Optional[str] = None) -> str:
+    tok = (token or "").strip() or _issue_csrf_token()
+    response.set_cookie(
+        key=CSRF_COOKIE_NAME,
+        value=tok,
+        max_age=int(CSRF_TOKEN_TTL_S),
+        path="/",
+        httponly=False,  # JS must be able to read this one.
+        secure=bool(JWT_COOKIE_SECURE),
+        samesite=JWT_COOKIE_SAMESITE,  # type: ignore[arg-type]
+    )
+    return tok
+
+
+def _clear_csrf_cookie(response: Response) -> None:
+    response.delete_cookie(
+        CSRF_COOKIE_NAME,
+        path="/",
+        secure=bool(JWT_COOKIE_SECURE),
+        httponly=False,
+        samesite=JWT_COOKIE_SAMESITE,  # type: ignore[arg-type]
+    )
+
+
+# Paths that cookie-authenticated browsers are allowed to POST/PUT/PATCH/DELETE
+# without a CSRF token. Auth endpoints issue the token so they can't require it
+# pre-login; device-side paths run over MQTT or per-device HMAC so the cookie
+# flow doesn't apply.
+_CSRF_EXEMPT_PREFIXES: tuple[str, ...] = (
+    "/auth/login",
+    "/auth/register",
+    "/auth/forgot-password",
+    "/auth/reset-password",
+    "/auth/account-activate",
+    "/auth/resend-activation",
+    "/auth/logout",
+    "/api/device/",
+    "/api/devices/",  # device-side self-service endpoints
+    "/ingest/",
+    "/integrations/telegram/webhook",
+    "/health",
+    "/dashboard/",
+    "/ui/",
+)
+
+
+def _csrf_path_exempt(path: str) -> bool:
+    p = str(path or "")
+    if p in ("/", "/favicon.ico", "/openapi.json", "/redoc", "/docs"):
+        return True
+    for pref in _CSRF_EXEMPT_PREFIXES:
+        if p == pref.rstrip("/") or p.startswith(pref):
+            return True
+    # Let the mounted /console SPA serve its static files freely.
+    if p == DASHBOARD_PATH or p.startswith(DASHBOARD_PATH + "/"):
+        return True
+    return False
+
+
+@app.middleware("http")
+async def _csrf_guard(request: Request, call_next):
+    """Enforce double-submit CSRF token for cookie-authenticated writes."""
+    if not CSRF_PROTECTION:
+        return await call_next(request)
+    method = str(request.method or "GET").upper()
+    if method in ("GET", "HEAD", "OPTIONS"):
+        return await call_next(request)
+    path = request.url.path
+    if _csrf_path_exempt(path):
+        return await call_next(request)
+    # If the caller is using Authorization: Bearer, CSRF is n/a (token is not
+    # ambient-authed via the browser). Browser-based attacks can't set this
+    # header cross-origin.
+    auth_hdr = str(request.headers.get("authorization") or "")
+    if auth_hdr.lower().startswith("bearer "):
+        return await call_next(request)
+    # Only enforce when the request actually carries our session cookie —
+    # otherwise the request will fail auth anyway and CSRF is moot.
+    jwt_ck = request.cookies.get(JWT_COOKIE_NAME)
+    if not jwt_ck:
+        return await call_next(request)
+    sent = str(request.headers.get(CSRF_HEADER_NAME) or "").strip()
+    expected = str(request.cookies.get(CSRF_COOKIE_NAME) or "").strip()
+    if not sent or not expected or not secrets.compare_digest(sent, expected):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "csrf token missing or invalid", "code": "csrf_invalid"},
+        )
+    return await call_next(request)
 
 _dash_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard")
 if os.path.isdir(_dash_dir):
@@ -5194,6 +5419,7 @@ def auth_login(body: LoginRequest, request: Request, response: Response) -> dict
     _clear_login_ip_state(ip)
     zones = zones_from_json(str(row["allowed_zones_json"]))
     token = issue_jwt(str(row["username"]), str(row["role"]), zones)
+    csrf_tok = ""
     if JWT_USE_HTTPONLY_COOKIE:
         response.set_cookie(
             key=JWT_COOKIE_NAME,
@@ -5204,6 +5430,8 @@ def auth_login(body: LoginRequest, request: Request, response: Response) -> dict
             secure=bool(JWT_COOKIE_SECURE),
             samesite=JWT_COOKIE_SAMESITE,  # type: ignore[arg-type]
         )
+        # Paired CSRF token — required on every cookie-authenticated write.
+        csrf_tok = _set_csrf_cookie(response)
     ok_detail = dict(ctx)
     ok_detail["owner_admin"] = owner_admin
     ok_detail["login_user"] = str(row["username"])
@@ -5248,7 +5476,26 @@ def auth_login(body: LoginRequest, request: Request, response: Response) -> dict
     out: dict[str, Any] = {"token_type": "bearer", "role": row["role"], "zones": zones}
     if JWT_RETURN_BODY_TOKEN or not JWT_USE_HTTPONLY_COOKIE:
         out["access_token"] = token
+    if csrf_tok:
+        # Also echo the CSRF token in the JSON body so SPA clients that ignore
+        # document.cookie (for whatever reason) can still bootstrap the header.
+        out["csrf_token"] = csrf_tok
     return out
+
+
+@app.get("/auth/csrf")
+def auth_csrf(
+    response: Response,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    """
+    Refresh / read the paired CSRF token for the signed-in session.
+
+    The SPA calls this on boot (or whenever it notices the header is rejected)
+    to re-sync its double-submit token without forcing a logout-login cycle.
+    """
+    tok = _set_csrf_cookie(response)
+    return {"csrf_token": tok, "header": CSRF_HEADER_NAME}
 
 
 @app.post("/auth/logout")
@@ -5261,6 +5508,7 @@ def auth_logout(response: Response) -> dict[str, Any]:
         httponly=True,
         samesite=JWT_COOKIE_SAMESITE,  # type: ignore[arg-type]
     )
+    _clear_csrf_cookie(response)
     return {"ok": True}
 
 
@@ -6229,6 +6477,9 @@ def _delete_user_auxiliary_cur(cur: Any, username: str) -> None:
     cur.execute("DELETE FROM user_fcm_tokens WHERE username = ?", (username,))
     cur.execute("DELETE FROM password_reset_tokens WHERE username = ?", (username,))
     cur.execute("DELETE FROM dashboard_users WHERE username = ?", (username,))
+    # If the deleted user was a superadmin, the cached chat list is stale;
+    # same for the username->role cache.
+    _invalidate_superadmin_telegram_chats_cache()
 
 
 def _apply_device_factory_unclaim_cur(cur: Any, device_id: str) -> None:
@@ -6390,6 +6641,7 @@ def _try_mqtt_unclaim_reset(device_id: str) -> tuple[bool, bool]:
             device_id,
             CMD_PROTO,
             get_cmd_key_for_device(device_id),
+            dedupe_key=f"unclaim_reset:{device_id}",
         )
     except HTTPException as exc:
         # 503 = broker disconnected → no MQTT, don't wait.
@@ -6522,18 +6774,61 @@ def _health_notify_summary_public() -> tuple[dict[str, Any], dict[str, Any]]:
     return smtp, tg
 
 
+def _health_db_probe(timeout_s: float = 1.5) -> dict[str, Any]:
+    """Fast DB liveness probe: run `SELECT 1` with a tight budget.
+    Returns {ok, latency_ms, error?}. Never raises.
+    """
+    t0 = time.monotonic()
+    out: dict[str, Any] = {"ok": False, "latency_ms": 0}
+    try:
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.fetchone()
+            out["ok"] = True
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception as exc:
+        out["error"] = str(exc)[:240]
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    out["latency_ms"] = latency_ms
+    out["slow"] = latency_ms > int(timeout_s * 1000)
+    return out
+
+
+def _health_subscriber_summary() -> dict[str, Any]:
+    try:
+        with event_bus._lock:  # noqa: SLF001 — intentional peek
+            n = len(event_bus._subs)  # noqa: SLF001
+            dropped = sum(int(getattr(s, "dropped", 0)) for s in event_bus._subs.values())  # noqa: SLF001
+        return {"count": n, "cap": int(EVENT_MAX_SUBSCRIBERS), "dropped_total": dropped}
+    except Exception:
+        return {"count": 0, "cap": int(EVENT_MAX_SUBSCRIBERS), "dropped_total": 0}
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     """Liveness for load balancers / `curl` — intentionally **no** auth so Uptime
     Kuma, Docker healthchecks, and reverse proxies can probe without a token."""
     ready = api_ready_event.is_set() and not api_bootstrap_error
+    db_probe = _health_db_probe()
+    # Flip `ok` to False when DB is actually stalled — this is the load-balancer
+    # signal that says "pull this worker out of rotation".
+    db_ok = bool(db_probe.get("ok"))
+    subs = _health_subscriber_summary()
     if not HEALTH_PUBLIC_DETAIL:
         smtp, tg = _health_notify_summary_public()
         # MQTT + mail/TG worker truth; FCM/token hints still only when HEALTH_PUBLIC_DETAIL=1.
         body = {
-            "ok": bool(ready),
+            "ok": bool(ready and db_ok),
             "ready": ready,
             "starting": not api_ready_event.is_set(),
+            "db": db_probe,
+            "sse_subscribers": subs,
             "mqtt_connected": mqtt_connected,
             "mqtt_ingest_queue_depth": mqtt_ingest_queue.qsize(),
             "mqtt_ingest_dropped": mqtt_ingest_dropped,
@@ -6562,9 +6857,11 @@ def health() -> dict[str, Any]:
     except Exception as exc:
         fcm = {"enabled": False, "error": str(exc), "queue_size": 0, "worker_running": False}
     body = {
-        "ok": bool(ready),
+        "ok": bool(ready and db_ok),
         "ready": ready,
         "starting": not api_ready_event.is_set(),
+        "db": db_probe,
+        "sse_subscribers": subs,
         "mqtt_connected": mqtt_connected,
         "mqtt_ingest_queue_depth": mqtt_ingest_queue.qsize(),
         "mqtt_ingest_dropped": mqtt_ingest_dropped,
@@ -6641,6 +6938,47 @@ def _device_is_online_parsed(
     updated = _parse_iso(str(updated_at_iso or ""))
     fresh = (now_s - updated) < OFFLINE_THRESHOLD_SECONDS
     return _effective_online_for_presence(last_status, last_heartbeat, last_ack, last_event) and fresh
+
+
+def _device_presence_ages(
+    last_status: dict[str, Any],
+    last_heartbeat: dict[str, Any],
+    last_ack: dict[str, Any],
+    last_event: dict[str, Any],
+    updated_at_iso: str,
+    now_s: int,
+) -> dict[str, int]:
+    """
+    Returns granular age-in-seconds fields for UI/health display.
+
+    Anything we can't compute comes back as -1 (render as "--" in the UI) so
+    the frontend never has to invent placeholder values.
+
+    - `last_heartbeat_age_s`: seconds since the device last sent /heartbeat
+      (HYBRID mode keepalive or an event heartbeat). -1 before first hb.
+    - `last_signal_age_s`: seconds since ANY channel (status/heartbeat/ack/
+      event) touched the row — this is the same clock the presence logic
+      compares against OFFLINE_THRESHOLD_SECONDS.
+    - `last_updated_age_s`: seconds since the DB row's updated_at column.
+    """
+    def _age(ts: int) -> int:
+        if ts <= 0:
+            return -1
+        return max(0, int(now_s) - int(ts))
+
+    hb_age = _age(_payload_ts(last_heartbeat))
+    signal_ts = max(
+        _payload_ts(last_status) or 0,
+        _payload_ts(last_heartbeat) or 0,
+        _payload_ts(last_ack) or 0,
+        _payload_ts(last_event) or 0,
+    )
+    updated = _parse_iso(str(updated_at_iso or ""))
+    return {
+        "last_heartbeat_age_s": hb_age,
+        "last_signal_age_s": _age(signal_ts),
+        "last_updated_age_s": _age(int(updated) if updated > 0 else 0),
+    }
 
 
 def _device_is_online_sql_row(row: dict[str, Any], now_s: int) -> bool:
@@ -7051,6 +7389,16 @@ def list_devices(principal: Principal = Depends(require_principal)) -> dict[str,
             d = dict(r)
             d["is_online"] = _device_is_online_sql_row(d, now_s)
             d["status_preview"] = _status_preview_from_device_row(d)
+            d.update(
+                _device_presence_ages(
+                    _row_json_val(d.get("last_status_json")),
+                    _row_json_val(d.get("last_heartbeat_json")),
+                    _row_json_val(d.get("last_ack_json")),
+                    _row_json_val(d.get("last_event_json")),
+                    str(d.get("updated_at") or ""),
+                    now_s,
+                )
+            )
             owner_admin = str(d.get("owner_admin") or "")
             d.pop("last_status_json", None)
             d.pop("last_heartbeat_json", None)
@@ -7131,6 +7479,16 @@ def get_device(device_id: str, principal: Principal = Depends(require_principal)
         out.get("last_event_json") or {},
         str(out.get("updated_at") or ""),
         now_s,
+    )
+    out.update(
+        _device_presence_ages(
+            out.get("last_status_json") or {},
+            out.get("last_heartbeat_json") or {},
+            out.get("last_ack_json") or {},
+            out.get("last_event_json") or {},
+            str(out.get("updated_at") or ""),
+            now_s,
+        )
     )
     with db_lock:
         conn = get_conn()
@@ -8441,6 +8799,43 @@ def publish_bootstrap_claim(
 
 
 MQTT_PUBLISH_WAIT_MS = max(0, min(5000, int(os.getenv("MQTT_PUBLISH_WAIT_MS", "800"))))
+# TTL (seconds) for the idempotency cache. Must be long enough to eat a double-click
+# or a rushed retry (UI, proxy, accidental re-post), short enough to not hide a
+# genuinely re-issued operator action minutes later.
+PUBLISH_DEDUPE_TTL_S = max(5, min(120, int(os.getenv("PUBLISH_DEDUPE_TTL_S", "30"))))
+
+# In-memory idempotency cache: { dedupe_key -> (cmd_id, expire_epoch_s) }.
+# Process-local only (ok: multi-worker deployments should use sticky sessions
+# for the admin dashboard; background fan-out has its own wall-clock cap).
+_publish_dedupe_cache: dict[str, tuple[str, float]] = {}
+_publish_dedupe_lock = threading.Lock()
+
+
+def _publish_dedupe_get(key: str) -> Optional[str]:
+    if not key:
+        return None
+    now = time.time()
+    with _publish_dedupe_lock:
+        # Opportunistic prune so the cache can't grow unbounded under a flood.
+        if len(_publish_dedupe_cache) > 2048:
+            expired = [k for k, (_cid, exp) in _publish_dedupe_cache.items() if exp <= now]
+            for k in expired:
+                _publish_dedupe_cache.pop(k, None)
+        entry = _publish_dedupe_cache.get(key)
+        if not entry:
+            return None
+        cid, exp = entry
+        if exp <= now:
+            _publish_dedupe_cache.pop(key, None)
+            return None
+        return cid
+
+
+def _publish_dedupe_set(key: str, cmd_id: str, ttl_s: float) -> None:
+    if not key or not cmd_id:
+        return
+    with _publish_dedupe_lock:
+        _publish_dedupe_cache[key] = (cmd_id, time.time() + max(1.0, ttl_s))
 
 
 def publish_command(
@@ -8452,6 +8847,8 @@ def publish_command(
     cmd_key: str,
     *,
     wait_publish: bool = True,
+    dedupe_key: Optional[str] = None,
+    dedupe_ttl_s: Optional[float] = None,
 ) -> str:
     """Publish a /cmd frame. Returns generated ``cmd_id`` (so callers can wait on ACK by id).
 
@@ -8459,8 +8856,19 @@ def publish_command(
     instead of stalling the caller (fan-out and HTTP handlers must stay responsive).
     When ``wait_publish=True`` (default), briefly waits for paho to drain (``MQTT_PUBLISH_WAIT_MS``)
     so QoS 1 can start delivery; callers that do fan-out in a worker pool can pass False.
+
+    ``dedupe_key`` makes the publish idempotent over a short TTL: if the same key is
+    re-used within the TTL, the previously generated ``cmd_id`` is returned and
+    **no new MQTT message is published**. This lets callers that represent
+    irreversible operations (unclaim_reset, factory-unregister, reboot) absorb
+    double-clicks and accidental retries without sending two commands to the device.
     """
     global mqtt_client
+    if dedupe_key:
+        cached = _publish_dedupe_get(dedupe_key)
+        if cached:
+            logger.info("publish_command dedupe hit: %s -> %s", dedupe_key, cached)
+            return cached
     if mqtt_client is None:
         raise HTTPException(status_code=503, detail="mqtt client not ready")
     if not mqtt_connected:
@@ -8486,6 +8894,8 @@ def publish_command(
             info.wait_for_publish(timeout=max(0.05, MQTT_PUBLISH_WAIT_MS / 1000.0))
         except Exception:
             pass
+    if dedupe_key:
+        _publish_dedupe_set(dedupe_key, cmd_id, float(dedupe_ttl_s or PUBLISH_DEDUPE_TTL_S))
     return cmd_id
 
 
@@ -10170,6 +10580,7 @@ def _telegram_bind_chat(chat_id: str, username: str, enabled: bool) -> None:
         )
         conn.commit()
         conn.close()
+    _invalidate_superadmin_telegram_chats_cache()
 
 
 def _telegram_policy_allow(principal: Principal, capability: str) -> bool:
@@ -10493,6 +10904,7 @@ def telegram_unbind(chat_id: str, principal: Principal = Depends(require_princip
         conn.close()
     if deleted == 0:
         raise HTTPException(status_code=404, detail="binding not found")
+    _invalidate_superadmin_telegram_chats_cache()
     audit_event(principal.username, "telegram.unbind", chat_id, {})
     return {"ok": True}
 
@@ -10522,6 +10934,7 @@ def telegram_binding_set_enabled(
         conn.close()
     if n == 0:
         raise HTTPException(status_code=404, detail="binding not found")
+    _invalidate_superadmin_telegram_chats_cache()
     audit_event(principal.username, "telegram.bind.enabled", chat_id, {"enabled": bool(enabled)})
     return {"ok": True, "chat_id": chat_id, "enabled": bool(enabled)}
 
@@ -10757,6 +11170,65 @@ def list_firmwares(principal: Principal = Depends(require_principal)) -> dict[st
     }
 
 
+@app.get("/ota/firmware-verify")
+def ota_firmware_verify(
+    fname: str,
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    """Re-hash a stored .bin and compare with its sidecar ``.sha256`` file.
+
+    Use this to confirm a firmware artifact on disk has not been corrupted (or
+    swapped) since upload. Only superadmin may call this; it reads the full
+    file so don't hit it in tight loops.
+    """
+    assert_min_role(principal, "superadmin")
+    safe = os.path.basename((fname or "").strip())
+    if not safe or not safe.lower().endswith(".bin") or "/" in safe or "\\" in safe or ".." in safe:
+        raise HTTPException(status_code=400, detail="invalid firmware filename")
+    base_dir = os.path.realpath(OTA_FIRMWARE_DIR)
+    path = os.path.join(OTA_FIRMWARE_DIR, safe)
+    try:
+        rp = os.path.realpath(path)
+    except OSError:
+        raise HTTPException(status_code=400, detail="invalid firmware path")
+    if not (rp == os.path.join(base_dir, safe) or rp.startswith(base_dir + os.sep)):
+        raise HTTPException(status_code=400, detail="path traversal rejected")
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="firmware not found")
+    sidecar = path + ".sha256"
+    expected = ""
+    if os.path.isfile(sidecar):
+        try:
+            with open(sidecar, "r", encoding="utf-8") as f:
+                first = (f.readline() or "").strip()
+                expected = (first.split()[0] if first else "").lower()
+        except OSError:
+            expected = ""
+    # Stream-hash the file so we don't balloon memory on a 2+ MB image.
+    h = hashlib.sha256()
+    nbytes = 0
+    try:
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(64 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+                nbytes += len(chunk)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"read error: {exc}")
+    actual = h.hexdigest().lower()
+    ok = bool(expected) and actual == expected
+    return {
+        "fname": safe,
+        "bytes": nbytes,
+        "sha256_expected": expected,
+        "sha256_actual": actual,
+        "ok": ok,
+        "has_sidecar": bool(expected),
+    }
+
+
 @app.post("/ota/broadcast")
 def ota_broadcast(req: OtaBroadcastRequest, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     # OTA is sensitive: the .bin can brick the fleet. Only superadmin may
@@ -10781,6 +11253,8 @@ def ota_broadcast(req: OtaBroadcastRequest, principal: Principal = Depends(requi
                 target_id=did,
                 proto=CMD_PROTO,
                 cmd_key=get_cmd_key_for_device(did),
+                dedupe_key=f"ota-broadcast:{did}:{req.fw or req.url}",
+                dedupe_ttl_s=60.0,
             )
             sent += 1
         except Exception as exc:
@@ -10918,11 +11392,54 @@ def _ota_delete_artifacts_for_stored_basename(basename: str) -> None:
             pass
 
 
+def _ota_in_use_basenames() -> set[str]:
+    """Set of .bin basenames currently referenced by a non-terminal OTA campaign.
+    We refuse to prune these so devices mid-download don't 404 on the artifact.
+    """
+    out: set[str] = set()
+    try:
+        with db_lock:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT url FROM ota_campaigns
+                WHERE state NOT IN ('success', 'failed', 'cancelled', 'rolled_back')
+                """
+            )
+            rows = cur.fetchall() or []
+            conn.close()
+    except Exception as exc:
+        logger.warning("in-use OTA campaign lookup failed: %s", exc)
+        return out
+    for r in rows:
+        url = str((r["url"] if r else "") or "")
+        if not url:
+            continue
+        try:
+            tail = url.rsplit("/", 1)[-1]
+            # Strip query string.
+            if "?" in tail:
+                tail = tail.split("?", 1)[0]
+            if tail.lower().endswith(".bin"):
+                out.add(tail)
+        except Exception:
+            continue
+    return out
+
+
 def _ota_enforce_max_stored_bins() -> None:
-    """Keep at most OTA_MAX_FIRMWARE_BINS .bin files; remove oldest by mtime first, with artifacts."""
+    """Keep at most OTA_MAX_FIRMWARE_BINS .bin files; remove oldest by mtime first, with artifacts.
+
+    Never prunes a .bin that's currently referenced by an active OTA campaign — doing
+    so would cause in-flight devices to fail the download and fall back to rollback.
+    If the number of in-use bins alone already exceeds the limit, we keep them all and
+    warn so the operator can raise ``OTA_MAX_FIRMWARE_BINS``.
+    """
     base = os.path.realpath(OTA_FIRMWARE_DIR)
     if not os.path.isdir(base):
         return
+    in_use = _ota_in_use_basenames()
     items: list[tuple[int, str, str]] = []  # mtime, name, relpath join path
     for name in os.listdir(OTA_FIRMWARE_DIR):
         if not str(name).lower().endswith(".bin"):
@@ -10943,9 +11460,22 @@ def _ota_enforce_max_stored_bins() -> None:
         items.append((int(st.st_mtime), str(name), p))
     # Oldest mtime first; break ties by name for stable order
     items.sort(key=lambda t: (t[0], t[1]))
-    while len(items) > OTA_MAX_FIRMWARE_BINS:
-        _m, name, _p = items.pop(0)
+    # Remove oldest until count ≤ max — but skip any in-use .bin.
+    idx = 0
+    kept_protected = 0
+    while len(items) > OTA_MAX_FIRMWARE_BINS and idx < len(items):
+        _m, name, _p = items[idx]
+        if name in in_use:
+            kept_protected += 1
+            idx += 1
+            continue
+        items.pop(idx)
         _ota_delete_artifacts_for_stored_basename(name)
+    if len(items) > OTA_MAX_FIRMWARE_BINS and kept_protected > 0:
+        logger.warning(
+            "OTA retention: %d artifact(s) kept above limit=%d because they are in-use by active campaigns",
+            kept_protected, OTA_MAX_FIRMWARE_BINS,
+        )
     _invalidate_ota_firmware_catalog_cache()
 
 
@@ -11152,6 +11682,10 @@ async def ota_campaign_from_upload(
 @app.get("/ota/campaigns")
 def list_ota_campaigns(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     """Superadmin sees every campaign; admin sees only campaigns that list them."""
+    # Campaign metadata is a fleet-management concern — sub-users (role=user)
+    # have no legitimate reason to enumerate it, and for target_admins=['*']
+    # they'd otherwise see every in-flight OTA. Gate at admin.
+    assert_min_role(principal, "admin")
     items: list[dict[str, Any]] = []
     with db_lock:
         conn = get_conn()
@@ -11188,6 +11722,8 @@ def list_ota_campaigns(principal: Principal = Depends(require_principal)) -> dic
 
 @app.get("/ota/campaigns/{campaign_id}")
 def get_ota_campaign(campaign_id: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    # Same reasoning as list endpoint: fleet OTA detail is admin+ territory.
+    assert_min_role(principal, "admin")
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()

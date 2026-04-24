@@ -49,7 +49,10 @@ class _TelegramQueue:
         self._chats: list[str] = []
         self._min = "info"
         self._min_rank = 1
-        self._q: "queue.Queue[str]" = queue.Queue(maxsize=800)
+        # Each queue item is (text, extra_chat_ids). extra_chat_ids is unioned
+        # with the env-wide TELEGRAM_CHAT_IDS at send time so superadmin
+        # bindings from the DB can receive events the env list didn't cover.
+        self._q: "queue.Queue[tuple[str, list[str]]]" = queue.Queue(maxsize=800)
         self._stop = threading.Event()
         self._worker: Optional[threading.Thread] = None
         self._last_error: str = ""
@@ -97,27 +100,39 @@ class _TelegramQueue:
             self._worker.join(timeout=2.0)
             self._worker = None
 
-    def maybe_enqueue(self, ev: dict[str, Any]) -> None:
+    def maybe_enqueue(self, ev: dict[str, Any], extra_chat_ids: Optional[list[str]] = None) -> None:
         self.reload_from_env()
-        if not self.enabled():
+        # Two channels:
+        #   env_chats  — operator-configured TELEGRAM_CHAT_IDS (signal-clean)
+        #   extras     — per-event routes (e.g. superadmin bindings, full firehose)
+        # We enqueue if EITHER channel has eligible targets. Env-side filters
+        # (min_level + noise categories) DO NOT apply to the extras channel —
+        # "superadmin 全量订阅" means superadmin wants every non-duplicate event.
+        extras_clean = [str(c).strip() for c in (extra_chat_ids or []) if str(c).strip()]
+        env_chats = list(self._chats)
+        if not self._token:
+            return
+        if not (env_chats or extras_clean):
             return
         lvl = str(ev.get("level") or "info").lower()
-        if _LEVEL_RANK.get(lvl, 1) < self._min_rank:
-            return
         cat = str(ev.get("category") or "")
         et = str(ev.get("event_type") or "")
         actor = str(ev.get("actor") or "-")
         target = str(ev.get("target") or "-")
         device_id = str(ev.get("device_id") or "-")
         summary = str(ev.get("summary") or et or "").strip()
-        # Keep Telegram signal clean: debug/info system chatter is skipped unless alarm/auth/ota.
-        if lvl in ("debug", "info") and cat not in ("alarm", "auth", "ota"):
-            return
-        # Device alarm raw echoes are noisy; the normalized alarm/* event follows.
+        # True duplicate filters — apply to EVERYONE including superadmin extras.
+        # The normalized alarm/* event or the canonical record follows these.
         if cat == "device" and "alarm.trigger" in et:
             return
-        # audit mirror for alarm fanout duplicates alarm category line.
         if et.startswith("audit.alarm.fanout"):
+            return
+        # Env-channel filters (superadmin extras ignore these).
+        env_below_min = _LEVEL_RANK.get(lvl, 1) < self._min_rank
+        env_noise = lvl in ("debug", "info") and cat not in ("alarm", "auth", "ota")
+        env_eligible = bool(env_chats) and not env_below_min and not env_noise
+        extras_eligible = bool(extras_clean)
+        if not (env_eligible or extras_eligible):
             return
         detail_map: dict[str, Any] = {}
         try:
@@ -213,22 +228,38 @@ class _TelegramQueue:
         if len(self._recent_fingerprint_ts) > 1200:
             cutoff = now - (self._dedupe_window_s * 4.0)
             self._recent_fingerprint_ts = {k: ts for k, ts in self._recent_fingerprint_ts.items() if ts >= cutoff}
+        # Materialize the target list at enqueue time so queue items are
+        # self-contained — the worker doesn't need to re-run the filter logic.
+        final_targets: list[str] = []
+        seen: set[str] = set()
+        if env_eligible:
+            for c in env_chats:
+                cs = str(c).strip()
+                if cs and cs not in seen:
+                    seen.add(cs); final_targets.append(cs)
+        if extras_eligible:
+            for c in extras_clean:
+                if c and c not in seen:
+                    seen.add(c); final_targets.append(c)
+        if not final_targets:
+            return
+        item = (line, final_targets)
         try:
-            self._q.put_nowait(line)
+            self._q.put_nowait(item)
         except queue.Full:
             try:
                 self._q.get_nowait()
             except queue.Empty:
                 pass
             try:
-                self._q.put_nowait(line)
+                self._q.put_nowait(item)
             except queue.Full:
                 pass
 
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                text = self._q.get(timeout=1.0)
+                item = self._q.get(timeout=1.0)
             except queue.Empty:
                 continue
             try:
@@ -236,12 +267,14 @@ class _TelegramQueue:
                 if not self._token:
                     self._last_error = "TELEGRAM_BOT_TOKEN empty after reload"
                     continue
+                text, targets = item
+                # Targets are already final/deduped/filtered at enqueue time.
                 any_ok = False
-                for chat in list(self._chats):
+                for chat in targets:
                     if self._send_one(chat, text):
                         any_ok = True
                 self._last_send_ok = any_ok
-                if not any_ok and self._chats:
+                if not any_ok and targets:
                     logger.warning("telegram: message not delivered to any chat (see prior warnings)")
             except Exception:
                 logger.exception("telegram worker iteration failed")
@@ -309,8 +342,8 @@ def stop_telegram_worker() -> None:
     _tg.stop()
 
 
-def maybe_notify_telegram(ev: dict[str, Any]) -> None:
-    _tg.maybe_enqueue(ev)
+def maybe_notify_telegram(ev: dict[str, Any], extra_chat_ids: Optional[list[str]] = None) -> None:
+    _tg.maybe_enqueue(ev, extra_chat_ids=extra_chat_ids)
 
 
 def telegram_status() -> dict[str, Any]:

@@ -660,7 +660,16 @@ unsigned long lastWiFiAttemptAt = 0;
 unsigned long lastMQTTAttemptAt = 0;
 unsigned long wifiBackoffMs = WIFI_RECONNECT_BASE_MS;
 unsigned long mqttBackoffMs = MQTT_RECONNECT_BASE_MS;
+// Consecutive MQTT connect failures since last success. Used to escalate to
+// self-heal reboot when the broker is unreachable for extended periods, rather
+// than relying solely on the task WDT (which only fires on hard CPU stalls).
+uint16_t s_mqttConnFails = 0;
+// Next boot attempt deadline (epoch-independent: millis()). Re-armed on reset.
+unsigned long s_mqttSelfHealAtMs = 0;
 unsigned long bootAtMs = 0;
+// Last time a heap low-water-mark was logged, so publishStatus bursts don't
+// spam the serial log with free-heap warnings.
+unsigned long s_lastHeapLowLogAtMs = 0;
 
 unsigned long sirenStartAt = 0;
 unsigned long sirenDurationMs = 0;
@@ -1557,7 +1566,68 @@ void publishAlarmEvent(const char *triggerKind, bool localSiren) {
 // ═══════════════════════════════════════════════
 
 #if OTA_ENABLED
+// Accept only http:// or https:// URLs of reasonable length. Reject anything
+// else so a malformed /cmd payload can't trigger TCP connects to random
+// schemes or local paths.
+static bool otaValidateUrl(const char *url) {
+  if (!url || !*url) return false;
+  size_t n = strlen(url);
+  if (n > 1024) return false;
+  if (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0) return false;
+  for (size_t i = 0; i < n; i++) {
+    unsigned char c = (unsigned char)url[i];
+    if (c < 0x20 || c == 0x7F) return false;
+  }
+  return true;
+}
+
+// Rough free-space check: the next OTA partition must be at least
+// OTA_MIN_FREE_PARTITION_BYTES in size. This won't catch a partition that's
+// the right size but currently contains data (ESP will erase it inline), but
+// it will catch completely missing or mis-sized partition tables early.
+static bool otaPartitionHasRoom() {
+  const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
+  if (!next) {
+    logLine("[ota] no next OTA partition");
+    return false;
+  }
+#ifndef OTA_MIN_FREE_PARTITION_BYTES
+#define OTA_MIN_FREE_PARTITION_BYTES (512U * 1024U)
+#endif
+  if (next->size < OTA_MIN_FREE_PARTITION_BYTES) {
+    char _pl[96];
+    snprintf(_pl, sizeof(_pl), "[ota] partition too small: %u bytes", (unsigned)next->size);
+    logLine(_pl);
+    return false;
+  }
+  return true;
+}
+
 void performOTA(const char *url, const char *targetFw, const char *campaignId) {
+  if (!otaValidateUrl(url)) {
+    logLine("[ota] reject: invalid URL");
+    publishAck("ota", false, "invalid url");
+    publishOtaResult(campaignId, targetFw, false, "invalid url");
+    return;
+  }
+  if (!otaPartitionHasRoom()) {
+    publishAck("ota", false, "partition full");
+    publishOtaResult(campaignId, targetFw, false, "partition full");
+    return;
+  }
+  // Low-heap guard: TLS + OTA buffers eat ~30–40KB; below this we abort
+  // rather than crash midway (half-written partition stays safe because ESP
+  // commits only after hash-match on end()).
+#ifndef OTA_MIN_FREE_HEAP_BYTES
+#define OTA_MIN_FREE_HEAP_BYTES 40000U
+#endif
+  if (ESP.getFreeHeap() < OTA_MIN_FREE_HEAP_BYTES) {
+    logLine("[ota] reject: heap too low to start OTA safely");
+    publishAck("ota", false, "low heap");
+    publishOtaResult(campaignId, targetFw, false, "low heap");
+    return;
+  }
+
   {
     String uq = stripQuery(url);
     char _of[192];
@@ -1572,13 +1642,39 @@ void performOTA(const char *url, const char *targetFw, const char *campaignId) {
 
   NetworkClient otaClient;
   httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  t_httpUpdate_return ret = httpUpdate.update(otaClient, url);
+  // Single HTTP connect + read timeouts. Without these the underlying
+  // WiFiClient will block up to 60s on a stalled TCP connect and the task
+  // WDT is already suspended for the OTA window.
+#ifndef OTA_CONNECT_TIMEOUT_MS
+#define OTA_CONNECT_TIMEOUT_MS 15000
+#endif
+  otaClient.setTimeout(OTA_CONNECT_TIMEOUT_MS / 1000);
+  // One retry on transient failure. `httpUpdate.update()` itself handles
+  // hash-commit and rollback, so a clean retry is safe (the partition gets
+  // re-erased at the start of each attempt).
+#ifndef OTA_MAX_ATTEMPTS
+#define OTA_MAX_ATTEMPTS 2
+#endif
+  t_httpUpdate_return ret = HTTP_UPDATE_FAILED;
+  String lastErr;
+  for (int attempt = 1; attempt <= OTA_MAX_ATTEMPTS; attempt++) {
+    ret = httpUpdate.update(otaClient, url);
+    if (ret != HTTP_UPDATE_FAILED) break;
+    lastErr = httpUpdate.getLastErrorString();
+    char _rt[128];
+    snprintf(_rt, sizeof(_rt), "[ota] attempt %d/%d failed: %s",
+             attempt, OTA_MAX_ATTEMPTS, lastErr.c_str());
+    logLine(_rt);
+    if (attempt < OTA_MAX_ATTEMPTS) {
+      delay(1500);
+    }
+  }
 
   esp_task_wdt_add(NULL);
 
   switch (ret) {
     case HTTP_UPDATE_FAILED: {
-      String err = httpUpdate.getLastErrorString();
+      String err = lastErr.length() ? lastErr : httpUpdate.getLastErrorString();
       {
         char _fe[256];
         snprintf(_fe, sizeof(_fe), "[ota] FAILED: %s", err.c_str());
@@ -2482,6 +2578,8 @@ void ensureMqtt() {
   }
   if (mqttClient.connected()) {
     mqttBackoffMs = MQTT_RECONNECT_BASE_MS;
+    s_mqttConnFails = 0;
+    s_mqttSelfHealAtMs = 0;
     return;
   }
   unsigned long now = millis();
@@ -2528,10 +2626,42 @@ void ensureMqtt() {
       }
     }
 #endif
-    mqttBackoffMs = min(mqttBackoffMs * 2UL, (unsigned long)RECONNECT_MAX_MS);
+    s_mqttConnFails++;
+    unsigned long nextBackoff = min(mqttBackoffMs * 2UL, (unsigned long)RECONNECT_MAX_MS);
+    // Jitter up to ±25% of the computed backoff so a whole fleet losing the
+    // broker at once doesn't resynchronize and slam the broker when it comes
+    // back (thundering herd). `esp_random() % span` produces 0..span-1.
+    unsigned long jitterSpan = nextBackoff / 4U;
+    if (jitterSpan > 0) {
+      long delta = (long)(esp_random() % (jitterSpan * 2U + 1U)) - (long)jitterSpan;
+      long biased = (long)nextBackoff + delta;
+      if (biased < (long)MQTT_RECONNECT_BASE_MS) biased = (long)MQTT_RECONNECT_BASE_MS;
+      nextBackoff = (unsigned long)biased;
+    }
+    mqttBackoffMs = nextBackoff;
+#ifndef MQTT_SELF_HEAL_FAILS
+#define MQTT_SELF_HEAL_FAILS 30
+#endif
+#ifndef MQTT_SELF_HEAL_GRACE_MS
+#define MQTT_SELF_HEAL_GRACE_MS (10UL * 60UL * 1000UL)
+#endif
+    // After MQTT_SELF_HEAL_FAILS consecutive connect failures AND at least
+    // MQTT_SELF_HEAL_GRACE_MS of uptime (so we don't reboot-loop on power-on
+    // before networks finish DHCP), arm a self-heal reboot. We do NOT reboot
+    // inline here so the caller can finish ensureMqtt() cleanly and let loop()
+    // flush any pending MQTT buffers; the reboot is executed at the top of
+    // loop() in the next iteration.
+    if (s_mqttConnFails >= MQTT_SELF_HEAL_FAILS &&
+        millis() > MQTT_SELF_HEAL_GRACE_MS &&
+        s_mqttSelfHealAtMs == 0) {
+      s_mqttSelfHealAtMs = millis() + 1500UL;
+      logLine("[mqtt] self-heal armed: too many consecutive connect fails");
+    }
     return;
   }
 
+  s_mqttConnFails = 0;
+  s_mqttSelfHealAtMs = 0;
   logLine("[mqtt] connected");
   s_mqttCmdGraceUntilMs = millis() + (unsigned long)MQTT_POST_CONNECT_CMD_GRACE_MS;
   if (isProvisioned) {
@@ -2855,6 +2985,42 @@ void loop() {
   twdtFeedMaybe();
 
   unsigned long now = millis();
+
+  // Self-heal: if MQTT reconnects have been failing for a long time AND we've
+  // reached the armed deadline in ensureMqtt(), reboot. This is controlled
+  // self-heal: we do it at the top of loop() with WDT fed, so in-flight state
+  // is already quiet.
+  if (s_mqttSelfHealAtMs != 0 && now >= s_mqttSelfHealAtMs) {
+    logLine("[mqtt] self-heal: rebooting to recover broker session");
+    delay(200);
+    ESP.restart();
+    return;
+  }
+
+  // Heap low-watermark guard: below MIN_FREE_HEAP_PANIC_BYTES we reboot.
+  // This protects us against long-running leaks (e.g. TLS handshake retry
+  // storms on a misconfigured broker) that would otherwise starve the kernel
+  // and brick the device until power-cycle.
+#ifndef MIN_FREE_HEAP_PANIC_BYTES
+#define MIN_FREE_HEAP_PANIC_BYTES 4096
+#endif
+#ifndef MIN_FREE_HEAP_WARN_BYTES
+#define MIN_FREE_HEAP_WARN_BYTES 12000
+#endif
+  uint32_t freeHeap = ESP.getFreeHeap();
+  if (freeHeap < (uint32_t)MIN_FREE_HEAP_PANIC_BYTES && now > 60000UL) {
+    logLine("[heap] PANIC: free heap below threshold — rebooting");
+    delay(200);
+    ESP.restart();
+    return;
+  }
+  if (freeHeap < (uint32_t)MIN_FREE_HEAP_WARN_BYTES &&
+      (s_lastHeapLowLogAtMs == 0 || now - s_lastHeapLowLogAtMs > 30000UL)) {
+    char _hl[64];
+    snprintf(_hl, sizeof(_hl), "[heap] low free=%u", (unsigned)freeHeap);
+    logLine(_hl);
+    s_lastHeapLowLogAtMs = now;
+  }
 
 #if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
     !defined(CONFIG_IDF_TARGET_ESP32P4)

@@ -618,6 +618,35 @@
     return `${Math.floor(diff / 86400000)}d ago`;
   }
 
+  function fmtAgeShort(secs) {
+    const n = Number(secs);
+    if (!Number.isFinite(n) || n < 0) return "—";
+    if (n < 60) return `${Math.floor(n)}s`;
+    if (n < 3600) return `${Math.floor(n / 60)}m`;
+    if (n < 86400) return `${Math.floor(n / 3600)}h`;
+    return `${Math.floor(n / 86400)}d`;
+  }
+
+  // Classify heartbeat freshness into a badge kind. Mirrors server-side
+  // OFFLINE_THRESHOLD_SECONDS=90 (warn early) + PRESENCE_PROBE_IDLE_SECONDS=600.
+  function heartbeatPillInfo(device) {
+    const age = Number(
+      device && device.last_heartbeat_age_s != null
+        ? device.last_heartbeat_age_s
+        : (device && device.last_signal_age_s != null ? device.last_signal_age_s : -1)
+    );
+    if (!Number.isFinite(age) || age < 0) {
+      return { kind: "unknown", label: "hb —", title: "No heartbeat recorded yet" };
+    }
+    if (age <= 120) {
+      return { kind: "ok", label: `hb ${fmtAgeShort(age)}`, title: `Last heartbeat ${fmtAgeShort(age)} ago` };
+    }
+    if (age <= 600) {
+      return { kind: "warn", label: `hb ${fmtAgeShort(age)}`, title: `Heartbeat idle ${fmtAgeShort(age)} ago — server will probe soon` };
+    }
+    return { kind: "stale", label: `hb ${fmtAgeShort(age)}`, title: `No heartbeat for ${fmtAgeShort(age)} — device may be offline` };
+  }
+
   function maskPlatform(_raw) {
     return "e**********";
   }
@@ -729,6 +758,38 @@
     el._t = setTimeout(() => { el.className = "toast"; }, 3200);
   }
 
+  // ------------------------------------------------------------------ csrf
+  const CSRF_COOKIE_NAME = "sentinel_csrf";
+  const CSRF_HEADER_NAME = "X-CSRF-Token";
+
+  function readCookie(name) {
+    try {
+      const needle = name + "=";
+      const parts = String(document.cookie || "").split(";");
+      for (let i = 0; i < parts.length; i++) {
+        const s = parts[i].trim();
+        if (s.startsWith(needle)) return decodeURIComponent(s.slice(needle.length));
+      }
+    } catch (_) {}
+    return "";
+  }
+
+  async function refreshCsrfToken() {
+    // Force-refresh the CSRF cookie from the server. Called after login and
+    // whenever a write gets rejected with code=csrf_invalid.
+    try {
+      const token = getToken();
+      const headers = {};
+      if (token) headers.Authorization = "Bearer " + token;
+      const r = await fetchWithDeadline(apiBase() + "/auth/csrf", { method: "GET", headers }, 8000);
+      if (!r.ok) return "";
+      const j = await r.json().catch(() => null);
+      return (j && j.csrf_token) ? String(j.csrf_token) : readCookie(CSRF_COOKIE_NAME);
+    } catch (_) {
+      return readCookie(CSRF_COOKIE_NAME);
+    }
+  }
+
   // ------------------------------------------------------------------ api
   async function api(path, opts) {
     opts = opts || {};
@@ -742,8 +803,16 @@
       body = JSON.stringify(body);
     }
     const method = String(opts.method || "GET").toUpperCase();
+    // Attach CSRF header to writes so the server's double-submit check passes
+    // for cookie-authenticated sessions. Bearer-token auth doesn't need it but
+    // sending the header is harmless.
+    if (method !== "GET" && method !== "HEAD" && method !== "OPTIONS") {
+      const csrf = readCookie(CSRF_COOKIE_NAME);
+      if (csrf && headers[CSRF_HEADER_NAME] == null) headers[CSRF_HEADER_NAME] = csrf;
+    }
     const retryable = opts.retryable != null ? !!opts.retryable : (method === "GET" || method === "HEAD");
     const retries = Number.isFinite(Number(opts.retries)) ? Math.max(0, Number(opts.retries)) : (retryable ? 2 : 0);
+    let csrfRetried = false;
     let lastErr;
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
@@ -760,6 +829,26 @@
           } catch (_) {}
           if (location.hash !== "#/login") location.hash = "#/login";
           throw new Error("401 Unauthorized or session expired");
+        }
+        if (r.status === 403 && !csrfRetried && method !== "GET" && method !== "HEAD" && method !== "OPTIONS") {
+          // Peek at the response body — if the server rejected us for a stale
+          // CSRF token, refresh it once and retry silently so routine writes
+          // don't bubble "403 forbidden" to the user for a solvable issue.
+          const peek = await r.clone().text().catch(() => "");
+          let isCsrf = false;
+          try {
+            const j = JSON.parse(peek);
+            isCsrf = (j && (j.code === "csrf_invalid" || /csrf/i.test(String(j.detail || ""))));
+          } catch (_) {}
+          if (isCsrf) {
+            csrfRetried = true;
+            const fresh = await refreshCsrfToken();
+            if (fresh) {
+              headers[CSRF_HEADER_NAME] = fresh;
+              await _sleep(100);
+              continue;
+            }
+          }
         }
         if (!r.ok) {
           if (retryable && attempt < retries && _isRetryableHttpStatus(Number(r.status))) {
@@ -1348,8 +1437,25 @@
       mqttLegHint;
     const mailPillClass = smtpHidden ? "neutral" : mailOk ? "ok" : sm.configured ? "warn" : "off";
     const tgPillClass = tgHidden ? "neutral" : tgOk ? "ok" : tgOn ? "warn" : "off";
+    // DB pill (added in the reliability pass): shows the freshly-added
+    // /health.db probe — ok (fast), warn (slow), off (unreachable).
+    const db = h.db || null;
+    let dbPillClass = "neutral";
+    let dbTitle = "DB probe not reported by /health.";
+    if (db) {
+      const dbOk = !!db.ok;
+      const dbSlow = !!db.slow;
+      const dbLat = Number(db.latency_ms || 0);
+      dbPillClass = dbOk ? (dbSlow ? "warn" : "ok") : "off";
+      dbTitle = dbOk
+        ? (dbSlow
+          ? `SQLite reachable but slow (${dbLat}ms). Under load consider tuning SQLITE_BUSY_TIMEOUT_MS / scaling reads.`
+          : `SQLite reachable (${dbLat}ms).`)
+        : `SQLite probe failed${db.error ? `: ${db.error}` : ""}. Admin routes will degrade — check disk/host.`;
+    }
     setHtmlIfChanged(el, `
       <span class="health-pill ${mqConn ? (mqDrop > 0 ? "warn" : "ok") : "off"}" title="${escapeHtml(mqttTitle)}">MQTT</span>
+      <span class="health-pill ${dbPillClass}" title="${escapeHtml(dbTitle)}">DB</span>
       <span class="health-pill ${mailPillClass}" title="${escapeHtml(mailTitle)}">MAIL</span>
       <span class="health-pill ${tgPillClass}" title="${escapeHtml(tgTitle)}">TG</span>`);
   }
@@ -4204,6 +4310,7 @@
               ${d.display_label ? `<div class="device-id-sub mono">${escapeHtml(id)}</div>` : ""}
             </div>
             <span class="badge ${dm.on ? "online" : "offline"}" id="devOnlineBadge">${dm.on ? "online" : "offline"}</span>
+            ${(() => { const hb = heartbeatPillInfo(d); return `<span class="chip device-hb-chip device-hb-chip--${hb.kind}" id="devHbChip" title="${escapeHtml(hb.title)}">${escapeHtml(hb.label)}</span>`; })()}
             <span class="chip" id="devReasonChip">${escapeHtml(reasonEn[dm.reason] || dm.reason)}</span>
             ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
           </div>
@@ -4372,6 +4479,13 @@
       if (onlineBadge) {
         onlineBadge.textContent = m.on ? "online" : "offline";
         onlineBadge.className = `badge ${m.on ? "online" : "offline"}`;
+      }
+      const hbChip = $("#devHbChip", view);
+      if (hbChip) {
+        const info = heartbeatPillInfo(dev);
+        hbChip.textContent = info.label;
+        hbChip.className = `chip device-hb-chip device-hb-chip--${info.kind}`;
+        hbChip.title = info.title;
       }
       const reasonChip = $("#devReasonChip", view);
       if (reasonChip) reasonChip.textContent = String(reasonEn[m.reason] || m.reason);
@@ -6783,20 +6897,43 @@
     } catch (_) {}
   }
 
-  async function boot() {
-    renderBootSplash();
-    initTheme();
+  function _bootPanic(err) {
+    // Last-resort UI if boot() itself throws before it could render anything.
+    // Mirrors the static boot-error state the inline <body> guard sets.
+    try {
+      document.body.setAttribute("data-boot-error", "1");
+      const msg = (err && (err.message || String(err))) || "Unknown error";
+      const v = document.getElementById("view");
+      if (v) {
+        v.innerHTML =
+          `<div class="card"><h2>Console failed to start</h2>` +
+          `<p class="muted">${String(msg).replace(/[<>]/g, "")}</p>` +
+          `<p class="muted"><button class="btn sm" onclick="location.reload()">Reload</button> ` +
+          `or <a href="#/login">Sign in</a>.</p></div>`;
+      }
+    } catch (_) {}
+  }
 
-    $("#menuBtn").addEventListener("click", () => toggleNav());
-    $("#sidebarBackdrop").addEventListener("click", () => toggleNav(false));
+  async function boot() {
+    // Replace the inline static splash with the dynamic one — same visual, but
+    // now owned by JS so renderRoute() can cleanly swap it out.
+    renderBootSplash();
+    try { initTheme(); } catch (e) { _bootPanic(e); return; }
+
+    const menuBtn = document.getElementById("menuBtn");
+    if (menuBtn) menuBtn.addEventListener("click", () => toggleNav());
+    const sbb = document.getElementById("sidebarBackdrop");
+    if (sbb) sbb.addEventListener("click", () => toggleNav(false));
     const railT = document.getElementById("sidebarRailToggle");
     if (railT) railT.addEventListener("click", () => toggleSidebarRail());
     window.addEventListener("resize", syncNavForViewport);
     window.addEventListener("orientationchange", syncNavForViewport);
-    $("#themeBtn").addEventListener("click", () => {
+    const themeBtn = document.getElementById("themeBtn");
+    if (themeBtn) themeBtn.addEventListener("click", () => {
       setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
     });
-    $("#logoutBtn").addEventListener("click", async () => {
+    const logoutBtn = document.getElementById("logoutBtn");
+    if (logoutBtn) logoutBtn.addEventListener("click", async () => {
       try {
         await fetchWithDeadline(apiBase() + "/auth/logout", { method: "POST" }, 12000);
       } catch (_) {}
@@ -6806,7 +6943,8 @@
       location.hash = "#/login";
       renderAuthState();
     });
-    $("#refreshBtn").addEventListener("click", () => renderRoute());
+    const refreshBtn = document.getElementById("refreshBtn");
+    if (refreshBtn) refreshBtn.addEventListener("click", () => renderRoute());
 
     document.addEventListener("click", (ev) => {
       const b = ev.target.closest(".btn-tap");
@@ -6821,6 +6959,11 @@
       await loadMe();
     } catch (_) {
       state.me = null;
+    }
+    // If we have a live session, make sure the CSRF cookie/header are in sync
+    // BEFORE any route tries to do a write. Safe to fire-and-forget.
+    if (state.me) {
+      refreshCsrfToken().catch(() => {});
     }
     syncNavForViewport();
     try { applySidebarRail(); } catch (_) {}
@@ -6878,5 +7021,9 @@
     document.documentElement.classList.toggle("tab-hidden", document.visibilityState === "hidden");
   }
 
-  document.addEventListener("DOMContentLoaded", boot);
+  document.addEventListener("DOMContentLoaded", () => {
+    // Wrap the top-level boot so an async throw in any preboot wiring surfaces
+    // the retry card instead of leaving a silent splash.
+    Promise.resolve().then(boot).catch(_bootPanic);
+  });
 })();

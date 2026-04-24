@@ -1805,6 +1805,15 @@ details.card.device-drawer[open] > summary.device-drawer__summary {
 
 .chip { display: inline-flex; gap: 4px; align-items: center; padding: 2px 6px; border-radius: 6px; background: var(--bg-muted); color: var(--text-muted); font-size: 11px; }
 
+/* Heartbeat freshness pill — color-coded so ops can see at a glance
+   whether a device is chatting, idle, or long silent. Kept small so it
+   doesn't crowd the online/offline badge it sits next to. */
+.device-hb-chip { font-variant-numeric: tabular-nums; letter-spacing: 0.2px; }
+.device-hb-chip--ok      { background: color-mix(in srgb, var(--ok, #18a957) 18%, transparent); color: var(--ok, #18a957); }
+.device-hb-chip--warn    { background: color-mix(in srgb, var(--warn, #d0a024) 20%, transparent); color: var(--warn, #d0a024); }
+.device-hb-chip--stale   { background: color-mix(in srgb, var(--err, #cc3b3b) 22%, transparent); color: var(--err, #cc3b3b); }
+.device-hb-chip--unknown { background: var(--bg-muted); color: var(--text-muted); }
+
 /* Inline forms in cards */
 .inline-form { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); align-items: end; }
 .inline-form .wide { grid-column: 1 / -1; }
