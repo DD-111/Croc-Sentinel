@@ -2610,7 +2610,7 @@
       const isSharedGroup = groupSharedBySlot(slot).length > 0;
       const scopeShareHtml = shareScopeBadgesHtml(rows);
       const dsec = Number(gs.delay_seconds || 0);
-      const modeLabel = dsec > 0 ? `after ${dsec}s` : "immediate";
+      const modeLabel = dsec > 0 ? `immediate (delay cfg: ${dsec}s)` : "immediate";
       const shareBtn = state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_manage_users")))
         ? `<button class="group-del-ico js-share-group" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button" title="Share devices in this card (device ACL only — not group secrets)">⇪</button>`
         : "";

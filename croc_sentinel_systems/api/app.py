@@ -8021,8 +8021,8 @@ def list_pending_claims(
     q: Optional[str] = Query(default=None, max_length=64, description="Filter by MAC (no colon) or QR substring"),
 ) -> dict[str, Any]:
     assert_min_role(principal, "admin")
-    if principal.role == "admin":
-        require_capability(principal, "can_claim_device")
+    if principal.role != "superadmin":
+        raise HTTPException(status_code=403, detail="pending claim list is superadmin-only")
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
