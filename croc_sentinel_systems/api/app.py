@@ -7677,6 +7677,15 @@ def list_devices(principal: Principal = Depends(require_principal)) -> dict[str,
                 d.pop("owner_admin", None)
             rows_out.append(d)
         conn.close()
+    # Bulk-join pending command counts so the dashboard can render a
+    # "X pending" chip next to devices that have queued MQTT commands.
+    try:
+        ids = [str(r.get("device_id") or "") for r in rows_out if r.get("device_id")]
+        counts = _cmd_queue_pending_counts(ids) if ids else {}
+        for r in rows_out:
+            r["pending_cmds"] = int(counts.get(str(r.get("device_id") or ""), 0))
+    except Exception as exc:
+        logger.debug("devices list: pending_cmds join failed: %s", exc)
     out = {"items": rows_out}
     cache_put(cache_key, out)
     return out
@@ -7757,6 +7766,12 @@ def get_device(device_id: str, principal: Principal = Depends(require_principal)
     # gaps, last disconnect reason code). Surfaced here so the device detail
     # page can render a "connectivity stability" card. Empty {} on older fw.
     out["net_health"] = _net_health_from_status(out.get("last_status_json") or {})
+    # Pending server-side commands waiting for delivery (MQTT replay or HTTP
+    # backup pull). Exposed for the device page's "X pending" chip.
+    try:
+        out["pending_cmds"] = int(_cmd_queue_pending_counts([device_id]).get(device_id, 0))
+    except Exception:
+        out["pending_cmds"] = 0
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -9252,6 +9267,60 @@ def _cmd_queue_pending_for_device(device_id: str, limit: int = 32) -> list[dict[
                 })
         except Exception as exc:
             logger.warning("cmd_queue pending scan failed device=%s err=%s", device_id, exc)
+        finally:
+            conn.close()
+    return out
+
+
+def _cmd_queue_pending_counts(device_ids: list[str] | None = None) -> dict[str, int]:
+    """Return ``{device_id: pending_count}`` for the supplied ids (or all
+    devices with at least one unacked entry when ``device_ids`` is None).
+
+    Used by the dashboard devices list to surface a "X pending" chip next to
+    devices that have queued MQTT commands waiting for delivery/ack. The
+    query is O(N) over the un-acked slice of ``cmd_queue``, which is small
+    in steady state (most entries get acked within a few seconds)."""
+    now = utc_now_iso()
+    out: dict[str, int] = {}
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        try:
+            if device_ids:
+                # SQLite has a default compiled-in 999-parameter cap; chunk so we
+                # stay safely below it on large fleets.
+                chunk = 500
+                for i in range(0, len(device_ids), chunk):
+                    batch = device_ids[i:i + chunk]
+                    placeholders = ",".join(["?"] * len(batch))
+                    cur.execute(
+                        f"""
+                        SELECT device_id, COUNT(*) AS n
+                        FROM cmd_queue
+                        WHERE acked_at IS NULL
+                          AND (expires_at IS NULL OR expires_at > ?)
+                          AND device_id IN ({placeholders})
+                        GROUP BY device_id
+                        """,
+                        (now, *batch),
+                    )
+                    for r in cur.fetchall():
+                        out[r["device_id"]] = int(r["n"])
+            else:
+                cur.execute(
+                    """
+                    SELECT device_id, COUNT(*) AS n
+                    FROM cmd_queue
+                    WHERE acked_at IS NULL
+                      AND (expires_at IS NULL OR expires_at > ?)
+                    GROUP BY device_id
+                    """,
+                    (now,),
+                )
+                for r in cur.fetchall():
+                    out[r["device_id"]] = int(r["n"])
+        except Exception as exc:
+            logger.warning("cmd_queue pending counts failed: %s", exc)
         finally:
             conn.close()
     return out

@@ -366,6 +366,7 @@
       // Re-arm dependent timers so they pick up the slower cadence immediately.
       try { armHealthPoll(); } catch (_) {}
       try { rearmVisibleRouteTickersForStreamHealth(); } catch (_) {}
+      try { renderHealthPills(); } catch (_) {}
     }
   }
   /** Mark stream unhealthy (close / error / stall). */
@@ -379,6 +380,7 @@
       // Speed up pollers so the UI doesn't go stale while we reconnect.
       try { armHealthPoll(); } catch (_) {}
       try { rearmVisibleRouteTickersForStreamHealth(); } catch (_) {}
+      try { renderHealthPills(); } catch (_) {}
     }
   }
   /** Called on each pushed event so staleness checks can use lastEventMs. */
@@ -1454,6 +1456,105 @@
       }
     }
     setHtmlIfChanged(nav, `<div class="nav-core">${coreParts.join("")}</div>`);
+    try { renderMobileNav(); } catch (_) { /* mobile nav is best-effort */ }
+  }
+
+  /* Mobile hybrid nav. Under 1024px the sidebar is hidden and this tab bar +
+     "More" drawer drive navigation. Populated from the same NAV_GROUPS as the
+     desktop sidebar so role gating and the active-item contract stay in sync. */
+  function renderMobileNav() {
+    const tabbar = $("#mobileTabbar");
+    const drawerGrid = $("#mobileDrawerGrid");
+    if (!tabbar && !drawerGrid) return;
+    if (!state.me) {
+      if (tabbar) setHtmlIfChanged(tabbar, "");
+      if (drawerGrid) setHtmlIfChanged(drawerGrid, "");
+      try { toggleMobileDrawer(false); } catch (_) {}
+      return;
+    }
+    const hash = location.hash || "#/overview";
+    const hashNoQuery = hash.split("?")[0];
+    const all = [];
+    for (const g of NAV_GROUPS) {
+      for (const n of g.items) {
+        if (!hasRole(n.min)) continue;
+        all.push(n);
+      }
+    }
+    /* Pinned primary tabs — order matters. Falls through if user lacks role. */
+    const preferred = ["overview", "devices", "alerts"];
+    const primary = [];
+    for (const id of preferred) {
+      const n = all.find((x) => x.id === id);
+      if (n) primary.push(n);
+    }
+    const primaryIds = new Set(primary.map((n) => n.id));
+    const overflow = all.filter((n) => !primaryIds.has(n.id));
+    const isActive = (n) => (n.path === "#/devices"
+      ? hashNoQuery === "#/devices"
+      : n.path === "#/site"
+        ? hashNoQuery === "#/site"
+        : hash.startsWith(n.path));
+    const tabItem = (n) => {
+      const active = isActive(n) ? ' aria-current="page"' : "";
+      return `<a href="${n.path}"${active} aria-label="${escapeHtml(n.label)}"><span class="tabbar-ico" aria-hidden="true">${n.ico}</span><span>${escapeHtml(n.label)}</span></a>`;
+    };
+    const moreActive = overflow.some(isActive) ? ' aria-current="page"' : "";
+    if (tabbar) {
+      setHtmlIfChanged(tabbar,
+        primary.map(tabItem).join("") +
+        `<a href="javascript:void(0)" class="tabbar-more" id="tabbarMore"${moreActive} aria-label="More" aria-haspopup="dialog"><span class="tabbar-ico" aria-hidden="true">⋯</span><span>More</span></a>`,
+      );
+      const mb = $("#tabbarMore");
+      if (mb && !mb.__wired) {
+        mb.__wired = true;
+        mb.addEventListener("click", (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          toggleMobileDrawer();
+        });
+      }
+    }
+    if (drawerGrid) {
+      const drawerItem = (n) => {
+        const active = isActive(n) ? ' aria-current="page"' : "";
+        return `<a href="${n.path}"${active} data-drawer-item="1"><span class="tabbar-ico" aria-hidden="true">${n.ico}</span><span>${escapeHtml(n.label)}</span></a>`;
+      };
+      setHtmlIfChanged(drawerGrid, overflow.map(drawerItem).join(""));
+    }
+  }
+
+  let _drawerOutsideHandler = null;
+  function toggleMobileDrawer(force) {
+    const drawer = $("#mobileDrawer");
+    if (!drawer) return;
+    const isOpen = drawer.getAttribute("data-open") === "1";
+    const next = typeof force === "boolean" ? force : !isOpen;
+    if (next) {
+      drawer.hidden = false;
+      /* requestAnimationFrame so the element paints first; without it the
+         translateY transition doesn't play. */
+      requestAnimationFrame(() => drawer.setAttribute("data-open", "1"));
+      if (!_drawerOutsideHandler) {
+        _drawerOutsideHandler = (ev) => {
+          const t = ev.target;
+          if (!drawer.contains(t) && !t.closest("#tabbarMore")) {
+            toggleMobileDrawer(false);
+          }
+        };
+        /* Schedule next tick so the opening click doesn't trigger close. */
+        setTimeout(() => document.addEventListener("click", _drawerOutsideHandler, true), 0);
+      }
+    } else {
+      drawer.removeAttribute("data-open");
+      setTimeout(() => {
+        if (drawer.getAttribute("data-open") !== "1") drawer.hidden = true;
+      }, 260);
+      if (_drawerOutsideHandler) {
+        document.removeEventListener("click", _drawerOutsideHandler, true);
+        _drawerOutsideHandler = null;
+      }
+    }
   }
 
   function renderHealthPills() {
@@ -1520,7 +1621,21 @@
           : `SQLite reachable (${dbLat}ms).`)
         : `SQLite probe failed${db.error ? `: ${db.error}` : ""}. Admin routes will degrade — check disk/host.`;
     }
+    /* Stream pill: "LIVE" if browser socket is healthy, "…" while reconnecting.
+       Sits to the left of MQTT because this one is about THIS tab's WebSocket/SSE,
+       whereas MQTT is API→broker ingest. The title disambiguates. */
+    const sh = window.__streamHealth || {};
+    const streamOk = !!sh.healthy;
+    const streamTransport = String(sh.transport || "").toUpperCase();
+    const streamAge = sh.lastEventMs ? Math.max(0, Math.round((Date.now() - sh.lastEventMs) / 1000)) : null;
+    const streamPillClass = streamOk ? "ok stream live" : "off stream";
+    const streamLabel = streamOk ? "LIVE" : "…";
+    const streamTitle = streamOk
+      ? `Live event stream connected via ${streamTransport || "?"}${streamAge != null ? ` — last event ${streamAge}s ago` : ""}`
+      : "Live stream not connected — dashboard is polling /health + /dashboard/overview as a fallback";
+
     setHtmlIfChanged(el, `
+      <span class="health-pill ${streamPillClass}" title="${escapeHtml(streamTitle)}">${streamLabel}</span>
       <span class="health-pill ${mqConn ? (mqDrop > 0 ? "warn" : "ok") : "off"}" title="${escapeHtml(mqttTitle)}">MQTT</span>
       <span class="health-pill ${dbPillClass}" title="${escapeHtml(dbTitle)}">DB</span>
       <span class="health-pill ${mailPillClass}" title="${escapeHtml(mailTitle)}">MAIL</span>
@@ -1557,7 +1672,7 @@
   }
 
   function applySidebarRail() {
-    const m = window.matchMedia && window.matchMedia("(min-width: 901px)");
+    const m = window.matchMedia && window.matchMedia("(min-width: 1024px)");
     if (!m || !m.matches) {
       try { document.body.removeAttribute("data-sidebar"); } catch (_) {}
     } else {
@@ -1582,7 +1697,7 @@
   }
 
   function toggleSidebarRail() {
-    if (!window.matchMedia("(min-width: 901px)").matches) return;
+    if (!window.matchMedia("(min-width: 1024px)").matches) return;
     const cur = localStorage.getItem(LS.sidebarCollapsed) === "1";
     try { localStorage.setItem(LS.sidebarCollapsed, cur ? "0" : "1"); } catch (_) {}
     applySidebarRail();
@@ -1591,8 +1706,9 @@
   /** Collapse drawer when viewport is desktop width (e.g. rotate phone / resize). */
   function syncNavForViewport() {
     try {
-      if (window.matchMedia && window.matchMedia("(min-width: 901px)").matches) {
+      if (window.matchMedia && window.matchMedia("(min-width: 1024px)").matches) {
         document.body.dataset.nav = "";
+        try { toggleMobileDrawer(false); } catch (_) {}
       }
     } catch (_) {}
     try { applySidebarRail(); } catch (_) {}
@@ -1801,6 +1917,7 @@
     }
     window.__eventsStreamResume = null;
     toggleNav(false);
+    try { toggleMobileDrawer(false); } catch (_) {}
     if (window.__evSSE) { try { window.__evSSE.close(); } catch {} window.__evSSE = null; }
 
     const publicRoutes = new Set(["login", "register", "account-activate", "forgot-password"]);
@@ -4159,6 +4276,9 @@
           `<span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>` +
           (d.zone ? `<span class="chip device-zone-chip">${escapeHtml(d.zone)}</span>` : "") +
           (d.is_shared ? `<span class="badge accent" title="shared device">shared</span>` : "") +
+          (Number(d.pending_cmds) > 0
+            ? `<span class="chip pending-cmds" title="Server-side commands queued for this device (MQTT replay or HTTP backup pull)">${Number(d.pending_cmds)} pending</span>`
+            : "") +
           `</div>` +
           `${fwBlock}` +
           `</div>` +
@@ -7172,6 +7292,24 @@
     });
     const refreshBtn = document.getElementById("refreshBtn");
     if (refreshBtn) refreshBtn.addEventListener("click", () => renderRoute());
+
+    /* Mobile drawer: close on item click (after navigation), Esc, or drag-dismiss. */
+    const mobileDrawer = document.getElementById("mobileDrawer");
+    if (mobileDrawer) {
+      mobileDrawer.addEventListener("click", (ev) => {
+        const link = ev.target.closest("a[data-drawer-item]");
+        if (link) setTimeout(() => toggleMobileDrawer(false), 20);
+      });
+    }
+    document.addEventListener("keydown", (ev) => {
+      if (ev.key === "Escape") {
+        try { toggleMobileDrawer(false); } catch (_) {}
+        /* If the slide-in sidebar is open on mobile, close it too. */
+        try {
+          if (document.body.dataset.nav === "open") toggleNav(false);
+        } catch (_) {}
+      }
+    });
 
     document.addEventListener("click", (ev) => {
       const b = ev.target.closest(".btn-tap");
