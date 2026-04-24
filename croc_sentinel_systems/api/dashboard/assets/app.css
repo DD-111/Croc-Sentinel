@@ -77,6 +77,12 @@ html[data-theme="dark"] {
 
 * { box-sizing: border-box; }
 
+/* iOS / Chrome: stop automatic text inflation when rotating or when address bar resizes (reduces “font drift”). */
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
 html, body { margin: 0; height: 100%; }
 
 body {
@@ -243,6 +249,17 @@ body[data-layout="auth"] .site-footer__row--auth {
 body[data-layout="auth"] .site-footer__row--auth .site-footer__legal {
   font-size: 0.62rem;
   text-align: right;
+}
+
+/* Narrow viewports: lock auth hero sizes to rem (avoids vw jump when mobile browser chrome shows/hides). */
+@media (max-width: 520px) {
+  body[data-layout="auth"] .auth-surface__wordmark {
+    font-size: 1.9rem;
+    letter-spacing: 0.1em;
+  }
+  body[data-layout="auth"] .auth-surface__headline {
+    font-size: 1.0625rem;
+  }
 }
 
 .app-shell {
@@ -1666,54 +1683,101 @@ body[data-layout="auth"] .auth-btn-primary {
   max-width: 100%;
   justify-content: flex-end;
 }
-/* All devices: upgrade dot next to v# chip; device detail: small info pill */
-button.fw-hint-dot {
-  width: 10px;
-  height: 10px;
-  padding: 0;
-  border: none;
-  border-radius: 50%;
-  background: var(--danger, #e11d48);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger, #e11d48) 30%, var(--bg-elev, #fff));
-  cursor: pointer;
-  flex-shrink: 0;
-  vertical-align: middle;
-  align-self: center;
-}
-button.fw-hint-dot:hover,
-button.fw-hint-dot:focus-visible {
-  filter: brightness(1.1);
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-button.fw-hint-pill {
+/* Firmware update: ↑ arrow + red dot badge (All devices + device detail) */
+button.fw-hint-badge {
   position: relative;
-  min-width: 24px;
-  min-height: 24px;
-  padding: 0 4px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--bg-elev);
-  cursor: pointer;
-  flex-shrink: 0;
-  color: var(--text-muted);
-  font-size: 12px;
-  line-height: 1;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  padding: 0;
+  margin: 0 0 0 2px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  flex-shrink: 0;
+  align-self: center;
+  vertical-align: middle;
+  color: inherit;
+  line-height: 0;
 }
-button.fw-hint-pill::after {
-  content: "";
+button.fw-hint-badge:hover .fw-hint-badge__arrow,
+button.fw-hint-badge:focus-visible .fw-hint-badge__arrow {
+  color: var(--accent-strong, var(--accent));
+}
+button.fw-hint-badge:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+.fw-hint-badge__shell {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.35em;
+  height: 1.35em;
+}
+button.fw-hint-badge--sm .fw-hint-badge__shell {
+  width: 1.15em;
+  height: 1.15em;
+}
+.fw-hint-badge__arrow {
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--accent, #38bdf8);
+  transform: translateY(1px);
+}
+button.fw-hint-badge--sm .fw-hint-badge__arrow {
+  font-size: 12px;
+  transform: translateY(0.5px);
+}
+.fw-hint-badge__dot {
   position: absolute;
-  top: 2px;
-  right: 2px;
-  width: 7px;
-  height: 7px;
+  top: -1px;
+  right: -3px;
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
   background: var(--danger, #e11d48);
-  box-shadow: 0 0 0 1px var(--bg-elev);
+  box-shadow: 0 0 0 1.5px var(--bg-elev, #fff);
 }
+button.fw-hint-badge--sm .fw-hint-badge__dot {
+  width: 5px;
+  height: 5px;
+  top: -2px;
+  right: -4px;
+}
+
+/* OTA help page (bilingual columns) */
+.ota-help-card .ota-help__cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px 18px;
+  margin-top: 10px;
+  align-items: start;
+}
+@media (max-width: 720px) {
+  .ota-help-card .ota-help__cols {
+    grid-template-columns: 1fr;
+  }
+}
+.ota-help-card .ota-help__h {
+  margin: 0 0 6px;
+  font-size: var(--text-sm);
+  font-weight: 650;
+  color: var(--text);
+}
+.ota-help-card .ota-help__ul {
+  margin: 0;
+  padding-left: 1.15rem;
+  line-height: 1.55;
+}
+.ota-help-card .ota-help__ul code {
+  font-size: 0.88em;
+  word-break: break-all;
+}
+
 .visually-hidden {
   position: absolute;
   width: 1px;
@@ -1931,7 +1995,7 @@ button.fw-hint-pill::after {
     padding: 12px 14px;
   }
   .auth-page--login .auth-hero h2 {
-    font-size: clamp(0.95rem, 4vw, 1.1rem);
+    font-size: 1rem;
     margin-bottom: 6px;
   }
   .auth-page--login .auth-hero p {
@@ -2077,6 +2141,8 @@ pre.code { background: var(--bg-muted); border: 1px solid var(--border); border-
   .table-actions .btn,
   .table-actions .toolbar-collapse { width: 100%; }
   .stat .v { font-size: 18px; }
+  body[data-layout="app"] .device-card .device-primary-name { font-size: 1rem; }
+  body[data-layout="app"] .device-page-head .device-primary-name { font-size: 1.2rem; }
   .kv { grid-template-columns: 1fr; }
   /* Keep wide OTA campaign tables usable on phones */
   .t th, .t td { padding: 8px 6px; font-size: 12px; }
@@ -3109,6 +3175,16 @@ html[data-theme="dark"] .auth-surface__side {
   color: rgba(241, 245, 249, 0.88);
 }
 .auth-surface__bullets li { margin: 0.45em 0; }
+
+@media (max-width: 520px) {
+  .auth-surface__wordmark {
+    font-size: 2rem;
+    letter-spacing: 0.12em;
+  }
+  .auth-surface__headline {
+    font-size: 1.125rem;
+  }
+}
 
 .auth-surface__body {
   flex: 1 1 auto;

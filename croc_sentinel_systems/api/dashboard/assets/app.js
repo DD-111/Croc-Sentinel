@@ -28,6 +28,7 @@
       items: [
         { id: "signals", label: "Signals", ico: "◉", path: "#/signals", min: "user" },
         { id: "events", label: "Events", ico: "≈", path: "#/events", min: "user" },
+        { id: "ota", label: "OTA & firmware", ico: "↑", path: "#/ota", min: "user" },
       ],
     },
     {
@@ -3293,7 +3294,9 @@
           ? `<span class="device-fw-inline" style="display:inline-flex;align-items:center;gap:3px;vertical-align:middle">` +
             `<span class="chip">v${escapeHtml(d.fw)}</span>` +
             (d.firmware_hint && d.firmware_hint.update_available
-              ? `<button type="button" class="fw-hint-dot js-fw-hint" data-did="${escapeHtml(did)}" title="New firmware on server" aria-label="View firmware release notes"></button>`
+              ? `<button type="button" class="fw-hint-badge fw-hint-badge--sm js-fw-hint" data-did="${escapeHtml(did)}" title="New firmware on server" aria-label="Firmware update: view release notes">` +
+                `<span class="fw-hint-badge__shell"><span class="fw-hint-badge__arrow" aria-hidden="true">↑</span><span class="fw-hint-badge__dot" aria-hidden="true"></span></span>` +
+                `</button>`
               : "") +
             `</span>`
           : "";
@@ -3644,7 +3647,7 @@
                 <span class="muted">Firmware</span>
                 <span class="device-hero-fw" style="display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end">
                   <span class="mono" id="devFwVer">${escapeHtml(d.fw || "—")}</span>
-                  <button type="button" class="fw-hint-pill" id="devFwHintBtn" style="display:${(d.firmware_hint && d.firmware_hint.update_available) ? "inline-flex" : "none"}" title="New firmware on server — view release notes" aria-label="View firmware release notes"><span class="visually-hidden">New firmware on server</span></button>
+                  <button type="button" class="fw-hint-badge" id="devFwHintBtn" style="display:${(d.firmware_hint && d.firmware_hint.update_available) ? "inline-flex" : "none"}" title="New firmware on server — view release notes" aria-label="Firmware update: view release notes"><span class="fw-hint-badge__shell"><span class="fw-hint-badge__arrow" aria-hidden="true">↑</span><span class="fw-hint-badge__dot" aria-hidden="true"></span></span><span class="visually-hidden">New firmware on server</span></button>
                 </span>
               </div>
               <div class="device-hero-line"><span class="muted">Platform</span><span class="mono">${escapeHtml(maskPlatform(`${d.chip_target || ""}/${d.board_profile || ""}`))}</span></div>
@@ -5779,10 +5782,227 @@
   }
   registerRoute("signals", renderSignalsPage);
 
-  registerRoute("ota", (view) => {
-    setCrumb("All devices");
-    if (view) { location.hash = "#/devices"; }
+  registerRoute("ota", async (view, _args, routeSeq) => {
+    await __renderOtaFirmwareRoute(view, routeSeq);
   });
+
+  async function __renderOtaFirmwareRoute(view, routeSeq) {
+    setCrumb("OTA & firmware");
+    const me = state.me || { username: "", role: "user" };
+    const isSuper = me.role === "superadmin";
+    const isAdm = hasRole("admin");
+
+    const helpCard = `
+      <div class="card ota-help-card">
+        <h2 class="ui-section-title" style="margin:0">OTA & firmware · 使用说明</h2>
+        <div class="ota-help__cols">
+          <div>
+            <h3 class="ota-help__h">中文</h3>
+            <ul class="muted ota-help__ul">
+              <li><strong>检测</strong>：服务器比较 <code>OTA_FIRMWARE_DIR</code> 中的 <code>.bin</code> 与设备上报版本；若有更高版本，在<strong>全部设备</strong>与<strong>设备详情</strong>的版本旁显示 <strong>↑ + 红点</strong>，点击查看说明与公开下载 URL（需配置 <code>OTA_PUBLIC_BASE_URL</code>）。</li>
+              <li><strong>文件</strong>：推荐 <code>croc-版本号-8位hex.bin</code>；同目录同名 <code>.txt</code> / <code>.md</code> 会作为 release notes 显示在弹窗中。</li>
+              <li><strong>派发</strong>：Superadmin 上传/建 campaign → 目标 Admin 在本页 <strong>Accept</strong> 后向自有设备下发 OTA；设备 <code>config.h</code> 须匹配 OTA 域名与 Token。</li>
+            </ul>
+          </div>
+          <div>
+            <h3 class="ota-help__h">English</h3>
+            <ul class="muted ota-help__ul">
+              <li><strong>Detection</strong>: compares <code>.bin</code> on disk vs device <code>fw</code>. When newer, <strong>↑ + red dot</strong> appears on <strong>All devices</strong> and <strong>Device detail</strong>; click for notes + URL (needs <code>OTA_PUBLIC_BASE_URL</code>).</li>
+              <li><strong>Files</strong>: use <code>croc-SEMVER-random8.bin</code>; optional sidecar <code>.txt</code>/<code>.md</code> for release notes.</li>
+              <li><strong>Rollout</strong>: superadmin stages + creates campaign; each admin <strong>Accepts</strong> here to dispatch OTA to owned devices. Match <code>config.h</code> to nginx OTA host + token.</li>
+            </ul>
+          </div>
+        </div>
+        <p class="muted" style="margin:12px 0 0">Fleet: <a href="#/devices">All devices</a></p>
+      </div>`;
+
+    const superCard = isSuper ? `
+      <div class="card">
+        <h2 class="ui-section-title">Superadmin · Upload & campaign</h2>
+        <p class="muted" style="margin:0 0 8px">Stage <code>.bin</code> on the API host (<code>POST /ota/firmware/upload</code>), then create a campaign from a stored filename (<code>POST /ota/campaigns/from-stored</code>).</p>
+        <div class="inline-form">
+          <label class="field"><span>Firmware file (.bin)</span><input type="file" id="otaStFile" accept=".bin,application/octet-stream" /></label>
+          <label class="field"><span>Version label *</span><input id="otaStFw" placeholder="6.6.8" maxlength="40" /></label>
+          <div class="row wide" style="justify-content:flex-end">
+            <button type="button" class="btn btn-tap" id="otaStBtn">Upload & verify</button>
+          </div>
+        </div>
+        <p class="muted" id="otaStResult" style="margin-top:10px;min-height:1.2em"></p>
+        <div class="divider"></div>
+        <h3 style="margin:0 0 6px">Publish from stored file</h3>
+        <label class="field"><span>Stored file *</span><select id="otaFromSel"><option value="">Loading…</option></select></label>
+        <label class="field"><span>Campaign version label *</span><input id="otaFromFw" maxlength="40" placeholder="6.6.8" /></label>
+        <label class="field wide"><span>Notes</span><input id="otaFromNotes" maxlength="500" /></label>
+        <label class="checkbox"><input type="checkbox" id="otaFromAllAd" checked /><span>Target all admins</span></label>
+        <label class="field wide"><span>Or comma-separated admin usernames</span><input id="otaFromAdmTxt" placeholder="admin-a, admin-b (when not targeting all)" /></label>
+        <div class="row wide" style="justify-content:flex-end;margin-top:10px">
+          <button type="button" class="btn btn-tap" id="otaFromBtn">Create campaign</button>
+        </div>
+      </div>` : "";
+
+    const adminCard = isAdm ? `
+      <div class="card">
+        <div class="row between">
+          <h2 class="ui-section-title" style="margin:0">Campaigns</h2>
+          <button type="button" class="btn sm secondary" id="otaCampRel">Refresh</button>
+        </div>
+        <div id="otaCampList" class="muted" style="margin-top:8px">Loading…</div>
+      </div>` : "";
+
+    mountView(view, helpCard + superCard + adminCard);
+
+    const renderOtaRow = (c) => {
+      const myDec = (c.decisions || []).find((d) => d.admin_username === me.username);
+      const decLabel = myDec
+        ? ({ accepted: "Accepted", declined: "Declined", rolled_back: "Rolled back" }[myDec.action] || myDec.action || "—")
+        : (me.role === "superadmin" ? "—" : "Pending");
+      const co = c.counters || {};
+      const counters = ["pending", "dispatched", "success", "failed", "rolled_back"]
+        .filter((k) => co[k])
+        .map((k) => `<span class="badge" title="${escapeHtml(k)}">${escapeHtml(k)}:${escapeHtml(String(co[k]))}</span>`)
+        .join(" ");
+      const u = String(c.url || "");
+      const urlShort = escapeHtml(u.length > 80 ? `${u.slice(0, 80)}…` : u);
+      return `<tr>
+        <td class="mono" style="max-width:120px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(c.id)}</td>
+        <td>${escapeHtml(c.fw_version)}</td>
+        <td class="mono" style="max-width:min(240px,100%);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(u)}">${urlShort}</td>
+        <td><span class="badge ${escapeHtml(c.state)}">${escapeHtml(c.state)}</span></td>
+        <td>${counters || "<span class=\"muted\">—</span>"}</td>
+        <td>${escapeHtml(decLabel)}</td>
+        <td>${escapeHtml(fmtTs(c.created_at))}</td>
+        <td>
+          <div class="table-actions">
+            ${(me.role === "admin" && (!myDec || myDec.action === "declined"))
+              ? `<button type="button" class="btn sm js-ota-acc" data-id="${escapeHtml(c.id)}">Accept</button>
+                 <button type="button" class="btn sm secondary js-ota-dec" data-id="${escapeHtml(c.id)}">Decline</button>`
+              : ""}
+            ${(myDec && myDec.action === "accepted" && me.role === "admin")
+              ? `<button type="button" class="btn sm danger js-ota-rol" data-id="${escapeHtml(c.id)}">Rollback</button>`
+              : ""}
+          </div>
+        </td>
+      </tr>`;
+    };
+
+    const loadOtaCampaigns = async () => {
+      if (!isAdm) return;
+      if (!isRouteCurrent(routeSeq)) return;
+      const el = $("#otaCampList", view);
+      if (!el) return;
+      try {
+        const r = await api("/ota/campaigns", { timeoutMs: 30000 });
+        if (!isRouteCurrent(routeSeq)) return;
+        const list = r.items || [];
+        if (!list.length) {
+          setChildMarkup(el, "<p class=\"muted\">No OTA campaigns visible for your account.</p>");
+          return;
+        }
+        setChildMarkup(el, `<div class="table-wrap"><table class="t"><thead><tr><th>ID</th><th>FW</th><th>URL</th><th>State</th><th>Counts</th><th>My decision</th><th>Created</th><th></th></tr></thead><tbody>${list.map(renderOtaRow).join("")}</tbody></table></div>`);
+        view.querySelectorAll(".js-ota-acc").forEach((b) => {
+          b.addEventListener("click", async () => {
+            if (!confirm("Accept upgrade? Server verifies URL then pushes OTA to your devices.")) return;
+            try {
+              const out = await api(`/ota/campaigns/${encodeURIComponent(b.dataset.id)}/accept`, { method: "POST", body: {} });
+              toast(`Dispatched ${out.dispatched}/${out.target_count} · verify: ${out.verify}`, "ok");
+              loadOtaCampaigns();
+            } catch (e) { toast(e.message || e, "err"); }
+          });
+        });
+        view.querySelectorAll(".js-ota-dec").forEach((b) => {
+          b.addEventListener("click", async () => {
+            if (!confirm("Decline this campaign?")) return;
+            try { await api(`/ota/campaigns/${encodeURIComponent(b.dataset.id)}/decline`, { method: "POST", body: {} }); loadOtaCampaigns(); }
+            catch (e) { toast(e.message || e, "err"); }
+          });
+        });
+        view.querySelectorAll(".js-ota-rol").forEach((b) => {
+          b.addEventListener("click", async () => {
+            if (!confirm("Rollback firmware for devices you accepted?")) return;
+            try {
+              const out = await api(`/ota/campaigns/${encodeURIComponent(b.dataset.id)}/rollback`, { method: "POST", body: {} });
+              toast(`Rolled back ${out.rolled_back || 0} device(s)`, "ok");
+              loadOtaCampaigns();
+            } catch (e) { toast(e.message || e, "err"); }
+          });
+        });
+      } catch (e) {
+        if (!isRouteCurrent(routeSeq)) return;
+        setChildMarkup(el, `<p class="badge offline">${escapeHtml(e.message || e)}</p>`);
+      }
+    };
+
+    const refreshFirmwareSelect = async () => {
+      if (!isSuper) return;
+      const sel = $("#otaFromSel", view);
+      if (!sel) return;
+      try {
+        const r = await api("/ota/firmwares", { timeoutMs: 20000 });
+        if (!isRouteCurrent(routeSeq)) return;
+        const items = r.items || [];
+        sel.innerHTML = items.length
+          ? items.map((it) => `<option value="${escapeHtml(it.name)}">${escapeHtml(it.name)} (${Math.round(Number(it.size || 0) / 1024)} KB)</option>`).join("")
+          : "<option value=\"\">(no .bin in folder)</option>";
+      } catch (e) {
+        sel.innerHTML = `<option value="">${escapeHtml(e.message || "list failed")}</option>`;
+      }
+    };
+
+    if (isAdm) {
+      const rel = $("#otaCampRel", view);
+      if (rel) rel.addEventListener("click", () => loadOtaCampaigns());
+      await loadOtaCampaigns();
+      scheduleRouteTicker(routeSeq, "ota-camp-live", loadOtaCampaigns, 45000);
+    }
+
+    if (isSuper) {
+      await refreshFirmwareSelect();
+      const stBtn = $("#otaStBtn", view);
+      if (stBtn) {
+        stBtn.addEventListener("click", async () => {
+          const inp = $("#otaStFile", view);
+          const f = inp && inp.files && inp.files[0];
+          const fw = String($("#otaStFw", view)?.value || "").trim();
+          if (!f || !fw) { toast("Choose file and version label", "err"); return; }
+          if (!confirm("Upload firmware to server (HEAD check against public /fw/ URL)?")) return;
+          try {
+            const fd = new FormData();
+            fd.append("file", f);
+            fd.append("fw_version", fw);
+            const r = await api("/ota/firmware/upload", { method: "POST", body: fd, timeoutMs: 180000 });
+            if (!isRouteCurrent(routeSeq)) return;
+            const resEl = $("#otaStResult", view);
+            if (resEl) resEl.textContent = `Stored ${r.stored_as || ""} · head_ok=${r.head_ok} · ${r.verify || ""}`;
+            toast("Upload finished", r.head_ok ? "ok" : "err");
+            if (inp) inp.value = "";
+            refreshFirmwareSelect();
+          } catch (e) { toast(e.message || e, "err"); }
+        });
+      }
+      const fromBtn = $("#otaFromBtn", view);
+      if (fromBtn) {
+        fromBtn.addEventListener("click", async () => {
+          const fn = String($("#otaFromSel", view)?.value || "").trim();
+          const pfw = String($("#otaFromFw", view)?.value || "").trim();
+          const notes = String($("#otaFromNotes", view)?.value || "").trim();
+          const allCh = $("#otaFromAllAd", view);
+          const rawAdm = String($("#otaFromAdmTxt", view)?.value || "").trim();
+          const target_admins = (allCh && allCh.checked) ? ["*"] : (rawAdm ? rawAdm.split(/[\s,;]+/).filter(Boolean) : ["*"]);
+          if (!fn || !pfw) { toast("Pick stored file and campaign version label", "err"); return; }
+          if (!confirm("Create OTA campaign from this stored file?")) return;
+          try {
+            await api("/ota/campaigns/from-stored", {
+              method: "POST",
+              body: { filename: fn, fw_version: pfw, notes: notes || undefined, target_admins },
+            });
+            toast("Campaign created", "ok");
+            loadOtaCampaigns();
+          } catch (e) { toast(e.message || e, "err"); }
+        });
+      }
+    }
+  }
+
 
   function renderPolicyPanel(username, p) {
     const row = (k, label, locked) => `
