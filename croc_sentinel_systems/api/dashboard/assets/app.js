@@ -28,7 +28,7 @@
       items: [
         { id: "signals", label: "Signals", ico: "◉", path: "#/signals", min: "user" },
         { id: "events", label: "Events", ico: "≈", path: "#/events", min: "user" },
-        { id: "ota", label: "OTA & firmware", ico: "↑", path: "#/ota", min: "user" },
+        { id: "ota", label: "OTA (ops)", ico: "↑", path: "#/ota", min: "superadmin" },
       ],
     },
     {
@@ -867,70 +867,179 @@
     scheduleSyncGroupMetaFromServer();
   }
 
-  function openGlobalFwHintDialog(hint) {
+  const FW_HINT_DLG_VER = "3";
+  function fwChangelogStorageKey(toFile) {
+    return "croc.fwChangelog.v1:" + String(toFile || "").replace(/[^\w.\-]/g, "_");
+  }
+
+  function openGlobalFwHintDialog(hint, ctx) {
+    ctx = ctx || {};
     if (!hint || !hint.update_available) return;
     let dlg = document.getElementById("crocFwHintDialog");
-    if (!dlg) {
+    if (!dlg || dlg.dataset.crocFwDlgVer !== FW_HINT_DLG_VER) {
+      if (dlg) dlg.remove();
       dlg = document.createElement("dialog");
       dlg.id = "crocFwHintDialog";
+      dlg.dataset.crocFwDlgVer = FW_HINT_DLG_VER;
       dlg.className = "croc-fw-hint-dlg";
-      dlg.setAttribute("aria-label", "Firmware update details");
+      dlg.setAttribute("aria-label", "Firmware update");
       dlg.innerHTML = `
-        <form method="dialog" class="croc-fw-hint-dlg__form">
-          <h3 class="croc-fw-hint-dlg__title" id="crocFwHintTitle"></h3>
-          <p class="croc-fw-hint-dlg__file muted" id="crocFwHintFile" style="margin:4px 0 0"></p>
-          <p class="croc-fw-hint-dlg__url" id="crocFwHintUrl" style="margin:6px 0 0"></p>
-          <p class="muted" style="margin:10px 0 4px">Release notes</p>
-          <pre class="croc-fw-hint-dlg__body" id="crocFwHintBody"></pre>
-          <div class="row" style="justify-content:flex-end;margin-top:10px;gap:8px">
-            <button class="btn" type="submit" value="ok">Close</button>
+        <div class="croc-fw-hint-dlg__form">
+          <h3 class="croc-fw-hint-dlg__title">固件更新 / Firmware update</h3>
+          <div class="croc-fw-hint-dlg__compare" id="crocFwHintCompare" aria-live="polite"></div>
+          <label class="croc-fw-hint-dlg__changelog-label" for="crocFwHintChangelog">本次更新 / What this update fixes</label>
+          <textarea id="crocFwHintChangelog" class="croc-fw-hint-dlg__changelog" rows="5" maxlength="8000" readonly spellcheck="true" placeholder="在此填写或粘贴说明（仅保存在本浏览器）… / Notes for your team (saved in this browser only)…"></textarea>
+          <div class="row croc-fw-hint-dlg__note-actions" style="margin-top:6px;flex-wrap:wrap;gap:8px">
+            <button type="button" class="btn secondary btn-tap" id="crocFwHintEditNote">编辑说明 / Edit</button>
+            <button type="button" class="btn btn-tap" id="crocFwHintSaveNote">保存说明 / Save notes</button>
           </div>
-        </form>`;
+          <p class="croc-fw-hint-dlg__preflight muted" id="crocFwHintPreflight" style="margin:10px 0 0;min-height:1.2em"></p>
+          <div class="row" style="justify-content:flex-end;margin-top:14px;gap:8px;flex-wrap:wrap">
+            <button type="button" class="btn secondary btn-tap" id="crocFwHintClose">关闭 / Close</button>
+            <button type="button" class="btn btn-tap" id="crocFwHintDoOta" style="display:none">发送 OTA / Send OTA</button>
+          </div>
+        </div>`;
       document.body.appendChild(dlg);
     }
-    const t = document.getElementById("crocFwHintTitle");
-    const f = document.getElementById("crocFwHintFile");
-    const u = document.getElementById("crocFwHintUrl");
-    const b = document.getElementById("crocFwHintBody");
-    if (t) t.textContent = `New firmware: v${String(hint.to_version || "—")}`;
-    if (f) f.textContent = hint.to_file ? `File: ${String(hint.to_file)}` : "";
-    if (b) b.textContent = (hint.release_notes && String(hint.release_notes).trim()) ? String(hint.release_notes) : "(No release notes .txt / .md next to this .bin on the server.)";
-    if (u) {
-      u.className = "croc-fw-hint-dlg__url";
-      u.replaceChildren();
-      const url = String(hint.download_url || "").trim();
-      if (url && /^https?:\/\//i.test(url)) {
-        const lab = document.createElement("span");
-        lab.className = "muted";
-        lab.textContent = "Download: ";
-        const a = document.createElement("a");
-        a.href = url;
-        a.target = "_blank";
-        a.rel = "noopener";
-        a.className = "mono";
-        a.style.wordBreak = "break-all";
-        a.textContent = url;
-        u.append(lab, a);
-      } else if (url) {
-        u.append(document.createTextNode("Download: "), document.createTextNode(url));
+
+    const curFw = String(ctx.currentFw != null ? ctx.currentFw : "").trim() || "—";
+    const newFw = String(hint.to_version || "—").trim() || "—";
+    const toFile = String(hint.to_file || "").trim();
+    const lsKey = fwChangelogStorageKey(toFile);
+    let savedLocal = "";
+    try { savedLocal = localStorage.getItem(lsKey) || ""; } catch (_) {}
+    const serverNotes = String(hint.release_notes || "").trim();
+    const mergedDefault = (savedLocal && savedLocal.trim()) ? savedLocal : serverNotes;
+
+    const cmp = document.getElementById("crocFwHintCompare");
+    if (cmp) {
+      cmp.innerHTML =
+        `<span class="croc-fw-hint-dlg__ver mono" title="Current firmware">${escapeHtml(curFw)}</span>` +
+        `<span class="croc-fw-hint-dlg__ver-arrow" aria-hidden="true">→</span>` +
+        `<span class="croc-fw-hint-dlg__ver mono croc-fw-hint-dlg__ver--new" title="Target firmware">${escapeHtml(newFw)}</span>`;
+    }
+
+    const ta = document.getElementById("crocFwHintChangelog");
+    if (ta) {
+      ta.value = mergedDefault;
+      ta.readOnly = true;
+    }
+
+    const pre = document.getElementById("crocFwHintPreflight");
+    if (pre) {
+      if (!ctx.deviceId || !can("can_send_command")) {
+        pre.textContent =
+          "在设备详情页且具备命令权限时，可一键下发 OTA。/ Open device detail with command permission for one-tap OTA.";
+      } else if (ctx.canOperateThisDevice === false) {
+        pre.textContent =
+          "当前账号对此设备无 Operate 权限，无法下发 OTA。/ No operate permission on this device — OTA disabled.";
       } else {
-        const sp = document.createElement("span");
-        sp.className = "muted";
-        sp.textContent = "(Set OTA_PUBLIC_BASE_URL to show public download URL.)";
-        u.appendChild(sp);
+        pre.textContent =
+          "「发送 OTA」将校验：登录 token、固件 URL（服务端 OTA token 探测）、设备 Operate 权限。/ Send OTA checks session, firmware URL (server-side token probe), and operate permission.";
       }
     }
+
+    const closeBtn = document.getElementById("crocFwHintClose");
+    if (closeBtn) {
+      closeBtn.onclick = () => { try { dlg.close(); } catch (_) {} };
+    }
+
+    const editBtn = document.getElementById("crocFwHintEditNote");
+    const saveBtn = document.getElementById("crocFwHintSaveNote");
+    if (editBtn) {
+      editBtn.onclick = () => {
+        if (!ta) return;
+        ta.readOnly = false;
+        ta.focus();
+      };
+    }
+    if (saveBtn) {
+      saveBtn.onclick = () => {
+        if (!ta || !toFile) return;
+        try {
+          localStorage.setItem(lsKey, ta.value);
+          ta.readOnly = true;
+          toast("说明已保存到本机 / Notes saved locally", "ok");
+        } catch (e) {
+          toast(e.message || "save failed", "err");
+        }
+      };
+    }
+
+    const did = String(ctx.deviceId || "").trim();
+    const knownNoOperate = ctx.canOperateThisDevice === false;
+    const otaBtn = document.getElementById("crocFwHintDoOta");
+    if (otaBtn) {
+      const show = !!(did && can("can_send_command") && !knownNoOperate);
+      otaBtn.style.display = show ? "inline-flex" : "none";
+      otaBtn.disabled = false;
+      otaBtn.onclick = async () => {
+        const url = String(hint.download_url || "").trim();
+        const fw = String(hint.to_version || "").trim();
+        if (!did || !url || !fw) {
+          toast("缺少设备或下载信息 / Missing device or download info", "err");
+          return;
+        }
+        if (!confirm(`向设备发送 OTA？\nSend OTA to device?\n\n${did}\n${curFw} → ${fw}`)) return;
+        otaBtn.disabled = true;
+        if (pre) pre.textContent = "检查中… / Checking…";
+        try {
+          if (!getToken()) {
+            throw new Error("未登录或会话已过期 / Not signed in or session expired");
+          }
+          let canOp = true;
+          if (ctx.canOperateThisDevice !== true) {
+            const row = await api(`/devices/${encodeURIComponent(did)}`, { timeoutMs: 20000 });
+            canOp = !!(row && row.can_operate);
+          } else {
+            canOp = true;
+          }
+          if (!canOp) {
+            throw new Error("无此设备的操作权限（需 Operate）/ No operate permission on this device");
+          }
+          const probe = await api(`/ota/firmware-reachability?name=${encodeURIComponent(toFile)}`, { timeoutMs: 25000 });
+          if (!probe || !probe.ok) {
+            const det = probe && probe.detail ? String(probe.detail) : "probe failed";
+            throw new Error(`固件 URL 探测失败 / Firmware probe failed: ${det}`);
+          }
+          if (pre) {
+            pre.textContent =
+              "探测通过，正在下发 OTA 命令… / Probe OK, sending ota command…";
+          }
+          await api(`/devices/${encodeURIComponent(did)}/commands`, {
+            method: "POST",
+            body: { cmd: "ota", params: { url, fw } },
+          });
+          toast("OTA 命令已发送 / OTA command sent", "ok");
+          try { bustDeviceListCaches(); } catch (_) {}
+          dlg.close();
+        } catch (e) {
+          const msg = e && e.message ? String(e.message) : String(e);
+          if (pre) pre.textContent = msg;
+          toast(msg, "err");
+        } finally {
+          otaBtn.disabled = false;
+        }
+      };
+    }
+
     if (typeof dlg.showModal === "function") dlg.showModal();
   }
 
   /** All-devices list + device detail: sync Firmware row version + OTA-hint control from API model. */
-  function syncDevicePageFirmwareHint(view, dev) {
+  function syncDevicePageFirmwareHint(view, dev, deviceIdForOta) {
     const hBtn = $("#devFwHintBtn", view);
     if (hBtn) {
       const h = dev && dev.firmware_hint;
       if (h && h.update_available) {
         hBtn.style.display = "inline-flex";
-        hBtn.onclick = () => openGlobalFwHintDialog(h);
+        const did = String(deviceIdForOta || (dev && dev.device_id) || "");
+        const operate = !!(dev && dev.can_operate);
+        hBtn.onclick = () => openGlobalFwHintDialog(h, {
+          currentFw: String(dev && dev.fw != null ? dev.fw : ""),
+          deviceId: did,
+          canOperateThisDevice: operate,
+        });
       } else {
         hBtn.style.display = "none";
       }
@@ -3491,7 +3600,14 @@
         ev.stopPropagation();
         const did0 = t.getAttribute("data-did");
         const h = did0 && hintById.get(did0);
-        if (h) openGlobalFwHintDialog(h);
+        const row = did0 ? allItems.find((x) => String(x.device_id) === String(did0)) : null;
+        if (h) {
+          openGlobalFwHintDialog(h, {
+            currentFw: row && row.fw != null ? String(row.fw) : "",
+            deviceId: String(did0 || ""),
+            canOperateThisDevice: undefined,
+          });
+        }
       });
       await loadDevicesAndHints();
       scheduleRouteTicker(routeSeq, "devices-list-live", loadDevicesAndHints, 12000);
@@ -3811,7 +3927,7 @@
       setText("#devUptime", m.s.uptime_s ? `${Math.floor(m.s.uptime_s / 3600)}h ${Math.floor((m.s.uptime_s % 3600) / 60)}m` : "—");
       setText("#devHeap", m.s.free_heap ? `${m.s.free_heap} B (min ${m.s.min_free_heap || "?"} B)` : "—");
       setText("#devUpdated", `${fmtTs(dev.updated_at)} (${fmtRel(dev.updated_at)})`);
-      syncDevicePageFirmwareHint(view, dev);
+      syncDevicePageFirmwareHint(view, dev, id);
     };
     patchDeviceLive(d);
     scheduleRouteTicker(routeSeq, `device-live-${id}`, async () => {
@@ -5787,10 +5903,19 @@
   });
 
   async function __renderOtaFirmwareRoute(view, routeSeq) {
-    setCrumb("OTA & firmware");
+    setCrumb("OTA (ops)");
     const me = state.me || { username: "", role: "user" };
     const isSuper = me.role === "superadmin";
-    const isAdm = hasRole("admin");
+
+    if (!isSuper) {
+      mountView(view, `
+        <div class="card">
+          <h2 class="ui-section-title" style="margin:0">OTA & firmware</h2>
+          <p class="muted" style="margin:8px 0 0">租户侧 <strong>不</strong>再使用 Admin OTA 控制台。请在 <a href="#/devices">全部设备</a> 与设备详情查看版本旁的 <strong>↑ + 红点</strong>（有可用新固件时）。OTA 上传与 campaign 仅 <strong>superadmin</strong> 在侧栏「OTA (ops)」操作。</p>
+          <p class="muted" style="margin:8px 0 0">There is <strong>no</strong> admin OTA console in this product. Use <a href="#/devices">All devices</a> and device detail for the <strong>↑ + red dot</strong> when an upgrade is available. Staging and campaigns are <strong>superadmin</strong> only (sidebar <strong>OTA (ops)</strong>).</p>
+        </div>`);
+      return;
+    }
 
     const helpCard = `
       <div class="card ota-help-card">
@@ -5799,24 +5924,26 @@
           <div>
             <h3 class="ota-help__h">中文</h3>
             <ul class="muted ota-help__ul">
-              <li><strong>检测</strong>：服务器比较 <code>OTA_FIRMWARE_DIR</code> 中的 <code>.bin</code> 与设备上报版本；若有更高版本，在<strong>全部设备</strong>与<strong>设备详情</strong>的版本旁显示 <strong>↑ + 红点</strong>，点击查看说明与公开下载 URL（需配置 <code>OTA_PUBLIC_BASE_URL</code>）。</li>
-              <li><strong>文件</strong>：推荐 <code>croc-版本号-8位hex.bin</code>；同目录同名 <code>.txt</code> / <code>.md</code> 会作为 release notes 显示在弹窗中。</li>
-              <li><strong>派发</strong>：Superadmin 上传/建 campaign → 目标 Admin 在本页 <strong>Accept</strong> 后向自有设备下发 OTA；设备 <code>config.h</code> 须匹配 OTA 域名与 Token。</li>
+              <li><strong>全员（含 admin）</strong>：只看 <a href="#/devices">全部设备</a> / 设备详情上的 <strong>↑ + 红点</strong> 与说明弹窗；不在此页对 campaign 做 Accept。</li>
+              <li><strong>检测</strong>：服务器比较 <code>OTA_FIRMWARE_DIR</code> 中的 <code>.bin</code> 与设备 <code>fw</code>；需 <code>OTA_PUBLIC_BASE_URL</code> 才能在弹窗中给出下载 URL。</li>
+              <li><strong>文件</strong>：推荐 <code>croc-版本号-8位hex.bin</code>；同名 <code>.txt</code> / <code>.md</code> 为 release notes。</li>
+              <li><strong>Superadmin</strong>：在本页下方上传 / 从已存文件建 campaign（若仍使用后端 campaign 流，由 API 或其它流程让各租户设备拉取；控制台不再给 admin 提供 OTA 入口）。</li>
             </ul>
           </div>
           <div>
             <h3 class="ota-help__h">English</h3>
             <ul class="muted ota-help__ul">
-              <li><strong>Detection</strong>: compares <code>.bin</code> on disk vs device <code>fw</code>. When newer, <strong>↑ + red dot</strong> appears on <strong>All devices</strong> and <strong>Device detail</strong>; click for notes + URL (needs <code>OTA_PUBLIC_BASE_URL</code>).</li>
-              <li><strong>Files</strong>: use <code>croc-SEMVER-random8.bin</code>; optional sidecar <code>.txt</code>/<code>.md</code> for release notes.</li>
-              <li><strong>Rollout</strong>: superadmin stages + creates campaign; each admin <strong>Accepts</strong> here to dispatch OTA to owned devices. Match <code>config.h</code> to nginx OTA host + token.</li>
+              <li><strong>Everyone (including admin)</strong>: use <a href="#/devices">All devices</a> / device detail <strong>↑ + red dot</strong> + notes dialog only — <strong>no</strong> tenant OTA Accept UI here.</li>
+              <li><strong>Detection</strong>: server compares <code>.bin</code> in <code>OTA_FIRMWARE_DIR</code> vs device <code>fw</code>; set <code>OTA_PUBLIC_BASE_URL</code> for URLs in the dialog.</li>
+              <li><strong>Files</strong>: prefer <code>croc-SEMVER-random8.bin</code>; sidecar <code>.txt</code>/<code>.md</code> for notes.</li>
+              <li><strong>Superadmin</strong>: upload / create-from-stored below. Campaign APIs may still exist server-side; this dashboard does not expose an admin OTA workflow.</li>
             </ul>
           </div>
         </div>
         <p class="muted" style="margin:12px 0 0">Fleet: <a href="#/devices">All devices</a></p>
       </div>`;
 
-    const superCard = isSuper ? `
+    const superCard = `
       <div class="card">
         <h2 class="ui-section-title">Superadmin · Upload & campaign</h2>
         <p class="muted" style="margin:0 0 8px">Stage <code>.bin</code> on the API host (<code>POST /ota/firmware/upload</code>), then create a campaign from a stored filename (<code>POST /ota/campaigns/from-stored</code>).</p>
@@ -5838,99 +5965,9 @@
         <div class="row wide" style="justify-content:flex-end;margin-top:10px">
           <button type="button" class="btn btn-tap" id="otaFromBtn">Create campaign</button>
         </div>
-      </div>` : "";
+      </div>`;
 
-    const adminCard = isAdm ? `
-      <div class="card">
-        <div class="row between">
-          <h2 class="ui-section-title" style="margin:0">Campaigns</h2>
-          <button type="button" class="btn sm secondary" id="otaCampRel">Refresh</button>
-        </div>
-        <div id="otaCampList" class="muted" style="margin-top:8px">Loading…</div>
-      </div>` : "";
-
-    mountView(view, helpCard + superCard + adminCard);
-
-    const renderOtaRow = (c) => {
-      const myDec = (c.decisions || []).find((d) => d.admin_username === me.username);
-      const decLabel = myDec
-        ? ({ accepted: "Accepted", declined: "Declined", rolled_back: "Rolled back" }[myDec.action] || myDec.action || "—")
-        : (me.role === "superadmin" ? "—" : "Pending");
-      const co = c.counters || {};
-      const counters = ["pending", "dispatched", "success", "failed", "rolled_back"]
-        .filter((k) => co[k])
-        .map((k) => `<span class="badge" title="${escapeHtml(k)}">${escapeHtml(k)}:${escapeHtml(String(co[k]))}</span>`)
-        .join(" ");
-      const u = String(c.url || "");
-      const urlShort = escapeHtml(u.length > 80 ? `${u.slice(0, 80)}…` : u);
-      return `<tr>
-        <td class="mono" style="max-width:120px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(c.id)}</td>
-        <td>${escapeHtml(c.fw_version)}</td>
-        <td class="mono" style="max-width:min(240px,100%);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(u)}">${urlShort}</td>
-        <td><span class="badge ${escapeHtml(c.state)}">${escapeHtml(c.state)}</span></td>
-        <td>${counters || "<span class=\"muted\">—</span>"}</td>
-        <td>${escapeHtml(decLabel)}</td>
-        <td>${escapeHtml(fmtTs(c.created_at))}</td>
-        <td>
-          <div class="table-actions">
-            ${(me.role === "admin" && (!myDec || myDec.action === "declined"))
-              ? `<button type="button" class="btn sm js-ota-acc" data-id="${escapeHtml(c.id)}">Accept</button>
-                 <button type="button" class="btn sm secondary js-ota-dec" data-id="${escapeHtml(c.id)}">Decline</button>`
-              : ""}
-            ${(myDec && myDec.action === "accepted" && me.role === "admin")
-              ? `<button type="button" class="btn sm danger js-ota-rol" data-id="${escapeHtml(c.id)}">Rollback</button>`
-              : ""}
-          </div>
-        </td>
-      </tr>`;
-    };
-
-    const loadOtaCampaigns = async () => {
-      if (!isAdm) return;
-      if (!isRouteCurrent(routeSeq)) return;
-      const el = $("#otaCampList", view);
-      if (!el) return;
-      try {
-        const r = await api("/ota/campaigns", { timeoutMs: 30000 });
-        if (!isRouteCurrent(routeSeq)) return;
-        const list = r.items || [];
-        if (!list.length) {
-          setChildMarkup(el, "<p class=\"muted\">No OTA campaigns visible for your account.</p>");
-          return;
-        }
-        setChildMarkup(el, `<div class="table-wrap"><table class="t"><thead><tr><th>ID</th><th>FW</th><th>URL</th><th>State</th><th>Counts</th><th>My decision</th><th>Created</th><th></th></tr></thead><tbody>${list.map(renderOtaRow).join("")}</tbody></table></div>`);
-        view.querySelectorAll(".js-ota-acc").forEach((b) => {
-          b.addEventListener("click", async () => {
-            if (!confirm("Accept upgrade? Server verifies URL then pushes OTA to your devices.")) return;
-            try {
-              const out = await api(`/ota/campaigns/${encodeURIComponent(b.dataset.id)}/accept`, { method: "POST", body: {} });
-              toast(`Dispatched ${out.dispatched}/${out.target_count} · verify: ${out.verify}`, "ok");
-              loadOtaCampaigns();
-            } catch (e) { toast(e.message || e, "err"); }
-          });
-        });
-        view.querySelectorAll(".js-ota-dec").forEach((b) => {
-          b.addEventListener("click", async () => {
-            if (!confirm("Decline this campaign?")) return;
-            try { await api(`/ota/campaigns/${encodeURIComponent(b.dataset.id)}/decline`, { method: "POST", body: {} }); loadOtaCampaigns(); }
-            catch (e) { toast(e.message || e, "err"); }
-          });
-        });
-        view.querySelectorAll(".js-ota-rol").forEach((b) => {
-          b.addEventListener("click", async () => {
-            if (!confirm("Rollback firmware for devices you accepted?")) return;
-            try {
-              const out = await api(`/ota/campaigns/${encodeURIComponent(b.dataset.id)}/rollback`, { method: "POST", body: {} });
-              toast(`Rolled back ${out.rolled_back || 0} device(s)`, "ok");
-              loadOtaCampaigns();
-            } catch (e) { toast(e.message || e, "err"); }
-          });
-        });
-      } catch (e) {
-        if (!isRouteCurrent(routeSeq)) return;
-        setChildMarkup(el, `<p class="badge offline">${escapeHtml(e.message || e)}</p>`);
-      }
-    };
+    mountView(view, helpCard + superCard);
 
     const refreshFirmwareSelect = async () => {
       if (!isSuper) return;
@@ -5948,58 +5985,49 @@
       }
     };
 
-    if (isAdm) {
-      const rel = $("#otaCampRel", view);
-      if (rel) rel.addEventListener("click", () => loadOtaCampaigns());
-      await loadOtaCampaigns();
-      scheduleRouteTicker(routeSeq, "ota-camp-live", loadOtaCampaigns, 45000);
+    await refreshFirmwareSelect();
+    const stBtn = $("#otaStBtn", view);
+    if (stBtn) {
+      stBtn.addEventListener("click", async () => {
+        const inp = $("#otaStFile", view);
+        const f = inp && inp.files && inp.files[0];
+        const fw = String($("#otaStFw", view)?.value || "").trim();
+        if (!f || !fw) { toast("Choose file and version label", "err"); return; }
+        if (!confirm("Upload firmware to server (HEAD check against public /fw/ URL)?")) return;
+        try {
+          const fd = new FormData();
+          fd.append("file", f);
+          fd.append("fw_version", fw);
+          const r = await api("/ota/firmware/upload", { method: "POST", body: fd, timeoutMs: 180000 });
+          if (!isRouteCurrent(routeSeq)) return;
+          const resEl = $("#otaStResult", view);
+          if (resEl) resEl.textContent = `Stored ${r.stored_as || ""} · head_ok=${r.head_ok} · ${r.verify || ""}`;
+          toast("Upload finished", r.head_ok ? "ok" : "err");
+          if (inp) inp.value = "";
+          refreshFirmwareSelect();
+        } catch (e) { toast(e.message || e, "err"); }
+      });
     }
-
-    if (isSuper) {
-      await refreshFirmwareSelect();
-      const stBtn = $("#otaStBtn", view);
-      if (stBtn) {
-        stBtn.addEventListener("click", async () => {
-          const inp = $("#otaStFile", view);
-          const f = inp && inp.files && inp.files[0];
-          const fw = String($("#otaStFw", view)?.value || "").trim();
-          if (!f || !fw) { toast("Choose file and version label", "err"); return; }
-          if (!confirm("Upload firmware to server (HEAD check against public /fw/ URL)?")) return;
-          try {
-            const fd = new FormData();
-            fd.append("file", f);
-            fd.append("fw_version", fw);
-            const r = await api("/ota/firmware/upload", { method: "POST", body: fd, timeoutMs: 180000 });
-            if (!isRouteCurrent(routeSeq)) return;
-            const resEl = $("#otaStResult", view);
-            if (resEl) resEl.textContent = `Stored ${r.stored_as || ""} · head_ok=${r.head_ok} · ${r.verify || ""}`;
-            toast("Upload finished", r.head_ok ? "ok" : "err");
-            if (inp) inp.value = "";
-            refreshFirmwareSelect();
-          } catch (e) { toast(e.message || e, "err"); }
-        });
-      }
-      const fromBtn = $("#otaFromBtn", view);
-      if (fromBtn) {
-        fromBtn.addEventListener("click", async () => {
-          const fn = String($("#otaFromSel", view)?.value || "").trim();
-          const pfw = String($("#otaFromFw", view)?.value || "").trim();
-          const notes = String($("#otaFromNotes", view)?.value || "").trim();
-          const allCh = $("#otaFromAllAd", view);
-          const rawAdm = String($("#otaFromAdmTxt", view)?.value || "").trim();
-          const target_admins = (allCh && allCh.checked) ? ["*"] : (rawAdm ? rawAdm.split(/[\s,;]+/).filter(Boolean) : ["*"]);
-          if (!fn || !pfw) { toast("Pick stored file and campaign version label", "err"); return; }
-          if (!confirm("Create OTA campaign from this stored file?")) return;
-          try {
-            await api("/ota/campaigns/from-stored", {
-              method: "POST",
-              body: { filename: fn, fw_version: pfw, notes: notes || undefined, target_admins },
-            });
-            toast("Campaign created", "ok");
-            loadOtaCampaigns();
-          } catch (e) { toast(e.message || e, "err"); }
-        });
-      }
+    const fromBtn = $("#otaFromBtn", view);
+    if (fromBtn) {
+      fromBtn.addEventListener("click", async () => {
+        const fn = String($("#otaFromSel", view)?.value || "").trim();
+        const pfw = String($("#otaFromFw", view)?.value || "").trim();
+        const notes = String($("#otaFromNotes", view)?.value || "").trim();
+        const allCh = $("#otaFromAllAd", view);
+        const rawAdm = String($("#otaFromAdmTxt", view)?.value || "").trim();
+        const target_admins = (allCh && allCh.checked) ? ["*"] : (rawAdm ? rawAdm.split(/[\s,;]+/).filter(Boolean) : ["*"]);
+        if (!fn || !pfw) { toast("Pick stored file and campaign version label", "err"); return; }
+        if (!confirm("Create OTA campaign from this stored file?")) return;
+        try {
+          await api("/ota/campaigns/from-stored", {
+            method: "POST",
+            body: { filename: fn, fw_version: pfw, notes: notes || undefined, target_admins },
+          });
+          toast("Campaign created", "ok");
+          try { bustDeviceListCaches(); } catch (_) {}
+        } catch (e) { toast(e.message || e, "err"); }
+      });
     }
   }
 

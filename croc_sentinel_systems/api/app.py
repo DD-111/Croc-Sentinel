@@ -9763,6 +9763,32 @@ def ota_service_check(principal: Principal = Depends(require_principal)) -> dict
     }
 
 
+@app.get("/ota/firmware-reachability")
+def ota_firmware_reachability(
+    name: str = Query(..., min_length=5, max_length=220),
+    principal: Principal = Depends(require_principal),
+) -> dict[str, Any]:
+    """Dashboard: confirm the staged .bin is reachable like a device (HEAD with OTA_TOKEN). Catalog-only name."""
+    assert_min_role(principal, "user")
+    require_capability(principal, "can_send_command")
+    safe = os.path.basename((name or "").strip())
+    if not safe.endswith(".bin") or safe != (name or "").strip() or "/" in (name or "") or "\\" in (name or ""):
+        raise HTTPException(status_code=400, detail="invalid firmware filename")
+    cat = _get_ota_firmware_catalog()
+    if not any(str(e.get("name") or "") == safe for e in cat):
+        raise HTTPException(status_code=404, detail="firmware not in catalog")
+    ok, detail, masked = _verify_firmware_file_on_service(safe)
+    tok = bool((OTA_TOKEN or "").strip())
+    return {
+        "ok": ok,
+        "detail": detail,
+        "probe_url_masked": masked,
+        "ota_token_configured": tok,
+        "public_base_configured": bool((OTA_PUBLIC_BASE_URL or "").strip()),
+        "filename": safe,
+    }
+
+
 @app.get("/ota/firmwares")
 def list_firmwares(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     # Only superadmin can even see the firmware inventory.

@@ -1810,6 +1810,63 @@ button.fw-hint-badge--sm .fw-hint-badge__dot {
   font-size: 1.1rem;
   font-weight: 650;
 }
+.croc-fw-hint-dlg__compare {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  margin: 14px 0 4px;
+  padding: 12px 14px;
+  background: var(--bg-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.croc-fw-hint-dlg__ver {
+  font-size: 1.05rem;
+  font-weight: 650;
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+}
+.croc-fw-hint-dlg__ver--new {
+  border-color: var(--accent, #2563eb);
+  color: var(--accent, #2563eb);
+}
+.croc-fw-hint-dlg__ver-arrow {
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: var(--text-muted, #64748b);
+  line-height: 1;
+}
+.croc-fw-hint-dlg__changelog-label {
+  display: block;
+  margin: 14px 0 6px;
+  font-size: var(--text-sm, 13px);
+  font-weight: 600;
+  color: var(--text-muted);
+}
+.croc-fw-hint-dlg__changelog {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0;
+  min-height: 100px;
+  max-height: min(40vh, 280px);
+  resize: vertical;
+  font-family: var(--font-sans, system-ui, sans-serif);
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 10px 12px;
+  background: var(--bg-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+}
+.croc-fw-hint-dlg__changelog:read-only {
+  opacity: 0.92;
+}
 .croc-fw-hint-dlg__body {
   margin: 0;
   max-height: min(48vh, 360px);
