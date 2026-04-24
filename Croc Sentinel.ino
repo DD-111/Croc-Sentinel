@@ -19,9 +19,30 @@
 
 #include "config.h"
 
+#ifndef DEVICE_SYNC_HTTP_ENABLED
+#define DEVICE_SYNC_HTTP_ENABLED 0
+#endif
+#ifndef DEVICE_SYNC_API_BASE
+#define DEVICE_SYNC_API_BASE ""
+#endif
+#ifndef DEVICE_SYNC_BOOT_PATH
+#define DEVICE_SYNC_BOOT_PATH "/api/device/boot-sync"
+#endif
+#ifndef DEVICE_SYNC_OTA_PATH
+#define DEVICE_SYNC_OTA_PATH "/api/device/ota/report"
+#endif
+#ifndef DEVICE_SYNC_HTTP_TIMEOUT_MS
+#define DEVICE_SYNC_HTTP_TIMEOUT_MS 15000
+#endif
+#ifndef DEVICE_SYNC_TLS_INSECURE
+#define DEVICE_SYNC_TLS_INSECURE 0
+#endif
+
 #if OTA_ENABLED
 #include <HTTPUpdate.h>
 #endif
+
+#include <HTTPClient.h>
 
 #if MQTT_USE_TLS
 #include <WiFiClientSecure.h>
@@ -595,6 +616,10 @@ NetworkClient netClient;
 #endif
 PubSubClient mqttClient(netClient);
 
+#if DEVICE_SYNC_HTTP_ENABLED && MQTT_USE_TLS
+static WiFiClientSecure gDeviceSyncTlsClient;
+#endif
+
 #if ENABLE_WS_LOG
 WebSocketsClient wsClient;
 #endif
@@ -1152,6 +1177,11 @@ void processOtaBootState() {
   otaPendingSinceMs = millis();
 }
 
+#if DEVICE_SYNC_HTTP_ENABLED
+void performDeviceBootSyncHttp();
+void postDeviceOtaReportHttp(bool otaOk, const char *campaignId, const char *targetFw, const char *detail);
+#endif
+
 void confirmOtaIfHealthy() {
   if (!otaPendingValidation) return;
   if (millis() - otaPendingSinceMs < OTA_HEALTH_CONFIRM_MS) return;
@@ -1178,6 +1208,9 @@ void confirmOtaIfHealthy() {
   otaPendingValidation = false;
   logLine("[ota] validated");
   publishOtaResult(cid.c_str(), tgt.c_str(), true, "post-reboot validated");
+#if DEVICE_SYNC_HTTP_ENABLED
+  postDeviceOtaReportHttp(true, cid.c_str(), tgt.c_str(), "post-reboot validated");
+#endif
   publishHeartbeatEvent("ota_success");
 }
 
@@ -1535,6 +1568,9 @@ void performOTA(const char *url, const char *targetFw, const char *campaignId) {
       }
       publishAck("ota", false, err.c_str());
       publishOtaResult(campaignId, targetFw, false, err.c_str());
+#if DEVICE_SYNC_HTTP_ENABLED
+      postDeviceOtaReportHttp(false, campaignId, targetFw, err.c_str());
+#endif
       clearOtaPendingState();
       break;
     }
@@ -1542,6 +1578,9 @@ void performOTA(const char *url, const char *targetFw, const char *campaignId) {
       clearOtaPendingState();
       publishAck("ota", false, "no update");
       publishOtaResult(campaignId, targetFw, false, "no update");
+#if DEVICE_SYNC_HTTP_ENABLED
+      postDeviceOtaReportHttp(false, campaignId, targetFw, "no update");
+#endif
       break;
     case HTTP_UPDATE_OK:
       // Success is announced after reboot by confirmOtaIfHealthy().
@@ -2162,6 +2201,151 @@ void buildTopics() {
            TOPIC_BOOTSTRAP_ASSIGN_PREFIX, deviceMacNoColon);
 }
 
+#if DEVICE_SYNC_HTTP_ENABLED
+// HTTP boot-sync + OTA report (parallel to MQTT bootstrap / ota.result).
+static bool deviceSyncHttpPost(const char *urlFull, const char *jsonBody, int *outCode, String *outBody) {
+  HTTPClient http;
+  http.setTimeout(DEVICE_SYNC_HTTP_TIMEOUT_MS);
+  *outCode = -1;
+  outBody->clear();
+  bool begun = false;
+  if (strncmp(urlFull, "https:", 6) == 0) {
+#if !MQTT_USE_TLS
+    logLine("[sync] HTTPS URL requires MQTT_USE_TLS");
+    return false;
+#else
+    gDeviceSyncTlsClient.stop();
+#if DEVICE_SYNC_TLS_INSECURE
+    gDeviceSyncTlsClient.setInsecure();
+#else
+    if (!hasPrimaryCa()) {
+      logLine("[sync] HTTPS needs MQTT CA PEM or DEVICE_SYNC_TLS_INSECURE=1");
+      return false;
+    }
+    gDeviceSyncTlsClient.setCACert(MQTT_CA_CERT_PRIMARY_PEM);
+#endif
+    begun = http.begin(gDeviceSyncTlsClient, urlFull);
+#endif
+  } else {
+#if defined(CONFIG_IDF_TARGET_ESP32P4)
+    static NetworkClient plain;
+#else
+    static WiFiClient plain;
+#endif
+    plain.stop();
+    begun = http.begin(plain, urlFull);
+  }
+  if (!begun) {
+    logLine("[sync] http.begin failed");
+    return false;
+  }
+  http.addHeader("Content-Type", "application/json");
+  *outCode = http.POST(jsonBody);
+  *outBody = http.getString();
+  http.end();
+  return *outCode > 0;
+}
+
+static void applyBootSyncResyncPayload(JsonObject doc) {
+  const char *nk = doc["cmd_key"] | "";
+  const char *nu = doc["mqtt_username"] | "";
+  const char *np = doc["mqtt_password"] | "";
+  const char *nz = doc["zone"] | "";
+  const char *nq = doc["qr_code"] | "";
+  if (!isHexStr(nk, 16) || strlen(nu) < 1 || strlen(np) < 1) {
+    logLine("[sync] resync payload invalid");
+    return;
+  }
+  prefs.begin(NVS_NAMESPACE, false);
+  prefs.putBool("prov", true);
+  prefs.putString("mqtt_u", nu);
+  prefs.putString("mqtt_p", np);
+  prefs.putString("cmd_key", nk);
+  if (strlen(nz) > 0 && strlen(nz) < 32) prefs.putString("zone", nz);
+  if (strlen(nq) > 0 && strlen(nq) < (int)sizeof(deviceQrCode)) prefs.putString("qr_code", nq);
+  prefs.end();
+  loadProvisioningRuntime();
+  logLine("[sync] NVS updated from boot-sync resync");
+}
+
+void performDeviceBootSyncHttp() {
+  if (strlen(DEVICE_SYNC_API_BASE) < 8) return;
+  if (!isProvisioned || !netIf->connected()) return;
+  char url[192];
+  snprintf(url, sizeof(url), "%s%s", DEVICE_SYNC_API_BASE, DEVICE_SYNC_BOOT_PATH);
+  StaticJsonDocument<384> doc;
+  doc["device_id"] = deviceId;
+  doc["mac_nocolon"] = deviceMacNoColon;
+  doc["cmd_key"] = cmdAuthKey;
+  doc["fw"] = FW_VERSION;
+  char payload[420];
+  size_t nw = serializeJson(doc, payload, sizeof(payload));
+  if (nw == 0 || nw >= sizeof(payload)) {
+    logLine("[sync] boot-sync JSON too large");
+    return;
+  }
+  int code = -1;
+  String resp;
+  if (!deviceSyncHttpPost(url, payload, &code, &resp)) {
+    logLine("[sync] boot-sync HTTP failed");
+    return;
+  }
+  {
+    char line[120];
+    snprintf(line, sizeof(line), "[sync] boot-sync HTTP status=%d", code);
+    logLine(line);
+  }
+  if (code != 200) {
+    if (resp.length() > 0 && resp.length() < 180) logLine(resp.c_str());
+    return;
+  }
+  StaticJsonDocument<512> ans;
+  if (deserializeJson(ans, resp)) {
+    logLine("[sync] boot-sync bad JSON");
+    return;
+  }
+  const char *st = ans["status"] | "";
+  if (strcmp(st, "ok") == 0) {
+    logLine("[sync] boot-sync ok");
+    return;
+  }
+  if (strcmp(st, "unprovisioned") == 0) {
+    logLine("[sync] server: unprovisioned");
+    return;
+  }
+  if (strcmp(st, "resync") == 0) {
+    applyBootSyncResyncPayload(ans.as<JsonObject>());
+    return;
+  }
+  logLine("[sync] boot-sync unknown status");
+}
+
+void postDeviceOtaReportHttp(bool otaOk, const char *campaignId, const char *targetFw, const char *detail) {
+  if (strlen(DEVICE_SYNC_API_BASE) < 8) return;
+  if (!isProvisioned || !netIf->connected()) return;
+  char url[192];
+  snprintf(url, sizeof(url), "%s%s", DEVICE_SYNC_API_BASE, DEVICE_SYNC_OTA_PATH);
+  StaticJsonDocument<512> doc;
+  doc["device_id"] = deviceId;
+  doc["mac_nocolon"] = deviceMacNoColon;
+  doc["cmd_key"] = cmdAuthKey;
+  doc["ok"] = otaOk;
+  doc["detail"] = detail ? detail : "";
+  doc["campaign_id"] = campaignId ? campaignId : "";
+  doc["target_fw"] = targetFw ? targetFw : "";
+  doc["current_fw"] = FW_VERSION;
+  char payload[520];
+  size_t nw = serializeJson(doc, payload, sizeof(payload));
+  if (nw == 0 || nw >= sizeof(payload)) return;
+  int code = -1;
+  String resp;
+  if (!deviceSyncHttpPost(url, payload, &code, &resp)) return;
+  char line[96];
+  snprintf(line, sizeof(line), "[ota-http] report status=%d", code);
+  logLine(line);
+}
+#endif  // DEVICE_SYNC_HTTP_ENABLED
+
 // ═══════════════════════════════════════════════
 //  Connection management
 // ═══════════════════════════════════════════════
@@ -2622,6 +2806,11 @@ void setup() {
     logLine(_nb);
     configTime(NTP_GMT_OFFSET_S, NTP_DAYLIGHT_OFFSET_S, NTP_SERVER);
     ntpInitDone = true;
+#if DEVICE_SYNC_HTTP_ENABLED
+    if (isProvisioned) {
+      performDeviceBootSyncHttp();
+    }
+#endif
   }
 }
 

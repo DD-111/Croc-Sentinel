@@ -339,4 +339,26 @@
 #define MQTT_RX_BUFFER_BYTES 2048
 #define MQTT_JSON_DOC_BYTES 1536
 
+// ── HTTP boot-sync & OTA report (optional; parallel to MQTT bootstrap / ota.result) ──
+// Set DEVICE_SYNC_HTTP_ENABLED=1 and point BASE at your API (same host as dashboard or Traefik /api).
+// HTTPS requires MQTT_USE_TLS=1 and MQTT_CA_CERT_PRIMARY_PEM to verify API cert (or DEVICE_SYNC_TLS_INSECURE=1 lab only).
+#ifndef DEVICE_SYNC_HTTP_ENABLED
+#define DEVICE_SYNC_HTTP_ENABLED 0
+#endif
+#ifndef DEVICE_SYNC_API_BASE
+#define DEVICE_SYNC_API_BASE ""
+#endif
+#ifndef DEVICE_SYNC_BOOT_PATH
+#define DEVICE_SYNC_BOOT_PATH "/api/device/boot-sync"
+#endif
+#ifndef DEVICE_SYNC_OTA_PATH
+#define DEVICE_SYNC_OTA_PATH "/api/device/ota/report"
+#endif
+#ifndef DEVICE_SYNC_HTTP_TIMEOUT_MS
+#define DEVICE_SYNC_HTTP_TIMEOUT_MS 15000
+#endif
+#ifndef DEVICE_SYNC_TLS_INSECURE
+#define DEVICE_SYNC_TLS_INSECURE 0
+#endif
+
 #endif

@@ -61,6 +61,15 @@
 | 22 | GET  | `/factory/devices` | superadmin | 列出 factory 清单 |
 | 23 | POST | `/factory/devices/{serial}/block` | superadmin | 封禁序列号（不可再被认领） |
 
+### 2b. 设备 HTTP：启动同步 & OTA 补充上报（公开，MAC+device_id 绑定）
+
+固件在联网后、MQTT 建链前可调用 **boot-sync**，OTA 完成后可额外 **HTTP 上报**（与 MQTT `ota.result` 并行）。
+
+| # | 方法 | 路径 | 认证 | 说明 |
+|---|------|------|------|------|
+| 23a | POST | `/device/boot-sync` | 公开 | Body: `device_id`, `mac_nocolon`, `cmd_key`（当前 NVS）, `fw`（可选）。`device_id`+`MAC` 必须与 `provisioned_credentials` 一致。响应：`{status:"ok"}` / `{status:"resync", cmd_key, mqtt_username, mqtt_password, zone, qr_code}` / `{status:"unprovisioned"}` |
+| 23b | POST | `/device/ota/report` | 公开 | Body: `device_id`, `mac_nocolon`, `cmd_key`（须与库中一致；可空则仅 MAC+id 校验）, `ok`, `detail`, `campaign_id`, `target_fw`, `current_fw`。有 `campaign_id` 时走与 MQTT 相同的 OTA 汇总逻辑；否则仅记事件 |
+
 ## 3. 设备吊销 & 查询 (`/devices/*`)
 
 | # | 方法 | 路径 | 最低角色 | 说明 |

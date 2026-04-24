@@ -13,6 +13,14 @@
     theme: "croc.theme",
     sidebarCollapsed: "croc.sidebar.collapsed",
   };
+  /** One-time: drop legacy JWT in localStorage; session uses HttpOnly cookie when API omits access_token. */
+  try {
+    const _m = "croc.auth.migrate_cookie_v1";
+    if (!localStorage.getItem(_m)) {
+      localStorage.removeItem(LS.token);
+      localStorage.setItem(_m, "1");
+    }
+  } catch (_) {}
   const OFFLINE_MS = 90 * 1000;
   /** Default remote siren / group loud duration (3 min). Panic sibling fan-out default (5 min) matches server. */
   const DEFAULT_REMOTE_SIREN_MS = 180000;
@@ -396,12 +404,13 @@
    * fetch() with AbortController timeout. opts.timeoutMs: number ms, false = no limit.
    */
   async function fetchWithDeadline(url, init, timeoutMs) {
+    const baseInit = Object.assign({ credentials: "include" }, init || {});
     const limit = timeoutMs === false ? 0 : (timeoutMs != null ? timeoutMs : DEFAULT_API_TIMEOUT_MS);
-    if (limit <= 0) return fetch(url, init || {});
+    if (limit <= 0) return fetch(url, baseInit);
     const ac = new AbortController();
     const tid = setTimeout(() => ac.abort(), limit);
     try {
-      return await fetch(url, Object.assign({}, init || {}, { signal: ac.signal }));
+      return await fetch(url, Object.assign({}, baseInit, { signal: ac.signal }));
     } catch (e) {
       if (e && e.name === "AbortError") {
         throw new Error(
@@ -729,6 +738,9 @@
         if (r.status === 401) {
           setToken("");
           state.me = null;
+          try {
+            await fetchWithDeadline(apiBase() + "/auth/logout", { method: "POST" }, 8000);
+          } catch (_) {}
           if (location.hash !== "#/login") location.hash = "#/login";
           throw new Error("401 Unauthorized or session expired");
         }
@@ -1047,7 +1059,7 @@
         otaBtn.disabled = true;
         if (pre) pre.textContent = "Checking…";
         try {
-          if (!getToken()) {
+          if (!state.me) {
             throw new Error("Not signed in or session expired");
           }
           let canOp = true;
@@ -1144,7 +1156,8 @@
       throw new Error(`${r.status} ${text}`);
     }
     const j = JSON.parse(text);
-    setToken(j.access_token || "");
+    if (j.access_token) setToken(j.access_token);
+    else setToken("");
     localStorage.setItem(LS.user, username);
     localStorage.setItem(LS.role, j.role || "");
     localStorage.setItem(LS.zones, JSON.stringify(j.zones || []));
@@ -5249,24 +5262,17 @@
       };
 
       const run = async () => {
-        if (!tok) {
-          shim.readyState = EventSource.CLOSED;
-          const live = $("#evLive");
-          if (live && isRouteCurrent(navTok)) {
-            live.textContent = "Offline";
-            live.className = "badge offline";
-          }
-          return;
-        }
         const url = apiBase() + "/events/stream" + (qs ? "?" + qs : "");
+        const hdrs = {
+          Accept: "text/event-stream",
+          "Cache-Control": "no-store",
+        };
+        if (tok) hdrs.Authorization = "Bearer " + tok;
         try {
           const r = await fetch(url, {
             method: "GET",
-            headers: {
-              Authorization: "Bearer " + tok,
-              Accept: "text/event-stream",
-              "Cache-Control": "no-store",
-            },
+            credentials: "include",
+            headers: hdrs,
             signal: ac.signal,
           });
           if (!isRouteCurrent(navTok)) return;
@@ -5357,7 +5363,10 @@
         const p = currentFilters();
         p.set("limit", "8000");
         const url = apiBase() + "/events/export.csv?" + p.toString();
-        const r = await fetch(url, { headers: { Authorization: "Bearer " + getToken() } });
+        const _ex = {};
+        const _t = getToken();
+        if (_t) _ex.Authorization = "Bearer " + _t;
+        const r = await fetch(url, { credentials: "include", headers: _ex });
         if (!r.ok) {
           const t = await r.text();
           throw new Error(t || r.statusText);
@@ -5965,8 +5974,12 @@
         const key = ($v("#bk_key").value || "").trim();
         if (!key) { toast("Enter backup encryption key", "err"); return; }
         try {
+          const _h = { "X-Backup-Encryption-Key": key };
+          const _tb = getToken();
+          if (_tb) _h.Authorization = "Bearer " + _tb;
           const r = await fetch(apiBase() + "/admin/backup/export", {
-            headers: { Authorization: "Bearer " + getToken(), "X-Backup-Encryption-Key": key },
+            credentials: "include",
+            headers: _h,
           });
           if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
           const blob = new Blob([await r.arrayBuffer()], { type: "application/octet-stream" });
@@ -5982,9 +5995,13 @@
         if (!key || !f) { toast("Pick a file and enter the encryption key", "err"); return; }
         const fd = new FormData(); fd.append("file", f, f.name || "sentinel-backup.enc");
         try {
+          const _hi = { "X-Backup-Encryption-Key": key };
+          const _ti = getToken();
+          if (_ti) _hi.Authorization = "Bearer " + _ti;
           const r = await fetch(apiBase() + "/admin/backup/import", {
             method: "POST",
-            headers: { Authorization: "Bearer " + getToken(), "X-Backup-Encryption-Key": key },
+            credentials: "include",
+            headers: _hi,
             body: fd,
           });
           const j = await r.json().catch(() => ({}));
@@ -6544,7 +6561,10 @@
     $("#themeBtn").addEventListener("click", () => {
       setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
     });
-    $("#logoutBtn").addEventListener("click", () => {
+    $("#logoutBtn").addEventListener("click", async () => {
+      try {
+        await fetchWithDeadline(apiBase() + "/auth/logout", { method: "POST" }, 12000);
+      } catch (_) {}
       setToken("");
       state.me = null;
       clearHealthPollTimer();
@@ -6562,7 +6582,7 @@
       } catch (_) {}
     }, true);
 
-    await (getToken() ? loadMe() : Promise.resolve());
+    await loadMe();
     syncNavForViewport();
     try { applySidebarRail(); } catch (_) {}
     if (!location.hash) location.hash = state.me ? "#/overview" : "#/login";

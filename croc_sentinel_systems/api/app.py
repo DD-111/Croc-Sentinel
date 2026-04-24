@@ -23,7 +23,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi import Cookie, Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.gzip import GZipMiddleware
@@ -34,6 +34,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from security import (
+    JWT_EXPIRE_S,
     Principal,
     assert_min_role,
     assert_zone_for_device,
@@ -82,6 +83,8 @@ CMD_AUTH_KEY = os.getenv("CMD_AUTH_KEY", "")
 BOOTSTRAP_BIND_KEY = os.getenv("BOOTSTRAP_BIND_KEY", "")
 CMD_PROTO = int(os.getenv("CMD_PROTO", "2"))
 API_TOKEN = os.getenv("API_TOKEN", "")
+# When 0 (default), the long-lived API_TOKEN bearer is not accepted — use JWT login only.
+LEGACY_API_TOKEN_ENABLED = os.getenv("LEGACY_API_TOKEN_ENABLED", "0") == "1"
 DB_PATH = os.getenv("DB_PATH", "/data/sentinel.db")
 LOG_FILE_PATH = os.getenv("LOG_FILE_PATH", "/data/api.log")
 PROVISION_USE_SHARED_MQTT_CREDS = os.getenv("PROVISION_USE_SHARED_MQTT_CREDS", "1") == "1"
@@ -93,6 +96,17 @@ CACHE_TTL_SECONDS = float(os.getenv("CACHE_TTL_SECONDS", "18.0"))
 MESSAGE_RETENTION_DAYS = int(os.getenv("MESSAGE_RETENTION_DAYS", "14"))
 STRICT_STARTUP_ENV_CHECK = os.getenv("STRICT_STARTUP_ENV_CHECK", "0") == "1"
 JWT_SECRET = os.getenv("JWT_SECRET", "")
+# Dashboard session: HttpOnly cookie (preferred) + optional JSON access_token for scripts.
+JWT_USE_HTTPONLY_COOKIE = os.getenv("JWT_USE_HTTPONLY_COOKIE", "1") == "1"
+JWT_COOKIE_NAME = (os.getenv("JWT_COOKIE_NAME", "sentinel_jwt").strip() or "sentinel_jwt")
+JWT_COOKIE_SECURE = os.getenv("JWT_COOKIE_SECURE", "0") == "1"
+_ss = (os.getenv("JWT_COOKIE_SAMESITE", "lax") or "lax").strip().lower()
+JWT_COOKIE_SAMESITE: str = "strict" if _ss == "strict" else "lax"
+JWT_RETURN_BODY_TOKEN = os.getenv("JWT_RETURN_BODY_TOKEN", "0") == "1"
+# SSE: ?token= leaks via logs; disable unless legacy clients need it.
+SSE_ALLOW_QUERY_TOKEN = os.getenv("SSE_ALLOW_QUERY_TOKEN", "0") == "1"
+# Public /health: set 1 only if load balancers need broker/smtp detail without auth.
+HEALTH_PUBLIC_DETAIL = os.getenv("HEALTH_PUBLIC_DETAIL", "0") == "1"
 BOOTSTRAP_DASHBOARD_SUPERADMIN_USERNAME = os.getenv("BOOTSTRAP_DASHBOARD_SUPERADMIN_USERNAME", "superadmin").strip()
 BOOTSTRAP_DASHBOARD_SUPERADMIN_PASSWORD = os.getenv("BOOTSTRAP_DASHBOARD_SUPERADMIN_PASSWORD", "")
 ENFORCE_PER_DEVICE_CREDS = os.getenv("ENFORCE_PER_DEVICE_CREDS", "0") == "1"
@@ -327,8 +341,10 @@ def is_hex_16(value: str) -> bool:
 
 def validate_production_env() -> None:
     errors: list[str] = []
-    if not API_TOKEN or len(API_TOKEN) < 20 or contains_insecure_marker(API_TOKEN):
-        errors.append("API_TOKEN is weak or default")
+    if LEGACY_API_TOKEN_ENABLED and (
+        not API_TOKEN or len(API_TOKEN) < 20 or contains_insecure_marker(API_TOKEN)
+    ):
+        errors.append("API_TOKEN is weak or default (LEGACY_API_TOKEN_ENABLED=1)")
     if not CMD_AUTH_KEY or not is_hex_16(CMD_AUTH_KEY):
         errors.append("CMD_AUTH_KEY must be 16 hex chars")
     if not BOOTSTRAP_BIND_KEY or len(BOOTSTRAP_BIND_KEY) < 16 or contains_insecure_marker(BOOTSTRAP_BIND_KEY):
@@ -3388,16 +3404,22 @@ def stop_mqtt_loop(client: mqtt.Client) -> None:
             pass
 
 
-def require_principal(authorization: Optional[str] = Header(default=None)) -> Principal:
+def require_principal(
+    authorization: Optional[str] = Header(default=None),
+    sentinel_jwt_cookie: Optional[str] = Cookie(default=None, alias=JWT_COOKIE_NAME),
+) -> Principal:
     """
-    Accepts legacy long-lived API_TOKEN (superadmin) or JWT from POST /auth/login.
+    JWT: Authorization Bearer, or HttpOnly cookie (when JWT_USE_HTTPONLY_COOKIE).
+    Optional legacy API_TOKEN superadmin bearer when LEGACY_API_TOKEN_ENABLED=1.
     """
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="missing bearer token")
-    token = authorization.removeprefix("Bearer ").strip()
+    token = ""
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.removeprefix("Bearer ").strip()
+    elif JWT_USE_HTTPONLY_COOKIE and sentinel_jwt_cookie:
+        token = str(sentinel_jwt_cookie).strip()
     if not token:
-        raise HTTPException(status_code=401, detail="empty bearer token")
-    if API_TOKEN:
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    if LEGACY_API_TOKEN_ENABLED and API_TOKEN:
         try:
             if secrets.compare_digest(token, API_TOKEN):
                 return Principal(username="api-legacy", role="superadmin", zones=["*"])
@@ -3696,6 +3718,26 @@ async def _app_lifespan(app: FastAPI):
 
 app = FastAPI(title="Croc Sentinel API", version="1.1.0", lifespan=_app_lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=700)
+
+
+@app.middleware("http")
+async def _security_headers_middleware(request: Request, call_next):
+    """Baseline hardening for dashboard + API responses (CSP allows Google Fonts used by index.html)."""
+    resp = await call_next(request)
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    resp.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    resp.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; "
+        "img-src 'self' data: https:; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com; "
+        "script-src 'self' 'unsafe-inline'; "
+        "connect-src 'self'",
+    )
+    return resp
 
 _dash_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard")
 if os.path.isdir(_dash_dir):
@@ -4940,7 +4982,7 @@ def auth_forgot_complete(body: ForgotCompleteRequest, request: Request) -> dict[
 
 
 @app.post("/auth/login")
-def auth_login(body: LoginRequest, request: Request) -> dict[str, Any]:
+def auth_login(body: LoginRequest, request: Request, response: Response) -> dict[str, Any]:
     ctx = _client_context(request)
     ip = ctx["ip"]
     _check_login_ip_lockout(ip, body.username)
@@ -4975,6 +5017,16 @@ def auth_login(body: LoginRequest, request: Request) -> dict[str, Any]:
     _clear_login_ip_state(ip)
     zones = zones_from_json(str(row["allowed_zones_json"]))
     token = issue_jwt(str(row["username"]), str(row["role"]), zones)
+    if JWT_USE_HTTPONLY_COOKIE:
+        response.set_cookie(
+            key=JWT_COOKIE_NAME,
+            value=token,
+            max_age=int(JWT_EXPIRE_S),
+            path="/",
+            httponly=True,
+            secure=bool(JWT_COOKIE_SECURE),
+            samesite=JWT_COOKIE_SAMESITE,  # type: ignore[arg-type]
+        )
     ok_detail = dict(ctx)
     ok_detail["owner_admin"] = owner_admin
     ok_detail["login_user"] = str(row["username"])
@@ -4998,7 +5050,153 @@ def auth_login(body: LoginRequest, request: Request) -> dict[str, Any]:
                 conn.close()
     except Exception:
         logger.warning("welcome email skipped or failed for %s", body.username, exc_info=True)
-    return {"access_token": token, "token_type": "bearer", "role": row["role"], "zones": zones}
+    out: dict[str, Any] = {"token_type": "bearer", "role": row["role"], "zones": zones}
+    if JWT_RETURN_BODY_TOKEN or not JWT_USE_HTTPONLY_COOKIE:
+        out["access_token"] = token
+    return out
+
+
+@app.post("/auth/logout")
+def auth_logout(response: Response) -> dict[str, Any]:
+    """Clear HttpOnly session cookie (no auth required)."""
+    response.delete_cookie(
+        JWT_COOKIE_NAME,
+        path="/",
+        secure=bool(JWT_COOKIE_SECURE),
+        httponly=True,
+        samesite=JWT_COOKIE_SAMESITE,  # type: ignore[arg-type]
+    )
+    return {"ok": True}
+
+
+def _norm_mac_nocolon12(raw: str) -> str:
+    s = re.sub(r"[^0-9A-Fa-f]", "", raw or "")
+    return s[:12].upper() if len(s) >= 12 else ""
+
+
+def _provision_row_for_device_mac(device_id: str, mac12: str) -> Optional[sqlite3.Row]:
+    """Return provisioned_credentials row when device_id and MAC both match (anti impersonation)."""
+    if len(mac12) != 12:
+        return None
+    did = (device_id or "").strip()
+    if not did:
+        return None
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT device_id, mac_nocolon, mqtt_username, mqtt_password, cmd_key, zone, qr_code
+            FROM provisioned_credentials
+            WHERE UPPER(device_id) = UPPER(?) AND UPPER(mac_nocolon) = UPPER(?)
+            LIMIT 1
+            """,
+            (did, mac12),
+        )
+        row = cur.fetchone()
+        conn.close()
+    return row
+
+
+class DeviceBootSyncRequest(BaseModel):
+    device_id: str = Field(min_length=3, max_length=40)
+    mac_nocolon: str = Field(min_length=12, max_length=24)
+    cmd_key: str = Field(default="", max_length=32)
+    fw: str = Field(default="", max_length=48)
+
+
+class DeviceOtaReportRequest(BaseModel):
+    device_id: str = Field(min_length=3, max_length=40)
+    mac_nocolon: str = Field(min_length=12, max_length=24)
+    cmd_key: str = Field(default="", max_length=32)
+    ok: bool
+    detail: str = Field(default="", max_length=480)
+    campaign_id: str = Field(default="", max_length=120)
+    target_fw: str = Field(default="", max_length=48)
+    current_fw: str = Field(default="", max_length=48)
+
+
+@app.post("/device/boot-sync")
+def device_boot_sync(body: DeviceBootSyncRequest) -> dict[str, Any]:
+    """Device HTTP: verify NVS cmd_key vs DB; return resync payload when mismatched (MAC+device_id bound)."""
+    mac = _norm_mac_nocolon12(body.mac_nocolon)
+    if len(mac) != 12:
+        raise HTTPException(status_code=400, detail="invalid mac_nocolon")
+    row = _provision_row_for_device_mac(body.device_id, mac)
+    if not row:
+        return {"status": "unprovisioned"}
+    did = str(row["device_id"])
+    db_key = str(row["cmd_key"] or "").strip().upper()
+    rep = (body.cmd_key or "").strip().upper()
+    if rep and is_hex_16(rep) and rep == db_key:
+        return {"status": "ok"}
+    owner = _lookup_owner_admin(did) or ""
+    emit_event(
+        level="warn",
+        category="provision",
+        event_type="device.boot_sync.resync",
+        summary=f"boot-sync resync {did}",
+        actor=f"device:{did}",
+        target=did,
+        owner_admin=owner or None,
+        device_id=did,
+        detail={"fw": (body.fw or "").strip(), "had_cmd_key": bool(rep)},
+    )
+    audit_event(
+        f"device:{did}",
+        "device.boot_sync.resync",
+        did,
+        {"mac_nocolon": mac, "fw": (body.fw or "").strip()},
+    )
+    return {
+        "status": "resync",
+        "cmd_key": db_key,
+        "mqtt_username": str(row["mqtt_username"] or ""),
+        "mqtt_password": str(row["mqtt_password"] or ""),
+        "zone": str(row["zone"] or "all").strip() or "all",
+        "qr_code": str(row["qr_code"] or ""),
+    }
+
+
+@app.post("/device/ota/report")
+def device_ota_report(body: DeviceOtaReportRequest) -> dict[str, Any]:
+    """Device HTTP: OTA outcome (duplicate path alongside MQTT ota.result for post-OTA recovery)."""
+    mac = _norm_mac_nocolon12(body.mac_nocolon)
+    if len(mac) != 12:
+        raise HTTPException(status_code=400, detail="invalid mac_nocolon")
+    row = _provision_row_for_device_mac(body.device_id, mac)
+    if not row:
+        raise HTTPException(status_code=404, detail="device not provisioned")
+    did = str(row["device_id"])
+    db_key = str(row["cmd_key"] or "").strip().upper()
+    rep = (body.cmd_key or "").strip().upper()
+    if rep and (not is_hex_16(rep) or rep != db_key):
+        raise HTTPException(status_code=403, detail="cmd_key does not match server")
+    owner = _lookup_owner_admin(did) or ""
+    payload: dict[str, Any] = {
+        "type": "ota.result",
+        "ok": bool(body.ok),
+        "detail": (body.detail or "")[:240],
+        "campaign_id": (body.campaign_id or "").strip(),
+        "target_fw": (body.target_fw or "").strip(),
+        "current_fw": (body.current_fw or "").strip(),
+    }
+    cid = str(payload.get("campaign_id") or "")
+    if cid and not cid.endswith("#rollback"):
+        _handle_ota_result_safe(did, payload)
+    else:
+        emit_event(
+            level="info" if body.ok else "warn",
+            category="ota",
+            event_type="ota.device.http_report",
+            summary=f"{did} ota http report ok={body.ok}",
+            actor=f"device:{did}",
+            target=owner or None,
+            owner_admin=owner or None,
+            device_id=did,
+            detail=payload,
+        )
+    return {"ok": True, "status": "recorded"}
 
 
 @app.get("/auth/me")
@@ -6081,6 +6279,24 @@ def device_factory_unregister(
 def health() -> dict[str, Any]:
     """Liveness for load balancers / `curl` — intentionally **no** auth so Uptime
     Kuma, Docker healthchecks, and reverse proxies can probe without a token."""
+    ready = api_ready_event.is_set() and not api_bootstrap_error
+    if not HEALTH_PUBLIC_DETAIL:
+        # Enough for dashboard MQTT pills / overview; omits smtp/telegram/fcm internals.
+        body = {
+            "ok": bool(ready),
+            "ready": ready,
+            "starting": not api_ready_event.is_set(),
+            "mqtt_connected": mqtt_connected,
+            "mqtt_ingest_queue_depth": mqtt_ingest_queue.qsize(),
+            "mqtt_ingest_dropped": mqtt_ingest_dropped,
+            "mqtt_last_connect_at": mqtt_last_connect_at,
+            "mqtt_last_disconnect_at": mqtt_last_disconnect_at,
+            "mqtt_last_disconnect_reason": mqtt_last_disconnect_reason,
+            "ts": int(time.time()),
+        }
+        if api_bootstrap_error:
+            body["bootstrap_error"] = api_bootstrap_error
+        return body
     tg: dict[str, Any] = {}
     try:
         from telegram_notify import telegram_status
@@ -6095,8 +6311,7 @@ def health() -> dict[str, Any]:
         fcm = dict(fcm_status())
     except Exception as exc:
         fcm = {"enabled": False, "error": str(exc), "queue_size": 0, "worker_running": False}
-    ready = api_ready_event.is_set() and not api_bootstrap_error
-    body: dict[str, Any] = {
+    body = {
         "ok": bool(ready),
         "ready": ready,
         "starting": not api_ready_event.is_set(),
@@ -11146,11 +11361,17 @@ def _sse_format(ev: dict[str, Any]) -> str:
     return f"id: {ev.get('id') or ''}\nevent: {ev.get('event_type') or 'event'}\ndata: {json.dumps(ev_out, ensure_ascii=False)}\n\n"
 
 
-def _principal_from_sse_headers_or_query(authorization: Optional[str], token: Optional[str]) -> Principal:
-    """Browsers can't set Authorization on EventSource, so fall back to ?token=."""
+def _principal_from_sse_headers_or_query(
+    authorization: Optional[str],
+    token: Optional[str],
+    cookie_token: Optional[str],
+) -> Principal:
+    """Prefer Authorization; optional legacy ?token= when SSE_ALLOW_QUERY_TOKEN; else HttpOnly cookie."""
     auth_header = authorization
-    if not auth_header and token:
+    if not auth_header and SSE_ALLOW_QUERY_TOKEN and token:
         auth_header = f"Bearer {token}"
+    if not auth_header and JWT_USE_HTTPONLY_COOKIE and cookie_token:
+        auth_header = f"Bearer {str(cookie_token).strip()}"
     if not auth_header:
         raise HTTPException(status_code=401, detail="missing bearer token")
     return require_principal(authorization=auth_header)
@@ -11162,7 +11383,7 @@ def events_stream(
     authorization: Optional[str] = Header(default=None),
     token: Optional[str] = Query(
         default=None,
-        description="Optional: auth for clients that cannot set Authorization (legacy). Prefer Authorization header.",
+        description="Legacy only when SSE_ALLOW_QUERY_TOKEN=1. Prefer Authorization header or session cookie.",
     ),
     min_level: Optional[str] = Query(default=None, pattern="^(debug|info|warn|error|critical)$"),
     category: Optional[str] = Query(default=None, max_length=32),
@@ -11170,7 +11391,9 @@ def events_stream(
     q: Optional[str] = Query(default=None, max_length=120),
     backlog: int = Query(default=100, ge=0, le=500),
 ) -> StreamingResponse:
-    principal = _principal_from_sse_headers_or_query(authorization, token)
+    ck = request.cookies.get(JWT_COOKIE_NAME) if JWT_USE_HTTPONLY_COOKIE else None
+    qtok = token if SSE_ALLOW_QUERY_TOKEN else None
+    principal = _principal_from_sse_headers_or_query(authorization, qtok, ck)
     assert_min_role(principal, "user")
 
     filters: dict[str, Any] = {

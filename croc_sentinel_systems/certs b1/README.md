@@ -1,10 +1,12 @@
 # MQTT TLS Certificates
 
+**Do not commit `*.key` files** — they are gitignored; generate locally or in CI secrets.
+
 Place these files in this folder for Mosquitto TLS:
 
 - `ca.crt`
 - `server.crt`
-- `server.key`
+- `server.key` (generated; not in repo)
 
 Example self-signed setup (for staging/testing):
 
