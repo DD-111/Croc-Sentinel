@@ -827,6 +827,9 @@ body[data-layout="auth"] .view {
 .site-footer--shell {
   flex-shrink: 0;
   margin-top: auto;
+  position: sticky;
+  bottom: 0;
+  z-index: 12;
   padding: 12px var(--gap) 14px;
   padding-left: max(var(--gap), env(safe-area-inset-left, 0px));
   padding-right: max(var(--gap), env(safe-area-inset-right, 0px));
@@ -1476,6 +1479,10 @@ table.t tr.sub td { background: var(--bg-muted); }
 .stat .sub { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
 
 .device-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); }
+#allDevicesGrid.device-grid { grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 1460px) {
+  #allDevicesGrid.device-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 .device-grid--skeleton { min-height: 120px; }
 .device-card--skeleton {
   display: flex;
@@ -1548,10 +1555,10 @@ table.t tr.sub td { background: var(--bg-muted); }
 /* #/devices list — same card grid, row layout + small letter thumbnail */
 .device-card--row-thumb {
   flex-direction: row;
-  align-items: flex-start;
-  gap: 10px;
+  align-items: center;
+  gap: 12px;
   text-align: left;
-  padding: 10px 11px;
+  padding: 11px 12px;
 }
 .device-card--row-thumb .device-card--row-body {
   flex: 1;
@@ -1560,7 +1567,7 @@ table.t tr.sub td { background: var(--bg-muted); }
   box-sizing: border-box;
   display: flex;
   flex-direction: column;
-  gap: 0;
+  gap: 2px;
 }
 .device-card--row-thumb .device-card__h3 {
   margin: 0;
@@ -1659,7 +1666,7 @@ table.t tr.sub td { background: var(--bg-muted); }
   flex-wrap: wrap;
   align-items: center;
   gap: 6px 10px;
-  margin-top: 4px;
+  margin-top: 2px;
   width: 100%;
   box-sizing: border-box;
 }

@@ -136,6 +136,10 @@ ALARM_FANOUT_SELF = os.getenv("ALARM_FANOUT_SELF", "0") == "1"
 # QoS1 can redeliver duplicate event frames after reconnect; suppress repeated
 # sibling fan-out for the same logical alarm event in this short window.
 ALARM_EVENT_DEDUP_WINDOW_SEC = int(os.getenv("ALARM_EVENT_DEDUP_WINDOW_SEC", "8"))
+AUTO_RECONCILE_ENABLED = os.getenv("AUTO_RECONCILE_ENABLED", "1") == "1"
+AUTO_RECONCILE_COOLDOWN_SEC = int(os.getenv("AUTO_RECONCILE_COOLDOWN_SEC", "180"))
+AUTO_RECONCILE_MAX_PER_TICK = max(1, int(os.getenv("AUTO_RECONCILE_MAX_PER_TICK", "2")))
+PENDING_CLAIM_STALE_SECONDS = int(os.getenv("PENDING_CLAIM_STALE_SECONDS", str(24 * 3600)))
 # Per-IP login lockout (replaces old sliding-window LOGIN_RATE_* on /auth/login only).
 # Tier 0: FAILS wrong → lock LOCK0 s; tier 1: FAILS → lock LOCK1; tier 2+: FAILS → lock LOCK2. Success clears IP state.
 LOGIN_LOCK_TIER0_FAILS = max(1, int(os.getenv("LOGIN_LOCK_TIER0_FAILS", "5")))
@@ -271,6 +275,9 @@ mqtt_last_disconnect_at = ""
 mqtt_last_disconnect_reason = ""
 alarm_event_dedup_lock = threading.Lock()
 alarm_event_dedup_seen: dict[str, float] = {}
+auto_reconcile_lock = threading.Lock()
+auto_reconcile_queue: collections.deque[tuple[str, str]] = collections.deque()
+auto_reconcile_last_seen: dict[str, float] = {}
 # Deferred bootstrap: ASGI binds immediately; heavy IO runs on api-bootstrap thread.
 api_ready_event = threading.Event()
 api_bootstrap_error: Optional[str] = None
@@ -2019,6 +2026,167 @@ def _alarm_event_is_duplicate(device_id: str, payload: dict[str, Any]) -> bool:
     return False
 
 
+def _is_ack_key_mismatch(payload: dict[str, Any]) -> bool:
+    """Detect device-side command auth mismatch from ACK payload."""
+    if bool(payload.get("ok", True)):
+        return False
+    detail = str(payload.get("detail") or "").strip().lower()
+    if not detail:
+        return False
+    return detail in ("bad key", "device cmd_key unset", "key not 16 hex", "missing key")
+
+
+def _enqueue_auto_reconcile(device_id: str, reason: str) -> None:
+    if not AUTO_RECONCILE_ENABLED:
+        return
+    did = str(device_id or "").strip().upper()
+    if not did:
+        return
+    now = time.time()
+    with auto_reconcile_lock:
+        last = auto_reconcile_last_seen.get(did, 0.0)
+        if (now - last) < max(1, AUTO_RECONCILE_COOLDOWN_SEC):
+            return
+        auto_reconcile_last_seen[did] = now
+        auto_reconcile_queue.append((did, str(reason or "auto")))
+
+
+def _run_auto_reconcile_once(device_id: str, reason: str) -> bool:
+    """Re-dispatch bootstrap assign with a fresh cmd_key for mismatched devices."""
+    if not AUTO_RECONCILE_ENABLED:
+        return False
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT pc.device_id, pc.mac_nocolon, IFNULL(pc.zone,'all') AS zone, IFNULL(pc.qr_code,'') AS qr_code
+            FROM provisioned_credentials pc
+            WHERE UPPER(pc.device_id)=UPPER(?)
+            LIMIT 1
+            """,
+            (device_id,),
+        )
+        prov = cur.fetchone()
+        if not prov:
+            conn.close()
+            return False
+        did = str(prov["device_id"])
+        mac = str(prov["mac_nocolon"] or "").upper()
+        zone = str(prov["zone"] or "all").strip() or "all"
+        qr = str(prov["qr_code"] or "")
+        cur.execute(
+            """
+            SELECT claim_nonce, IFNULL(proposed_device_id,'') AS proposed_device_id
+            FROM pending_claims
+            WHERE mac_nocolon = ?
+            LIMIT 1
+            """,
+            (mac,),
+        )
+        pending = cur.fetchone()
+        if not pending:
+            conn.close()
+            emit_event(
+                level="warn",
+                category="provision",
+                event_type="provision.auto_reconcile.skipped",
+                summary=f"auto-reconcile skipped for {did} (no pending_claim)",
+                actor="system",
+                target=did,
+                device_id=did,
+                detail={"reason": reason, "mac_nocolon": mac},
+            )
+            return False
+        claim_nonce = str(pending["claim_nonce"] or "").strip()
+        if len(claim_nonce) != 16:
+            conn.close()
+            return False
+        mqtt_u, mqtt_p, cmd_key = generate_device_credentials(did)
+        cur.execute(
+            """
+            UPDATE provisioned_credentials
+            SET mqtt_username=?, mqtt_password=?, cmd_key=?, zone=?, qr_code=?, claimed_at=?
+            WHERE device_id=?
+            """,
+            (mqtt_u, mqtt_p, cmd_key, zone, qr, utc_now_iso(), did),
+        )
+        # Auto-rebind: keep pending proposed ID aligned to active provisioned device_id.
+        cur.execute(
+            "UPDATE pending_claims SET proposed_device_id = ? WHERE mac_nocolon = ?",
+            (did, mac),
+        )
+        conn.commit()
+        conn.close()
+    publish_bootstrap_claim(
+        mac_nocolon=mac,
+        claim_nonce=claim_nonce,
+        device_id=did,
+        zone=zone,
+        qr_code=qr if qr else f"CROC-{mac}",
+        mqtt_username=mqtt_u,
+        mqtt_password=mqtt_p,
+        cmd_key=cmd_key,
+    )
+    audit_event("system", "provision.auto_reconcile", did, {"reason": reason, "mac_nocolon": mac})
+    emit_event(
+        level="warn",
+        category="provision",
+        event_type="provision.auto_reconcile.dispatched",
+        summary=f"auto-reconcile assign dispatched for {did}",
+        actor="system",
+        target=did,
+        device_id=did,
+        detail={"reason": reason, "mac_nocolon": mac},
+    )
+    return True
+
+
+def _auto_reconcile_tick() -> None:
+    if not AUTO_RECONCILE_ENABLED:
+        return
+    batch: list[tuple[str, str]] = []
+    with auto_reconcile_lock:
+        for _ in range(min(AUTO_RECONCILE_MAX_PER_TICK, len(auto_reconcile_queue))):
+            batch.append(auto_reconcile_queue.popleft())
+    for did, why in batch:
+        try:
+            _run_auto_reconcile_once(did, why)
+        except Exception as exc:
+            logger.warning("auto_reconcile failed for %s: %s", did, exc)
+
+
+def _prune_stale_pending_claims() -> None:
+    """Remove old pending_claim rows and keep proposed_device_id aligned by MAC."""
+    if PENDING_CLAIM_STALE_SECONDS <= 0:
+        return
+    cutoff = datetime.fromtimestamp(time.time() - PENDING_CLAIM_STALE_SECONDS, tz=timezone.utc).isoformat()
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        # Rebind pending proposed_device_id to known provisioned device_id by MAC.
+        cur.execute(
+            """
+            UPDATE pending_claims
+            SET proposed_device_id = (
+                SELECT pc.device_id FROM provisioned_credentials pc
+                WHERE pc.mac_nocolon = pending_claims.mac_nocolon LIMIT 1
+            )
+            WHERE EXISTS (
+                SELECT 1 FROM provisioned_credentials pc
+                WHERE pc.mac_nocolon = pending_claims.mac_nocolon
+            )
+            """
+        )
+        # Clear stale rows that no longer refreshed by bootstrap.register.
+        cur.execute("DELETE FROM pending_claims WHERE last_seen_at < ?", (cutoff,))
+        deleted = int(cur.rowcount or 0)
+        conn.commit()
+        conn.close()
+    if deleted:
+        logger.info("pending_claims: pruned %d stale row(s)", deleted)
+
+
 def _lookup_owner_admin(device_id: str) -> Optional[str]:
     with db_lock:
         conn = get_conn()
@@ -3118,6 +3286,9 @@ def _dispatch_mqtt_payload(topic: str, payload: dict[str, Any]) -> None:
             daemon=True,
         )
         t.start()
+
+    if channel == "ack" and device_id and _is_ack_key_mismatch(payload):
+        _enqueue_auto_reconcile(device_id, "ack_key_mismatch")
 
     if channel in ("heartbeat", "status", "ack", "event") and device_id:
         try:
@@ -7912,6 +8083,7 @@ def scheduler_loop() -> None:
     next_probe_at = time.time() + 30  # kick probe worker ~30s after boot
     next_events_retention_at = time.time() + 300  # first retention pass ~5 min after boot
     next_pwd_prune_at = time.time() + 900
+    next_pending_claim_prune_at = time.time() + 120
     while not scheduler_stop.is_set():
         now_ts = int(time.time())
         jobs: list[sqlite3.Row] = []
@@ -7972,6 +8144,10 @@ def scheduler_loop() -> None:
             _expire_presence_probes_waiting_ack()
         except Exception as exc:
             logger.warning("presence probe ack expiry failed: %s", exc)
+        try:
+            _auto_reconcile_tick()
+        except Exception as exc:
+            logger.warning("auto reconcile tick failed: %s", exc)
 
         now = time.time()
         if now >= next_cleanup_at:
@@ -8011,6 +8187,13 @@ def scheduler_loop() -> None:
             except Exception as exc:
                 logger.warning("password reset token prune failed: %s", exc)
             next_pwd_prune_at = now + 21600  # every 6h
+
+        if now >= next_pending_claim_prune_at:
+            try:
+                _prune_stale_pending_claims()
+            except Exception as exc:
+                logger.warning("pending_claim prune failed: %s", exc)
+            next_pending_claim_prune_at = now + 900
 
         scheduler_stop.wait(SCHEDULER_POLL_SECONDS)
 

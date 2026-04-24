@@ -60,11 +60,10 @@
     return `
       <footer class="site-footer site-footer--auth" aria-label="Page footer">
         <div class="site-footer__row site-footer__row--auth">
-          <div class="site-footer__brand site-footer__brand--company" role="group" aria-label="ESA · Croc Sentinel">
+          <div class="site-footer__brand site-footer__brand--company" role="group" aria-label="ESA">
             <div class="site-footer__wordmark" lang="en">ESA</div>
-            <p class="site-footer__product">Croc Sentinel <span class="site-footer__product-pill">console</span></p>
           </div>
-          <p class="site-footer__legal">© 2026 · Private operations</p>
+          <p class="site-footer__legal">CROC AI</p>
         </div>
       </footer>`;
   }
@@ -113,9 +112,9 @@
         </div>
         <div class="auth-surface__side-foot" role="group" aria-label="Partners">
           <div class="auth-surface__partner-logos">
-            <img class="auth-surface__partner-logo" src="assets/partners/partner-1.png" alt="" data-partner-slot="1" loading="lazy" decoding="async" onerror="this.style.display='none'" />
-            <img class="auth-surface__partner-logo" src="assets/partners/partner-2.png" alt="" data-partner-slot="2" loading="lazy" decoding="async" onerror="this.style.display='none'" />
-            <img class="auth-surface__partner-logo" src="assets/partners/partner-3.png" alt="" data-partner-slot="3" loading="lazy" decoding="async" onerror="this.style.display='none'" />
+            <img class="auth-surface__partner-logo" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==" alt="" data-partner-slot="1" loading="lazy" decoding="async" />
+            <img class="auth-surface__partner-logo" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==" alt="" data-partner-slot="2" loading="lazy" decoding="async" />
+            <img class="auth-surface__partner-logo" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==" alt="" data-partner-slot="3" loading="lazy" decoding="async" />
           </div>
         </div>
       </aside>`;
@@ -4744,7 +4743,7 @@
         </section>
 
         <dialog id="activateWifiDialog" class="activate-wifi-dlg">
-          <div class="activate-wifi-dlg__inner">
+          <form class="activate-wifi-dlg__inner" onsubmit="return false">
             <h3 class="activate-wifi-dlg__title">Target Wi‑Fi</h3>
             <p class="muted activate-wifi-dlg__lead">
               If the device has <strong>never been online</strong>, the server cannot push Wi‑Fi to it directly. SSID/password here are saved only in <strong>this browser</strong>; after claim, paste them into the device page for MQTT delivery. Leave password empty on open networks.
@@ -4763,7 +4762,7 @@
               <button type="button" class="btn" id="activateWifiDlgSave">Save to this browser</button>
               <button type="button" class="btn secondary" id="activateWifiDlgClear">Clear draft</button>
             </div>
-          </div>
+          </form>
         </dialog>
 
         <section class="card activate-pending-card">

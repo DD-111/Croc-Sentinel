@@ -94,6 +94,15 @@
 
 ---
 
+## 4.1 Auto-Reconcile（cmd_key mismatch 自愈）
+
+- **Detect key mismatch**：当设备 `ack` 报文出现 `ok=false` 且 `detail` 为 `bad key` / `device cmd_key unset`（等）时，服务端自动入队 reconcile。  
+- **Auto trigger re-claim**：调度器执行 reconcile 时，会给该设备生成新 `mqtt_username` / `mqtt_password` / `cmd_key`，并复用当前 `pending_claims.claim_nonce` 重新发布 `bootstrap.assign`。  
+- **Auto clear stale pending_claims**：定时清理长时间未刷新的 `pending_claims`（默认 24h，`PENDING_CLAIM_STALE_SECONDS`）。  
+- **Auto rebind device**：按 `mac_nocolon` 对齐 `pending_claims.proposed_device_id` 到当前 `provisioned_credentials.device_id`，避免 pending 与已注册 ID 漂移。  
+
+---
+
 ## 5. 与《白话总览》的边界
 
 `OVERVIEW_CN.md` 里「按一下全响」是概括。**实际上**：兄弟是否响取决于 **组名（归一化）+ owner + zone + 策略 + 在线 + 上限**，且 **恐慌时本机由固件、兄弟由 MQTT**。
