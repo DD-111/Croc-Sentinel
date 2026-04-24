@@ -37,6 +37,10 @@
 #ifndef DEVICE_SYNC_TLS_INSECURE
 #define DEVICE_SYNC_TLS_INSECURE 0
 #endif
+// 0 = only at boot (after IP). >0 = periodic HTTP boot-sync for cmd_key self-heal / server authority.
+#ifndef DEVICE_SYNC_BOOT_INTERVAL_MS
+#define DEVICE_SYNC_BOOT_INTERVAL_MS (15UL * 60UL * 1000UL)
+#endif
 
 #if OTA_ENABLED
 #include <HTTPUpdate.h>
@@ -708,6 +712,9 @@ static size_t sPendingCmdLen = 0;
 static volatile bool sPendingCmdArm = false;
 static unsigned long s_mqttCmdGraceUntilMs = 0;
 static volatile bool s_mqttPostConnectPublish = false;
+#if DEVICE_SYNC_HTTP_ENABLED
+static unsigned long s_lastBootSyncHttpAtMs = 0;
+#endif
 
 // ═══════════════════════════════════════════════
 //  Utility
@@ -2266,6 +2273,11 @@ static void applyBootSyncResyncPayload(JsonObject doc) {
   prefs.end();
   loadProvisioningRuntime();
   logLine("[sync] NVS updated from boot-sync resync");
+  // Pick up new mqtt user/pass (and cmd_key for /cmd) on next connect.
+  if (mqttClient.connected()) {
+    mqttClient.disconnect();
+    logLine("[sync] MQTT disconnected to reconnect after resync");
+  }
 }
 
 void performDeviceBootSyncHttp() {
@@ -2809,6 +2821,7 @@ void setup() {
 #if DEVICE_SYNC_HTTP_ENABLED
     if (isProvisioned) {
       performDeviceBootSyncHttp();
+      s_lastBootSyncHttpAtMs = millis();
     }
 #endif
   }
@@ -2841,6 +2854,15 @@ void loop() {
 
   ensureWiFi();
   ensureMqtt();
+
+#if DEVICE_SYNC_HTTP_ENABLED
+  if (DEVICE_SYNC_BOOT_INTERVAL_MS > 0 && isProvisioned && netIf->connected()) {
+    if ((now - s_lastBootSyncHttpAtMs) >= DEVICE_SYNC_BOOT_INTERVAL_MS) {
+      s_lastBootSyncHttpAtMs = now;
+      performDeviceBootSyncHttp();
+    }
+  }
+#endif
 
   if (mqttClient.connected()) {
     mqttClient.loop();

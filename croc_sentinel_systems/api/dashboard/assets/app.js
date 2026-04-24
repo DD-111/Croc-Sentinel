@@ -133,6 +133,8 @@
     me: null,
     mqttConnected: false,
     health: null,
+    /** Last successful GET /health (ms); used to label pill staleness. */
+    healthFetchedAt: 0,
     overviewCache: null,
     routeSeq: 0,
   };
@@ -342,9 +344,9 @@
     loadHealth();
   }
 
-  /** When MQTT is down, poll faster so the green dot tracks reality (not a 30s stale snapshot). */
-  const HEALTH_POLL_SLOW_MS = 12000;
-  const HEALTH_POLL_FAST_MS = 3500;
+  /** When MQTT is down, poll faster so the green dot tracks reality (not a stale snapshot). */
+  const HEALTH_POLL_SLOW_MS = 8000;
+  const HEALTH_POLL_FAST_MS = 3000;
 
   function armHealthPoll() {
     clearHealthPollTimer();
@@ -538,7 +540,9 @@
 
   /** Read chunked text/event-stream; invokes onFrame(type, payload) where type is "message"|"ping". */
   const SSE_PARSE_BUF_MAX = 262144;
-  async function pumpSseBody(reader, signal, onFrame) {
+  /** If no bytes for this long while "live", abort fetch to recover half-open TCP (client-side). */
+  const SSE_STALL_ABORT_MS = 90000;
+  async function pumpSseBody(reader, signal, onFrame, onReadActivity) {
     const dec = new TextDecoder();
     let buf = "";
     while (!signal.aborted) {
@@ -550,6 +554,11 @@
       }
       const { done, value } = chunk || {};
       if (done) break;
+      if (onReadActivity && value && value.byteLength) {
+        try {
+          onReadActivity();
+        } catch (_) {}
+      }
       buf += dec.decode(value, { stream: true });
       if (buf.length > SSE_PARSE_BUF_MAX) {
         const cut = buf.lastIndexOf("\n\n", buf.length - 65536);
@@ -1183,6 +1192,7 @@
       const h = await r.json();
       state.mqttConnected = !!h.mqtt_connected;
       state.health = h;
+      state.healthFetchedAt = Date.now();
     } catch {
       state.mqttConnected = false;
       state.health = null;
@@ -1287,8 +1297,11 @@
       setHtmlIfChanged(el, "");
       return;
     }
-    const sm = state.health.smtp || {};
-    const tg = state.health.telegram || {};
+    const h = state.health;
+    const smtpHidden = !Object.prototype.hasOwnProperty.call(h, "smtp");
+    const tgHidden = !Object.prototype.hasOwnProperty.call(h, "telegram");
+    const sm = h.smtp || {};
+    const tg = h.telegram || {};
     const mailOk = !!sm.configured && !!sm.worker_running;
     const tgOn = !!tg.enabled;
     const tgOk = tgOn && !!tg.worker_running;
@@ -1299,30 +1312,47 @@
     const mqLastUp = String(state.health.mqtt_last_connect_at || "");
     const mqLastDown = String(state.health.mqtt_last_disconnect_at || "");
     const mqLastReason = String(state.health.mqtt_last_disconnect_reason || "");
-    const mailTitle = sm.configured
-      ? (mailOk ? "Mail worker running — verification email can be sent" : "Mail channel configured but worker not running — check API logs")
-      : "Mail channel not configured on server";
-    const tgTitle = tgOn
-      ? (tgOk
-        ? (tgErr ? `Telegram worker up — last API error: ${tgErr}` : "Telegram worker running — events at min_level+ are queued")
-        : "Telegram enabled but worker not running — check API logs")
-      : "Telegram disabled — set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS (numeric chat id; start a chat with the bot first)";
-    const mqttTitle = mqConn
+    const ageSec =
+      state.healthFetchedAt > 0 ? Math.max(0, Math.round((Date.now() - state.healthFetchedAt) / 1000)) : null;
+    const staleHint = ageSec != null ? ` Health snapshot age ~${ageSec}s (browser polls /health).` : "";
+    const mqttLegHint =
+      " This pill is API→broker ingest (server-side), not your browser WebSocket.";
+    const mailTitle = smtpHidden
+      ? "Mail status not included in /health response — upgrade API or set HEALTH_PUBLIC_DETAIL=1 for full detail."
+      : sm.configured
+        ? (mailOk ? "Mail worker running — verification email can be sent" : "Mail channel configured but worker not running — check API logs")
+        : "Mail channel not configured on server";
+    const tgTitle = tgHidden
+      ? "Telegram status not included in /health response — upgrade API or set HEALTH_PUBLIC_DETAIL=1 for full detail."
+      : tgOn
+        ? (tgOk
+          ? (tgErr ? `Telegram worker up — last API error: ${tgErr}` : "Telegram worker running — events at min_level+ are queued")
+          : "Telegram enabled but worker not running — check API logs")
+        : "Telegram disabled — set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS (numeric chat id; start a chat with the bot first)";
+    const mqttTitle = (mqConn
       ? (mqDrop > 0
-        ? `MQTT connected, but ingest dropped ${mqDrop} message(s); queue depth=${mqQ}. last_up=${mqLastUp ? fmtTs(mqLastUp) : "—"}`
-        : `MQTT connected; ingest queue depth=${mqQ}. last_up=${mqLastUp ? fmtTs(mqLastUp) : "—"}`)
-      : `MQTT disconnected — check broker/TLS/network. last_down=${mqLastDown ? fmtTs(mqLastDown) : "—"} reason=${mqLastReason || "—"}`;
+        ? `MQTT ingest connected, but dropped ${mqDrop} message(s); queue depth=${mqQ}. last_up=${mqLastUp ? fmtTs(mqLastUp) : "—"}`
+        : `MQTT ingest connected; queue depth=${mqQ}. last_up=${mqLastUp ? fmtTs(mqLastUp) : "—"}`)
+      : `MQTT ingest disconnected — remote/device commands may fail until broker is back. last_down=${mqLastDown ? fmtTs(mqLastDown) : "—"} reason=${mqLastReason || "—"}`) +
+      staleHint +
+      mqttLegHint;
+    const mailPillClass = smtpHidden ? "neutral" : mailOk ? "ok" : sm.configured ? "warn" : "off";
+    const tgPillClass = tgHidden ? "neutral" : tgOk ? "ok" : tgOn ? "warn" : "off";
     setHtmlIfChanged(el, `
       <span class="health-pill ${mqConn ? (mqDrop > 0 ? "warn" : "ok") : "off"}" title="${escapeHtml(mqttTitle)}">MQTT</span>
-      <span class="health-pill ${mailOk ? "ok" : sm.configured ? "warn" : "off"}" title="${escapeHtml(mailTitle)}">MAIL</span>
-      <span class="health-pill ${tgOk ? "ok" : tgOn ? "warn" : "off"}" title="${escapeHtml(tgTitle)}">TG</span>`);
+      <span class="health-pill ${mailPillClass}" title="${escapeHtml(mailTitle)}">MAIL</span>
+      <span class="health-pill ${tgPillClass}" title="${escapeHtml(tgTitle)}">TG</span>`);
   }
 
   function renderMqttDot() {
     const dot = $("#mqttDot");
     if (!dot) return;
     dot.className = "dot-status " + (state.mqttConnected ? "ok" : "bad");
-    dot.title = state.mqttConnected ? "MQTT up" : "MQTT down";
+    const age =
+      state.healthFetchedAt > 0 ? Math.max(0, Math.round((Date.now() - state.healthFetchedAt) / 1000)) : null;
+    dot.title = state.mqttConnected
+      ? `API MQTT ingest up (server→broker). Snapshot ~${age != null ? age + "s" : "?" } old — see /health poll.`
+      : `API MQTT ingest down. Snapshot ~${age != null ? age + "s" : "?" } old — remote commands may fail.`;
   }
 
   function setCrumb(text) { const el = $("#crumb"); if (el) el.textContent = text; }
@@ -5094,7 +5124,8 @@
     const BUFFER_MAX = 180;
     const RENDER_LIMIT = 150;
     let evRenderTimer = 0;
-    let evReconnectBackoffMs = 800;
+    let evReconnectBackoffMs = 500;
+    let evStallTimer = null;
 
     function badgeClass(lvl) {
       return ({
@@ -5212,6 +5243,10 @@
     }
 
     function closeStream() {
+      if (evStallTimer) {
+        try { clearInterval(evStallTimer); } catch (_) {}
+        evStallTimer = null;
+      }
       if (window.__evReconnectTimer) {
         try { clearTimeout(window.__evReconnectTimer); } catch (_) {}
         window.__evReconnectTimer = 0;
@@ -5254,13 +5289,13 @@
 
       const scheduleReconnect = () => {
         if (!isRouteCurrent(navTok) || paused || window.__evReconnectTimer) return;
-        const wait = evReconnectBackoffMs + Math.floor(Math.random() * 480);
+        const wait = evReconnectBackoffMs + Math.floor(Math.random() * 400);
         window.__evReconnectTimer = setTimeout(() => {
           window.__evReconnectTimer = 0;
           if (!isRouteCurrent(navTok) || paused) return;
           openStream();
         }, wait);
-        evReconnectBackoffMs = Math.min(8000, Math.floor(evReconnectBackoffMs * 1.5));
+        evReconnectBackoffMs = Math.min(15000, Math.floor(evReconnectBackoffMs * 1.45));
       };
 
       const run = async () => {
@@ -5271,11 +5306,13 @@
         };
         if (tok) hdrs.Authorization = "Bearer " + tok;
         try {
+          let lastChunkAt = Date.now();
           const r = await fetch(url, {
             method: "GET",
             credentials: "include",
             headers: hdrs,
             signal: ac.signal,
+            cache: "no-store",
           });
           if (!isRouteCurrent(navTok)) return;
           if (!r.ok) {
@@ -5285,7 +5322,7 @@
           if (!r.body || typeof r.body.getReader !== "function") {
             throw new Error("Event stream unsupported in this browser");
           }
-          evReconnectBackoffMs = 800;
+          evReconnectBackoffMs = 500;
           shim.readyState = EventSource.OPEN;
           const liveOn = $("#evLive");
           if (liveOn) {
@@ -5293,19 +5330,43 @@
             liveOn.className = "badge online";
             liveOn.title = "Live stream connected";
           }
-          await pumpSseBody(r.body.getReader(), ac.signal, (kind, payload) => {
-            if (kind === "ping") return;
-            if (!isRouteCurrent(navTok)) return;
-            try {
-              const ev = JSON.parse(payload);
-              if (ev.event_type === "stream.hello") return;
-              pushEvent(ev);
-            } catch (_) {}
-          });
+          if (evStallTimer) {
+            try { clearInterval(evStallTimer); } catch (_) {}
+            evStallTimer = null;
+          }
+          evStallTimer = setInterval(() => {
+            if (paused || ac.signal.aborted || !isRouteCurrent(navTok)) return;
+            if (shim.readyState !== EventSource.OPEN) return;
+            if (Date.now() - lastChunkAt >= SSE_STALL_ABORT_MS) {
+              try {
+                ac.abort();
+              } catch (_) {}
+            }
+          }, 4000);
+          await pumpSseBody(
+            r.body.getReader(),
+            ac.signal,
+            (kind, payload) => {
+              if (kind === "ping") return;
+              if (!isRouteCurrent(navTok)) return;
+              try {
+                const ev = JSON.parse(payload);
+                if (ev.event_type === "stream.hello") return;
+                pushEvent(ev);
+              } catch (_) {}
+            },
+            () => {
+              lastChunkAt = Date.now();
+            },
+          );
+          if (evStallTimer) {
+            try { clearInterval(evStallTimer); } catch (_) {}
+            evStallTimer = null;
+          }
           if (ac.signal.aborted || !isRouteCurrent(navTok)) return;
           shim.readyState = EventSource.CLOSED;
           if (!paused && isRouteCurrent(navTok)) {
-            evReconnectBackoffMs = 800;
+            evReconnectBackoffMs = 500;
             const live = $("#evLive");
             if (live) {
               live.textContent = "Reconnecting…";
@@ -5314,6 +5375,10 @@
             scheduleReconnect();
           }
         } catch (e) {
+          if (evStallTimer) {
+            try { clearInterval(evStallTimer); } catch (_) {}
+            evStallTimer = null;
+          }
           if (e && e.name === "AbortError") return;
           if (!isRouteCurrent(navTok)) return;
           shim.readyState = EventSource.CLOSED;

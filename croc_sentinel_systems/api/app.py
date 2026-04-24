@@ -70,6 +70,9 @@ def _normalize_delete_confirm(raw: str) -> str:
 
 MQTT_HOST = os.getenv("MQTT_HOST", "mosquitto")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
+# Paho CONNECT keepalive (seconds). Higher values reduce control traffic and help some NATs;
+# must stay below broker / firewall idle cuts; typical 45–120.
+MQTT_KEEPALIVE = max(10, min(600, int(os.getenv("MQTT_KEEPALIVE", "60"))))
 MQTT_USERNAME = os.getenv("MQTT_USERNAME", "")
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
 # Broker listener is TLS-only (see mosquitto.conf.template): API must use TLS too.
@@ -228,7 +231,8 @@ EVENT_RING_SIZE = int(os.getenv("EVENT_RING_SIZE", "2000"))
 EVENT_SUB_QUEUE_SIZE = int(os.getenv("EVENT_SUB_QUEUE_SIZE", "500"))
 # SSE keepalive: comment + named `ping` event so proxies that strip `:`
 # comments still see traffic. Keep well below your reverse-proxy read_timeout (often 60s).
-EVENT_SSE_KEEPALIVE_SECONDS = int(os.getenv("EVENT_SSE_KEEPALIVE_SECONDS", "12"))
+# Default 9s works better than 12s with strict proxies / mobile networks.
+EVENT_SSE_KEEPALIVE_SECONDS = max(3, int(os.getenv("EVENT_SSE_KEEPALIVE_SECONDS", "9")))
 # Hint for browser EventSource automatic reconnect delay (milliseconds).
 EVENT_SSE_RETRY_MS = int(os.getenv("EVENT_SSE_RETRY_MS", "4000"))
 # Hard cap on concurrent SSE subscribers (cheap, but bound the damage).
@@ -3389,7 +3393,7 @@ def start_mqtt_loop() -> mqtt.Client:
     client.on_disconnect = on_disconnect
     client.on_message = on_message
     client.reconnect_delay_set(min_delay=1, max_delay=60)
-    client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=30)
+    client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=MQTT_KEEPALIVE)
     client.loop_start()
     return client
 
@@ -6275,13 +6279,32 @@ def device_factory_unregister(
     return _device_delete_reset_impl(device_id, principal, req, super_unclaim=True)
 
 
+def _health_notify_summary_public() -> tuple[dict[str, Any], dict[str, Any]]:
+    """Mail/TG liveness without secrets (for HEALTH_PUBLIC_DETAIL=0). Keeps dashboard pills honest."""
+    smtp = {"configured": notifier.enabled(), "worker_running": notifier.worker_alive()}
+    tg: dict[str, Any] = {"enabled": False, "worker_running": False, "last_error": ""}
+    try:
+        from telegram_notify import telegram_status
+
+        full = dict(telegram_status())
+        tg = {
+            "enabled": bool(full.get("enabled")),
+            "worker_running": bool(full.get("worker_running")),
+            "last_error": str(full.get("last_error") or "")[:240],
+        }
+    except Exception as exc:
+        tg = {"enabled": False, "worker_running": False, "last_error": str(exc)[:240]}
+    return smtp, tg
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     """Liveness for load balancers / `curl` — intentionally **no** auth so Uptime
     Kuma, Docker healthchecks, and reverse proxies can probe without a token."""
     ready = api_ready_event.is_set() and not api_bootstrap_error
     if not HEALTH_PUBLIC_DETAIL:
-        # Enough for dashboard MQTT pills / overview; omits smtp/telegram/fcm internals.
+        smtp, tg = _health_notify_summary_public()
+        # MQTT + mail/TG worker truth; FCM/token hints still only when HEALTH_PUBLIC_DETAIL=1.
         body = {
             "ok": bool(ready),
             "ready": ready,
@@ -6292,6 +6315,8 @@ def health() -> dict[str, Any]:
             "mqtt_last_connect_at": mqtt_last_connect_at,
             "mqtt_last_disconnect_at": mqtt_last_disconnect_at,
             "mqtt_last_disconnect_reason": mqtt_last_disconnect_reason,
+            "smtp": smtp,
+            "telegram": tg,
             "ts": int(time.time()),
         }
         if api_bootstrap_error:

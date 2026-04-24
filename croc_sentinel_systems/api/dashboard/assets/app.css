@@ -521,6 +521,10 @@ body[data-auth="ok"] .health-pills {
 .health-pill.ok { border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); color: var(--ok); background: var(--ok-weak); }
 .health-pill.warn { border-color: color-mix(in srgb, var(--warn) 50%, var(--border)); color: var(--warn); background: var(--warn-weak); }
 .health-pill.off { opacity: 0.55; }
+.health-pill.neutral {
+  border-style: dashed;
+  opacity: 0.85;
+}
 
 .sidebar-foot {
   border-top: 1px solid var(--border);

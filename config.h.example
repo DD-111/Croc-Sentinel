@@ -360,5 +360,9 @@
 #ifndef DEVICE_SYNC_TLS_INSECURE
 #define DEVICE_SYNC_TLS_INSECURE 0
 #endif
+// Milliseconds between HTTP boot-sync retries (cmd_key resync, server-as-source-of-truth). 0 = boot only.
+#ifndef DEVICE_SYNC_BOOT_INTERVAL_MS
+#define DEVICE_SYNC_BOOT_INTERVAL_MS (15UL * 60UL * 1000UL)
+#endif
 
 #endif
