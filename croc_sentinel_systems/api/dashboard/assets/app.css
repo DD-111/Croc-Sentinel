@@ -291,13 +291,43 @@ body[data-layout="app"] {
   grid-template-columns: var(--sidebar-w) 1fr;
   min-height: 100dvh;
   background: var(--bg-main);
+  align-content: start;
+  align-items: stretch;
+}
+/* One primary scroll region: #view. (Old 3-row grid on .main broke with 6+ main children + fixed .tabbar.) */
+.app-shell > .main {
+  min-width: 0;
+  min-height: 0; /* let grid item shrink; inner #view can overflow-scroll */
+  align-self: stretch;
+  max-height: 100dvh;
+  display: flex;
+  flex-direction: column;
 }
 
 .main {
-  display: grid;
-  grid-template-rows: var(--topbar-h) 1fr auto;
+  display: flex;
+  flex-direction: column;
   min-width: 0;
-  min-height: 100dvh;
+}
+.main > .topbar {
+  flex: 0 0 auto;
+}
+/* Scroll all routed content here; footer + fixed tabbar stay chromed outside this box. */
+.main > .view,
+.main > #view {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+body[data-layout="app"] .main > .view,
+body[data-layout="app"] .main > #view {
+  overflow-y: auto;
+}
+/* Shell footer sits under the scroll; keep it out of the 1fr flex grow. */
+body[data-layout="app"] .main > .site-footer--shell {
+  flex: 0 0 auto;
 }
 
 .view {
@@ -1184,7 +1214,17 @@ body[data-layout="auth"] .topbar,
 body[data-layout="auth"] .tabbar,
 body[data-layout="auth"] .site-footer--shell { display: none; }
 body[data-layout="auth"] .main {
-  grid-template-rows: 1fr auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 100dvh;
+  min-width: 0;
+  max-height: 100dvh;
+}
+body[data-layout="auth"] .main .view,
+body[data-layout="auth"] .main #view {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
 }
 
 .auth-surface {
@@ -2082,20 +2122,34 @@ body[data-boot-error="1"] .static-boot__retry { display: inline-block; }
   body[data-sidebar="collapsed"] .sidebar .btn-label,
   body[data-sidebar="collapsed"] .sidebar .who-card__body { display: initial; }
   .sidebar-rail-toggle { display: none; }
-  .main { grid-template-rows: var(--topbar-h) 1fr auto; }
   .menu-btn { display: inline-grid; }
   .tabbar { display: flex; }
-  .view { padding-bottom: calc(var(--tabbar-h) + var(--safe-bottom) + var(--sp-4)); }
-  .site-footer--shell { padding-bottom: calc(var(--tabbar-h) + var(--safe-bottom) + var(--sp-2)); }
+  /* App 路由：为底部 fixed tabbar 让位。登录/注册不显示 tabbar，见下方 auth 覆盖。 */
+  body[data-layout="app"] .view,
+  body[data-layout="app"] #view {
+    padding-bottom: calc(var(--tabbar-h) + var(--safe-bottom) + var(--sp-4));
+  }
+  body[data-layout="auth"] .view,
+  body[data-layout="auth"] #view {
+    padding-bottom: max(var(--sp-6), var(--safe-bottom));
+  }
+  /* .view 已在底部为 tabbar 让位；底栏只留 safe + 一缝，避免 107px 的“空条 + 再叠一层 tabbar 占位”感 */
+  .site-footer--shell {
+    padding-top: var(--sp-2);
+    padding-left: max(var(--sp-4), var(--safe-left));
+    padding-right: max(var(--sp-4), var(--safe-right));
+    padding-bottom: max(var(--sp-2), var(--safe-bottom));
+  }
+  /* 以上仅关主导航；设备/登录 单栏叠放 见下方 ≤768px 块。 */
+}
+
+/* 768px — 窄视口：单栏、登录侧栏在表单下、设备详情两列→一列、卡片等收紧。 */
+@media (max-width: 767.98px) {
   .device-focus-layout { grid-template-columns: 1fr; }
   .device-focus-right { position: static; }
   .device-hero-line .device-primary-name { font-size: var(--text-xl); }
   .auth-surface__inner--wide { grid-template-columns: 1fr; }
   .auth-surface__side { order: 2; padding: var(--sp-4); }
-}
-
-/* 768px — cards stack to single column, chips wrap. */
-@media (max-width: 767.98px) {
   :root {
     --sp-gutter: 14px;
     --sidebar-w: 100vw;
