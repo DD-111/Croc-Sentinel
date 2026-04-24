@@ -1,5 +1,6 @@
 fastapi==0.115.12
 uvicorn==0.34.2
+redis==5.2.1
 paho-mqtt==2.1.0
 bcrypt==4.2.1
 PyJWT==2.10.1

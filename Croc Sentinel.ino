@@ -712,6 +712,8 @@ static size_t sPendingCmdLen = 0;
 static volatile bool sPendingCmdArm = false;
 static unsigned long s_mqttCmdGraceUntilMs = 0;
 static volatile bool s_mqttPostConnectPublish = false;
+// Echo server cmd_id in ACK for correlation / idempotency (Phase 3 minimal).
+static char sPendingCmdIdForAck[40];
 #if DEVICE_SYNC_HTTP_ENABLED
 static unsigned long s_lastBootSyncHttpAtMs = 0;
 #endif
@@ -1374,16 +1376,20 @@ bool alarmInCooldown() {
 // ═══════════════════════════════════════════════
 
 void publishAck(const char *cmd, bool ok, const char *detail) {
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument<320> doc;
   doc["device_id"] = deviceId;
   doc["cmd"]       = cmd;
   doc["ok"]        = ok;
   doc["detail"]    = detail;
   doc["ts"]        = tsNow();
+  if (sPendingCmdIdForAck[0] != '\0') {
+    doc["cmd_id"] = sPendingCmdIdForAck;
+  }
 
-  char buf[256];
+  char buf[320];
   serializeJson(doc, buf, sizeof(buf));
   publishRaw(topicAck, buf, false);
+  sPendingCmdIdForAck[0] = '\0';
 }
 
 // Dedicated OTA result event. Carries campaign_id + target fw so the API can
@@ -2031,6 +2037,7 @@ static void handleCmdFromBody(const char *body) {
     strlcpy(lastError, "json_fail", sizeof(lastError));
     return;
   }
+  sPendingCmdIdForAck[0] = '\0';
   if (!isProvisioned) {
     return;
   }
@@ -2070,6 +2077,14 @@ static void handleCmdFromBody(const char *body) {
     return;
   }
 
+  {
+    const char *cid = doc["cmd_id"] | "";
+    size_t n = strlen(cid);
+    if (n > 0 && n < sizeof(sPendingCmdIdForAck)) {
+      strlcpy(sPendingCmdIdForAck, cid, sizeof(sPendingCmdIdForAck));
+    }
+  }
+
   const char *target = doc["target_id"] | "self";
   bool forMe   = (strcmp(target, deviceId) == 0);
   bool forAll  = (strcmp(target, "all") == 0);
@@ -2079,6 +2094,7 @@ static void handleCmdFromBody(const char *body) {
   macToDeviceId(macId, sizeof(macId));
   bool forMac  = (strcmp(target, macId) == 0);
   if (!forMe && !forAll && !isSelf && !forZone && !forMac) {
+    sPendingCmdIdForAck[0] = '\0';
     char line[192];
     snprintf(line, sizeof(line),
              "[mqtt] cmd ignored: target_id mismatch (target=%s me=%s zone=%s macId=%s)",

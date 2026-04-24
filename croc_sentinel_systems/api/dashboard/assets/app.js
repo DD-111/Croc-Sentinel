@@ -397,6 +397,14 @@
     return location.origin;
   }
 
+  /** ws:// / wss:// base matching apiBase() (Phase 2: /events/ws). */
+  function apiBaseToWsBase(httpBase) {
+    const s = String(httpBase || "").trim();
+    if (s.startsWith("https://")) return "wss://" + s.slice(8);
+    if (s.startsWith("http://")) return "ws://" + s.slice(7);
+    return s;
+  }
+
   /** Default ceiling so a stuck reverse-proxy / API cannot leave the SPA on “Loading…” forever. */
   const DEFAULT_API_TIMEOUT_MS = 45000;
   /** Route-level async guard: full page handlers may await several API calls (slow links / cold DB). */
@@ -4306,7 +4314,12 @@
         <div class="device-drawer__body danger-zone-body">
           <p class="muted danger-zone-compact-lead">Removes this device from your tenant and sends <span class="mono">unclaim_reset</span> when online. Re-add from Activate.</p>
           <div class="danger-zone-single-action">
-            <button class="btn danger sm danger-zone-unbind-btn" type="button" id="deleteReset" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Unbind &amp; reset</button>
+            <button class="btn danger sm danger-zone-unbind-btn" type="button" id="deleteReset" ${can("can_send_command") && !d.is_shared && canOperateThisDevice ? "" : "disabled"} title="${(() => {
+              if (!canOperateThisDevice) return "Operate access required";
+              if (!can("can_send_command")) return "can_send_command required";
+              if (d.is_shared) return "Not available on shared devices";
+              return "";
+            })()}">Unbind &amp; reset</button>
           </div>
         </div>
       </details>
@@ -4445,6 +4458,9 @@
         if (!confirm("Delete this device from current account records? You can re-add and reconfigure later.")) return;
         const typed = String(prompt(`Type device ID to confirm delete/reset:\n${id}`) || "").trim();
         if (typed.toUpperCase() !== String(id).toUpperCase()) { toast("Confirmation mismatch", "err"); return; }
+        deleteResetBtn.disabled = true;
+        toast("Unbind in progress (server may wait ~3s for device ack)…", "ok");
+        await new Promise((r) => requestAnimationFrame(() => r()));
         try {
           const dr = await api(`/devices/${encodeURIComponent(id)}/delete-reset`, {
             method: "POST",
@@ -4460,6 +4476,7 @@
           );
           location.hash = "#/devices";
         } catch (e) { toast(e.message || e, "err"); }
+        finally { deleteResetBtn.disabled = false; }
       });
     }
     const sendCmdBtn = $("#sendCmd");
@@ -4537,6 +4554,7 @@
           wifiApplyBtn.disabled = true;
           setWifiProgress(10);
           if (st) st.textContent = "Creating provision task…";
+          await new Promise((r) => requestAnimationFrame(() => r()));
           const chain = [];
           const cGi = $("#wifiChainGetInfo", view);
           const cPi = $("#wifiChainPing", view);
@@ -4552,9 +4570,14 @@
           });
           setWifiProgress(r.progress || 35);
           if (st) st.textContent = `Task ${r.task_id} running…`;
-          await pollWifiTask(r.task_id);
-        } catch (e) { toast(e.message || e, "err"); if (st) st.textContent = String(e.message || e); }
-        finally { wifiApplyBtn.disabled = false; }
+          void pollWifiTask(r.task_id).finally(() => {
+            wifiApplyBtn.disabled = false;
+          });
+        } catch (e) {
+          toast(e.message || e, "err");
+          if (st) st.textContent = String(e.message || e);
+          wifiApplyBtn.disabled = false;
+        }
       });
     }
     const tpPanicLocal = $("#tpPanicLocal");
@@ -5251,6 +5274,10 @@
         try { clearTimeout(window.__evReconnectTimer); } catch (_) {}
         window.__evReconnectTimer = 0;
       }
+      if (window.__evWS) {
+        try { window.__evWS.close(); } catch (_) {}
+        window.__evWS = null;
+      }
       if (window.__evSSE) {
         try { window.__evSSE.close(); } catch (_) {}
         window.__evSSE = null;
@@ -5263,9 +5290,8 @@
       if (live) { live.textContent = "Offline"; live.className = "badge offline"; }
     }
     /**
-     * Live events: use fetch() + ReadableStream instead of EventSource so we can send
-     * Authorization (JWT never appears in URL query — fewer proxy/logging issues).
-     * Server still emits ping keepalives for buffered proxies.
+     * Live events: prefer WebSocket (/events/ws); fall back to fetch()+SSE stream (cookie/JWT).
+     * Force SSE only: localStorage.setItem("croc.events.transport","sse")
      */
     function openStream() {
       if (!isRouteCurrent(navTok)) return;
@@ -5275,17 +5301,6 @@
       p.set("backlog", String(Math.min(100, slack)));
       const qs = p.toString();
       const tok = getToken();
-      const ac = new AbortController();
-      window.__evFetchAbort = ac;
-      const shim = {
-        readyState: EventSource.CONNECTING,
-        close() {
-          try { ac.abort(); } catch (_) {}
-          window.__evFetchAbort = null;
-          this.readyState = EventSource.CLOSED;
-        },
-      };
-      window.__evSSE = shim;
 
       const scheduleReconnect = () => {
         if (!isRouteCurrent(navTok) || paused || window.__evReconnectTimer) return;
@@ -5298,73 +5313,188 @@
         evReconnectBackoffMs = Math.min(15000, Math.floor(evReconnectBackoffMs * 1.45));
       };
 
-      const run = async () => {
-        const url = apiBase() + "/events/stream" + (qs ? "?" + qs : "");
-        const hdrs = {
-          Accept: "text/event-stream",
-          "Cache-Control": "no-store",
+      function startSseFetch() {
+        const ac = new AbortController();
+        window.__evFetchAbort = ac;
+        const shim = {
+          readyState: EventSource.CONNECTING,
+          close() {
+            try { ac.abort(); } catch (_) {}
+            window.__evFetchAbort = null;
+            this.readyState = EventSource.CLOSED;
+          },
         };
-        if (tok) hdrs.Authorization = "Bearer " + tok;
-        try {
-          let lastChunkAt = Date.now();
-          const r = await fetch(url, {
-            method: "GET",
-            credentials: "include",
-            headers: hdrs,
-            signal: ac.signal,
-            cache: "no-store",
-          });
-          if (!isRouteCurrent(navTok)) return;
-          if (!r.ok) {
-            const errText = await r.text().catch(() => "");
-            throw new Error(errText || String(r.status));
+        window.__evSSE = shim;
+        const run = async () => {
+          const url = apiBase() + "/events/stream" + (qs ? "?" + qs : "");
+          const hdrs = {
+            Accept: "text/event-stream",
+            "Cache-Control": "no-store",
+          };
+          if (tok) hdrs.Authorization = "Bearer " + tok;
+          try {
+            let lastChunkAt = Date.now();
+            const r = await fetch(url, {
+              method: "GET",
+              credentials: "include",
+              headers: hdrs,
+              signal: ac.signal,
+              cache: "no-store",
+            });
+            if (!isRouteCurrent(navTok)) return;
+            if (!r.ok) {
+              const errText = await r.text().catch(() => "");
+              throw new Error(errText || String(r.status));
+            }
+            if (!r.body || typeof r.body.getReader !== "function") {
+              throw new Error("Event stream unsupported in this browser");
+            }
+            evReconnectBackoffMs = 500;
+            shim.readyState = EventSource.OPEN;
+            const liveOn = $("#evLive");
+            if (liveOn) {
+              liveOn.textContent = "Live";
+              liveOn.className = "badge online";
+              liveOn.title = "Live stream connected (SSE)";
+            }
+            if (evStallTimer) {
+              try { clearInterval(evStallTimer); } catch (_) {}
+              evStallTimer = null;
+            }
+            evStallTimer = setInterval(() => {
+              if (paused || ac.signal.aborted || !isRouteCurrent(navTok)) return;
+              if (shim.readyState !== EventSource.OPEN) return;
+              if (Date.now() - lastChunkAt >= SSE_STALL_ABORT_MS) {
+                try {
+                  ac.abort();
+                } catch (_) {}
+              }
+            }, 4000);
+            await pumpSseBody(
+              r.body.getReader(),
+              ac.signal,
+              (kind, payload) => {
+                if (kind === "ping") return;
+                if (!isRouteCurrent(navTok)) return;
+                try {
+                  const ev = JSON.parse(payload);
+                  if (ev.event_type === "stream.hello") return;
+                  pushEvent(ev);
+                } catch (_) {}
+              },
+              () => {
+                lastChunkAt = Date.now();
+              },
+            );
+            if (evStallTimer) {
+              try { clearInterval(evStallTimer); } catch (_) {}
+              evStallTimer = null;
+            }
+            if (ac.signal.aborted || !isRouteCurrent(navTok)) return;
+            shim.readyState = EventSource.CLOSED;
+            if (!paused && isRouteCurrent(navTok)) {
+              evReconnectBackoffMs = 500;
+              const live = $("#evLive");
+              if (live) {
+                live.textContent = "Reconnecting…";
+                live.className = "badge offline";
+              }
+              scheduleReconnect();
+            }
+          } catch (e) {
+            if (evStallTimer) {
+              try { clearInterval(evStallTimer); } catch (_) {}
+              evStallTimer = null;
+            }
+            if (e && e.name === "AbortError") return;
+            if (!isRouteCurrent(navTok)) return;
+            shim.readyState = EventSource.CLOSED;
+            const live = $("#evLive");
+            if (live && isRouteCurrent(navTok)) {
+              live.textContent = "Reconnecting…";
+              live.className = "badge offline";
+            }
+            if (!paused && isRouteCurrent(navTok)) scheduleReconnect();
           }
-          if (!r.body || typeof r.body.getReader !== "function") {
-            throw new Error("Event stream unsupported in this browser");
-          }
+        };
+        void run();
+      }
+
+      const tryWs =
+        localStorage.getItem("croc.events.transport") !== "sse" && typeof WebSocket !== "undefined";
+      if (tryWs) {
+        const wsUrl = apiBaseToWsBase(apiBase()) + "/events/ws" + (qs ? "?" + qs : "");
+        const ws = new WebSocket(wsUrl);
+        window.__evWS = ws;
+        let wsOpened = false;
+        const wsTimer = setTimeout(() => {
+          try { ws.close(); } catch (_) {}
+        }, 4800);
+        const shimWs = {
+          readyState: EventSource.CONNECTING,
+          close() {
+            clearTimeout(wsTimer);
+            try { ws.close(); } catch (_) {}
+            window.__evWS = null;
+            this.readyState = EventSource.CLOSED;
+          },
+        };
+        window.__evSSE = shimWs;
+        let lastChunkAt = Date.now();
+        ws.onopen = () => {
+          clearTimeout(wsTimer);
+          wsOpened = true;
           evReconnectBackoffMs = 500;
-          shim.readyState = EventSource.OPEN;
+          shimWs.readyState = EventSource.OPEN;
           const liveOn = $("#evLive");
           if (liveOn) {
             liveOn.textContent = "Live";
             liveOn.className = "badge online";
-            liveOn.title = "Live stream connected";
+            liveOn.title = "Live stream (WebSocket)";
           }
           if (evStallTimer) {
             try { clearInterval(evStallTimer); } catch (_) {}
             evStallTimer = null;
           }
           evStallTimer = setInterval(() => {
-            if (paused || ac.signal.aborted || !isRouteCurrent(navTok)) return;
-            if (shim.readyState !== EventSource.OPEN) return;
+            if (paused || !isRouteCurrent(navTok)) return;
+            if (shimWs.readyState !== EventSource.OPEN) return;
             if (Date.now() - lastChunkAt >= SSE_STALL_ABORT_MS) {
-              try {
-                ac.abort();
-              } catch (_) {}
+              try { ws.close(); } catch (_) {}
             }
           }, 4000);
-          await pumpSseBody(
-            r.body.getReader(),
-            ac.signal,
-            (kind, payload) => {
-              if (kind === "ping") return;
-              if (!isRouteCurrent(navTok)) return;
-              try {
-                const ev = JSON.parse(payload);
-                if (ev.event_type === "stream.hello") return;
-                pushEvent(ev);
-              } catch (_) {}
-            },
-            () => {
-              lastChunkAt = Date.now();
-            },
-          );
+        };
+        ws.onmessage = (mev) => {
+          lastChunkAt = Date.now();
+          let j;
+          try {
+            j = JSON.parse(mev.data);
+          } catch (_) {
+            return;
+          }
+          if (!isRouteCurrent(navTok)) return;
+          if (j.type === "ping" || j.type === "hello") return;
+          if (j.type === "event" && j.ev) {
+            pushEvent(j.ev);
+            return;
+          }
+          if (j.event_type === "stream.hello") return;
+          if (j.summary || j.event_type) pushEvent(j);
+        };
+        ws.onclose = () => {
+          clearTimeout(wsTimer);
           if (evStallTimer) {
             try { clearInterval(evStallTimer); } catch (_) {}
             evStallTimer = null;
           }
-          if (ac.signal.aborted || !isRouteCurrent(navTok)) return;
-          shim.readyState = EventSource.CLOSED;
+          window.__evWS = null;
+          shimWs.readyState = EventSource.CLOSED;
+          if (!wsOpened) {
+            window.__evSSE = null;
+            if (!isRouteCurrent(navTok) || paused) return;
+            startSseFetch();
+            return;
+          }
           if (!paused && isRouteCurrent(navTok)) {
             evReconnectBackoffMs = 500;
             const live = $("#evLive");
@@ -5374,23 +5504,12 @@
             }
             scheduleReconnect();
           }
-        } catch (e) {
-          if (evStallTimer) {
-            try { clearInterval(evStallTimer); } catch (_) {}
-            evStallTimer = null;
-          }
-          if (e && e.name === "AbortError") return;
-          if (!isRouteCurrent(navTok)) return;
-          shim.readyState = EventSource.CLOSED;
-          const live = $("#evLive");
-          if (live && isRouteCurrent(navTok)) {
-            live.textContent = "Reconnecting…";
-            live.className = "badge offline";
-          }
-          if (!paused && isRouteCurrent(navTok)) scheduleReconnect();
-        }
-      };
-      void run();
+        };
+        ws.onerror = () => {};
+        return;
+      }
+
+      startSseFetch();
     }
 
     $("#evPause").addEventListener("click", () => {

@@ -14,6 +14,7 @@ import urllib.error
 import urllib.request
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from contextlib import asynccontextmanager
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -23,7 +24,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from fastapi import Cookie, Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi import Cookie, Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.gzip import GZipMiddleware
@@ -1120,24 +1121,32 @@ class _EventBus:
                 break
         return list(reversed(out))
 
+    def _fanout_locked(self, ev: dict[str, Any]) -> None:
+        for sub in list(self._subs.values()):
+            if not _event_visible(sub.principal, ev):
+                continue
+            if not _event_matches_filters(ev, sub.filters):
+                continue
+            try:
+                sub.q.put_nowait(ev)
+            except _stdqueue.Full:
+                try:
+                    sub.q.get_nowait()
+                    sub.q.put_nowait(ev)
+                    sub.dropped += 1
+                except Exception:
+                    sub.dropped += 1
+
     def publish(self, ev: dict[str, Any]) -> None:
         with self._lock:
             self._ring.append(ev)
-            for sub in list(self._subs.values()):
-                if not _event_visible(sub.principal, ev):
-                    continue
-                if not _event_matches_filters(ev, sub.filters):
-                    continue
-                try:
-                    sub.q.put_nowait(ev)
-                except _stdqueue.Full:
-                    # Slow consumer. Drop one oldest event, signal backpressure.
-                    try:
-                        sub.q.get_nowait()
-                        sub.q.put_nowait(ev)
-                        sub.dropped += 1
-                    except Exception:
-                        sub.dropped += 1
+            self._fanout_locked(ev)
+
+    def publish_from_peer(self, ev: dict[str, Any]) -> None:
+        """Fan-in from another API worker (Redis). Same ring + local subscribers; no DB insert."""
+        with self._lock:
+            self._ring.append(ev)
+            self._fanout_locked(ev)
 
 
 class _EventSub:
@@ -1206,6 +1215,17 @@ def _event_matches_filters(ev: dict[str, Any], filters: dict[str, Any]) -> bool:
 
 
 event_bus = _EventBus(ring_size=EVENT_RING_SIZE)
+
+# --- Multi-instance event bus (optional Redis Pub/Sub) ---
+BUS_INSTANCE_ID = str(uuid.uuid4())
+REDIS_URL = (os.getenv("REDIS_URL") or "").strip()
+EVENT_BUS_REDIS_CHANNEL = (os.getenv("EVENT_BUS_REDIS_CHANNEL") or "sentinel:event_bus").strip() or "sentinel:event_bus"
+EVENT_WS_ENABLED = os.getenv("EVENT_WS_ENABLED", "1") == "1"
+SLOW_REQUEST_LOG_MS = int(os.getenv("SLOW_REQUEST_LOG_MS", "0"))
+_redis_sync_client: Optional[Any] = None
+_redis_bridge_stop = threading.Event()
+_redis_listener_thread: Optional[threading.Thread] = None
+
 _superadmin_cache: set[str] = set()
 _superadmin_cache_ts = 0.0
 
@@ -1312,6 +1332,7 @@ def emit_event(
     rid = _insert_event_row(ev)
     ev["id"] = rid
     event_bus.publish(ev)
+    _redis_event_forward(ev)
     try:
         from telegram_notify import maybe_notify_telegram
 
@@ -1323,6 +1344,99 @@ def emit_event(
         _maybe_dispatch_fcm_for_ev(ev)
     except Exception as exc:
         logger.warning("fcm_notify skipped: %s", exc)
+
+
+def _redis_event_forward(ev: dict[str, Any]) -> None:
+    if _redis_sync_client is None:
+        return
+    try:
+        out = dict(ev)
+        out["_bus_origin"] = BUS_INSTANCE_ID
+        _redis_sync_client.publish(EVENT_BUS_REDIS_CHANNEL, json.dumps(out, default=str))
+    except Exception as exc:
+        logger.warning("redis event forward failed: %s", exc)
+
+
+def _redis_listener_main() -> None:
+    try:
+        import redis as redis_lib
+    except ImportError:
+        logger.error("redis package not installed; pip install redis")
+        return
+    try:
+        r2 = redis_lib.Redis.from_url(REDIS_URL, decode_responses=True)
+        pubsub = r2.pubsub()
+        pubsub.subscribe(EVENT_BUS_REDIS_CHANNEL)
+        while not _redis_bridge_stop.is_set():
+            msg = pubsub.get_message(timeout=1.0)
+            if not msg or msg.get("type") != "message":
+                continue
+            raw = msg.get("data")
+            if not raw or not isinstance(raw, str):
+                continue
+            try:
+                data = json.loads(raw)
+            except Exception:
+                logger.warning("redis event bus bad json")
+                continue
+            origin = str(data.pop("_bus_origin", "") or "")
+            if origin == BUS_INSTANCE_ID:
+                continue
+            try:
+                event_bus.publish_from_peer(data)
+            except Exception:
+                logger.exception("event_bus.publish_from_peer failed")
+        try:
+            pubsub.close()
+        except Exception:
+            pass
+        try:
+            r2.close()
+        except Exception:
+            pass
+    except Exception:
+        logger.exception("redis event bus listener exited")
+
+
+def _start_event_redis_bridge() -> None:
+    global _redis_sync_client, _redis_listener_thread
+    if not REDIS_URL:
+        logger.info("REDIS_URL unset — event bus is single-process memory only")
+        return
+    try:
+        import redis as redis_lib
+    except ImportError:
+        logger.error("REDIS_URL set but redis package missing; install redis or unset REDIS_URL")
+        return
+    try:
+        _redis_sync_client = redis_lib.Redis.from_url(REDIS_URL, decode_responses=True)
+        _redis_sync_client.ping()
+    except Exception as exc:
+        logger.error("redis connect failed (event bus): %s", exc)
+        _redis_sync_client = None
+        return
+    _redis_bridge_stop.clear()
+    _redis_listener_thread = threading.Thread(target=_redis_listener_main, name="redis-event-bus", daemon=True)
+    _redis_listener_thread.start()
+    logger.info(
+        "event bus redis bridge ok channel=%s instance=%s",
+        EVENT_BUS_REDIS_CHANNEL,
+        BUS_INSTANCE_ID[:8],
+    )
+
+
+def _stop_event_redis_bridge() -> None:
+    global _redis_sync_client, _redis_listener_thread
+    _redis_bridge_stop.set()
+    if _redis_listener_thread is not None:
+        _redis_listener_thread.join(timeout=4.0)
+        _redis_listener_thread = None
+    if _redis_sync_client is not None:
+        try:
+            _redis_sync_client.close()
+        except Exception:
+            pass
+        _redis_sync_client = None
 
 
 def _alarm_severity_bucket(level: str) -> str:
@@ -3653,6 +3767,7 @@ def _blocking_api_bootstrap_inner() -> None:
     scheduler_stop.clear()
     scheduler_thread = threading.Thread(target=scheduler_loop, name="cmd-scheduler", daemon=True)
     scheduler_thread.start()
+    _start_event_redis_bridge()
     logger.info(
         "API started mqtt_host=%s mqtt_port=%s mqtt_tls=%s "
         "mqtt_tls_verify_hostname=%s db=%s notifier_enabled=%s telegram=%s fcm=%s",
@@ -3669,6 +3784,7 @@ def _blocking_api_bootstrap_inner() -> None:
 
 def _shutdown_api() -> None:
     global mqtt_client, scheduler_thread, mqtt_worker_thread
+    _stop_event_redis_bridge()
     scheduler_stop.set()
     if scheduler_thread is not None:
         scheduler_thread.join(timeout=2.0)
@@ -3788,6 +3904,18 @@ async def _readiness_guard(request: Request, call_next):
             content={"detail": "bootstrap failed", "ready": False, "error": api_bootstrap_error},
         )
     return await call_next(request)
+
+
+@app.middleware("http")
+async def _slow_request_log_middleware(request: Request, call_next):
+    if SLOW_REQUEST_LOG_MS <= 0:
+        return await call_next(request)
+    t0 = time.perf_counter()
+    resp = await call_next(request)
+    dt_ms = (time.perf_counter() - t0) * 1000
+    if dt_ms >= float(SLOW_REQUEST_LOG_MS):
+        logger.warning("slow HTTP %s %s %.0fms", request.method, request.url.path, dt_ms)
+    return resp
 
 
 @app.get("/", include_in_schema=False)
@@ -6134,8 +6262,9 @@ def _close_admin_tenant_cur(
     return summary
 
 
-def _wait_cmd_ack(device_id: str, cmd: str, timeout_s: float = 2.5) -> bool:
+def _wait_cmd_ack(device_id: str, cmd: str, timeout_s: float = 2.5, cmd_id: Optional[str] = None) -> bool:
     deadline = time.time() + max(0.2, float(timeout_s))
+    cid = (cmd_id or "").strip()
     while time.time() < deadline:
         with db_lock:
             conn = get_conn()
@@ -6147,9 +6276,13 @@ def _wait_cmd_ack(device_id: str, cmd: str, timeout_s: float = 2.5) -> bool:
             ack = json.loads(str((row["last_ack_json"] if row else "") or ""))
         except Exception:
             ack = {}
-        if str(ack.get("cmd") or "") == cmd and bool(ack.get("ok")):
-            return True
-        time.sleep(0.12)
+        if str(ack.get("cmd") or "") != cmd or not bool(ack.get("ok")):
+            time.sleep(0.12)
+            continue
+        if cid and str(ack.get("cmd_id") or "") != cid:
+            time.sleep(0.12)
+            continue
+        return True
     return False
 
 
@@ -6185,16 +6318,16 @@ def _device_delete_reset_impl(
     *,
     super_unclaim: bool,
 ) -> dict[str, Any]:
-    assert_min_role(principal, "admin")
     if str(req.confirm_text or "").strip().upper() != str(device_id or "").strip().upper():
         raise HTTPException(status_code=400, detail="confirm_text must exactly match device_id")
-    if principal.role == "admin":
-        require_capability(principal, "can_send_command")
+    require_capability(principal, "can_send_command")
     if super_unclaim:
-        # Superadmin: any device. Admin: only own (non-shared) devices — same factory rollback as superadmin.
+        # Factory rollback: admin+ only (not subordinate "user" accounts).
+        assert_min_role(principal, "admin")
         if not principal.is_superadmin():
             assert_device_owner(principal, device_id)
     else:
+        assert_min_role(principal, "user")
         assert_device_owner(principal, device_id)
     nvs_purge_sent, nvs_purge_acked = _try_mqtt_unclaim_reset(device_id)
     with db_lock:
@@ -6265,7 +6398,7 @@ def device_delete_reset(
     req: DeviceDeleteRequest,
     principal: Principal = Depends(require_principal),
 ) -> dict[str, Any]:
-    """Admin/superadmin: delete device records so it can be re-added/reset."""
+    """Tenant user (operate) / admin / superadmin: unlink device + best-effort unclaim_reset."""
     return _device_delete_reset_impl(device_id, principal, req, super_unclaim=False)
 
 
@@ -8225,6 +8358,7 @@ def publish_command(topic: str, cmd: str, params: dict[str, Any], target_id: str
         "target_id": target_id,
         "cmd": cmd,
         "params": params,
+        "cmd_id": str(uuid.uuid4()),
     }
     body = json.dumps(payload, ensure_ascii=True)
     for attempt in range(3):
@@ -11495,6 +11629,88 @@ def events_stream(
         media_type="text/event-stream; charset=utf-8",
         headers=headers,
     )
+
+
+@app.websocket("/events/ws")
+async def events_ws(websocket: WebSocket) -> None:
+    """JSON WebSocket mirror of /events/stream (Phase 2). Cookie JWT auth; same filters as query params."""
+    if not EVENT_WS_ENABLED:
+        await websocket.close(code=1008, reason="ws disabled")
+        return
+    await websocket.accept()
+    qp = websocket.query_params
+    qtok = qp.get("token") if SSE_ALLOW_QUERY_TOKEN else None
+    backlog = min(500, max(0, int(qp.get("backlog") or 100)))
+    filters: dict[str, Any] = {
+        "min_level": qp.get("min_level"),
+        "category": qp.get("category"),
+        "device_id": qp.get("device_id"),
+        "q": qp.get("q"),
+    }
+    filters = {k: v for k, v in filters.items() if v}
+    ck = websocket.cookies.get(JWT_COOKIE_NAME) if JWT_USE_HTTPONLY_COOKIE else None
+    auth_header = websocket.headers.get("authorization") or None
+    try:
+        principal = _principal_from_sse_headers_or_query(auth_header, qtok, ck)
+        assert_min_role(principal, "user")
+    except HTTPException:
+        await websocket.close(code=1008, reason="auth failed")
+        return
+
+    sub = event_bus.subscribe(principal, filters)
+    try:
+        _hello_now = datetime.now(timezone.utc)
+        _hello_ts = _hello_now.isoformat()
+        hello = {
+            "type": "hello",
+            "event_type": "stream.hello",
+            "level": "info",
+            "category": "system",
+            "ts": _hello_ts,
+            "ts_malaysia": iso_timestamp_to_malaysia(_hello_ts),
+            "ts_epoch_ms": int(_hello_now.timestamp() * 1000),
+            "summary": f"connected as {principal.role}",
+            "actor": "system",
+            "detail": {"role": principal.role, "filters": filters},
+            "id": 0,
+        }
+        await websocket.send_text(json.dumps(hello, default=str))
+        if backlog:
+            for ev in event_bus.backlog(principal, filters, backlog):
+                await websocket.send_text(json.dumps({"type": "event", "ev": ev}, default=str))
+        last_keepalive = time.time()
+        while True:
+            try:
+                ev = await asyncio.to_thread(lambda: sub.q.get(timeout=1.0))
+                await websocket.send_text(json.dumps({"type": "event", "ev": ev}, default=str))
+            except _stdqueue.Empty:
+                pass
+            now = time.time()
+            if now - last_keepalive >= EVENT_SSE_KEEPALIVE_SECONDS:
+                last_keepalive = now
+                await websocket.send_text(
+                    json.dumps({"type": "ping", "ts": int(now * 1000), "dropped": sub.dropped}, default=str)
+                )
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        logger.exception("events_ws failed")
+    finally:
+        event_bus.unsubscribe(sub)
+
+
+@app.get("/diag/db-ping")
+def diag_db_ping(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    """Cheap SQLite latency probe — use when the UI feels slow (admin+)."""
+    assert_min_role(principal, "admin")
+    t0 = time.perf_counter()
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.fetchone()
+        conn.close()
+    return {"ok": True, "db_ms": round((time.perf_counter() - t0) * 1000, 3), "pid": os.getpid()}
 
 
 # =====================================================================
