@@ -43,6 +43,14 @@
 #ifndef WIFI_MULTI_RUN_SLICE_MS
 #define WIFI_MULTI_RUN_SLICE_MS 200
 #endif
+// Captive setup timing: softAP opens only after BOOT strap long-press (see lower
+// "Captive Wi-Fi setup" for WIFI_PROVISION_PORTAL_ENABLED / AP_PREFIX / accessory rules).
+#ifndef WIFI_PROVISION_BOOT_HOLD_MS
+#define WIFI_PROVISION_BOOT_HOLD_MS 10000UL
+#endif
+#ifndef WIFI_PROVISION_IDLE_TIMEOUT_MS
+#define WIFI_PROVISION_IDLE_TIMEOUT_MS 120000UL
+#endif
 
 // ── Network interface mode ──
 // WIFI=1, ETHERNET=2, AUTO=3 (prefer Ethernet on ETH boards, fall back to WiFi).
@@ -233,7 +241,9 @@
 // Physical alarm input: firmware uses INPUT_PULLUP and fires on HIGH→LOW (falling edge).
 // Typical wiring: normally-open contact to GND (pressed = LOW). If your switch is NC or
 // active-high, this edge will never match — change hardware or adapt TRIGGER handling.
-#define DEBOUNCE_MS 80
+#ifndef BUTTON_DEBOUNCE_MS
+#define BUTTON_DEBOUNCE_MS 80
+#endif
 #define ALARM_COOLDOWN_MS 5000
 
 // ── Task intervals (milliseconds) ──
@@ -268,6 +278,16 @@
 #define WIFI_RECONNECT_BASE_MS 2000
 #define MQTT_RECONNECT_BASE_MS 2000
 #define RECONNECT_MAX_MS 60000
+// After STA was up at least once, ignore sub-second link flaps before treating
+// Wi-Fi as "really down" (DHCP renew / driver noise).
+#ifndef WIFI_LINK_DOWN_DEBOUNCE_MS
+#define WIFI_LINK_DOWN_DEBOUNCE_MS 3500u
+#endif
+// Ignore /cmd execution for this long after each MQTT session comes up — stops
+// retained broker messages (e.g. reboot) firing inside SUBACK-critical paths.
+#ifndef MQTT_POST_CONNECT_CMD_GRACE_MS
+#define MQTT_POST_CONNECT_CMD_GRACE_MS 5000u
+#endif
 
 // ── MQTT self-heal ──
 // After N consecutive MQTT connect failures the firmware reboots to recover
@@ -287,6 +307,20 @@
 #ifndef MIN_FREE_HEAP_WARN_BYTES
 #define MIN_FREE_HEAP_WARN_BYTES 12000
 #endif
+// Drop inbound /cmd frames when free heap is below this (JSON parse + dispatch
+// can fragment heap; better to skip one frame than corrupt state).
+#ifndef MIN_FREE_HEAP_ACCEPT_CMD_BYTES
+#define MIN_FREE_HEAP_ACCEPT_CMD_BYTES 10000u
+#endif
+// Reboot-on-critical-low-heap is suppressed until this long after boot so a
+// slow Wi-Fi + TLS bring-up does not reboot-loop on transient fragmentation.
+#ifndef HEAP_PANIC_MIN_UPTIME_MS
+#define HEAP_PANIC_MIN_UPTIME_MS 60000UL
+#endif
+// Throttle "[heap] low …" log lines so UART / MQTT logging cannot self-amplify.
+#ifndef HEAP_WARN_LOG_INTERVAL_MS
+#define HEAP_WARN_LOG_INTERVAL_MS 30000UL
+#endif
 
 // ── OTA hardening ──
 #ifndef OTA_MIN_FREE_PARTITION_BYTES
@@ -301,6 +335,10 @@
 #ifndef OTA_MAX_ATTEMPTS
 #define OTA_MAX_ATTEMPTS 2
 #endif
+// Future: HTTP OTA resume (Range). Needs (1) server/nginx serving /fw/*.bin with
+// Accept-Ranges: bytes, (2) firmware NVS keys for last offset + expected SHA-256,
+// (3) chunked read + append to Update partition instead of single-shot HTTPUpdate.
+// Not implemented in the stock sketch — current flow retries full download only.
 
 // ── Offline event queue (cap RAM when MQTT is down; oldest dropped when full) ──
 #define OFFLINE_QUEUE_MAX 12
@@ -321,20 +359,17 @@
 #endif
 #endif
 #define VBAT_LOW_THRESHOLD 3.30f
+// Telemetry only (net_health `signal_weak`); does not change Wi-Fi mode or open softAP.
 #define RSSI_WEAK_THRESHOLD -75
 
-// ── Wi-Fi roaming (signal-driven AP switch) ──
-// When RSSI stays below WIFI_ROAM_RSSI_DBM for WIFI_ROAM_SUSTAIN_MS and at
-// least one other registered AP is configured, we call WiFi.disconnect(false)
-// + WiFiMulti::run to let the radio pick the strongest available AP. Pure
-// ESP-IDF STA has no automatic roaming and otherwise sticks to the first AP
-// it associated with — which is often a distant router with weak link.
-//   rssi threshold: dBm; set <= -90 to effectively disable roaming
-//   sustain:        ms the weak reading must hold before we switch (avoids
-//                   flapping on momentary fading)
-//   min_gap:        ms between two roam attempts (rate-limit)
+// ── Wi-Fi STA roaming (optional; never opens provisioning softAP) ──
+// If 1: weak sustained RSSI + 2+ saved APs triggers one STA disconnect so WiFiMulti
+// can rejoin the strongest AP. If 0 (default): no RSSI-driven disconnects; change
+// Wi-Fi only via Dashboard wifi_config / NVS or the BOOT long-press captive portal.
+//   rssi threshold: dBm (only when WIFI_ROAM_ENABLED=1)
+//   sustain / min_gap: rate-limit roam attempts
 #ifndef WIFI_ROAM_ENABLED
-#define WIFI_ROAM_ENABLED 1
+#define WIFI_ROAM_ENABLED 0
 #endif
 #ifndef WIFI_ROAM_RSSI_DBM
 #define WIFI_ROAM_RSSI_DBM -80
@@ -386,7 +421,9 @@
 #define NVS_SAVE_COOLDOWN_MS 10000
 
 // ── Captive Wi-Fi setup (soft AP + browser form; see Croc Sentinel.ino) ──
-// When 0, wrong NVS/mis-provisioned STA cannot be recovered on-device.
+// Never started by RSSI. Only BOARD_BOOT_GPIO held for WIFI_PROVISION_BOOT_HOLD_MS
+// while firmware runs (LED slow→fast); RST/EN reset does not open the portal.
+// When WIFI_PROVISION_PORTAL_ENABLED=0, wrong NVS cannot be fixed on-device (use Dashboard).
 #ifndef WIFI_PROVISION_PORTAL_ENABLED
 #define WIFI_PROVISION_PORTAL_ENABLED 1
 #endif

@@ -2695,13 +2695,10 @@ static void updateConnectivityLedger(unsigned long now) {
   s_prevMqttConnected = mqttUp;
 }
 
-// Signal-driven AP switch. Pure ESP-IDF STA does NOT roam automatically — if
-// the initial join was a distant AP, the device will stay glued to it even
-// when a closer registered AP is available. Here we watch RSSI; once it has
-// been sustained below WIFI_ROAM_RSSI_DBM for WIFI_ROAM_SUSTAIN_MS and we
-// haven't just roamed, release the association so WiFiMulti re-picks the best
-// candidate. Effect: no disruption when signal is fine; a short
-// disconnect/rejoin window (a few hundred ms) when a weaker AP is replaced.
+// Optional STA roam among saved APs (WIFI_ROAM_ENABLED). Does NOT open the
+// provisioning softAP — that is only via BOOT long-press (pollBootLongPressForPortal).
+// Pure ESP-IDF STA does not roam; weak RSSI here triggers a controlled disconnect
+// so WiFiMulti can re-pick the strongest registered AP when roaming is enabled.
 #if (NETIF_MODE == NETIF_MODE_WIFI || NETIF_MODE == NETIF_MODE_AUTO) && \
     !defined(CONFIG_IDF_TARGET_ESP32P4)
 static void maybeRoamToStrongerAp(unsigned long now) {
@@ -3263,15 +3260,24 @@ void loop() {
 #ifndef MIN_FREE_HEAP_WARN_BYTES
 #define MIN_FREE_HEAP_WARN_BYTES 12000
 #endif
+#ifndef HEAP_PANIC_MIN_UPTIME_MS
+#define HEAP_PANIC_MIN_UPTIME_MS 60000UL
+#endif
+#ifndef HEAP_WARN_LOG_INTERVAL_MS
+#define HEAP_WARN_LOG_INTERVAL_MS 30000UL
+#endif
+#ifndef MIN_FREE_HEAP_ACCEPT_CMD_BYTES
+#define MIN_FREE_HEAP_ACCEPT_CMD_BYTES 10000u
+#endif
   uint32_t freeHeap = ESP.getFreeHeap();
-  if (freeHeap < (uint32_t)MIN_FREE_HEAP_PANIC_BYTES && now > 60000UL) {
+  if (freeHeap < (uint32_t)MIN_FREE_HEAP_PANIC_BYTES && now > (unsigned long)HEAP_PANIC_MIN_UPTIME_MS) {
     logLine("[heap] PANIC: free heap below threshold — rebooting");
     delay(200);
     ESP.restart();
     return;
   }
   if (freeHeap < (uint32_t)MIN_FREE_HEAP_WARN_BYTES &&
-      (s_lastHeapLowLogAtMs == 0 || now - s_lastHeapLowLogAtMs > 30000UL)) {
+      (s_lastHeapLowLogAtMs == 0 || now - s_lastHeapLowLogAtMs > (unsigned long)HEAP_WARN_LOG_INTERVAL_MS)) {
     char _hl[64];
     snprintf(_hl, sizeof(_hl), "[heap] low free=%u", (unsigned)freeHeap);
     logLine(_hl);

@@ -44,6 +44,8 @@
 #ifndef BOARD_HAS_ETH
 #define BOARD_HAS_ETH 0
 #endif
+// Strap pin for captive portal long-press (often labeled BOOT/FLASH). -1 = not
+// available on this profile (e.g. P4 without Wi‑Fi) — use Dashboard wifi_config.
 #ifndef BOARD_BOOT_GPIO
 #define BOARD_BOOT_GPIO (-1)
 #endif

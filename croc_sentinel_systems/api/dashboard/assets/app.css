@@ -1468,8 +1468,9 @@ body[data-layout="auth"] .main {
 .device-card.online .device-thumb::after { background: var(--ok); box-shadow: 0 0 0 2px var(--bg-elev), 0 0 0 4px color-mix(in oklch, var(--ok) 25%, transparent); }
 .device-card.offline .device-thumb::after { background: var(--danger); }
 
-/* Device drawer (slide-in preview on device list). */
-.device-drawer {
+/* Optional fixed peek panel (not used by current DOM). If reintroduced, put
+   class `device-drawer--peek` on the root element and toggle data-open="1". */
+.device-drawer--peek {
   position: fixed;
   top: 0; right: 0;
   width: min(440px, 100vw);
@@ -1483,21 +1484,21 @@ body[data-layout="auth"] .main {
   display: flex;
   flex-direction: column;
 }
-.device-drawer[data-open="1"] { transform: translateX(0); }
-.device-drawer__title {
+.device-drawer--peek[data-open="1"] { transform: translateX(0); }
+.device-drawer--peek .device-drawer__title {
   padding: var(--sp-5) var(--sp-5) var(--sp-3);
   font-family: var(--font-display);
   font-size: var(--text-xl);
   font-weight: var(--weight-heavy);
   border-bottom: 1px solid var(--border);
 }
-.device-drawer__summary {
+.device-drawer--peek .device-drawer__summary {
   padding: var(--sp-3) var(--sp-5);
   border-bottom: 1px solid var(--border);
   background: var(--bg-muted);
   font-size: var(--text-sm);
 }
-.device-drawer__body {
+.device-drawer--peek .device-drawer__body {
   flex: 1 1 auto;
   overflow-y: auto;
   padding: var(--sp-3) var(--sp-5);
@@ -1505,18 +1506,77 @@ body[data-layout="auth"] .main {
   flex-direction: column;
   gap: var(--sp-3);
 }
-.device-drawer__hint {
+.device-drawer--peek .device-drawer__hint {
   padding: var(--sp-3) var(--sp-5);
   border-top: 1px solid var(--border);
   color: var(--text-muted);
   font-size: var(--text-xs);
 }
 
+/* In-flow <details> accordions on device / group pages (same BEM, no fixed layer). */
+details.card.device-drawer {
+  position: static;
+  inset: auto;
+  width: 100%;
+  max-width: none;
+  height: auto;
+  min-height: 0;
+  transform: none;
+  z-index: auto;
+  display: block;
+  overflow: visible;
+}
+details.card.device-drawer > summary.device-drawer__summary {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-start;
+  gap: var(--sp-2) var(--sp-3);
+  cursor: pointer;
+  font-size: var(--text-sm);
+  padding: var(--sp-3) var(--sp-4);
+  background: var(--bg-muted);
+  border-bottom: 1px solid var(--border);
+}
+details.card.device-drawer > summary.device-drawer__summary::-webkit-details-marker {
+  display: none;
+}
+details.card.device-drawer .device-drawer__title {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  font-family: var(--font-display);
+  font-size: var(--text-md);
+  font-weight: var(--weight-heavy);
+  flex: 1 1 auto;
+  min-width: 0;
+}
+details.card.device-drawer .device-drawer__hint {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  flex: 0 1 auto;
+  text-align: right;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+details.card.device-drawer .device-drawer__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-4);
+  overflow: visible;
+}
+details.card.danger-zone.device-drawer > summary.device-drawer__summary {
+  background: color-mix(in oklch, var(--danger-weak) 35%, var(--bg-muted));
+}
+
 /* Device detail (focus) — device page. */
 .device-focus-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 360px;
-  gap: var(--sp-4);
+  gap: var(--sp-5);
   align-items: start;
 }
 .device-focus-left  { display: flex; flex-direction: column; gap: var(--sp-4); min-width: 0; }
@@ -1790,6 +1850,10 @@ body[data-layout="auth"] .main {
   font-size: var(--text-sm);
 }
 .danger-zone--compact > summary { padding: var(--sp-2) var(--sp-3); }
+/* Keep compact danger rows tight even with accordion summary BEM. */
+details.card.danger-zone.danger-zone--compact.device-drawer > summary.device-drawer__summary {
+  padding: var(--sp-2) var(--sp-3);
+}
 .danger-zone-compact-lead { color: var(--text-muted); font-size: var(--text-xs); }
 .danger-zone-single-action { margin-top: var(--sp-2); }
 .danger-zone-unbind-btn { width: fit-content; }
@@ -2046,7 +2110,7 @@ body[data-boot-error="1"] .static-boot__retry { display: inline-block; }
   .grid2, .grid3, .grid4 { grid-template-columns: 1fr; }
   .stats { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
   .device-grid { grid-template-columns: 1fr; }
-  .device-drawer { width: 100vw; border-left: 0; }
+  .device-drawer--peek { width: 100vw; border-left: 0; }
   .device-quick-split { grid-template-columns: 1fr; }
   .grp-modal { padding: 0; align-items: flex-end; }
   .grp-modal-card {

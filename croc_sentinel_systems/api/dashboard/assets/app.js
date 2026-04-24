@@ -5916,9 +5916,13 @@
         const ws = new WebSocket(wsUrl);
         window.__evWS = ws;
         let wsOpened = false;
+        // Handshake must complete before the browser fires `onopen`. Slow TLS/proxies
+        // or a cold API can exceed a few seconds; a short timer + ws.close() while still
+        // CONNECTING produces Chrome's "closed before the connection is established".
+        const WS_HANDSHAKE_WAIT_MS = 20000;
         const wsTimer = setTimeout(() => {
           try { ws.close(); } catch (_) {}
-        }, 4800);
+        }, WS_HANDSHAKE_WAIT_MS);
         const shimWs = {
           readyState: EventSource.CONNECTING,
           close() {
@@ -5976,6 +5980,9 @@
             try { window.__streamBus && window.__streamBus.emit(j); } catch (_) {}
           }
         };
+        ws.onerror = () => {
+          clearTimeout(wsTimer);
+        };
         ws.onclose = () => {
           clearTimeout(wsTimer);
           if (evStallTimer) {
@@ -6001,7 +6008,6 @@
             scheduleReconnect();
           }
         };
-        ws.onerror = () => {};
         return;
       }
 

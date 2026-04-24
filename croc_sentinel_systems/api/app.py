@@ -308,7 +308,97 @@ TOPIC_ACK = f"{TOPIC_ROOT}/+/ack"
 TOPIC_BOOTSTRAP_REGISTER = f"{TOPIC_ROOT}/bootstrap/register"
 
 
-db_lock = threading.Lock()
+class _SqliteRWLock:
+    """Coordinates access across many short-lived ``sqlite3`` connections.
+
+    ``get_conn()`` opens a **new** connection per call and ``init_db_pragmas``
+    enables WAL, so multiple read transactions can run concurrently as long as
+    no writer holds the database. This replaces a single ``threading.Lock`` that
+    serialized every SELECT — a major source of dashboard slowness under load.
+
+    Writer preference: new readers block while a writer is waiting so we don't
+    starve writes behind a continuous stream of read-only dashboard polls.
+    """
+
+    __slots__ = ("_cv", "_readers", "_writer", "_writers_waiting")
+
+    def __init__(self) -> None:
+        self._cv = threading.Condition(threading.Lock())
+        self._readers = 0
+        self._writer = False
+        self._writers_waiting = 0
+
+    def acquire_read(self) -> None:
+        with self._cv:
+            while self._writer or self._writers_waiting > 0:
+                self._cv.wait()
+            self._readers += 1
+
+    def release_read(self) -> None:
+        with self._cv:
+            self._readers -= 1
+            if self._readers == 0:
+                self._cv.notify_all()
+
+    def acquire_write(self) -> None:
+        with self._cv:
+            self._writers_waiting += 1
+            try:
+                while self._readers > 0 or self._writer:
+                    self._cv.wait()
+                self._writer = True
+            finally:
+                self._writers_waiting -= 1
+
+    def release_write(self) -> None:
+        with self._cv:
+            self._writer = False
+            self._cv.notify_all()
+
+    def try_acquire_read(self) -> bool:
+        with self._cv:
+            if self._writer or self._writers_waiting > 0:
+                return False
+            self._readers += 1
+            return True
+
+
+class _DbLockContext:
+    __slots__ = ("_rw", "_read")
+
+    def __init__(self, rw: _SqliteRWLock, *, read: bool) -> None:
+        self._rw = rw
+        self._read = read
+
+    def __enter__(self) -> "_DbLockContext":
+        if self._read:
+            self._rw.acquire_read()
+        else:
+            self._rw.acquire_write()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self._read:
+            self._rw.release_read()
+        else:
+            self._rw.release_write()
+
+
+_db_rw = _SqliteRWLock()
+
+
+def db_read_lock() -> _DbLockContext:
+    """Use for pure SELECT paths (one connection per ``with`` body)."""
+    return _DbLockContext(_db_rw, read=True)
+
+
+def db_write_lock() -> _DbLockContext:
+    """Use for INSERT/UPDATE/DELETE/DDL or read+write in one critical section."""
+    return _DbLockContext(_db_rw, read=False)
+
+
+# Backwards compatible: ``with db_lock:`` remains exclusive write semantics.
+db_lock = _DbLockContext(_db_rw, read=False)
 mqtt_client: Optional[mqtt.Client] = None
 mqtt_connected = False
 mqtt_ingest_queue: _stdqueue.Queue[Optional[dict[str, Any]]] = _stdqueue.Queue(maxsize=MQTT_INGEST_QUEUE_MAX)
@@ -1375,7 +1465,7 @@ def _is_superadmin_username(username: str) -> bool:
     global _superadmin_cache_ts, _superadmin_cache
     now = time.time()
     if (now - _superadmin_cache_ts) > 20.0:
-        if not db_lock.acquire(blocking=False):
+        if not _db_rw.try_acquire_read():
             # Avoid lock inversion on hot paths; conservative fallback still hides default superadmin names.
             return u.lower().startswith("superadmin")
         try:
@@ -1385,7 +1475,7 @@ def _is_superadmin_username(username: str) -> bool:
             _superadmin_cache = {str(r["username"]) for r in cur.fetchall() if r["username"]}
             conn.close()
         finally:
-            db_lock.release()
+            _db_rw.release_read()
         _superadmin_cache_ts = now
     return u in _superadmin_cache
 
@@ -1402,7 +1492,7 @@ def _superadmin_telegram_chat_ids() -> list[str]:
     if _superadmin_tg_chats_cache and (now - _superadmin_tg_chats_ts) < _superadmin_tg_chats_ttl_s:
         return list(_superadmin_tg_chats_cache)
     # Best-effort non-blocking lock to avoid starving the emit_event hot path.
-    if not db_lock.acquire(blocking=False):
+    if not _db_rw.try_acquire_read():
         return list(_superadmin_tg_chats_cache)
     try:
         conn = get_conn()
@@ -1421,7 +1511,7 @@ def _superadmin_telegram_chat_ids() -> list[str]:
         logger.warning("superadmin telegram chat lookup failed: %s", exc)
         chats = list(_superadmin_tg_chats_cache)
     finally:
-        db_lock.release()
+        _db_rw.release_read()
     _superadmin_tg_chats_cache = chats
     _superadmin_tg_chats_ts = now
     return list(chats)
@@ -7501,7 +7591,7 @@ def dashboard_overview(principal: Principal = Depends(require_principal)) -> dic
     zs, za = zone_sql_suffix(principal)
     osf, osa = owner_scope_clause_for_device_state(principal)
     args = tuple(za + osa)
-    with db_lock:
+    with db_read_lock():
         conn = get_conn()
         cur = conn.cursor()
         cur.execute(f"SELECT COUNT(*) AS c FROM device_state WHERE 1=1 {zs} {osf}", args)
@@ -7628,7 +7718,7 @@ def list_devices(principal: Principal = Depends(require_principal)) -> dict[str,
         return cached
     zs, za = zone_sql_suffix(principal, "d.zone")
     osf, osa = owner_scope_clause_for_device_state(principal, "d")
-    with db_lock:
+    with db_read_lock():
         conn = get_conn()
         cur = conn.cursor()
         cur.execute(
@@ -7698,7 +7788,7 @@ def list_devices_firmware_hints(principal: Principal = Depends(require_principal
     catalog = _get_ota_firmware_catalog()
     zs, za = zone_sql_suffix(principal, "d.zone")
     osf, osa = owner_scope_clause_for_device_state(principal, "d")
-    with db_lock:
+    with db_read_lock():
         conn = get_conn()
         cur = conn.cursor()
         cur.execute(
@@ -7728,14 +7818,25 @@ def list_devices_firmware_hints(principal: Principal = Depends(require_principal
 def get_device(device_id: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     assert_min_role(principal, "user")
     assert_device_view_access(principal, device_id)
-    with db_lock:
+    with db_read_lock():
         conn = get_conn()
         cur = conn.cursor()
         cur.execute("SELECT * FROM device_state WHERE device_id = ?", (device_id,))
         row = cur.fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(status_code=404, detail="device not found")
+        cur.execute(
+            """
+            SELECT o.owner_admin, o.assigned_by, o.assigned_at, IFNULL(u.email, '') AS owner_email
+            FROM device_ownership o
+            LEFT JOIN dashboard_users u ON u.username = o.owner_admin
+            WHERE o.device_id = ?
+            """,
+            (device_id,),
+        )
+        ow = cur.fetchone()
         conn.close()
-    if not row:
-        raise HTTPException(status_code=404, detail="device not found")
     assert_zone_for_device(principal, str(row["zone"]) if row["zone"] is not None else "")
     can_view, can_operate = _device_access_flags(principal, device_id)
 
@@ -7772,20 +7873,6 @@ def get_device(device_id: str, principal: Principal = Depends(require_principal)
         out["pending_cmds"] = int(_cmd_queue_pending_counts([device_id]).get(device_id, 0))
     except Exception:
         out["pending_cmds"] = 0
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT o.owner_admin, o.assigned_by, o.assigned_at, IFNULL(u.email, '') AS owner_email
-            FROM device_ownership o
-            LEFT JOIN dashboard_users u ON u.username = o.owner_admin
-            WHERE o.device_id = ?
-            """,
-            (device_id,),
-        )
-        ow = cur.fetchone()
-        conn.close()
     owner_admin = str(ow["owner_admin"]) if ow and ow["owner_admin"] is not None else ""
     out["owner_admin"] = owner_admin
     out["owner_email"] = str(ow["owner_email"]) if ow and ow["owner_email"] is not None else ""
@@ -7815,7 +7902,7 @@ def preview_device_siblings(
     """Debug helper: resolve current sibling fan-out targets for a device."""
     assert_min_role(principal, "user")
     assert_device_view_access(principal, device_id)
-    with db_lock:
+    with db_read_lock():
         conn = get_conn()
         cur = conn.cursor()
         cur.execute(
@@ -9231,7 +9318,7 @@ def _cmd_queue_pending_for_device(device_id: str, limit: int = 32) -> list[dict[
         return []
     now = utc_now_iso()
     out: list[dict[str, Any]] = []
-    with db_lock:
+    with db_read_lock():
         conn = get_conn()
         cur = conn.cursor()
         try:
@@ -9282,7 +9369,7 @@ def _cmd_queue_pending_counts(device_ids: list[str] | None = None) -> dict[str, 
     in steady state (most entries get acked within a few seconds)."""
     now = utc_now_iso()
     out: dict[str, int] = {}
-    with db_lock:
+    with db_read_lock():
         conn = get_conn()
         cur = conn.cursor()
         try:
@@ -12302,7 +12389,7 @@ def list_ota_campaigns(principal: Principal = Depends(require_principal)) -> dic
     # they'd otherwise see every in-flight OTA. Gate at admin.
     assert_min_role(principal, "admin")
     items: list[dict[str, Any]] = []
-    with db_lock:
+    with db_read_lock():
         conn = get_conn()
         cur = conn.cursor()
         cur.execute(
@@ -12339,7 +12426,7 @@ def list_ota_campaigns(principal: Principal = Depends(require_principal)) -> dic
 def get_ota_campaign(campaign_id: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     # Same reasoning as list endpoint: fleet OTA detail is admin+ territory.
     assert_min_role(principal, "admin")
-    with db_lock:
+    with db_read_lock():
         conn = get_conn()
         cur = conn.cursor()
         cur.execute("SELECT * FROM ota_campaigns WHERE id = ?", (campaign_id,))
@@ -12913,6 +13000,8 @@ def events_stream(
 async def events_ws(websocket: WebSocket) -> None:
     """JSON WebSocket mirror of /events/stream (Phase 2). Cookie JWT auth; same filters as query params."""
     if not EVENT_WS_ENABLED:
+        # Complete the HTTP Upgrade so the client leaves CONNECTING; then close with policy.
+        await websocket.accept()
         await websocket.close(code=1008, reason="ws disabled")
         return
     await websocket.accept()
