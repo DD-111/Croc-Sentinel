@@ -15,6 +15,8 @@
 | **Mosquitto** | `8883`（TLS） | ESP32 连 Broker，与控制台端口无关 |
 | **OTA 文件 Nginx（容器）** | `9231`（宿主机 **`127.0.0.1:9231`**） | `/fw/*.bin?token=`；对外由宿主机 **443** 反代到 `9231` |
 
+**HEAD 校验失败（连接被拒绝）时：** API 会向 `OTA_PUBLIC_BASE_URL/fw/…`（并带 `?token=`）发请求。若 API 容器访问不到公网域名，在 `.env` 设置 `OTA_VERIFY_BASE_URL=http://ota-nginx:9231`，使校验走 Docker 内网直达 `ota-nginx`。宿主机仍需为 `ota.yourdomain` 配置 TLS 反代到 `127.0.0.1:9231`，否则设备无法下载。
+
 控制台 SPA 使用 `location.origin` 调 API，因此 **API 必须在同一 Origin 的根路径**（例如 `https://esasecure.com:8088/auth/...`），静态页在 **`/Croc_Sentinel_systems/`** 子路径即可。
 
 ---

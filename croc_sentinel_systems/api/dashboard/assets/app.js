@@ -1135,38 +1135,41 @@
     };
     mountView(view, `
       <div class="auth-page auth-page-pro auth-page--login" role="main">
-        <section class="auth-hero auth-hero--compact">
-          <div class="auth-hero__tag">ESA Secure Platform</div>
-          <h2>Fleet security console</h2>
-          <p>Monitoring, roles, and device control in one place.</p>
-          <ul class="auth-hero__bullets">
-            <li>Role-scoped live visibility</li>
-            <li>Secure commands & triggers</li>
-            <li>Audit-ready operations</li>
-          </ul>
-        </section>
-        <div class="auth-card auth-card--pro auth-card--login" data-auth-card>
+        <details class="auth-hero-fold" open>
+          <summary class="auth-hero-fold__summary"><span class="auth-hero-fold__label">About this console</span></summary>
+          <section class="auth-hero auth-hero--compact">
+            <div class="auth-hero__tag">ESA Secure Platform</div>
+            <h2>Fleet security console</h2>
+            <p>Monitoring, roles, and device control in one place.</p>
+            <ul class="auth-hero__bullets">
+              <li>Role-scoped live visibility</li>
+              <li>Secure commands & triggers</li>
+              <li>Audit-ready operations</li>
+            </ul>
+          </section>
+        </details>
+        <div class="auth-card auth-card--surface auth-card--login" data-auth-card>
           <header class="auth-card__head">
             <div class="auth-card__logo" aria-hidden="true"></div>
             <h1 class="auth-card__title">Sign in</h1>
-            <p class="auth-card__lead">Welcome back — continue to your dashboard.</p>
+            <p class="auth-card__lead">Welcome back — pick up where you left off.</p>
           </header>
           <form class="auth-card__body" id="loginForm" autocomplete="on">
             <label class="field">
               <span>Username</span>
-              <input name="username" autocomplete="username" required placeholder="your username" />
+              <input name="username" autocomplete="username" required placeholder="e.g. dan" />
             </label>
             <label class="field field--spaced">
               <span>Password</span>
-              <input name="password" type="password" autocomplete="current-password" required placeholder="your password" />
+              <input name="password" type="password" autocomplete="current-password" required placeholder="••••••••" />
             </label>
             <div class="auth-card__submit">
-              <button class="btn btn-tap btn-block" type="submit" id="loginSubmit">Sign in</button>
+              <button class="btn btn-tap btn-block auth-btn-primary" type="submit" id="loginSubmit">Sign in</button>
             </div>
             <p class="auth-card__msg muted" id="loginMsg" aria-live="polite"></p>
-            <nav class="auth-card__links" aria-label="Other sign-in options">
-              <a class="auth-link" href="#/register">Create admin account</a>
-              <a class="auth-link" href="#/account-activate">Activate with email code</a>
+            <nav class="auth-card__links auth-card__links--grid" aria-label="Other sign-in options">
+              <a class="auth-link" href="#/register">Register admin</a>
+              <a class="auth-link" href="#/account-activate">Activate account</a>
               <a class="auth-link" href="#/forgot-password">Forgot password</a>
             </nav>
           </form>
@@ -1219,12 +1222,12 @@
       enabled = !!j.enabled;
     } catch { enabled = false; }
     mountView(view, `
-      <div class="auth-page" role="main">
-        <div class="auth-card auth-card--wide auth-card--prose" data-auth-card>
+      <div class="auth-page auth-page--solo" role="main">
+        <div class="auth-card auth-card--surface auth-card--wide auth-card--prose" data-auth-card>
           <header class="auth-card__head">
             <div class="auth-card__logo" aria-hidden="true"></div>
             <h1 class="auth-card__title">Account recovery</h1>
-            <p class="auth-card__lead">Email SHA code recovery</p>
+            <p class="auth-card__lead">Reset via email verification code</p>
           </header>
           <div class="auth-card__body">
           <p class="muted auth-card__prose">
@@ -1403,21 +1406,24 @@
     };
     mountView(view, `
       <div class="auth-page auth-page-pro" role="main">
-        <section class="auth-hero auth-hero--compact">
-          <div class="auth-hero__tag">Admin Onboarding</div>
-          <h2>Create your admin workspace</h2>
-          <p>Verify by email, then manage your fleet.</p>
-          <ul class="auth-hero__bullets">
-            <li>No superadmin approval</li>
-            <li>Email verification & cooldown</li>
-            <li>Tenant-isolated workspace</li>
-          </ul>
-        </section>
-        <div class="auth-card auth-card--wide auth-card--pro" data-auth-card>
+        <details class="auth-hero-fold" open>
+          <summary class="auth-hero-fold__summary"><span class="auth-hero-fold__label">Admin onboarding</span></summary>
+          <section class="auth-hero auth-hero--compact">
+            <div class="auth-hero__tag">Admin Onboarding</div>
+            <h2>Create your admin workspace</h2>
+            <p>Verify by email, then manage your fleet.</p>
+            <ul class="auth-hero__bullets">
+              <li>No superadmin approval</li>
+              <li>Email verification & cooldown</li>
+              <li>Tenant-isolated workspace</li>
+            </ul>
+          </section>
+        </details>
+        <div class="auth-card auth-card--surface auth-card--wide" data-auth-card>
           <header class="auth-card__head">
             <div class="auth-card__logo" aria-hidden="true"></div>
             <h1 class="auth-card__title">Create admin</h1>
-            <p class="auth-card__lead">Create your account with email verification.</p>
+            <p class="auth-card__lead">Email verification, then sign in.</p>
           </header>
           <div class="auth-card__body">
             <p class="auth-card__note muted">After verification, you can sign in immediately.</p>
@@ -1515,8 +1521,8 @@
     setCrumb("Activate account");
     document.body.dataset.auth = "none";
     mountView(view, `
-      <div class="auth-page" role="main">
-        <div class="auth-card auth-card--wide" data-auth-card>
+      <div class="auth-page auth-page--solo" role="main">
+        <div class="auth-card auth-card--surface auth-card--wide" data-auth-card>
           <header class="auth-card__head">
             <div class="auth-card__logo" aria-hidden="true"></div>
             <h1 class="auth-card__title">Activate account</h1>

@@ -9,7 +9,9 @@ import secrets
 import sqlite3
 import threading
 import time
+import urllib.error
 import urllib.request
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from contextlib import asynccontextmanager
 import base64
 import hashlib
@@ -111,6 +113,10 @@ def _legacy_unowned_device_scope(principal: "Principal") -> bool:
     return bool(ALLOW_LEGACY_UNOWNED) and not TENANT_STRICT
 OTA_FIRMWARE_DIR = os.getenv("OTA_FIRMWARE_DIR", "/opt/sentinel/firmware")
 OTA_PUBLIC_BASE_URL = os.getenv("OTA_PUBLIC_BASE_URL", "").rstrip("/")
+# Optional: base URL used only for server-side HEAD/GET checks (same /fw/ path as public).
+# Use when devices resolve https://ota.example.com but the API container cannot (hairpin NAT),
+# or before public TLS is ready: e.g. http://ota-nginx:9231 on the Docker network.
+OTA_VERIFY_BASE_URL = os.getenv("OTA_VERIFY_BASE_URL", "").rstrip("/")
 OTA_TOKEN = os.getenv("OTA_TOKEN", "")
 MAX_OTA_UPLOAD_BYTES = int(os.getenv("MAX_OTA_UPLOAD_BYTES", str(16 * 1024 * 1024)))
 ALARM_FANOUT_DURATION_MS = int(os.getenv("ALARM_FANOUT_DURATION_MS", "8000"))
@@ -2405,22 +2411,90 @@ def _presence_probe_tick() -> None:
 #  OTA campaigns (superadmin -> admin accept -> per-device rollout)
 # ═══════════════════════════════════════════════
 
-def _verify_ota_url(url: str) -> tuple[bool, str]:
-    """HEAD the firmware URL so we fail fast if the superadmin typoed it.
-    Returns (ok, detail)."""
+def _append_ota_token_to_url(url: str) -> str:
+    """Append ?token=OTA_TOKEN when set — nginx OTA template requires it (SECURITY.md)."""
+    tok = (OTA_TOKEN or "").strip()
+    if not tok:
+        return url
+    p = urlparse(url)
+    q = dict(parse_qsl(p.query, keep_blank_values=True))
+    if q.get("token"):
+        return url
+    q["token"] = tok
+    new_query = urlencode(q)
+    return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
+
+
+def _effective_ota_verify_base() -> str:
+    """Prefer OTA_VERIFY_BASE_URL so the API can reach ota-nginx inside Docker."""
+    return (OTA_VERIFY_BASE_URL or OTA_PUBLIC_BASE_URL).rstrip("/")
+
+
+def _service_check_url_for_firmware(fname: str) -> str:
+    """URL the API uses for HTTP checks (may be internal Docker base)."""
+    base = _effective_ota_verify_base()
+    return _append_ota_token_to_url(f"{base}/fw/{fname}")
+
+
+def _public_firmware_url(fname: str) -> str:
+    """Canonical URL stored in campaigns / shown to devices (no token in DB; ESP adds token)."""
+    return f"{OTA_PUBLIC_BASE_URL}/fw/{fname}"
+
+
+def _http_probe_ota(url: str) -> tuple[bool, str]:
+    """HEAD first (with optional Range GET fallback). URL should already include token if required."""
     if not url.startswith(("http://", "https://")):
         return False, "scheme_not_http"
+
+    def _read_response(resp: Any) -> tuple[int, str]:
+        code = int(getattr(resp, "status", getattr(resp, "code", 200)))
+        length = resp.headers.get("content-length", "") if hasattr(resp, "headers") else ""
+        return code, length or "?"
+
     try:
-        import urllib.request
         req = urllib.request.Request(url, method="HEAD")
         with urllib.request.urlopen(req, timeout=OTA_URL_VERIFY_TIMEOUT_SECONDS) as resp:
-            code = int(getattr(resp, "status", 200))
-            length = resp.headers.get("content-length", "")
+            code, length = _read_response(resp)
             if 200 <= code < 400:
-                return True, f"http_{code} size={length or '?'}"
-            return False, f"http_{code}"
+                return True, f"HEAD http_{code} size={length}"
+            return False, f"HEAD http_{code}"
+    except urllib.error.HTTPError as exc:
+        if int(exc.code) == 405:
+            pass  # fall through to GET range
+        else:
+            return False, f"HEAD http_{exc.code}:{exc.reason}"
     except Exception as exc:
-        return False, f"head_err:{exc.__class__.__name__}:{exc}"
+        return False, f"HEAD_err:{exc.__class__.__name__}:{exc}"
+
+    try:
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("Range", "bytes=0-0")
+        with urllib.request.urlopen(req, timeout=OTA_URL_VERIFY_TIMEOUT_SECONDS) as resp:
+            code, length = _read_response(resp)
+            if code in (200, 206) or (200 <= code < 400):
+                return True, f"GET_range http_{code} size={length}"
+            return False, f"GET_range http_{code}"
+    except urllib.error.HTTPError as exc:
+        return False, f"GET http_{exc.code}:{exc.reason}"
+    except Exception as exc:
+        return False, f"GET_err:{exc.__class__.__name__}:{exc}"
+
+
+def _verify_ota_url(url: str) -> tuple[bool, str]:
+    """Verify the firmware URL responds (HEAD or byte-range GET). Appends OTA_TOKEN for nginx."""
+    return _http_probe_ota(_append_ota_token_to_url(url))
+
+
+def _verify_firmware_file_on_service(fname: str) -> tuple[bool, str, str]:
+    """Check reachability via OTA_VERIFY_BASE_URL or public base; returns (ok, detail, checked_url_masked)."""
+    safe = os.path.basename(fname.strip())
+    u = _service_check_url_for_firmware(safe)
+    ok, detail = _http_probe_ota(u)
+    masked = u
+    tok = (OTA_TOKEN or "").strip()
+    if tok:
+        masked = u.replace(tok, "***")
+    return ok, detail, masked
 
 
 def _ota_campaign_targets_for_admin(admin_username: str, fw_version: str, target_url: str) -> list[dict[str, Any]]:
@@ -9347,6 +9421,31 @@ def _sha256_for(path: str) -> Optional[str]:
         return None
 
 
+@app.get("/ota/service-check")
+def ota_service_check(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
+    """Superadmin: safe diagnostics for OTA URL probing (no secrets)."""
+    assert_min_role(principal, "superadmin")
+    hints: list[str] = []
+    tok = bool((OTA_TOKEN or "").strip())
+    if not tok:
+        hints.append("OTA_TOKEN is unset — nginx /fw/ token rule returns 403; devices and probes need the same token as config.h.")
+    if OTA_PUBLIC_BASE_URL and not OTA_VERIFY_BASE_URL:
+        hints.append(
+            "If probes fail with connection refused from the API container, set OTA_VERIFY_BASE_URL=http://ota-nginx:9231 "
+            "(Docker Compose service name on croc_net)."
+        )
+    if not OTA_PUBLIC_BASE_URL:
+        hints.append("Set OTA_PUBLIC_BASE_URL for device-facing URLs (must match config.h OTA_ALLOWED_HOST).")
+    return {
+        "OTA_FIRMWARE_DIR": OTA_FIRMWARE_DIR,
+        "OTA_PUBLIC_BASE_URL": OTA_PUBLIC_BASE_URL or None,
+        "OTA_VERIFY_BASE_URL": OTA_VERIFY_BASE_URL or None,
+        "effective_verify_base": _effective_ota_verify_base() or None,
+        "OTA_TOKEN_configured": tok,
+        "hints": hints,
+    }
+
+
 @app.get("/ota/firmwares")
 def list_firmwares(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
     # Only superadmin can even see the firmware inventory.
@@ -9544,9 +9643,16 @@ async def ota_firmware_upload_stage(
             detail="OTA_PUBLIC_BASE_URL is not set (e.g. https://ota.esasecure.com). Devices must match config.h OTA_ALLOWED_HOST + OTA_TOKEN.",
         )
     fname, sha_hex, nbytes = await _ota_store_uploaded_bin(file, fw_version)
-    url = f"{OTA_PUBLIC_BASE_URL}/fw/{fname}"
-    ok, verify_detail = _verify_ota_url(url)
+    url = _public_firmware_url(fname)
+    ok, verify_detail, probe_masked = _verify_firmware_file_on_service(fname)
     audit_event(principal.username, "ota.firmware.stage", fname, {"size": nbytes, "url": url, "head_ok": ok})
+    hint = None
+    if not ok:
+        hint = (
+            "Probe failed — ensure nginx serves /fw/ with ?token= (OTA_TOKEN). "
+            "From inside Docker use OTA_VERIFY_BASE_URL=http://ota-nginx:9231; "
+            "on the host ensure HTTPS server_name ota.esasecure.com proxies to 127.0.0.1:9231."
+        )
     return {
         "ok": True,
         "stored_as": fname,
@@ -9555,10 +9661,10 @@ async def ota_firmware_upload_stage(
         "size": nbytes,
         "head_ok": ok,
         "verify": verify_detail,
+        "probe_url": probe_masked,
+        "verify_base_used": _effective_ota_verify_base(),
         "public_base": OTA_PUBLIC_BASE_URL,
-        "hint": None
-        if ok
-        else "HEAD failed — nginx/DNS/path may be wrong; fix deployment then publish via POST /ota/campaigns/from-stored",
+        "hint": hint,
     }
 
 
@@ -9576,12 +9682,16 @@ def create_ota_campaign_from_stored(req: OtaCampaignFromStoredRequest, principal
     sha_hex = _sha256_for(path)
     if not sha_hex:
         raise HTTPException(status_code=500, detail="could not compute firmware SHA-256")
-    url = f"{OTA_PUBLIC_BASE_URL}/fw/{fname}"
-    ok, verify_detail = _verify_ota_url(url)
+    url = _public_firmware_url(fname)
+    ok, verify_detail, probe_masked = _verify_firmware_file_on_service(fname)
     if not ok:
         raise HTTPException(
             status_code=400,
-            detail=f"HEAD check failed ({verify_detail}). Devices must be able to download this URL — fix nginx /fw/ mapping and OTA_PUBLIC_BASE_URL.",
+            detail=(
+                f"firmware HTTP check failed ({verify_detail}); probed {probe_masked}. "
+                "Set OTA_TOKEN to match nginx; optional OTA_VERIFY_BASE_URL=http://ota-nginx:9231 for Docker. "
+                "Public URL for devices remains OTA_PUBLIC_BASE_URL."
+            ),
         )
     insert_req = OtaCampaignCreateRequest(
         fw_version=req.fw_version.strip(),
@@ -9622,8 +9732,8 @@ async def ota_campaign_from_upload(
         )
     fname, sha_hex, nbytes = await _ota_store_uploaded_bin(file, fw_version)
 
-    url = f"{OTA_PUBLIC_BASE_URL}/fw/{fname}"
-    ok, verify_detail = _verify_ota_url(url)
+    url = _public_firmware_url(fname)
+    ok, verify_detail, probe_masked = _verify_firmware_file_on_service(fname)
     if not ok:
         dest = os.path.join(OTA_FIRMWARE_DIR, fname)
         try:
@@ -9635,7 +9745,10 @@ async def ota_campaign_from_upload(
             pass
         raise HTTPException(
             status_code=400,
-            detail=f"firmware saved but URL not reachable (HEAD failed): {verify_detail}. Check OTA nginx, DNS, and OTA_PUBLIC_BASE_URL.",
+            detail=(
+                f"firmware saved but HTTP check failed ({verify_detail}); probed {probe_masked}. "
+                "Set OTA_TOKEN (nginx token gate). Use OTA_VERIFY_BASE_URL=http://ota-nginx:9231 if public hostname is unreachable from the API container."
+            ),
         )
 
     ta = (target_admins or "").strip()

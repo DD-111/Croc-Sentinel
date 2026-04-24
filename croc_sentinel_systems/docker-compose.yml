@@ -41,6 +41,7 @@ services:
 
     depends_on:
       - mosquitto
+      - ota-nginx
 
     expose:
       - "8088"
@@ -60,6 +61,8 @@ services:
     volumes:
       - ./data:/data
       - ./certs/ca.crt:/etc/sentinel/mqtt-ca.crt:ro
+      # Same host dir as ota-nginx so uploads and firmware list match /fw/ files.
+      - ./firmware:/opt/sentinel/firmware
 
     networks:
       - croc_net
