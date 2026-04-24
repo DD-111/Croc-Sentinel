@@ -947,10 +947,15 @@
     const relEl = document.getElementById("crocFwHintRelease");
     const relLab = document.getElementById("crocFwHintRelLabel");
     if (relEl) {
-      relEl.textContent = serverNotes || "No release notes for this build (add .txt / .md next to the .bin on the server).";
-      relEl.style.display = "block";
+      if (serverNotes) {
+        relEl.textContent = serverNotes;
+        relEl.style.display = "block";
+      } else {
+        relEl.textContent = "";
+        relEl.style.display = "none";
+      }
     }
-    if (relLab) relLab.style.display = "block";
+    if (relLab) relLab.style.display = serverNotes ? "block" : "none";
 
     const cmp = document.getElementById("crocFwHintCompare");
     if (cmp) {
@@ -1048,11 +1053,18 @@
 
   /** All-devices list + device detail: sync Firmware row version + OTA-hint control from API model. */
   function syncDevicePageFirmwareHint(view, dev, deviceIdForOta) {
+    const hasUpd = !!(dev && dev.firmware_hint && dev.firmware_hint.update_available && firmwareHintStillValid(dev && dev.fw, dev.firmware_hint));
+    const stEl = $("#devFwStatus", view);
+    if (stEl) {
+      stEl.textContent = hasUpd ? "Update available · 有更新" : "Up to date · 已是最新";
+      stEl.className = hasUpd ? "device-fw-state device-fw-state--update" : "device-fw-state device-fw-state--ok";
+    }
     const hBtn = $("#devFwHintBtn", view);
     if (hBtn) {
-      const h = dev && dev.firmware_hint;
-      if (h && h.update_available && firmwareHintStillValid(dev && dev.fw, h)) {
+      if (hasUpd) {
         hBtn.style.display = "inline-flex";
+        hBtn.setAttribute("aria-pressed", "true");
+        const h = dev.firmware_hint;
         const did = String(deviceIdForOta || (dev && dev.device_id) || "");
         const operate = !!(dev && dev.can_operate);
         hBtn.onclick = () => openGlobalFwHintDialog(h, {
@@ -1062,6 +1074,8 @@
         });
       } else {
         hBtn.style.display = "none";
+        hBtn.removeAttribute("aria-pressed");
+        hBtn.onclick = null;
       }
     }
     const vEl = $("#devFwVer", view);
@@ -1136,13 +1150,36 @@
     document.body.dataset.auth = state.me ? "ok" : "none";
     const who = $("#who");
     if (state.me) {
+      const u = String(state.me.username || "").trim() || "—";
+      const role = String(state.me.role || "").trim() || "—";
+      const zt = (state.me.zones || []).map((z) => String(z)).filter(Boolean).join(", ") || "—";
+      const initial = (u[0] || "?").toUpperCase();
       setChildMarkup(
         who,
-        `<div><strong>${escapeHtml(state.me.username)}</strong></div>` +
-          `<div class="muted">${escapeHtml(state.me.role)} · ${escapeHtml((state.me.zones || []).join(", ") || "—")}</div>`,
+        `<div class="who-card" title="${escapeHtml(u)}">` +
+          `<div class="who-card__avatar" aria-hidden="true">${escapeHtml(initial)}</div>` +
+          `<div class="who-card__body">` +
+            `<div class="who-card__name">${escapeHtml(u)}</div>` +
+            `<div class="who-card__meta">` +
+            `<span class="who-card__role">${escapeHtml(role)}</span>` +
+            `<span class="who-card__zones" title="${escapeHtml(zt)}">${escapeHtml(zt)}</span>` +
+            `</div>` +
+          `</div>` +
+        `</div>`,
       );
+      if (who) {
+        who.className = "who who--authed";
+        who.setAttribute("role", "group");
+        who.setAttribute("aria-label", "Account");
+      }
     } else {
-      who.textContent = "Signed out";
+      if (who) {
+        who.className = "who who--guest";
+        who.textContent = "Signed out";
+        who.removeAttribute("role");
+        who.removeAttribute("aria-label");
+        who.removeAttribute("title");
+      }
     }
     renderNav();
     renderHealthPills();
@@ -2206,7 +2243,7 @@
                 <strong>Devices</strong>
                 <label class="muted"><input type="checkbox" id="shareSelAllDevices" /> Select all</label>
               </div>
-              <div id="shareDeviceList" class="grp-pick-list" style="max-height:260px;overflow:auto"></div>
+              <div id="shareDeviceList" class="grp-pick-list grp-pick-list--devices" style="max-height:280px;overflow:auto"></div>
             </div>
             <div style="flex:1;min-width:280px">
               <div class="row" style="justify-content:space-between;align-items:center">
@@ -2248,15 +2285,28 @@
         </div>
       </div>
       <div id="grpModal" class="grp-modal" style="display:none">
-        <div class="grp-modal-card">
-          <h3 style="margin:0 0 8px">Edit group card</h3>
-          <label class="field"><span>Group key</span><input id="gmKey" placeholder="e.g. Warehouse-A"/></label>
-          <label class="field"><span>Display name</span><input id="gmName"/></label>
-          <label class="field"><span>Owner name</span><input id="gmOwner"/></label>
-          <label class="field"><span>Phone</span><input id="gmPhone"/></label>
-          <label class="field"><span>Email</span><input id="gmEmail"/></label>
-          <div class="field"><span>Devices</span><div id="gmDevices" class="grp-pick-list"></div></div>
-          <div class="row" style="justify-content:flex-end;gap:8px;margin-top:10px">
+        <div class="grp-modal-card grp-modal-card--edit">
+          <header class="grp-modal__head">
+            <h3 class="grp-modal__title">编辑组卡 / Edit group card</h3>
+            <p class="grp-modal__lede">兄弟机 = 同一租户、同一 <strong>Group key</strong>（= 设备 <strong>Notification group</strong>）且 Zone 规则允许时，由云端做联动；下面勾选要显示在此组卡上的设备。 · Siblings: same tenant + same group key (device <code>notification_group</code>); tick devices to show on this card.</p>
+            <ol class="grp-modal__steps" lang="zh-Hans">
+              <li>为每台设备在「全部设备 / 设备详情」里设好同一组名，或与这里保存时一并写入（见 Save）。</li>
+              <li>空组名 = 不参与同组兄弟联动。</li>
+            </ol>
+            <p class="grp-modal__steps-en muted" lang="en">Empty group = no sibling fan-out. Full rules: <code>docs/GROUP_AND_LINKAGE.md</code> in the repo.</p>
+          </header>
+          <div class="grp-modal__fields">
+            <label class="field"><span>Group key</span><input id="gmKey" placeholder="e.g. Warehouse-A" autocomplete="off"/></label>
+            <label class="field"><span>Display name</span><input id="gmName" autocomplete="off"/></label>
+            <label class="field"><span>Owner name</span><input id="gmOwner" autocomplete="name"/></label>
+            <label class="field"><span>Phone</span><input id="gmPhone" inputmode="tel" autocomplete="tel"/></label>
+            <label class="field"><span>Email</span><input id="gmEmail" type="email" autocomplete="email"/></label>
+            <div class="field field--devices">
+              <span>Devices in this group</span>
+              <div id="gmDevices" class="grp-pick-list grp-pick-list--devices" role="group" aria-label="Devices in group"></div>
+            </div>
+          </div>
+          <div class="row grp-modal__actions" style="justify-content:flex-end;gap:8px;margin-top:12px">
             <button class="btn sm secondary" id="gmCancel" type="button">Cancel</button>
             <button class="btn sm" id="gmSave" type="button">Save</button>
           </div>
@@ -2280,6 +2330,23 @@
     const grpSetModalEl = $("#grpSetModal", view);
     const shareModalEl = $("#shareModal", view);
     if (!groupCardsEl || !grpModalEl || !grpSetModalEl) return;
+
+    const groupDeviceRow = (d, { checked, disabled } = {}) => {
+      const did = String(d && d.device_id != null ? d.device_id : "").trim();
+      if (!did) return "";
+      const name0 = d && d.display_label != null && String(d.display_label).trim();
+      const name = name0 || did;
+      const ck = checked ? " checked" : "";
+      const di = disabled ? " disabled" : "";
+      return (
+        `<label class="grp-pick-item grp-pick-item--device">` +
+        `<input type="checkbox" class="grp-pick-chk" value="${escapeHtml(did)}"${ck}${di} />` +
+        `<span class="grp-pick-text">` +
+        `<span class="grp-pick-name">${escapeHtml(name)}</span>` +
+        `<span class="grp-pick-id mono" title="Device ID / 序列号">${escapeHtml(did)}</span>` +
+        `</span></label>`
+      );
+    };
 
     let editingGroup = "";
     const normalizeGroupKey = (v) => String(v == null ? "" : v).trim();
@@ -2670,10 +2737,16 @@
       if (pick) {
         setChildMarkup(
           pick,
-          devices.map((d) => `<label class="grp-pick-item"><input type="checkbox" value="${escapeHtml(d.device_id)}" ${sel.has(String(d.device_id)) ? "checked" : ""} ${isSharedGroup ? "disabled" : ""}/> <span>${escapeHtml(d.display_label || d.device_id)} <span class="mono">(${escapeHtml(d.device_id)})</span></span></label>`).join(""),
+          devices
+            .map((d) => groupDeviceRow(d, { checked: sel.has(String(d.device_id)), disabled: isSharedGroup }))
+            .filter(Boolean)
+            .join(""),
         );
         if (isSharedGroup) {
-          prependChildMarkup(pick, `<p class="muted" style="margin:0 0 6px">Shared group: device membership is read-only.</p>`);
+          prependChildMarkup(
+            pick,
+            `<p class="grp-pick-hint muted" style="margin:0 0 8px">Shared group: 成员只读。 · Device membership is read-only.</p>`,
+          );
         }
       }
       grpModalEl.style.display = "flex";
@@ -2814,17 +2887,23 @@
       );
       if (shareModalEditSpec) {
         const row = devices.find((d) => String(d.device_id) === editDid);
-        const label = row ? `${row.display_label || editDid} (${editDid})` : editDid;
         setChildMarkup(
           devListEl,
-          `<label class="grp-pick-item"><input type="checkbox" value="${escapeHtml(editDid)}" checked disabled/> <span>${escapeHtml(label)}</span></label>`,
+          row
+            ? groupDeviceRow(row, { checked: true, disabled: true })
+            : `<label class="grp-pick-item grp-pick-item--device">` +
+              `<input type="checkbox" class="grp-pick-chk" value="${escapeHtml(editDid)}" checked disabled />` +
+              `<span class="grp-pick-text">` +
+              `<span class="grp-pick-name">${escapeHtml(editDid)}</span>` +
+              `<span class="grp-pick-id mono">${escapeHtml(editDid)}</span></span></label>`,
         );
       } else {
         setChildMarkup(
           devListEl,
           devices
             .filter((d) => !d.is_shared)
-            .map((d) => `<label class="grp-pick-item"><input type="checkbox" value="${escapeHtml(d.device_id)}" ${picked.has(String(d.device_id)) ? "checked" : ""}/> <span>${escapeHtml(d.display_label || d.device_id)} <span class="mono">(${escapeHtml(d.device_id)})</span></span></label>`)
+            .map((d) => groupDeviceRow(d, { checked: picked.has(String(d.device_id)), disabled: false }))
+            .filter(Boolean)
             .join("") || `<p class="muted">No own devices available.</p>`,
         );
       }
@@ -3454,15 +3533,16 @@
         } else if (d.is_shared && d.shared_by) {
           subMeta = `Shared: ${escapeHtml(String(d.shared_by))}<br/>`;
         }
-        const fwInline = d.fw
-          ? `<span class="device-fw-inline" style="display:inline-flex;align-items:center;gap:3px;vertical-align:middle">` +
-            `<span class="chip">v${escapeHtml(d.fw)}</span>` +
-            (d.firmware_hint && d.firmware_hint.update_available && firmwareHintStillValid(d.fw, d.firmware_hint)
-              ? `<button type="button" class="fw-hint-badge fw-hint-badge--sm js-fw-hint" data-did="${escapeHtml(did)}" title="New firmware on server" aria-label="Firmware update: view release notes">` +
-                `<span class="fw-hint-badge__shell"><span class="fw-hint-badge__arrow" aria-hidden="true">↑</span><span class="fw-hint-badge__dot" aria-hidden="true"></span></span>` +
-                `</button>`
+        const needFw = !!(d.firmware_hint && d.firmware_hint.update_available && firmwareHintStillValid(d.fw, d.firmware_hint));
+        const fwBlock = d.fw
+          ? `<div class="device-card__firmware">` +
+            `<span class="device-fw-inline" role="group" aria-label="Firmware">` +
+            `<span class="chip device-fw-chip" title="Reported firmware">v${escapeHtml(d.fw)}</span>` +
+            (needFw
+              ? `<span class="device-fw-pill" title="Newer build on server / 服务器上有较新版本">Update / 有更新</span>` +
+                `<button type="button" class="btn sm secondary fw-hint-cta fw-hint-cta--sm js-fw-hint" data-did="${escapeHtml(did)}" title="View update details / 查看更新" aria-label="Firmware update">更新</button>`
               : "") +
-            `</span>`
+            `</span></div>`
           : "";
         return `<div class="device-card device-card--row-thumb" style="position:relative">` +
           `<label style="position:absolute;right:8px;top:8px;z-index:2;display:flex;align-items:center;gap:6px;font-size:12px">` +
@@ -3472,12 +3552,15 @@
           `<div class="device-thumb device-thumb--list" aria-hidden="true">${letter}</div>` +
           `<div class="device-card--row-body" style="padding-right:56px">` +
           `<h3 style="margin:0"><div class="device-primary-name">${primary}</div>${subId}</h3>` +
-          `<div><span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>` +
-          (d.zone ? ` <span class="chip">${escapeHtml(d.zone)}</span>` : "") +
-          (fwInline ? ` ${fwInline}` : "") +
-          (d.is_shared ? ` <span class="badge accent" title="shared device">shared</span>` : "") +
+          `<div class="device-card__status">` +
+          `<div class="device-card__pills">` +
+          `<span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>` +
+          (d.zone ? `<span class="chip device-zone-chip">${escapeHtml(d.zone)}</span>` : "") +
+          (d.is_shared ? `<span class="badge accent" title="shared device">shared</span>` : "") +
           `</div>` +
-          `<div class="meta" style="margin-top:4px">Live: ${spLine}<br/>${subMeta}Updated: ${escapeHtml(fmtRel(d.updated_at))}</div>` +
+          `${fwBlock}` +
+          `</div>` +
+          `<div class="meta" style="margin-top:6px">Live: ${spLine}<br/>${subMeta}Updated: ${escapeHtml(fmtRel(d.updated_at))}</div>` +
           `</div></a></div>`;
       };
       const applyFilter = () => {
@@ -3805,6 +3888,9 @@
         </details>
       </div>` : "";
     mountView(view, `
+      <nav class="device-page-back-nav" aria-label="Device navigation">
+        <a href="#/devices" class="btn secondary sm btn-tap device-page-back">← Back</a>
+      </nav>
       <div class="card device-focus-layout">
         <div class="device-focus-left">
           <div class="row" style="align-items:flex-start;flex-wrap:wrap;gap:10px">
@@ -3815,17 +3901,17 @@
             <span class="badge ${dm.on ? "online" : "offline"}" id="devOnlineBadge">${dm.on ? "online" : "offline"}</span>
             <span class="chip" id="devReasonChip">${escapeHtml(reasonEn[dm.reason] || dm.reason)}</span>
             ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
-            <a href="#/devices" class="btn ghost right">← All devices</a>
           </div>
           <div class="device-hero-card">
             <div class="device-thumb">${escapeHtml((d.display_label || id || "?").slice(0, 1).toUpperCase())}</div>
             <div class="device-hero-meta">
               <div class="device-hero-line device-hero-line--fw">
                 <span class="muted">Firmware</span>
-                <span class="device-hero-fw" style="display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end">
+                <div class="device-hero-fw">
                   <span class="mono" id="devFwVer">${escapeHtml(d.fw || "—")}</span>
-                  <button type="button" class="fw-hint-badge" id="devFwHintBtn" style="display:${(d.firmware_hint && d.firmware_hint.update_available && firmwareHintStillValid(d.fw, d.firmware_hint)) ? "inline-flex" : "none"}" title="New firmware on server" aria-label="Firmware update"><span class="fw-hint-badge__shell"><span class="fw-hint-badge__arrow" aria-hidden="true">↑</span><span class="fw-hint-badge__dot" aria-hidden="true"></span></span><span class="visually-hidden">New firmware on server</span></button>
-                </span>
+                  <span class="device-fw-state" id="devFwStatus" aria-live="polite">—</span>
+                  <button type="button" class="btn sm secondary fw-hint-cta" id="devFwHintBtn" style="display:${(d.firmware_hint && d.firmware_hint.update_available && firmwareHintStillValid(d.fw, d.firmware_hint)) ? "inline-flex" : "none"}" title="New firmware on server / 服务器有新固件">更新</button>
+                </div>
               </div>
               <div class="device-hero-line"><span class="muted">Platform</span><span class="mono">${escapeHtml(maskPlatform(`${d.chip_target || ""}/${d.board_profile || ""}`))}</span></div>
               <div class="device-hero-line"><span class="muted">Network</span><span class="mono" id="devNetRow">${escapeHtml(d.net_type || "—")} · ${escapeHtml(dm.s.ip || "—")}</span></div>
@@ -6011,19 +6097,22 @@
     const superCard = `
       <div class="card">
         <h2 class="ui-section-title">Superadmin · Upload & campaign</h2>
-        <p class="muted" style="margin:0 0 8px">Stage <code>.bin</code> on the API host (<code>POST /ota/firmware/upload</code>), then create a campaign from a stored filename (<code>POST /ota/campaigns/from-stored</code>).</p>
+        <p class="muted" style="margin:0 0 8px">Stage <code>.bin</code> to <code>OTA_FIRMWARE_DIR</code> (default repo <code>croc_sentinel_systems/firmware</code>) with the server <strong>upload password</strong> (<code>OTA_UPLOAD_PASSWORD</code> env). The server keeps at most 10 <code>.bin</code> files, dropping the <strong>oldest</strong> (by file mtime) when a new one is added. Then create a campaign from a stored filename (<code>POST /ota/campaigns/from-stored</code>).</p>
         <div class="inline-form">
+          <label class="field wide"><span>Upload password *</span><input type="password" id="otaStUploadPwd" autocomplete="off" placeholder="Server OTA_UPLOAD_PASSWORD" /></label>
           <label class="field"><span>Firmware file (.bin)</span><input type="file" id="otaStFile" accept=".bin,application/octet-stream" /></label>
           <label class="field"><span>Version label *</span><input id="otaStFw" placeholder="6.6.8" maxlength="40" /></label>
           <div class="row wide" style="justify-content:flex-end">
             <button type="button" class="btn btn-tap" id="otaStBtn">Upload & verify</button>
           </div>
         </div>
-        <p class="muted" id="otaStResult" style="margin-top:10px;min-height:1.2em"></p>
+        <p class="muted" id="otaRetentionInfo" style="margin-top:8px;min-height:1.2em"></p>
+        <p class="muted" id="otaStResult" style="margin-top:4px;min-height:1.2em"></p>
         <div class="divider"></div>
         <h3 style="margin:0 0 6px">Publish from stored file</h3>
-        <label class="field"><span>Stored file *</span><select id="otaFromSel"><option value="">Loading…</option></select></label>
-        <label class="field"><span>Campaign version label *</span><input id="otaFromFw" maxlength="40" placeholder="6.6.8" /></label>
+        <p class="muted" style="margin:0 0 8px;font-size:12.5px">Select which staged <code>.bin</code> to offer in the campaign. The <strong>version string</strong> is read from the server (upload-time <code>.version</code> or filename) — not hand-typed. It should match the firmware&rsquo;s <code>FW_VERSION</code> for that build.</p>
+        <label class="field wide"><span>Firmware to deploy *</span><select id="otaFromSel"><option value="">Loading…</option></select></label>
+        <label class="field wide"><span>Version (from server, read-only)</span><input type="text" id="otaFromResolvedVer" class="mono" readonly tabindex="-1" value="—" style="background:var(--bg-muted);cursor:default" aria-live="polite" /></label>
         <label class="field wide"><span>Notes</span><input id="otaFromNotes" maxlength="500" /></label>
         <label class="checkbox"><input type="checkbox" id="otaFromAllAd" checked /><span>Target all admins</span></label>
         <label class="field wide"><span>Or comma-separated admin usernames</span><input id="otaFromAdmTxt" placeholder="admin-a, admin-b (when not targeting all)" /></label>
@@ -6034,6 +6123,21 @@
 
     mountView(view, helpCard + superCard);
 
+    const otaSyncFromStoredVersion = () => {
+      const sel = $("#otaFromSel", view);
+      const ro = $("#otaFromResolvedVer", view);
+      if (!ro) return;
+      if (!sel || !sel.value) {
+        ro.value = "—";
+        return;
+      }
+      const i = Number(sel.selectedIndex);
+      const opt = sel.options[i];
+      const raw = opt && opt.getAttribute("data-fw-version");
+      const v = (raw && String(raw).trim()) || "";
+      ro.value = v || "—";
+    };
+
     const refreshFirmwareSelect = async () => {
       if (!isSuper) return;
       const sel = $("#otaFromSel", view);
@@ -6042,11 +6146,31 @@
         const r = await api("/ota/firmwares", { timeoutMs: 20000 });
         if (!isRouteCurrent(routeSeq)) return;
         const items = r.items || [];
+        const ret = r.retention;
+        const inf = $("#otaRetentionInfo", view);
+        if (inf) {
+          inf.textContent = ret
+            ? `Staged .bin: ${ret.stored_count} / max ${ret.max_bins}. Upload password: ${ret.upload_password_configured ? "configured" : "not set on server"}.`
+            : "";
+        }
         sel.innerHTML = items.length
-          ? items.map((it) => `<option value="${escapeHtml(it.name)}">${escapeHtml(it.name)} (${Math.round(Number(it.size || 0) / 1024)} KB)</option>`).join("")
+          ? items.map((it) => {
+            const vRaw = (it.fw_version && String(it.fw_version).trim()) || "";
+            const dv = vRaw ? escapeHtml(vRaw) : "";
+            const fv = vRaw
+              ? ` · v${escapeHtml(vRaw)}`
+              : "";
+            return `<option value="${escapeHtml(it.name)}" data-fw-version="${dv}">${escapeHtml(it.name)}${fv} (${Math.round(Number(it.size || 0) / 1024)} KB)</option>`;
+          }).join("")
           : "<option value=\"\">(no .bin in folder)</option>";
+        otaSyncFromStoredVersion();
+        sel.onchange = otaSyncFromStoredVersion;
       } catch (e) {
+        const inf = $("#otaRetentionInfo", view);
+        if (inf) inf.textContent = "";
         sel.innerHTML = `<option value="">${escapeHtml(e.message || "list failed")}</option>`;
+        otaSyncFromStoredVersion();
+        sel.onchange = otaSyncFromStoredVersion;
       }
     };
 
@@ -6057,12 +6181,15 @@
         const inp = $("#otaStFile", view);
         const f = inp && inp.files && inp.files[0];
         const fw = String($("#otaStFw", view)?.value || "").trim();
+        const upw = String($("#otaStUploadPwd", view)?.value || "");
         if (!f || !fw) { toast("Choose file and version label", "err"); return; }
+        if (!upw) { toast("Enter the upload password (set OTA_UPLOAD_PASSWORD on the server).", "err"); return; }
         if (!confirm("Upload firmware to server (HEAD check against public /fw/ URL)?")) return;
         try {
           const fd = new FormData();
           fd.append("file", f);
           fd.append("fw_version", fw);
+          fd.append("upload_password", upw);
           const r = await api("/ota/firmware/upload", { method: "POST", body: fd, timeoutMs: 180000 });
           if (!isRouteCurrent(routeSeq)) return;
           const resEl = $("#otaStResult", view);
@@ -6077,19 +6204,21 @@
     if (fromBtn) {
       fromBtn.addEventListener("click", async () => {
         const fn = String($("#otaFromSel", view)?.value || "").trim();
-        const pfw = String($("#otaFromFw", view)?.value || "").trim();
         const notes = String($("#otaFromNotes", view)?.value || "").trim();
         const allCh = $("#otaFromAllAd", view);
         const rawAdm = String($("#otaFromAdmTxt", view)?.value || "").trim();
         const target_admins = (allCh && allCh.checked) ? ["*"] : (rawAdm ? rawAdm.split(/[\s,;]+/).filter(Boolean) : ["*"]);
-        if (!fn || !pfw) { toast("Pick stored file and campaign version label", "err"); return; }
-        if (!confirm("Create OTA campaign from this stored file?")) return;
+        if (!fn) { toast("Select a firmware package from the list", "err"); return; }
+        if (!confirm("Create OTA campaign from this stored file? The campaign version will be taken from the server (staged .version / filename), not the UI.")) return;
         try {
-          await api("/ota/campaigns/from-stored", {
+          const out = await api("/ota/campaigns/from-stored", {
             method: "POST",
-            body: { filename: fn, fw_version: pfw, notes: notes || undefined, target_admins },
+            body: { filename: fn, notes: notes || undefined, target_admins },
           });
-          toast("Campaign created", "ok");
+          toast(
+            (out && out.fw_version) ? `Campaign created · v${out.fw_version}` : "Campaign created",
+            "ok",
+          );
           try { bustDeviceListCaches(); } catch (_) {}
         } catch (e) { toast(e.message || e, "err"); }
       });

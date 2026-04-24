@@ -111,8 +111,16 @@ def _legacy_unowned_device_scope(principal: "Principal") -> bool:
     if principal.is_superadmin():
         return False
     return bool(ALLOW_LEGACY_UNOWNED) and not TENANT_STRICT
-OTA_FIRMWARE_DIR = os.getenv("OTA_FIRMWARE_DIR", "/opt/sentinel/firmware")
+# Default: repo `croc_sentinel_systems/firmware` (alongside this package). Docker sets OTA_FIRMWARE_DIR=/opt/sentinel/firmware.
+_API_DIR = os.path.dirname(os.path.abspath(__file__))
+_DEFAULT_OTA_FIRMWARE_DIR = os.path.normpath(os.path.join(_API_DIR, "..", "firmware"))
+OTA_FIRMWARE_DIR = os.path.abspath(os.getenv("OTA_FIRMWARE_DIR", _DEFAULT_OTA_FIRMWARE_DIR))
 OTA_PUBLIC_BASE_URL = os.getenv("OTA_PUBLIC_BASE_URL", "").rstrip("/")
+# Required for API uploads (dashboard Upload & verify, POST /ota/firmware/upload, /ota/campaigns/from-upload).
+# Use a long random secret. If unset, uploads are rejected.
+OTA_UPLOAD_PASSWORD = (os.getenv("OTA_UPLOAD_PASSWORD") or os.getenv("FIRMWARE_UPLOAD_PASSWORD") or "").strip()
+# How many .bin files to keep under OTA_FIRMWARE_DIR; oldest mtime is removed first when over limit.
+OTA_MAX_FIRMWARE_BINS = max(1, int(os.getenv("OTA_MAX_FIRMWARE_BINS", "10")))
 # Optional: base URL used only for server-side HEAD/GET checks (same /fw/ path as public).
 # Use when devices resolve https://ota.example.com but the API container cannot (hairpin NAT),
 # or before public TLS is ready: e.g. http://ota-nginx:9231 on the Docker network.
@@ -5915,6 +5923,30 @@ def _version_str_from_ota_bin_name(name: str) -> str:
     return base
 
 
+def _read_ota_stored_version_sidecar(bin_path: str) -> str:
+    """Canonical version string from OTA upload (`<name>.version`, one line). Not derived from the filename."""
+    b = (bin_path or "").strip()
+    if not b or ".." in b:
+        return ""
+    p = b + ".version"
+    if not os.path.isfile(p):
+        return ""
+    try:
+        with open(p, encoding="utf-8", errors="replace") as f:
+            line = f.readline()
+        v = (line or "").strip()
+        return v[:80] if v else ""
+    except OSError:
+        return ""
+
+
+def _version_str_for_ota_bin_file(bin_path: str, name: str) -> str:
+    v = _read_ota_stored_version_sidecar(bin_path).strip()
+    if v:
+        return v
+    return str(_version_str_from_ota_bin_name(name) or "").strip()
+
+
 def _read_ota_release_notes_for_stem(stem: str) -> str:
     if not stem or ".." in stem or "/" in stem or "\\" in stem:
         return ""
@@ -5958,7 +5990,7 @@ def _get_ota_firmware_catalog() -> list[dict[str, Any]]:
                 st = os.stat(p)
             except OSError:
                 continue
-            vs = _version_str_from_ota_bin_name(name).strip()
+            vs = _version_str_for_ota_bin_file(p, name).strip()
             if not vs:
                 continue
             items.append(
@@ -9757,12 +9789,16 @@ def ota_service_check(principal: Principal = Depends(require_principal)) -> dict
         )
     if not OTA_PUBLIC_BASE_URL:
         hints.append("Set OTA_PUBLIC_BASE_URL for device-facing URLs (must match config.h OTA_ALLOWED_HOST).")
+    if not OTA_UPLOAD_PASSWORD:
+        hints.append("OTA_UPLOAD_PASSWORD is unset — superadmin cannot stage .bin via POST /ota/firmware/upload until you set it in the API environment.")
     return {
         "OTA_FIRMWARE_DIR": OTA_FIRMWARE_DIR,
         "OTA_PUBLIC_BASE_URL": OTA_PUBLIC_BASE_URL or None,
         "OTA_VERIFY_BASE_URL": OTA_VERIFY_BASE_URL or None,
         "effective_verify_base": _effective_ota_verify_base() or None,
         "OTA_TOKEN_configured": tok,
+        "OTA_MAX_FIRMWARE_BINS": OTA_MAX_FIRMWARE_BINS,
+        "OTA_UPLOAD_PASSWORD_configured": bool(OTA_UPLOAD_PASSWORD),
         "hints": hints,
     }
 
@@ -9811,14 +9847,25 @@ def list_firmwares(principal: Principal = Depends(require_principal)) -> dict[st
             url = ""
             if OTA_PUBLIC_BASE_URL:
                 url = f"{OTA_PUBLIC_BASE_URL}/fw/{name}"
+            fw_label = _version_str_for_ota_bin_file(path, name)
             items.append({
                 "name": name,
+                "fw_version": fw_label,
                 "size": st.st_size,
                 "mtime": int(st.st_mtime),
                 "sha256": _sha256_for(path),
                 "download_url": url,
             })
-    return {"dir": base, "public_base": OTA_PUBLIC_BASE_URL, "items": items}
+    return {
+        "dir": base,
+        "public_base": OTA_PUBLIC_BASE_URL,
+        "items": items,
+        "retention": {
+            "max_bins": OTA_MAX_FIRMWARE_BINS,
+            "stored_count": len(items),
+            "upload_password_configured": bool(OTA_UPLOAD_PASSWORD),
+        },
+    }
 
 
 @app.post("/ota/broadcast")
@@ -9948,6 +9995,71 @@ def _ota_bin_path_for_stored_name(fname: str) -> str:
     return path
 
 
+def _require_ota_upload_password(provided: str | None) -> None:
+    """Server-side shared secret for staging .bin (separate from JWT). Constant-time compare."""
+    if not OTA_UPLOAD_PASSWORD:
+        raise HTTPException(
+            status_code=503,
+            detail="OTA_UPLOAD_PASSWORD is not set on the server; firmware uploads are disabled. Set it in the API environment.",
+        )
+    a = OTA_UPLOAD_PASSWORD
+    b = (provided or "")
+    if len(a) != len(b) or not hmac.compare_digest(a, b):
+        raise HTTPException(status_code=403, detail="Invalid upload password")
+
+
+def _ota_delete_artifacts_for_stored_basename(basename: str) -> None:
+    """Delete .bin, .bin.sha256, .bin.version, and sidecar release notes (stem + .txt/.md/.notes)."""
+    if not str(basename).endswith(".bin") or ".." in basename or "/" in basename or "\\" in basename:
+        return
+    base_dir = os.path.realpath(OTA_FIRMWARE_DIR)
+    path = os.path.realpath(os.path.join(OTA_FIRMWARE_DIR, basename))
+    if not path.startswith(base_dir + os.sep) or not path.lower().endswith(".bin"):
+        return
+    stem_name = path[:-4]  # full path without ".bin" suffix; basename for sidecars
+    base_name = os.path.basename(stem_name)
+    to_try: list[str] = [path, path + ".sha256", path + ".version"]
+    for ext in (".txt", ".md", ".notes"):
+        to_try.append(os.path.join(OTA_FIRMWARE_DIR, base_name + ext))
+    for p in to_try:
+        try:
+            if p and os.path.isfile(p):
+                os.remove(p)
+        except OSError:
+            pass
+
+
+def _ota_enforce_max_stored_bins() -> None:
+    """Keep at most OTA_MAX_FIRMWARE_BINS .bin files; remove oldest by mtime first, with artifacts."""
+    base = os.path.realpath(OTA_FIRMWARE_DIR)
+    if not os.path.isdir(base):
+        return
+    items: list[tuple[int, str, str]] = []  # mtime, name, relpath join path
+    for name in os.listdir(OTA_FIRMWARE_DIR):
+        if not str(name).lower().endswith(".bin"):
+            continue
+        p = os.path.join(OTA_FIRMWARE_DIR, name)
+        if not os.path.isfile(p):
+            continue
+        try:
+            rp = os.path.realpath(p)
+        except OSError:
+            continue
+        if not str(rp).startswith(base + os.sep):
+            continue
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        items.append((int(st.st_mtime), str(name), p))
+    # Oldest mtime first; break ties by name for stable order
+    items.sort(key=lambda t: (t[0], t[1]))
+    while len(items) > OTA_MAX_FIRMWARE_BINS:
+        _m, name, _p = items.pop(0)
+        _ota_delete_artifacts_for_stored_basename(name)
+    _invalidate_ota_firmware_catalog_cache()
+
+
 async def _ota_store_uploaded_bin(file: UploadFile, fw_version: str) -> tuple[str, str, str, int]:
     """Save multipart upload to OTA_FIRMWARE_DIR. Returns (fname_on_disk, sha256_hex, byte_size)."""
     os.makedirs(OTA_FIRMWARE_DIR, mode=0o755, exist_ok=True)
@@ -9964,15 +10076,27 @@ async def _ota_store_uploaded_bin(file: UploadFile, fw_version: str) -> tuple[st
             out.write(body)
         with open(dest + ".sha256", "w", encoding="utf-8") as sf:
             sf.write(f"{sha_hex}  {fname}\n")
+        ver = (fw_version or "").strip()
+        if ver:
+            with open(dest + ".version", "w", encoding="utf-8") as vf:
+                vf.write(ver + "\n")
+        else:
+            try:
+                if os.path.isfile(dest + ".version"):
+                    os.remove(dest + ".version")
+            except OSError:
+                pass
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"failed to save firmware: {exc}") from exc
-    _invalidate_ota_firmware_catalog_cache()
+    _ota_enforce_max_stored_bins()
     return fname, sha_hex, len(body)
 
 
 class OtaCampaignFromStoredRequest(BaseModel):
     filename: str = Field(min_length=4, max_length=200)
-    fw_version: str = Field(min_length=1, max_length=40)
+    # Deprecated: was required; version is now always taken from server-side staged metadata
+    # (.version sidecar and/or filename), same as GET /ota/firmwares "fw_version".
+    fw_version: Optional[str] = Field(default=None, max_length=40)
     notes: Optional[str] = Field(default=None, max_length=500)
     target_admins: list[str] = Field(default_factory=lambda: ["*"], max_length=256)
 
@@ -9982,9 +10106,11 @@ async def ota_firmware_upload_stage(
     principal: Principal = Depends(require_principal),
     file: UploadFile = File(...),
     fw_version: str = Form(...),
+    upload_password: str = Form(...),
 ) -> dict[str, Any]:
     """Superadmin: store .bin only. Runs HEAD against the public URL for diagnostics; does **not** create a campaign (file kept even if HEAD fails)."""
     assert_min_role(principal, "superadmin")
+    _require_ota_upload_password(upload_password)
     if not OTA_PUBLIC_BASE_URL:
         raise HTTPException(
             status_code=400,
@@ -10041,8 +10167,15 @@ def create_ota_campaign_from_stored(req: OtaCampaignFromStoredRequest, principal
                 "Public URL for devices remains OTA_PUBLIC_BASE_URL."
             ),
         )
+    # Campaign version label: single source of truth = staged .bin metadata (not client hand-typed).
+    resolved_fw = _version_str_for_ota_bin_file(path, fname).strip()
+    if not resolved_fw:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not resolve firmware version for this file. Add a <name>.version file next to the .bin, or re-upload from the dashboard with a version label.",
+        )
     insert_req = OtaCampaignCreateRequest(
-        fw_version=req.fw_version.strip(),
+        fw_version=resolved_fw,
         url=url,
         sha256=sha_hex,
         notes=(req.notes or "").strip() or None,
@@ -10053,7 +10186,8 @@ def create_ota_campaign_from_stored(req: OtaCampaignFromStoredRequest, principal
     out["download_url"] = url
     out["sha256"] = sha_hex
     out["verify"] = verify_detail
-    audit_event(principal.username, "ota.campaign.from_stored", fname, {"fw_version": req.fw_version.strip(), "url": url})
+    out["fw_version"] = resolved_fw
+    audit_event(principal.username, "ota.campaign.from_stored", fname, {"fw_version": resolved_fw, "url": url})
     return out
 
 
@@ -10068,11 +10202,13 @@ async def ota_campaign_from_upload(
     principal: Principal = Depends(require_principal),
     file: UploadFile = File(...),
     fw_version: str = Form(...),
+    upload_password: str = Form(...),
     notes: str = Form(""),
     target_admins: str = Form("*"),
 ) -> dict[str, Any]:
     """Superadmin: upload .bin to OTA_FIRMWARE_DIR, HEAD-verify public URL, then create the same campaign row as POST /ota/campaigns."""
     assert_min_role(principal, "superadmin")
+    _require_ota_upload_password(upload_password)
     if not OTA_PUBLIC_BASE_URL:
         raise HTTPException(
             status_code=400,
@@ -10089,8 +10225,11 @@ async def ota_campaign_from_upload(
                 os.remove(dest)
             if os.path.isfile(dest + ".sha256"):
                 os.remove(dest + ".sha256")
+            if os.path.isfile(dest + ".version"):
+                os.remove(dest + ".version")
         except OSError:
             pass
+        _invalidate_ota_firmware_catalog_cache()
         raise HTTPException(
             status_code=400,
             detail=(
