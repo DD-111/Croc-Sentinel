@@ -357,6 +357,10 @@
 #ifndef DEVICE_SYNC_HTTP_TIMEOUT_MS
 #define DEVICE_SYNC_HTTP_TIMEOUT_MS 15000
 #endif
+// Shorter timeout for boot-sync right after MQTT is up (must not block mqtt.loop() long).
+#ifndef DEVICE_SYNC_HTTP_QUICK_TIMEOUT_MS
+#define DEVICE_SYNC_HTTP_QUICK_TIMEOUT_MS 4500
+#endif
 #ifndef DEVICE_SYNC_TLS_INSECURE
 #define DEVICE_SYNC_TLS_INSECURE 0
 #endif

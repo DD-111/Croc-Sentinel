@@ -34,6 +34,10 @@
 #ifndef DEVICE_SYNC_HTTP_TIMEOUT_MS
 #define DEVICE_SYNC_HTTP_TIMEOUT_MS 15000
 #endif
+// Used after MQTT is already up — must stay short so mqtt.loop() keeps broker alive (avoid connect/read timeout).
+#ifndef DEVICE_SYNC_HTTP_QUICK_TIMEOUT_MS
+#define DEVICE_SYNC_HTTP_QUICK_TIMEOUT_MS 4500
+#endif
 #ifndef DEVICE_SYNC_TLS_INSECURE
 #define DEVICE_SYNC_TLS_INSECURE 0
 #endif
@@ -716,6 +720,7 @@ static volatile bool s_mqttPostConnectPublish = false;
 static char sPendingCmdIdForAck[40];
 #if DEVICE_SYNC_HTTP_ENABLED
 static unsigned long s_lastBootSyncHttpAtMs = 0;
+static bool s_bootSyncQuickPending = false;
 #endif
 
 // ═══════════════════════════════════════════════
@@ -1187,7 +1192,7 @@ void processOtaBootState() {
 }
 
 #if DEVICE_SYNC_HTTP_ENABLED
-void performDeviceBootSyncHttp();
+void performDeviceBootSyncHttp(bool quickTimeout = false);
 void postDeviceOtaReportHttp(bool otaOk, const char *campaignId, const char *targetFw, const char *detail);
 #endif
 
@@ -2226,9 +2231,9 @@ void buildTopics() {
 
 #if DEVICE_SYNC_HTTP_ENABLED
 // HTTP boot-sync + OTA report (parallel to MQTT bootstrap / ota.result).
-static bool deviceSyncHttpPost(const char *urlFull, const char *jsonBody, int *outCode, String *outBody) {
+static bool deviceSyncHttpPost(const char *urlFull, const char *jsonBody, int *outCode, String *outBody, uint32_t timeoutMs) {
   HTTPClient http;
-  http.setTimeout(DEVICE_SYNC_HTTP_TIMEOUT_MS);
+  http.setTimeout((int)timeoutMs);
   *outCode = -1;
   outBody->clear();
   bool begun = false;
@@ -2296,9 +2301,12 @@ static void applyBootSyncResyncPayload(JsonObject doc) {
   }
 }
 
-void performDeviceBootSyncHttp() {
+void performDeviceBootSyncHttp(bool quickTimeout) {
   if (strlen(DEVICE_SYNC_API_BASE) < 8) return;
   if (!isProvisioned || !netIf->connected()) return;
+  uint32_t tmo = quickTimeout
+                   ? (uint32_t)DEVICE_SYNC_HTTP_QUICK_TIMEOUT_MS
+                   : (uint32_t)DEVICE_SYNC_HTTP_TIMEOUT_MS;
   char url[192];
   snprintf(url, sizeof(url), "%s%s", DEVICE_SYNC_API_BASE, DEVICE_SYNC_BOOT_PATH);
   StaticJsonDocument<384> doc;
@@ -2314,7 +2322,7 @@ void performDeviceBootSyncHttp() {
   }
   int code = -1;
   String resp;
-  if (!deviceSyncHttpPost(url, payload, &code, &resp)) {
+  if (!deviceSyncHttpPost(url, payload, &code, &resp, tmo)) {
     logLine("[sync] boot-sync HTTP failed");
     return;
   }
@@ -2367,7 +2375,7 @@ void postDeviceOtaReportHttp(bool otaOk, const char *campaignId, const char *tar
   if (nw == 0 || nw >= sizeof(payload)) return;
   int code = -1;
   String resp;
-  if (!deviceSyncHttpPost(url, payload, &code, &resp)) return;
+  if (!deviceSyncHttpPost(url, payload, &code, &resp, (uint32_t)DEVICE_SYNC_HTTP_TIMEOUT_MS)) return;
   char line[96];
   snprintf(line, sizeof(line), "[ota-http] report status=%d", code);
   logLine(line);
@@ -2871,17 +2879,18 @@ void loop() {
   ensureWiFi();
   ensureMqtt();
 
-#if DEVICE_SYNC_HTTP_ENABLED
-  if (DEVICE_SYNC_BOOT_INTERVAL_MS > 0 && isProvisioned && netIf->connected()) {
-    if ((now - s_lastBootSyncHttpAtMs) >= DEVICE_SYNC_BOOT_INTERVAL_MS) {
-      s_lastBootSyncHttpAtMs = now;
-      performDeviceBootSyncHttp();
-    }
-  }
-#endif
-
   if (mqttClient.connected()) {
     mqttClient.loop();
+#if DEVICE_SYNC_HTTP_ENABLED
+    if (DEVICE_SYNC_BOOT_INTERVAL_MS > 0 && isProvisioned) {
+      if ((now - s_lastBootSyncHttpAtMs) >= DEVICE_SYNC_BOOT_INTERVAL_MS) {
+        mqttClient.loop();
+        performDeviceBootSyncHttp(false);
+        s_lastBootSyncHttpAtMs = millis();
+        mqttClient.loop();
+      }
+    }
+#endif
     processPendingMqttCommand();
     processPendingWifiChain();
     flushOfflineQueue();
@@ -2890,13 +2899,19 @@ void loop() {
       publishStatus();
       publishHeartbeatEvent("mqtt_connected");
 #if DEVICE_SYNC_HTTP_ENABLED
-      // After flash or reconnect, re-align cmd_key with server before sibling/remote cmds.
-      if (isProvisioned) {
-        performDeviceBootSyncHttp();
-        s_lastBootSyncHttpAtMs = millis();
-      }
+      // Defer quick boot-sync: long HTTP inside this branch starves mqtt.loop() → broker timeouts.
+      if (isProvisioned) s_bootSyncQuickPending = true;
 #endif
     }
+#if DEVICE_SYNC_HTTP_ENABLED
+    if (s_bootSyncQuickPending && isProvisioned) {
+      s_bootSyncQuickPending = false;
+      mqttClient.loop();
+      performDeviceBootSyncHttp(true);
+      s_lastBootSyncHttpAtMs = millis();
+      mqttClient.loop();
+    }
+#endif
     if (!isProvisioned && now - lastBootstrapRegisterAt >= BOOTSTRAP_REGISTER_INTERVAL_MS) {
       lastBootstrapRegisterAt = now;
       publishBootstrapRegister();

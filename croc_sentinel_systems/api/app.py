@@ -90,6 +90,10 @@ API_TOKEN = os.getenv("API_TOKEN", "")
 # When 0 (default), the long-lived API_TOKEN bearer is not accepted — use JWT login only.
 LEGACY_API_TOKEN_ENABLED = os.getenv("LEGACY_API_TOKEN_ENABLED", "0") == "1"
 DB_PATH = os.getenv("DB_PATH", "/data/sentinel.db")
+# sqlite3.connect(timeout=…): seconds waiting to acquire DB lock at open.
+SQLITE_CONNECT_TIMEOUT_S = float(os.getenv("SQLITE_CONNECT_TIMEOUT_S", "10.0"))
+_sqlite_busy_ms = int(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "5000"))
+SQLITE_BUSY_TIMEOUT_MS = max(0, min(600_000, _sqlite_busy_ms))
 LOG_FILE_PATH = os.getenv("LOG_FILE_PATH", "/data/api.log")
 PROVISION_USE_SHARED_MQTT_CREDS = os.getenv("PROVISION_USE_SHARED_MQTT_CREDS", "1") == "1"
 SCHEDULER_POLL_SECONDS = float(os.getenv("SCHEDULER_POLL_SECONDS", "1.0"))
@@ -150,6 +154,12 @@ DEFAULT_REMOTE_FANOUT_MS = int(os.getenv("DEFAULT_REMOTE_FANOUT_MS", "180000"))
 DEFAULT_PANIC_FANOUT_MS = int(os.getenv("DEFAULT_PANIC_FANOUT_MS", "300000"))
 ALARM_FANOUT_DURATION_MS = int(os.getenv("ALARM_FANOUT_DURATION_MS", str(DEFAULT_REMOTE_FANOUT_MS)))
 ALARM_FANOUT_MAX_TARGETS = int(os.getenv("ALARM_FANOUT_MAX_TARGETS", "200"))
+# Max wall-clock seconds the ingest thread will spend on a single fan-out round
+# (workers are daemon threads; unfinished publishes still complete in paho).
+FANOUT_WALL_CLOCK_MAX_S = max(0.5, min(10.0, float(os.getenv("FANOUT_WALL_CLOCK_MAX_S", "1.5"))))
+# Cap parallel MQTT publishes per fan-out round. Paho's single writer means too
+# many concurrent publishes only add thread overhead; 8–16 is plenty for QoS 1.
+FANOUT_WORKER_POOL_SIZE = max(1, min(64, int(os.getenv("FANOUT_WORKER_POOL_SIZE", "12"))))
 ALARM_FANOUT_SELF = os.getenv("ALARM_FANOUT_SELF", "0") == "1"
 # QoS1 can redeliver duplicate event frames after reconnect; suppress repeated
 # sibling fan-out for the same logical alarm event in this short window.
@@ -407,13 +417,13 @@ def cache_invalidate(prefix: str = "") -> None:
 
 
 def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10.0)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=max(1.0, SQLITE_CONNECT_TIMEOUT_S))
     conn.row_factory = sqlite3.Row
     # Per-connection pragmas. WAL + synchronous are set once in init_db_pragmas
     # because they're persistent; these here are per-connection tuning.
     try:
         cur = conn.cursor()
-        cur.execute("PRAGMA busy_timeout = 5000")
+        cur.execute(f"PRAGMA busy_timeout = {int(SQLITE_BUSY_TIMEOUT_MS)}")
         cur.execute("PRAGMA cache_size = -32768")   # 32 MB page cache / conn
         cur.execute("PRAGMA temp_store = MEMORY")
         cur.execute("PRAGMA foreign_keys = ON")
@@ -3264,6 +3274,9 @@ def _fan_out_alarm(device_id: str, payload: dict[str, Any]) -> None:
         else:
             dur_ms = panic_ms if triggered_by == "panic_button" else loud_ms
             cmd, params = "siren_on", {"duration_ms": dur_ms}
+        # wait_publish=False: fan-out runs in a thread pool; we don't want each
+        # target to block waiting for paho drain, otherwise a 50-device group can
+        # stall the MQTT ingest thread for tens of seconds and back up the queue.
         publish_command(
             topic=f"{TOPIC_ROOT}/{did}/cmd",
             cmd=cmd,
@@ -3271,28 +3284,56 @@ def _fan_out_alarm(device_id: str, payload: dict[str, Any]) -> None:
             target_id=did,
             proto=CMD_PROTO,
             cmd_key=ckey,
+            wait_publish=False,
         )
 
-    if should_fanout:
-        for did, _z in targets:
+    if should_fanout and targets:
+        sent_lock = threading.Lock()
+        fail_lock = threading.Lock()
+
+        # Bounded concurrency: on a 200-device group we do not want 200 threads.
+        pool = min(max(4, FANOUT_WORKER_POOL_SIZE), max(1, len(targets)))
+        sem = threading.BoundedSemaphore(pool)
+
+        def _worker(did: str) -> None:
+            nonlocal sent
             ck = cmd_key_map.get(did.strip().upper(), default_cmd_key)
-            try:
-                _fanout_publish_one(did, ck)
-                sent += 1
-            except Exception as exc:
-                failures.append(f"{did}:{exc}")
+            with sem:
+                try:
+                    _fanout_publish_one(did, ck)
+                    with sent_lock:
+                        sent += 1
+                except Exception as exc:
+                    with fail_lock:
+                        failures.append(f"{did}:{exc}")
+
+        workers = [
+            threading.Thread(target=_worker, args=(did,), name=f"fanout-{did}", daemon=True)
+            for did, _z in targets
+        ]
+        for t in workers:
+            t.start()
+        # Cap wall-clock on the ingest thread: even in a 100-device group, we should
+        # return in ~1.5s. QoS 1 retries remain paho's responsibility.
+        deadline = time.time() + float(FANOUT_WALL_CLOCK_MAX_S)
+        for t in workers:
+            left = max(0.05, deadline - time.time())
+            t.join(timeout=left)
         if failures:
             retry_ids = [x.split(":", 1)[0] for x in failures if ":" in x and x.split(":", 1)[0]]
             if retry_ids:
-                time.sleep(0.4)
+                time.sleep(0.3)
                 failures.clear()
-                for did in retry_ids:
-                    ck = cmd_key_map.get(did.strip().upper(), default_cmd_key)
-                    try:
-                        _fanout_publish_one(did, ck)
-                        sent += 1
-                    except Exception as exc:
-                        failures.append(f"{did}:{exc}")
+                retry_threads = [
+                    threading.Thread(target=_worker, args=(did,), name=f"fanout-retry-{did}", daemon=True)
+                    for did in retry_ids
+                ]
+                for t in retry_threads:
+                    t.start()
+                retry_deadline = time.time() + float(FANOUT_WALL_CLOCK_MAX_S)
+                for t in retry_threads:
+                    left = max(0.05, retry_deadline - time.time())
+                    t.join(timeout=left)
 
     email_sent = False
     email_detail = ""
@@ -5167,25 +5208,43 @@ def auth_login(body: LoginRequest, request: Request, response: Response) -> dict
     ok_detail["owner_admin"] = owner_admin
     ok_detail["login_user"] = str(row["username"])
     audit_event(str(row["username"]), "auth.login.ok", str(row["username"]), ok_detail)
-    # One-time welcome email after first successful login (requires SMTP + stored email).
+    # One-time welcome email after first successful login. Runs in a background
+    # thread so a slow SMTP server never stalls the login response (was seen as
+    # "sometimes login freezes").
     try:
         email_u = str(row["email"] or "").strip()
         rk = row.keys()
         wel_sent = int(row["welcome_email_sent"] or 0) if "welcome_email_sent" in rk else 0
         if notifier.enabled() and email_u and wel_sent == 0:
-            ws, wt, wh = render_welcome_email(username=str(row["username"]), role=str(row["role"]))
-            notifier.send_sync([email_u], ws, wt, wh)
-            with db_lock:
-                conn = get_conn()
-                cur = conn.cursor()
-                cur.execute(
-                    "UPDATE dashboard_users SET welcome_email_sent = 1 WHERE username = ?",
-                    (body.username,),
-                )
-                conn.commit()
-                conn.close()
+            uname_snap = str(row["username"])
+            role_snap = str(row["role"])
+
+            def _send_welcome_async() -> None:
+                try:
+                    ws, wt, wh = render_welcome_email(username=uname_snap, role=role_snap)
+                    # Prefer the async enqueue if available (non-blocking + retried).
+                    if hasattr(notifier, "enqueue"):
+                        try:
+                            notifier.enqueue([email_u], ws, wt, wh)
+                        except Exception:
+                            notifier.send_sync([email_u], ws, wt, wh)
+                    else:
+                        notifier.send_sync([email_u], ws, wt, wh)
+                    with db_lock:
+                        c2 = get_conn()
+                        cu2 = c2.cursor()
+                        cu2.execute(
+                            "UPDATE dashboard_users SET welcome_email_sent = 1 WHERE username = ?",
+                            (uname_snap,),
+                        )
+                        c2.commit()
+                        c2.close()
+                except Exception:
+                    logger.warning("welcome email skipped or failed for %s", uname_snap, exc_info=True)
+
+            threading.Thread(target=_send_welcome_async, name=f"welcome-mail-{uname_snap}", daemon=True).start()
     except Exception:
-        logger.warning("welcome email skipped or failed for %s", body.username, exc_info=True)
+        logger.warning("welcome email scheduling failed for %s", body.username, exc_info=True)
     out: dict[str, Any] = {"token_type": "bearer", "role": row["role"], "zones": zones}
     if JWT_RETURN_BODY_TOKEN or not JWT_USE_HTTPONLY_COOKIE:
         out["access_token"] = token
@@ -6291,17 +6350,40 @@ def _wait_cmd_ack(device_id: str, cmd: str, timeout_s: float = 2.5, cmd_id: Opti
 
 
 def _try_mqtt_unclaim_reset(device_id: str) -> tuple[bool, bool]:
-    """Best-effort dispatch + short ack wait for unclaim_reset before DB unlink."""
+    """Best-effort dispatch + short ack wait for unclaim_reset before DB unlink.
+
+    Returns (sent, acked). Fails fast (no blocking) when the broker is down or
+    the device is offline — the HTTP request must not hang for a dead device.
+    """
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute("SELECT 1 FROM provisioned_credentials WHERE device_id = ?", (device_id,))
-        has = cur.fetchone() is not None
+        cur.execute(
+            """
+            SELECT 1 AS ok,
+                   IFNULL((SELECT updated_at FROM device_state WHERE device_id = pc.device_id),'') AS updated_at
+            FROM provisioned_credentials pc
+            WHERE pc.device_id = ?
+            """,
+            (device_id,),
+        )
+        row = cur.fetchone()
         conn.close()
-    if not has:
+    if not row:
         return False, False
+    last_seen = str(row["updated_at"] or "")
+    # If the device hasn't been seen recently, skip the ACK wait entirely.
+    # The command is still published (broker queues for QoS 1), but the HTTP caller
+    # won't block waiting for an ACK that's never coming.
+    online_hint = False
     try:
-        publish_command(
+        last_ts = _parse_iso(last_seen)
+        if last_ts > 0:
+            online_hint = (time.time() - last_ts) < max(60, int(OFFLINE_THRESHOLD_SECONDS))
+    except Exception:
+        online_hint = False
+    try:
+        cmd_id = publish_command(
             f"{TOPIC_ROOT}/{device_id}/cmd",
             "unclaim_reset",
             {},
@@ -6309,10 +6391,16 @@ def _try_mqtt_unclaim_reset(device_id: str) -> tuple[bool, bool]:
             CMD_PROTO,
             get_cmd_key_for_device(device_id),
         )
-        return True, _wait_cmd_ack(device_id, "unclaim_reset", timeout_s=2.8)
-    except Exception as exc:
-        logger.warning("unclaim_reset MQTT not delivered for %s: %s", device_id, exc)
+    except HTTPException as exc:
+        # 503 = broker disconnected → no MQTT, don't wait.
+        logger.warning("unclaim_reset MQTT not delivered for %s: %s", device_id, getattr(exc, "detail", exc))
         return False, False
+    except Exception as exc:
+        logger.warning("unclaim_reset MQTT error for %s: %s", device_id, exc)
+        return False, False
+    if not online_hint:
+        return True, False
+    return True, _wait_cmd_ack(device_id, "unclaim_reset", timeout_s=2.2, cmd_id=cmd_id)
 
 
 def _device_delete_reset_impl(
@@ -8352,27 +8440,53 @@ def publish_bootstrap_claim(
         raise HTTPException(status_code=502, detail="bootstrap publish failed")
 
 
-def publish_command(topic: str, cmd: str, params: dict[str, Any], target_id: str, proto: int, cmd_key: str) -> None:
+MQTT_PUBLISH_WAIT_MS = max(0, min(5000, int(os.getenv("MQTT_PUBLISH_WAIT_MS", "800"))))
+
+
+def publish_command(
+    topic: str,
+    cmd: str,
+    params: dict[str, Any],
+    target_id: str,
+    proto: int,
+    cmd_key: str,
+    *,
+    wait_publish: bool = True,
+) -> str:
+    """Publish a /cmd frame. Returns generated ``cmd_id`` (so callers can wait on ACK by id).
+
+    Does **not** block for retries. If the broker is disconnected, raises 503 immediately
+    instead of stalling the caller (fan-out and HTTP handlers must stay responsive).
+    When ``wait_publish=True`` (default), briefly waits for paho to drain (``MQTT_PUBLISH_WAIT_MS``)
+    so QoS 1 can start delivery; callers that do fan-out in a worker pool can pass False.
+    """
     global mqtt_client
     if mqtt_client is None:
-        raise HTTPException(status_code=500, detail="mqtt client not ready")
+        raise HTTPException(status_code=503, detail="mqtt client not ready")
+    if not mqtt_connected:
+        raise HTTPException(status_code=503, detail="mqtt broker disconnected")
+    cmd_id = str(uuid.uuid4())
     payload = {
         "proto": proto,
         "key": cmd_key,
         "target_id": target_id,
         "cmd": cmd,
         "params": params,
-        "cmd_id": str(uuid.uuid4()),
+        "cmd_id": cmd_id,
     }
     body = json.dumps(payload, ensure_ascii=True)
-    for attempt in range(3):
+    try:
         info = mqtt_client.publish(topic, body, qos=1)
-        info.wait_for_publish(timeout=3.0)
-        if info.is_published():
-            return
-        if attempt < 2:
-            time.sleep(0.15)
-    raise HTTPException(status_code=502, detail="mqtt publish failed")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"mqtt publish error: {exc}")
+    if getattr(info, "rc", 0) not in (0, None):
+        raise HTTPException(status_code=502, detail=f"mqtt publish rc={info.rc}")
+    if wait_publish and MQTT_PUBLISH_WAIT_MS > 0:
+        try:
+            info.wait_for_publish(timeout=max(0.05, MQTT_PUBLISH_WAIT_MS / 1000.0))
+        except Exception:
+            pass
+    return cmd_id
 
 
 def enqueue_scheduled_command(device_id: str, cmd: str, params: dict[str, Any], target_id: str, proto: int, execute_at_ts: int) -> int:

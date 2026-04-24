@@ -4420,3 +4420,43 @@ body[data-layout="auth"] .site-footer--auth .site-footer__product-pill {
 .auth-surface__inner--wide {
   max-width: 36rem;
 }
+
+/* Boot splash: shown immediately on page load so mobile never shows a blank screen.
+   Replaced by renderRoute() or the error fallback in boot(). */
+.boot-splash {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  min-height: 60vh;
+  padding: 24px 16px;
+  text-align: center;
+  color: var(--text);
+}
+.boot-splash__ring {
+  width: 46px;
+  height: 46px;
+  border-radius: 50%;
+  border: 3px solid color-mix(in srgb, var(--border) 60%, transparent);
+  border-top-color: var(--accent, #38bdf8);
+  animation: boot-spin 0.9s linear infinite;
+}
+.boot-splash__title {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+.boot-splash__hint {
+  margin: 0;
+  max-width: 32ch;
+  font-size: 0.8rem;
+  line-height: 1.35;
+}
+@keyframes boot-spin {
+  to { transform: rotate(360deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .boot-splash__ring { animation-duration: 2.2s; }
+}

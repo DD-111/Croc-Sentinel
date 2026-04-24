@@ -1181,10 +1181,12 @@
     return j;
   }
 
-  async function loadMe() {
+  async function loadMe(opts) {
     try {
-      // Uses default API ceiling; slow Nginx/upstream still yields login page on failure.
-      state.me = await api("/auth/me");
+      // Boot path uses a short ceiling so a slow API (DB lock, cold start) does
+      // not leave the SPA blank. Subsequent route-level auth checks still use api().
+      const timeoutMs = opts && opts.timeoutMs != null ? opts.timeoutMs : 8000;
+      state.me = await api("/auth/me", { timeoutMs, retries: 1 });
     } catch (e) {
       state.me = null;
     }
@@ -4351,11 +4353,13 @@
             <label class="field"><span>Loud (min)</span><input id="tpLoudMin" type="number" min="0.5" max="5" step="0.5" value="3" title="Remote / #2 sibling siren length" /></label>
             <label class="field"><span>Panic sibling (min)</span><input id="tpPanicMin" type="number" min="0.5" max="10" step="0.5" value="5" title="Panic MQTT sibling siren length" /></label>
             <div class="row wide" style="justify-content:flex-end;flex-basis:100%">
+              <button class="btn secondary btn-tap" type="button" id="tpPreviewSiblings" title="Show which devices would receive group fan-out right now">Preview siblings</button>
               <button class="btn secondary btn-tap" type="button" id="tpRefresh">Refresh</button>
               <button class="btn btn-tap" type="button" id="tpSave">Save</button>
             </div>
           </div>
-          <p class="muted" id="tpStatus" style="margin-top:8px;min-height:1.3em"></p>` : `<p class="muted">Requires <span class="mono">can_send_command</span> and <strong>operate</strong> access on this device.</p>`}
+          <p class="muted" id="tpStatus" style="margin-top:8px;min-height:1.3em"></p>
+          <div id="tpSiblingBox" class="muted" style="margin-top:6px"></div>` : `<p class="muted">Requires <span class="mono">can_send_command</span> and <strong>operate</strong> access on this device.</p>`}
         </div>
       </details>`}
 
@@ -4641,6 +4645,37 @@
         }
       });
       loadTriggerPolicy();
+    }
+
+    const tpPreviewBtn = $("#tpPreviewSiblings");
+    const tpSiblingBox = $("#tpSiblingBox");
+    if (tpPreviewBtn && tpSiblingBox) {
+      tpPreviewBtn.addEventListener("click", async () => {
+        tpPreviewBtn.disabled = true;
+        setChildMarkup(tpSiblingBox, `<span class="muted">Checking siblings…</span>`);
+        try {
+          const r = await api(`/devices/${encodeURIComponent(id)}/siblings-preview`, { timeoutMs: 12000 });
+          const group = r.notification_group || "";
+          const zone = r.zone || "";
+          const count = Number(r.target_count || 0);
+          const eligible = Number(r.eligible_total || count);
+          const capped = r.fanout_capped ? ` <span class="badge warn">capped at ${r.fanout_max}</span>` : "";
+          let reason = "";
+          if (!group) reason = ` <span class="badge offline">notification_group empty — no siblings will fire</span>`;
+          else if (count === 0) reason = ` <span class="badge offline">no peer devices share this group</span>`;
+          const items = Array.isArray(r.targets) ? r.targets.slice(0, 25) : [];
+          const list = items.length
+            ? `<ul class="kv" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:4px 10px;margin:6px 0 0;padding:0;list-style:none">${items
+                .map((t) => `<li class="mono" style="font-size:12px">${escapeHtml(String(t.device_id || "?"))}${t.zone ? ` · ${escapeHtml(String(t.zone))}` : ""}</li>`)
+                .join("")}${eligible > items.length ? `<li class="muted" style="grid-column:1 / -1">… +${eligible - items.length} more</li>` : ""}</ul>`
+            : "";
+          setChildMarkup(tpSiblingBox, `<div>Group <span class="mono">${escapeHtml(group || "(empty)")}</span> · zone <span class="mono">${escapeHtml(zone || "(none)")}</span> · <strong>${count}</strong> target${count === 1 ? "" : "s"} of ${eligible} eligible${capped}${reason}</div>${list}`);
+        } catch (e) {
+          setChildMarkup(tpSiblingBox, `<span class="badge offline">${escapeHtml(String(e.message || e))}</span>`);
+        } finally {
+          tpPreviewBtn.disabled = false;
+        }
+      });
     }
 
     const shareListEl = $("#shareList");
@@ -6735,7 +6770,21 @@
   }
 
   // ------------------------------------------------------------------ boot
+  function renderBootSplash() {
+    const v = document.getElementById("view");
+    if (!v) return;
+    try {
+      v.innerHTML = `
+        <div class="boot-splash" role="status" aria-live="polite">
+          <div class="boot-splash__ring" aria-hidden="true"></div>
+          <p class="boot-splash__title">Loading console…</p>
+          <p class="boot-splash__hint muted">If this stays visible for 10+ seconds, the API is unreachable.</p>
+        </div>`;
+    } catch (_) {}
+  }
+
   async function boot() {
+    renderBootSplash();
     initTheme();
 
     $("#menuBtn").addEventListener("click", () => toggleNav());
@@ -6768,11 +6817,28 @@
       } catch (_) {}
     }, true);
 
-    await loadMe();
+    try {
+      await loadMe();
+    } catch (_) {
+      state.me = null;
+    }
     syncNavForViewport();
     try { applySidebarRail(); } catch (_) {}
-    if (!location.hash) location.hash = state.me ? "#/overview" : "#/login";
-    else renderRoute();
+    if (!location.hash) {
+      location.hash = state.me ? "#/overview" : "#/login";
+    } else {
+      try {
+        await renderRoute();
+      } catch (err) {
+        const v = document.getElementById("view");
+        if (v) {
+          v.innerHTML = `<div class="card"><h2>Console failed to start</h2><p class="muted">${String((err && err.message) || err || "")}</p>
+          <p class="muted">Try <button class="btn sm" id="bootRetry">retry</button> or open the login page directly: <a href="#/login">Sign in</a>.</p></div>`;
+          const rb = document.getElementById("bootRetry");
+          if (rb) rb.addEventListener("click", () => location.reload());
+        }
+      }
+    }
     await loadHealth().catch(() => {});
     window.addEventListener("online", () => {
       loadHealth().catch(() => {});

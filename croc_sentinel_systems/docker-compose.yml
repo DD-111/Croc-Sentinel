@@ -49,10 +49,11 @@ services:
     ports:
       - "18999:8088"
 
-    # Single process only: MQTT client, mqtt_ingest queue, event_bus, and
-    # api_ready_event are in-memory — multiple workers break routing and can
-    # duplicate broker connections. Do not add --loop uvloop unless uvloop is
-    # listed in api/requirements.txt.
+    # Default: one process (MQTT client + in-memory bus). For horizontal scale,
+    # set REDIS_URL (event bridge) and run multiple API replicas or uvicorn
+    # --workers N behind a load balancer — do not use multiple workers without
+    # Redis or you will split SSE/WS sessions and duplicate MQTT connects.
+    # Do not add --loop uvloop unless uvloop is listed in api/requirements.txt.
     command: >
       uvicorn app:app
       --host 0.0.0.0
