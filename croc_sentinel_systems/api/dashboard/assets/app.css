@@ -192,10 +192,10 @@ body[data-layout="app"] .view {
 }
 /* Match content width to #view on ultra-wide or collapsed-rail viewports. */
 body[data-layout="app"] .site-footer.site-footer--shell {
-  max-width: var(--app-content-max);
-  margin-left: auto;
-  margin-right: auto;
-  width: 100%;
+  max-width: none;
+  margin-left: 0;
+  margin-right: 0;
+  width: auto;
   box-sizing: border-box;
 }
 body[data-layout="app"] .icon-btn {
@@ -336,7 +336,7 @@ body[data-layout="app"].app-shell > .main {
 .brand-mark {
   display: flex;
   align-items: center;
-  gap: 11px;
+  gap: 4px;
   min-width: 0;
   flex: 1;
 }
@@ -351,11 +351,15 @@ body[data-layout="app"].app-shell > .main {
 }
 .brand-co {
   font-family: var(--font-display);
-  font-size: 0.55rem;
-  font-weight: 700;
-  letter-spacing: 0.22em;
+  font-size: clamp(1.05rem, 1.3vw, 1.35rem);
+  font-weight: 800;
+  letter-spacing: 0.18em;
   text-transform: uppercase;
-  color: var(--accent);
+  color: transparent;
+  background: linear-gradient(135deg, #111 0%, #444 48%, #111 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-stroke: 0.6px color-mix(in srgb, #111 75%, #777);
   line-height: 1.25;
   margin-bottom: 1px;
 }
@@ -388,6 +392,10 @@ body[data-layout="app"].app-shell > .main {
   box-shadow:
     inset 0 0 0 1px rgba(255, 255, 255, 0.15),
     0 0 0 1px color-mix(in srgb, var(--accent) 25%, var(--border));
+}
+/* Sidebar brand now uses typographic mark only. */
+.sidebar .logo {
+  display: none !important;
 }
 
 .nav {
@@ -827,8 +835,10 @@ body[data-layout="auth"] .view {
 .site-footer--shell {
   flex-shrink: 0;
   margin-top: auto;
-  position: sticky;
+  position: fixed;
   bottom: 0;
+  left: var(--sidebar-w);
+  right: 0;
   z-index: 12;
   padding: 12px var(--gap) 14px;
   padding-left: max(var(--gap), env(safe-area-inset-left, 0px));
@@ -842,6 +852,11 @@ body[data-layout="auth"] .view {
   );
   font-size: var(--text-sm);
   line-height: var(--leading-snug);
+}
+
+/* Keep content visible above fixed footer in app shell. */
+body[data-layout="app"] .main {
+  padding-bottom: max(72px, calc(56px + env(safe-area-inset-bottom, 0px)));
 }
 .site-footer__row--main {
   display: flex;
@@ -1341,6 +1356,35 @@ html[data-theme="dark"] .card-owner-tag {
   border-radius: var(--radius-sm);
   border: 1px solid var(--border);
   background: var(--bg-muted);
+}
+.share-fold {
+  margin-top: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-muted);
+}
+.share-fold__summary {
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
+  font-weight: 650;
+}
+.share-fold__summary::-webkit-details-marker {
+  display: none;
+}
+.share-fold:not([open]) .share-global-panel {
+  display: none;
+}
+.share-fold[open] .share-global-panel {
+  margin-top: 0;
+  border: 0;
+  border-top: 1px solid var(--border);
+  border-radius: 0 0 var(--radius-sm) var(--radius-sm);
 }
 .share-global-head {
   display: flex;
@@ -2856,6 +2900,36 @@ button.fw-hint-badge--sm .fw-hint-badge__dot {
   }
 }
 
+/* Auth on phones: prioritize form readability and keep footer anchored low. */
+@media (max-width: 760px) {
+  body[data-layout="auth"] .auth-surface {
+    display: block;
+  }
+  body[data-layout="auth"] .auth-surface__side {
+    display: none;
+  }
+  body[data-layout="auth"] .auth-surface__body,
+  body[data-layout="auth"] .auth-surface__inner {
+    width: 100%;
+    max-width: none;
+    padding-left: max(12px, env(safe-area-inset-left, 0px));
+    padding-right: max(12px, env(safe-area-inset-right, 0px));
+  }
+  body[data-layout="auth"] .auth-card--login {
+    width: 100%;
+    max-width: none;
+    border-radius: 14px;
+  }
+  body[data-layout="auth"] .site-footer.site-footer--auth {
+    margin-top: auto;
+    width: 100%;
+    max-width: none;
+    padding-top: 8px;
+    padding-left: max(8px, env(safe-area-inset-left, 0px));
+    padding-right: max(8px, env(safe-area-inset-right, 0px));
+  }
+}
+
 /* Toast */
 .toast {
   position: fixed;
@@ -2991,6 +3065,10 @@ pre.code { background: var(--bg-muted); border: 1px solid var(--border); border-
 @media (max-width: 900px) {
   :root { --sidebar-w: 0px; }
   .app-shell { grid-template-columns: 1fr; }
+  .site-footer--shell {
+    left: 0;
+    right: 0;
+  }
   .sidebar {
     position: fixed;
     top: 0;
@@ -3129,6 +3207,9 @@ pre.code { background: var(--bg-muted); border: 1px solid var(--border); border-
   }
   body[data-layout="app"] .site-footer--shell {
     padding: 6px max(var(--gap), env(safe-area-inset-right, 0px)) max(6px, env(safe-area-inset-bottom, 0px)) max(var(--gap), env(safe-area-inset-left, 0px));
+  }
+  body[data-layout="app"] .main {
+    padding-bottom: max(84px, calc(66px + env(safe-area-inset-bottom, 0px)));
   }
   .site-footer.site-footer--auth {
     padding-left: max(8px, env(safe-area-inset-left, 0px));

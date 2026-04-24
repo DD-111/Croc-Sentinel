@@ -2335,7 +2335,7 @@
         <div class="stat"><div class="k">TX</div><div class="v" id="ovTxV">—</div><div class="sub">aggregate uplink</div></div>
         <div class="stat"><div class="k">RX</div><div class="v" id="ovRxV">—</div><div class="sub">aggregate downlink</div></div>
       </section>
-      <section class="card">
+      <section class="card card--groups">
         <div class="row">
           <h3 style="margin:0">MQTT risk</h3>
           <span class="badge ${mqClass}" id="ovMqttRisk">${mqStatus}</span>
@@ -2357,26 +2357,28 @@
           </label>
           <button type="button" class="btn sm secondary btn-tap" id="ovOwnerClear">Clear</button>
         </div>
-        <p class="muted" style="margin:0 0 8px;font-size:12px">Each tenant gets one card per notification group (unassigned devices use the <span class="mono">__unowned__</span> bucket). Use Site for a full owner-centric view.</p>
+        <p class="muted" style="margin:0 0 8px;font-size:12px">One card per tenant group. <span class="mono">__unowned__</span> means no owner.</p>
         ` : ""}
-        ${state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_manage_users"))) ? `
-        <div class="share-global-panel">
-          <div class="share-global-head">
-            <div>
-              <h3 style="margin:0;font-size:14px;font-weight:650">Global sharing</h3>
-              <p class="muted" style="margin:4px 0 0"><strong>Device ACL only</strong> — each grant is per device. Grantees do <strong>not</strong> receive your notification groups, group cards, or trigger policy; they use their own tenant groups or single-device workflows. Superadmin-owned groups stay invisible to other tenants unless you share specific devices.</p>
-            </div>
-            <div class="share-global-toolbar">
-              <button class="btn sm secondary btn-tap" type="button" id="grpShareRefresh">Refresh list</button>
-              <button class="btn sm btn-tap" type="button" id="grpShareOpen">New grant…</button>
-            </div>
-          </div>
-          <div id="shareGrantsTableWrap" class="share-grants-table mini" style="margin-top:10px">
-            <p class="muted" style="margin:0;padding:8px 0">Loading shares…</p>
-          </div>
-        </div>` : ""}
-        <div class="divider"></div>
         <div id="groupCards" class="device-grid"></div>
+        ${state.me && (state.me.role === "superadmin" || (state.me.role === "admin" && can("can_manage_users"))) ? `
+        <details class="share-fold" id="grpShareFold">
+          <summary class="share-fold__summary">
+            <span>Global sharing</span>
+            <span class="muted">Device ACL only</span>
+          </summary>
+          <div class="share-global-panel">
+            <div class="share-global-head">
+              <div class="share-global-toolbar">
+                <button class="btn sm secondary btn-tap" type="button" id="grpShareRefresh">Refresh</button>
+                <button class="btn sm btn-tap" type="button" id="grpShareOpen">New grant</button>
+              </div>
+            </div>
+            <p class="muted" style="margin:0 0 6px;font-size:12px">Shared users get per-device access only; group cards and trigger policy stay tenant-local.</p>
+            <div id="shareGrantsTableWrap" class="share-grants-table mini" style="margin-top:10px">
+              <p class="muted" style="margin:0;padding:8px 0">Loading shares…</p>
+            </div>
+          </div>
+        </details>` : ""}
       </section>
       <div id="shareModal" class="grp-modal" style="display:none">
         <div class="grp-modal-card" style="max-width:760px;width:min(760px,96vw)">
