@@ -185,10 +185,19 @@ def register_routers(app: FastAPI) -> None:
 
     app.include_router(_telegram_router)
 
-    # Phase-13: every /ota/* route + schemas + 8 OTA-only helpers.
+    # Phase-13 / 65: OTA surface split into two halves —
+    #   * routers.ota                — diagnostics + listing + broadcast +
+    #                                  firmware upload (no campaign row)
+    #   * routers.ota_campaigns      — full 2-stage campaign lifecycle
+    # ``ota`` ships first because ``ota_campaigns`` imports the
+    # firmware-bytes helpers (``_ota_store_uploaded_bin``,
+    # ``_ota_bin_path_for_stored_name``, ``_require_ota_upload_password``,
+    # ``_sha256_for``) from it at module-load time.
     from routers.ota import router as _ota_router
+    from routers.ota_campaigns import router as _ota_campaigns_router
 
     app.include_router(_ota_router)
+    app.include_router(_ota_campaigns_router)
 
     # Phase-8: event center (paginated /events, CSV, by-device, taxonomy, SSE, WS).
     from routers.events import router as _events_router
