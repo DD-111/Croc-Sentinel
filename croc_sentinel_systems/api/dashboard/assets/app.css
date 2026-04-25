@@ -139,6 +139,24 @@ html[data-theme="light"] {
   /* Glow used on pending / live indicators. */
   --pulse-accent: oklch(61% 0.152 202 / 0.45);
   --pulse-danger: oklch(60% 0.195 25  / 0.45);
+
+  /* Scrim, modal sheets, and button ramp (separate from link/brand accent). */
+  --overlay-scrim: oklch(20% 0.045 255 / 0.42);
+  --surface-modal: color-mix(in oklch, #fff 88%, var(--accent) 12%);
+  --surface-modal-border: color-mix(in oklch, var(--border) 60%, var(--accent) 40%);
+  --surface-modal-foot: color-mix(in oklch, var(--tone-1) 86%, var(--accent-weak) 14%);
+  --shadow-modal: 0 28px 64px oklch(15% 0.04 260 / 0.2), 0 0 0 1px var(--surface-modal-border);
+  /* Primary = deeper blue-cyan than inline links. */
+  --btn-primary: oklch(49% 0.17 213);
+  --btn-primary-hover: oklch(42% 0.165 216);
+  --btn-primary-text: #f2f7fb;
+  /* Neutral = default / ghost-ish outline. */
+  --btn-surface: color-mix(in oklch, #fff 95%, var(--tone-3));
+  --btn-surface-hover: var(--tone-2);
+  /* Secondary = soft tinted chip (outlines). */
+  --btn-secondary-surface: color-mix(in oklch, var(--accent-weak) 82%, #fff 18%);
+  --btn-secondary-surface-hover: color-mix(in oklch, var(--accent-weak) 65%, var(--accent) 20%);
+  --drawer-elev: color-mix(in oklch, #fff 90%, var(--tone-2));
 }
 
 /* Dark palette. All accents get a 6–10% L boost so contrast holds. */
@@ -189,6 +207,21 @@ html[data-theme="dark"] {
 
   --pulse-accent: oklch(72% 0.155 202 / 0.6);
   --pulse-danger: oklch(72% 0.195 25  / 0.6);
+
+  --overlay-scrim: oklch(4% 0.04 270 / 0.72);
+  --surface-modal: color-mix(in oklch, var(--tone-1) 80%, var(--accent) 20%);
+  --surface-modal-border: color-mix(in oklch, var(--border) 45%, var(--accent) 55%);
+  --surface-modal-foot: color-mix(in oklch, var(--tone-2) 70%, var(--accent-weak) 30%);
+  --shadow-modal: 0 40px 100px #000c, 0 0 0 1px var(--surface-modal-border);
+  /* Bright fill on dark canvas. */
+  --btn-primary: oklch(71% 0.135 210);
+  --btn-primary-hover: oklch(78% 0.12 210);
+  --btn-primary-text: oklch(7% 0.03 255);
+  --btn-surface: var(--tone-1);
+  --btn-surface-hover: var(--tone-2);
+  --btn-secondary-surface: color-mix(in oklch, var(--tone-1) 72%, var(--accent) 16%);
+  --btn-secondary-surface-hover: color-mix(in oklch, var(--tone-1) 55%, var(--accent) 32%);
+  --drawer-elev: color-mix(in oklch, var(--tone-1) 90%, var(--tone-0));
 }
 
 /* High-contrast mode — triggered by `data-theme="hc"` or user preference. */
@@ -199,6 +232,18 @@ html[data-theme="hc"],
     --accent-strong: oklch(34% 0.200 202);
     --border:        oklch(60% 0.010 250);
     --border-strong: oklch(40% 0.010 250);
+    --overlay-scrim: oklch(5% 0.02 250 / 0.6);
+    --btn-primary:   oklch(38% 0.22 215);
+    --btn-primary-hover: oklch(32% 0.22 215);
+    --btn-primary-text: #fff;
+    --btn-surface:   #fff;
+    --btn-surface-hover: oklch(96% 0.01 250);
+    --btn-secondary-surface: oklch(94% 0.04 200);
+    --btn-secondary-surface-hover: oklch(90% 0.06 200);
+    --surface-modal: #fff;
+    --surface-modal-border: var(--border);
+    --surface-modal-foot: oklch(97% 0.01 250);
+    --drawer-elev: #fff;
   }
 }
 
@@ -417,12 +462,12 @@ body[data-layout="app"] .main > .site-footer--shell {
   place-items: center;
   border: 1px solid var(--border);
   border-radius: var(--rad-md);
-  background: var(--bg-elev);
+  background: var(--btn-surface);
   color: var(--text);
   cursor: pointer;
   transition: background var(--dur-fast) var(--easing), border-color var(--dur-fast) var(--easing);
 }
-.icon-btn:hover { background: var(--bg-muted); border-color: var(--border-strong); }
+.icon-btn:hover { background: var(--btn-surface-hover); border-color: var(--border-strong); }
 
 .menu-btn { display: none; }
 
@@ -565,8 +610,8 @@ body[data-sidebar="collapsed"] .sidebar .who-card { grid-template-columns: auto;
 .sidebar-backdrop {
   position: fixed;
   inset: 0;
-  background: oklch(10% 0.01 245 / 0.55);
-  backdrop-filter: blur(3px);
+  background: var(--overlay-scrim);
+  backdrop-filter: blur(3px) saturate(120%);
   z-index: 48;
   display: none;
   animation: fade-in var(--dur-med) var(--easing-out);
@@ -650,11 +695,12 @@ body[data-nav="open"] .sidebar-backdrop { display: block; }
   left: 0; right: 0; bottom: 0;
   z-index: 45;
   padding: var(--sp-1) var(--sp-2) max(var(--sp-1), var(--safe-bottom));
-  background: color-mix(in oklch, var(--bg-elev) 92%, transparent);
-  backdrop-filter: saturate(140%) blur(12px);
-  -webkit-backdrop-filter: saturate(140%) blur(12px);
-  border-top: 1px solid var(--border);
+  background: color-mix(in oklch, var(--drawer-elev) 92%, var(--tone-6) 8%);
+  backdrop-filter: saturate(150%) blur(14px);
+  -webkit-backdrop-filter: saturate(150%) blur(14px);
+  border-top: 1px solid var(--surface-modal-border);
   gap: 2px;
+  box-shadow: 0 -8px 32px color-mix(in oklch, var(--tone-8) 6%, transparent);
 }
 .tabbar a {
   flex: 1 1 0;
@@ -698,11 +744,12 @@ body[data-nav="open"] .sidebar-backdrop { display: block; }
   position: fixed;
   left: 0; right: 0; bottom: 0;
   z-index: 55;
-  background: var(--bg-elev);
+  background: var(--drawer-elev);
   border-top-left-radius: var(--rad-xl);
   border-top-right-radius: var(--rad-xl);
+  border-top: 1px solid var(--surface-modal-border);
   padding: var(--sp-3) var(--sp-4) max(var(--sp-4), var(--safe-bottom));
-  box-shadow: var(--shadow-lg);
+  box-shadow: var(--shadow-modal);
   transform: translateY(101%);
   transition: transform var(--dur-med) var(--easing-out);
 }
@@ -710,7 +757,7 @@ body[data-nav="open"] .sidebar-backdrop { display: block; }
 .mobile-drawer__handle {
   width: 40px; height: 4px;
   border-radius: 2px;
-  background: var(--border-strong);
+  background: linear-gradient(90deg, var(--border), color-mix(in oklch, var(--accent) 45%, var(--border)));
   margin: 0 auto var(--sp-3);
 }
 .mobile-drawer__grid {
@@ -742,9 +789,9 @@ body[data-nav="open"] .sidebar-backdrop { display: block; }
 
 .btn {
   --_btn-fg: var(--text);
-  --_btn-bg: var(--bg-elev);
+  --_btn-bg: var(--btn-surface);
   --_btn-border: var(--border);
-  --_btn-hover-bg: var(--bg-muted);
+  --_btn-hover-bg: var(--btn-surface-hover);
 
   display: inline-flex;
   align-items: center;
@@ -778,37 +825,53 @@ body[data-nav="open"] .sidebar-backdrop { display: block; }
 
 .btn.primary,
 .btn.accent {
-  --_btn-fg: var(--accent-contrast);
-  --_btn-bg: var(--accent);
-  --_btn-border: transparent;
-  --_btn-hover-bg: var(--accent-strong);
-  box-shadow: 0 1px 2px color-mix(in oklch, var(--accent) 35%, transparent);
+  --_btn-fg: var(--btn-primary-text);
+  --_btn-bg: var(--btn-primary);
+  --_btn-border: color-mix(in oklch, var(--btn-primary) 55%, black);
+  --_btn-hover-bg: var(--btn-primary-hover);
+  box-shadow:
+    0 1px 0 color-mix(in oklch, #fff 20%, transparent),
+    0 3px 10px color-mix(in oklch, var(--btn-primary) 38%, transparent);
+}
+html[data-theme="dark"] .btn.primary,
+html[data-theme="dark"] .btn.accent {
+  /* Flat highlight — avoid “halo” on bright fills. */
+  box-shadow:
+    0 0 0 1px color-mix(in oklch, #fff 18%, var(--btn-primary) 82%),
+    0 10px 28px color-mix(in oklch, var(--btn-primary) 45%, transparent);
 }
 .btn.secondary {
   --_btn-fg: var(--accent-strong);
-  --_btn-bg: var(--accent-weak);
-  --_btn-border: color-mix(in oklch, var(--accent) 18%, var(--border));
-  --_btn-hover-bg: color-mix(in oklch, var(--accent-weak) 80%, var(--accent));
+  --_btn-bg: var(--btn-secondary-surface);
+  --_btn-border: color-mix(in oklch, var(--accent) 28%, var(--border));
+  --_btn-hover-bg: var(--btn-secondary-surface-hover);
+  box-shadow: 0 1px 0 color-mix(in oklch, #fff 35%, transparent);
+}
+html[data-theme="dark"] .btn.secondary {
+  box-shadow: none;
 }
 .btn.danger {
   --_btn-fg: #fff;
   --_btn-bg: var(--danger);
-  --_btn-border: transparent;
-  --_btn-hover-bg: color-mix(in oklch, var(--danger) 80%, black);
-  box-shadow: 0 1px 2px color-mix(in oklch, var(--danger) 35%, transparent);
+  --_btn-border: color-mix(in oklch, var(--danger) 70%, #300);
+  --_btn-hover-bg: color-mix(in oklch, var(--danger) 70%, #000 30%);
+  box-shadow:
+    0 1px 0 color-mix(in oklch, #fff 18%, transparent),
+    0 2px 10px color-mix(in oklch, var(--danger) 32%, transparent);
 }
 .btn.ghost {
   --_btn-bg: transparent;
   --_btn-border: transparent;
-  --_btn-hover-bg: var(--bg-muted);
+  --_btn-hover-bg: var(--btn-surface-hover);
   color: var(--text-muted);
 }
 .btn.ghost:hover:not(:disabled) { color: var(--text); }
 .btn.warn {
   --_btn-fg: #fff;
   --_btn-bg: var(--warn);
-  --_btn-border: transparent;
-  --_btn-hover-bg: color-mix(in oklch, var(--warn) 80%, black);
+  --_btn-border: color-mix(in oklch, var(--warn) 65%, #420);
+  --_btn-hover-bg: color-mix(in oklch, var(--warn) 75%, #000 22%);
+  box-shadow: 0 2px 8px color-mix(in oklch, var(--warn) 28%, transparent);
 }
 
 .btn.sm  { height: 30px; padding: 0 var(--sp-2); font-size: var(--text-xs); }
@@ -1590,9 +1653,9 @@ body[data-layout="auth"] .main #view {
   top: 0; right: 0;
   width: min(440px, 100vw);
   height: 100dvh;
-  background: var(--bg-elev);
-  border-left: 1px solid var(--border);
-  box-shadow: var(--shadow-lg);
+  background: var(--surface-modal);
+  border-left: 1px solid var(--surface-modal-border);
+  box-shadow: var(--shadow-modal);
   z-index: 60;
   transform: translateX(100%);
   transition: transform var(--dur-med) var(--easing-out);
@@ -1880,8 +1943,8 @@ details.card.danger-zone.device-drawer > summary.device-drawer__summary {
   position: fixed;
   inset: 0;
   z-index: 70;
-  background: oklch(10% 0.01 245 / 0.6);
-  backdrop-filter: blur(4px);
+  background: var(--overlay-scrim);
+  backdrop-filter: blur(6px) saturate(120%);
   display: grid;
   place-items: center;
   padding: var(--sp-4);
@@ -1890,10 +1953,10 @@ details.card.danger-zone.device-drawer > summary.device-drawer__summary {
 .grp-modal-card {
   width: min(720px, 100%);
   max-height: min(88dvh, 800px);
-  background: var(--bg-elev);
+  background: var(--surface-modal);
   border-radius: var(--rad-xl);
-  border: 1px solid var(--border);
-  box-shadow: var(--shadow-lg);
+  border: 1px solid var(--surface-modal-border);
+  box-shadow: var(--shadow-modal);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -1921,11 +1984,11 @@ details.card.danger-zone.device-drawer > summary.device-drawer__summary {
 }
 .grp-modal__foot {
   padding: var(--sp-3) var(--sp-5);
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--surface-modal-border);
   display: flex;
   justify-content: flex-end;
   gap: var(--sp-2);
-  background: var(--bg-muted);
+  background: var(--surface-modal-foot);
 }
 
 .grp-pick-list {
@@ -2042,20 +2105,24 @@ details.card.danger-zone.danger-zone--compact.device-drawer > summary.device-dra
   position: fixed;
   inset: 0;
   z-index: 70;
-  background: oklch(10% 0.01 245 / 0.55);
+  background: var(--overlay-scrim);
+  backdrop-filter: blur(6px) saturate(120%);
   display: grid;
   place-items: center;
   padding: var(--sp-4);
+  animation: fade-in var(--dur-med) var(--easing-out);
 }
 .activate-wifi-dlg__inner {
   width: min(500px, 100%);
   padding: var(--sp-5);
-  background: var(--bg-elev);
+  background: var(--surface-modal);
   border-radius: var(--rad-xl);
-  box-shadow: var(--shadow-lg);
+  border: 1px solid var(--surface-modal-border);
+  box-shadow: var(--shadow-modal);
   display: flex;
   flex-direction: column;
   gap: var(--sp-3);
+  animation: pop-in var(--dur-med) var(--easing-out);
 }
 .activate-wifi-dlg__title { font-family: var(--font-display); font-size: var(--text-xl); font-weight: var(--weight-heavy); }
 .activate-wifi-dlg__lead { color: var(--text-muted); font-size: var(--text-sm); }
@@ -2102,13 +2169,15 @@ details.card.danger-zone.danger-zone--compact.device-drawer > summary.device-dra
   bottom: calc(var(--sp-5) + var(--safe-bottom));
   transform: translateX(-50%) translateY(30px);
   z-index: 80;
-  padding: 10px var(--sp-4);
+  padding: 10px var(--sp-4) 10px 12px;
   border-radius: var(--rad-md);
   background: var(--tone-8);
-  color: var(--bg-elev);
+  color: #fff;
   font-weight: var(--weight-medium);
   font-size: var(--text-sm);
   box-shadow: var(--shadow-lg);
+  border: 1px solid color-mix(in oklch, var(--tone-8) 30%, var(--btn-primary) 70%);
+  border-left: 4px solid var(--btn-primary);
   opacity: 0;
   pointer-events: none;
   transition: transform var(--dur-med) var(--easing-out), opacity var(--dur-med) var(--easing-out);
@@ -2116,9 +2185,20 @@ details.card.danger-zone.danger-zone--compact.device-drawer > summary.device-dra
   word-break: break-word;
 }
 .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
-.toast.warn  { background: var(--warn); color: #111; }
-.toast.danger, .toast.error { background: var(--danger); }
-.toast.ok { background: var(--ok); }
+html[data-theme="dark"] .toast {
+  color: var(--text);
+  background: var(--surface-modal);
+  border: 1px solid var(--surface-modal-border);
+  border-left: 4px solid var(--btn-primary);
+  box-shadow: var(--shadow-modal);
+}
+.toast.warn  { background: var(--warn-weak); color: var(--tone-8); border-color: color-mix(in oklch, var(--warn) 45%, var(--border)); border-left-color: var(--warn); }
+html[data-theme="dark"] .toast.warn { color: var(--text); background: var(--warn-weak); }
+.toast.danger, .toast.error { background: var(--danger-weak); color: var(--tone-8); border-color: color-mix(in oklch, var(--danger) 40%, var(--border)); border-left-color: var(--danger); }
+html[data-theme="dark"] .toast.danger,
+html[data-theme="dark"] .toast.error { color: var(--text); }
+.toast.ok { background: var(--ok-weak); color: var(--tone-8); border-color: color-mix(in oklch, var(--ok) 35%, var(--border)); border-left-color: var(--ok); }
+html[data-theme="dark"] .toast.ok { color: var(--text); }
 
 .route-loading {
   display: flex;
