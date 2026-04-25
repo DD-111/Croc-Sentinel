@@ -44,6 +44,7 @@ services:
 
     depends_on:
       - mosquitto
+      - redis
       - ota-nginx
 
     expose:
@@ -62,6 +63,17 @@ services:
       - ./certs/ca.crt:/etc/sentinel/mqtt-ca.crt:ro
       - ./firmware:/opt/sentinel/firmware
 
+    networks:
+      - croc_net
+
+
+  redis:
+    image: redis:7-alpine
+    container_name: croc_redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    expose:
+      - "6379"
     networks:
       - croc_net
 
