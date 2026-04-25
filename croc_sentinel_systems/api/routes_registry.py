@@ -221,14 +221,24 @@ def register_routers(app: FastAPI) -> None:
 
     app.include_router(_notif_admin_router)
 
-    # Phase-12 / 67: Telegram surface split into two halves —
-    #   * routers.telegram          — link-token + bind/unbind/list/toggle CRUD
-    #                                 (5 routes + shared _telegram_bind_chat)
-    #   * routers.telegram_webhook  — POST /integrations/telegram/webhook
-    #                                 + 9 command-grammar helpers
-    # telegram must ship first because telegram_webhook imports
+    # Phase-12 / 67 / 78: Telegram surface split into three modules —
+    #   * routers.telegram           — link-token + bind/unbind/list/toggle
+    #                                  CRUD (5 routes + shared
+    #                                  ``_telegram_bind_chat``).
+    #   * routers.telegram_commands  — natural-language command grammar
+    #                                  (Phase-78). Function library (no
+    #                                  router); webhook imports
+    #                                  ``handle_text`` directly.
+    #   * routers.telegram_webhook   — POST /integrations/telegram/webhook
+    #                                  + bind / chat-allowlist / reply
+    #                                  plumbing.
+    # ``telegram`` must ship first because ``telegram_webhook`` imports
     # ``_telegram_bind_chat`` from it at module-load time (the
-    # /start bind_<token> deep-link flow shares that helper).
+    # ``/start bind_<token>`` deep-link flow shares that helper).
+    # ``telegram_commands`` has no router so it isn't included here —
+    # the import chain ``telegram_webhook → telegram_commands → app``
+    # gives it the same late-bound helper capture window as every other
+    # router module.
     from routers.telegram import router as _telegram_router
     from routers.telegram_webhook import router as _telegram_webhook_router
 
