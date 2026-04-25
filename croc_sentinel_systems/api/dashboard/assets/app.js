@@ -389,6 +389,8 @@
   }
 
   let healthPollTimer = null;
+  /** One in-flight /health at a time (stops setInterval + boot piling parallel probes). */
+  let healthIsFetching = false;
   /** Overview device search debounce. */
   let overviewFilterDebounce = null;
   function clearHealthPollTimer() {
@@ -399,7 +401,7 @@
   }
   function tickHealthIfVisible() {
     if (document.visibilityState !== "visible") return;
-    loadHealth();
+    void loadHealth();
   }
 
   /**
@@ -409,7 +411,8 @@
    *   FAST  = MQTT is DOWN → track green-dot reality (don't coast on stale)
    * Stream being healthy is the "we already know live-state in real time" signal.
    */
-  const HEALTH_POLL_IDLE_MS = 20000;
+  /** When WS/SSE is healthy, rely more on push and poll /health for DB/mail/TG only. */
+  const HEALTH_POLL_IDLE_MS = 35000;
   const HEALTH_POLL_SLOW_MS = 8000;
   const HEALTH_POLL_FAST_MS = 3000;
 
@@ -480,18 +483,52 @@
   const ROUTE_RENDER_TIMEOUT_MS = 90000;
 
   /**
-   * fetch() with AbortController timeout. opts.timeoutMs: number ms, false = no limit.
+   * fetch() with timeout + optional merge of init.signal. Caller abort and deadline both cancel
+   * the same request. If init.signal is already aborted, rejects immediately. timeoutMs false = no limit.
    */
   async function fetchWithDeadline(url, init, timeoutMs) {
     const baseInit = Object.assign({ credentials: "include" }, init || {});
+    if (baseInit.signal && baseInit.signal.aborted) {
+      return Promise.reject(new DOMException("Aborted", "AbortError"));
+    }
     const limit = timeoutMs === false ? 0 : (timeoutMs != null ? timeoutMs : DEFAULT_API_TIMEOUT_MS);
-    if (limit <= 0) return fetch(url, baseInit);
-    const ac = new AbortController();
-    const tid = setTimeout(() => ac.abort(), limit);
+    if (limit <= 0) {
+      return fetch(url, baseInit);
+    }
+    const { signal: ext, ...rest } = baseInit;
+    if (rest.signal) delete rest.signal;
+    const timeoutAc = new AbortController();
+    let tid = 0;
+    const clearTid = () => {
+      if (tid) {
+        clearTimeout(tid);
+        tid = 0;
+      }
+    };
+    tid = setTimeout(() => {
+      if (!timeoutAc.signal.aborted) timeoutAc.abort();
+    }, limit);
+    const useAny = typeof AbortSignal !== "undefined" && typeof AbortSignal.any === "function" && ext;
+    const fetchSig = useAny ? AbortSignal.any([timeoutAc.signal, ext]) : timeoutAc.signal;
+    let extToTimeout = null;
+    if (!useAny && ext) {
+      extToTimeout = () => {
+        clearTid();
+        if (!timeoutAc.signal.aborted) timeoutAc.abort();
+      };
+      if (ext.aborted) extToTimeout();
+      else ext.addEventListener("abort", extToTimeout, { once: true });
+    }
     try {
-      return await fetch(url, Object.assign({}, baseInit, { signal: ac.signal }));
+      if (timeoutAc.signal.aborted) {
+        throw new DOMException("Aborted", "AbortError");
+      }
+      return await fetch(url, Object.assign({}, rest, { signal: fetchSig }));
     } catch (e) {
       if (e && e.name === "AbortError") {
+        if (ext && ext.aborted) {
+          throw e;
+        }
         throw new Error(
           `Request timed out after ${limit} ms — API slow or unreachable. Check browser Network tab, ` +
             "Nginx `proxy_connect_timeout` / `proxy_read_timeout`, and upstream service.",
@@ -499,7 +536,14 @@
       }
       throw e;
     } finally {
-      clearTimeout(tid);
+      clearTid();
+      if (ext && extToTimeout) {
+        try {
+          ext.removeEventListener("abort", extToTimeout);
+        } catch {
+          /* noop */
+        }
+      }
     }
   }
   function _sleep(ms) {
@@ -1352,22 +1396,28 @@
   }
 
   async function loadHealth() {
+    if (healthIsFetching) return;
+    healthIsFetching = true;
     try {
-      // Public endpoint — do not use api() (no Authorization) so bad/expired JWT
-      // never affects probes and we never trip the global 401 handler here.
-      const r = await fetchWithDeadline(apiBase() + "/health", { method: "GET" }, 12000);
-      if (!r.ok) throw new Error(String(r.status));
-      const h = await r.json();
-      state.mqttConnected = !!h.mqtt_connected;
-      state.health = h;
-      state.healthFetchedAt = Date.now();
-    } catch {
-      state.mqttConnected = false;
-      state.health = null;
+      try {
+        // Public endpoint — do not use api() (no Authorization) so bad/expired JWT
+        // never affects probes and we never trip the global 401 handler here.
+        const r = await fetchWithDeadline(apiBase() + "/health", { method: "GET" }, 12000);
+        if (!r.ok) throw new Error(String(r.status));
+        const h = await r.json();
+        state.mqttConnected = !!h.mqtt_connected;
+        state.health = h;
+        state.healthFetchedAt = Date.now();
+      } catch {
+        state.mqttConnected = false;
+        state.health = null;
+      }
+      renderMqttDot();
+      renderHealthPills();
+      armHealthPoll();
+    } finally {
+      healthIsFetching = false;
     }
-    renderMqttDot();
-    renderHealthPills();
-    armHealthPoll();
   }
 
   // ------------------------------------------------------------------ layout
@@ -7356,6 +7406,14 @@
       }
     }
     await loadHealth().catch(() => {});
+    /* SPA has no unmount: clear the interval on real navigation/close; restore on bfcache. */
+    window.addEventListener("pagehide", () => {
+      try { clearHealthPollTimer(); } catch (_) {}
+    });
+    window.addEventListener("pageshow", (ev) => {
+      if (!state.me) return;
+      if (ev && ev.persisted) void loadHealth().catch(() => {});
+    });
     window.addEventListener("online", () => {
       loadHealth().catch(() => {});
       tickHealthIfVisible();
