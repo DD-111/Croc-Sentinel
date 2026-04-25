@@ -210,14 +210,15 @@ def claim_device(req: ClaimDeviceRequest, principal: Principal = Depends(require
         cur = conn.cursor()
         cur.execute(
             """
-            INSERT INTO device_ownership (device_id, owner_admin, assigned_by, assigned_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO device_ownership (device_id, owner_admin, assigned_by, assigned_at, cmd_key_shadow)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(device_id) DO UPDATE SET
               owner_admin = excluded.owner_admin,
               assigned_by = excluded.assigned_by,
-              assigned_at = excluded.assigned_at
+              assigned_at = excluded.assigned_at,
+              cmd_key_shadow = excluded.cmd_key_shadow
             """,
-            (did_norm, owner_admin, principal.username, utc_now_iso()),
+            (did_norm, owner_admin, principal.username, utc_now_iso(), cmd_key),
         )
         # Stale device_state from a previous tenant/owner: clear profile fields on (re)claim
         cur.execute(

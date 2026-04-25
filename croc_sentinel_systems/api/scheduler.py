@@ -46,6 +46,10 @@ import logging
 import sqlite3
 import threading
 import time
+import tempfile
+import urllib.request
+import os
+import gzip
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -55,8 +59,12 @@ from config import (
     PRESENCE_PROBE_SCAN_SECONDS,
     SCHEDULER_POLL_SECONDS,
     TOPIC_ROOT,
+    DB_BACKUP_ENABLED,
+    DB_BACKUP_INTERVAL_SECONDS,
+    DB_BACKUP_TIMEOUT_SECONDS,
+    DB_BACKUP_PRESIGNED_URL_TEMPLATE,
 )
-from db import db_lock, get_conn
+from db import DB_PATH, db_lock, get_conn
 from helpers import utc_now_iso
 
 import app as _app
@@ -76,12 +84,82 @@ scheduler_stop = threading.Event()
 scheduler_thread: Optional[threading.Thread] = None
 
 
+def _upload_db_backup_once() -> None:
+    """Create a consistent SQLite snapshot and upload it via PUT to object storage.
+
+    Transport contract:
+      * destination URL comes from DB_BACKUP_PRESIGNED_URL_TEMPLATE
+      * if template contains ``{ts}``, it is replaced with UTC timestamp
+      * payload is gzip-compressed SQLite bytes
+    """
+    if not DB_BACKUP_PRESIGNED_URL_TEMPLATE:
+        return
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    url = DB_BACKUP_PRESIGNED_URL_TEMPLATE.replace("{ts}", ts)
+    tmp_path = ""
+    try:
+        with db_lock:
+            src = get_conn()
+            fd, tmp_path = tempfile.mkstemp(prefix="sentinel-db-backup-", suffix=".sqlite")
+            os.close(fd)
+            dst = sqlite3.connect(tmp_path, timeout=5.0)
+            # Online-consistent snapshot even while the API is writing.
+            src.backup(dst)
+            dst.close()
+            src.close()
+        with open(tmp_path, "rb") as f:
+            raw = f.read()
+        if len(raw) < 16 or raw[:15] != b"SQLite format 3":
+            raise RuntimeError("snapshot is not a valid sqlite file")
+        payload = gzip.compress(raw, compresslevel=6)
+        req = urllib.request.Request(
+            url=url,
+            data=payload,
+            method="PUT",
+            headers={
+                "Content-Type": "application/gzip",
+                "X-Sentinel-Backup-Ts": ts,
+                "X-Sentinel-Backup-Source": os.path.basename(DB_PATH),
+            },
+        )
+        with urllib.request.urlopen(req, timeout=float(DB_BACKUP_TIMEOUT_SECONDS)) as resp:
+            code = int(getattr(resp, "status", 0) or 0)
+            if code < 200 or code >= 300:
+                raise RuntimeError(f"backup upload failed: HTTP {code}")
+        logger.info(
+            "db backup uploaded ts=%s bytes_raw=%d bytes_gzip=%d",
+            ts,
+            len(raw),
+            len(payload),
+        )
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+def _db_backup_tick(now: float, next_backup_at: float) -> float:
+    """Periodic wrapper that keeps scheduler_loop readable."""
+    if not DB_BACKUP_ENABLED:
+        return now + 3600
+    if now < next_backup_at:
+        return next_backup_at
+    try:
+        _upload_db_backup_once()
+    except Exception as exc:
+        logger.warning("db backup tick failed: %s", exc)
+    return now + max(60, DB_BACKUP_INTERVAL_SECONDS)
+
+
 def scheduler_loop() -> None:
     next_cleanup_at = time.time() + 60
     next_probe_at = time.time() + 30  # kick probe worker ~30s after boot
     next_events_retention_at = time.time() + 300  # first retention pass ~5 min after boot
     next_pwd_prune_at = time.time() + 900
     next_pending_claim_prune_at = time.time() + 120
+    next_db_backup_at = time.time() + 90
     while not scheduler_stop.is_set():
         now_ts = int(time.time())
         jobs: list[sqlite3.Row] = []
@@ -196,6 +274,8 @@ def scheduler_loop() -> None:
             except Exception as exc:
                 logger.warning("pending_claim prune failed: %s", exc)
             next_pending_claim_prune_at = now + 900
+
+        next_db_backup_at = _db_backup_tick(now, next_db_backup_at)
 
         scheduler_stop.wait(SCHEDULER_POLL_SECONDS)
 

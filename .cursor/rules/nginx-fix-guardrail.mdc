@@ -1,0 +1,31 @@
+---
+description: Guardrail for nginx reverse-proxy fixes (api /console /api strip / ws / sse only)
+alwaysApply: true
+---
+
+# Nginx Reverse-Proxy Fix Guardrail
+
+When user asks to solve Nginx issues, the agent MUST stay within this scope:
+
+## Allowed Scope
+
+- Nginx reverse-proxy config for:
+  - `/console` dashboard static path passthrough to API
+  - `/api/*` upstream proxy with prefix stripping
+  - `/api/events/ws` WebSocket forwarding
+  - `/api/events/stream` SSE forwarding with buffering disabled
+- Supporting smoke/debug scripts and documentation for the above.
+
+## Forbidden Scope
+
+- MUST NOT change firmware.
+- MUST NOT change unrelated backend business logic.
+- MUST NOT refactor frontend structure unrelated to proxy pathing.
+- MUST NOT modify OTA-only nginx template semantics except documenting separation.
+
+## No-Drift Requirements
+
+- Keep existing route contracts (`DASHBOARD_PATH=/console`, frontend `croc-api-base=/api`) intact.
+- Prefer additive files/templates over risky rewrites of existing OTA config.
+- Every fix part MUST include smoke checks and debug notes.
+

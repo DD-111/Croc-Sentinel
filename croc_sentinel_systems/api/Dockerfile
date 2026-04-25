@@ -5,8 +5,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py security.py notifier.py telegram_notify.py email_templates.py tz_display.py fcm_notify.py ./
-COPY dashboard ./dashboard
+# Phase-62+ modularized API: app.py now imports many sibling modules
+# (config.py, helpers.py, db.py, routers/*, etc). Copy the whole API
+# context so runtime imports never miss newly extracted modules.
+COPY . .
 
 EXPOSE 8088
 

@@ -156,6 +156,47 @@ def _auth_device_http(device_id: str, mac_nocolon: str, cmd_key: str) -> sqlite3
     return row
 
 
+def _reconcile_ownership_cmd_key_shadow(device_id: str, db_key: str) -> None:
+    """Cross-table consistency check for cmd_key shadow.
+
+    Source of truth for runtime auth remains ``provisioned_credentials.cmd_key``.
+    ``device_ownership.cmd_key_shadow`` is a redundancy/consistency copy used
+    for drift detection and recovery workflows.
+    """
+    did = str(device_id or "").strip()
+    key = str(db_key or "").strip().upper()
+    if not did or not is_hex_16(key):
+        return
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT IFNULL(cmd_key_shadow,'') AS cmd_key_shadow "
+            "FROM device_ownership WHERE device_id = ? LIMIT 1",
+            (did,),
+        )
+        ow = cur.fetchone()
+        if not ow:
+            conn.close()
+            return
+        sh = str(ow["cmd_key_shadow"] or "").strip().upper()
+        if sh == key:
+            conn.close()
+            return
+        cur.execute(
+            "UPDATE device_ownership SET cmd_key_shadow = ? WHERE device_id = ?",
+            (key, did),
+        )
+        conn.commit()
+        conn.close()
+    logger.warning(
+        "device_ownership cmd_key_shadow reconciled for %s (had=%s now=%s)",
+        did,
+        bool(sh),
+        key[:4] + "..." + key[-4:],
+    )
+
+
 # ─────────────────────────────────────── routes ────
 
 @router.post("/device/boot-sync")
@@ -169,6 +210,8 @@ def device_boot_sync(body: DeviceBootSyncRequest) -> dict[str, Any]:
         return {"status": "unprovisioned"}
     did = str(row["device_id"])
     db_key = str(row["cmd_key"] or "").strip().upper()
+    # Keep ownership-side shadow in sync every time a known device checks in.
+    _reconcile_ownership_cmd_key_shadow(did, db_key)
     rep = (body.cmd_key or "").strip().upper()
     if rep and is_hex_16(rep) and rep == db_key:
         return {"status": "ok"}

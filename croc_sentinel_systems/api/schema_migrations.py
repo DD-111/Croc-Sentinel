@@ -76,6 +76,9 @@ def _run_ensure_columns(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "role_policies", "tg_test_single", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(conn, "role_policies", "tg_test_bulk", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(conn, "trigger_policies", "panic_link_enabled", "INTEGER NOT NULL DEFAULT 1")
+    # Phase 93: ownership-side cmd_key shadow for cross-table consistency checks.
+    # Keep default empty so legacy rows remain valid until backfilled.
+    ensure_column(conn, "device_ownership", "cmd_key_shadow", "TEXT NOT NULL DEFAULT ''")
     ensure_column(
         conn,
         "trigger_policies",
@@ -189,6 +192,39 @@ def _ensure_provisioned_credentials_unique_index(conn: sqlite3.Connection) -> No
     )
 
 
+def _backfill_device_ownership_cmd_key_shadow(conn: sqlite3.Connection) -> None:
+    """Backfill empty ownership cmd_key_shadow from provisioned_credentials.
+
+    Why:
+      * ``device_ownership`` is the long-lived binding ledger.
+      * ``provisioned_credentials`` is the active runtime credential row.
+      * We keep a shadow copy so drift can be detected (and repaired) without
+        relying on a single table as the only historical source.
+
+    Policy:
+      * Backfill only when ``cmd_key_shadow`` is empty.
+      * Do not overwrite non-empty shadow values here; runtime paths perform
+        explicit drift checks and controlled repairs with audit/event logs.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE device_ownership
+        SET cmd_key_shadow = (
+            SELECT IFNULL(pc.cmd_key, '')
+            FROM provisioned_credentials pc
+            WHERE pc.device_id = device_ownership.device_id
+            LIMIT 1
+        )
+        WHERE IFNULL(cmd_key_shadow, '') = ''
+          AND EXISTS (
+            SELECT 1 FROM provisioned_credentials pc
+            WHERE pc.device_id = device_ownership.device_id
+          )
+        """
+    )
+
+
 def run_migrations(conn: sqlite3.Connection) -> None:
     """Run every idempotent migration step.
 
@@ -204,6 +240,7 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     _run_ensure_columns(conn)
     _normalize_trigger_policies(conn)
     _backfill_dashboard_users_status(conn)
+    _backfill_device_ownership_cmd_key_shadow(conn)
     _ensure_provisioned_credentials_unique_index(conn)
 
 

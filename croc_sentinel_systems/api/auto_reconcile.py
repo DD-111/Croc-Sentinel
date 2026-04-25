@@ -199,6 +199,15 @@ def _run_auto_reconcile_once(device_id: str, reason: str) -> bool:
             """,
             (mqtt_u, mqtt_p, cmd_key, zone, qr, utc_now_iso(), did),
         )
+        # Keep ownership-side cmd_key shadow aligned with active credentials.
+        cur.execute(
+            """
+            UPDATE device_ownership
+            SET cmd_key_shadow = ?
+            WHERE device_id = ?
+            """,
+            (cmd_key, did),
+        )
         # Auto-rebind: keep pending proposed ID aligned to active provisioned device_id.
         cur.execute(
             "UPDATE pending_claims SET proposed_device_id = ? WHERE mac_nocolon = ?",

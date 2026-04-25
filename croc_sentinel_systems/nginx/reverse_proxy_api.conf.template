@@ -1,0 +1,97 @@
+##
+## Croc Sentinel reverse-proxy template (main site/API)
+##
+## Purpose:
+##   - Keep dashboard at /console (matches DASHBOARD_PATH default)
+##   - Keep browser API base at /api (matches dashboard/index.html meta)
+##   - Strip /api before proxying to uvicorn (backend routes are rooted at /auth,/events,...)
+##   - Preserve SSE + WebSocket behavior
+##
+## Upstream assumptions:
+##   - API container/service reachable at: http://api:8088
+##   - Nginx is the public front door for HTTPS 443 (TLS/server_name omitted here)
+##
+
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 80;
+    server_name _;
+
+    # 1) Dashboard shell mount
+    # /console and /console/* are served by FastAPI StaticFiles mount.
+    location = /console {
+        return 301 /console/;
+    }
+    location /console/ {
+        proxy_pass http://api:8088;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Port $server_port;
+        proxy_connect_timeout 10s;
+        proxy_read_timeout 120s;
+        proxy_send_timeout 120s;
+    }
+
+    # 2) API prefix adapter
+    # Frontend sends /api/... ; backend expects /...
+    # NOTE: trailing slash on proxy_pass is critical to strip /api/
+    location /api/ {
+        proxy_pass http://api:8088/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Port $server_port;
+        proxy_connect_timeout 10s;
+        proxy_read_timeout 120s;
+        proxy_send_timeout 120s;
+        proxy_buffering off;
+        proxy_request_buffering off;
+    }
+
+    # 3) SSE hot path
+    location /api/events/stream {
+        proxy_pass http://api:8088/events/stream;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection '';
+        chunked_transfer_encoding off;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_cache off;
+        add_header X-Accel-Buffering no always;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
+    # 4) WebSocket hot path
+    location /api/events/ws {
+        proxy_pass http://api:8088/events/ws;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
+    # 5) Legacy aliases handled server-side by /ui /dashboard redirect routes.
+    location = / {
+        return 302 /console/;
+    }
+}
+

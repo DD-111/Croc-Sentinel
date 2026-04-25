@@ -66,6 +66,8 @@ from config import (
     BOOTSTRAP_DASHBOARD_SUPERADMIN_PASSWORD,
     CMD_AUTH_KEY,
     DEVICE_CHALLENGE_TTL_SECONDS,
+    DB_BACKUP_ENABLED,
+    DB_BACKUP_PRESIGNED_URL_TEMPLATE,
     ENFORCE_DEVICE_CHALLENGE,
     JWT_SECRET,
     LEGACY_API_TOKEN_ENABLED,
@@ -128,6 +130,8 @@ def validate_production_env() -> None:
     if BOOTSTRAP_DASHBOARD_SUPERADMIN_PASSWORD:
         if not JWT_SECRET or len(JWT_SECRET) < 32:
             errors.append("JWT_SECRET must be set (>=32 chars) when BOOTSTRAP_DASHBOARD_SUPERADMIN_PASSWORD is used")
+    if DB_BACKUP_ENABLED and not DB_BACKUP_PRESIGNED_URL_TEMPLATE:
+        errors.append("DB_BACKUP_ENABLED=1 requires DB_BACKUP_PRESIGNED_URL_TEMPLATE")
     if errors:
         msg = "Invalid production environment: " + "; ".join(errors)
         if STRICT_STARTUP_ENV_CHECK:

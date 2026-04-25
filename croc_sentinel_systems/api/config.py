@@ -74,6 +74,15 @@ MAX_BULK_TARGETS: int = int(os.getenv("MAX_BULK_TARGETS", "500"))
 MESSAGE_RETENTION_DAYS: int = int(os.getenv("MESSAGE_RETENTION_DAYS", "14"))
 STRICT_STARTUP_ENV_CHECK: bool = os.getenv("STRICT_STARTUP_ENV_CHECK", "0") == "1"
 
+# --- DB object-storage backup -----------------------------------------------
+# Uses HTTP PUT to a pre-signed object-storage URL (S3/R2/OSS/MinIO style).
+# Keep URL generation outside the API process for least privilege.
+DB_BACKUP_ENABLED: bool = os.getenv("DB_BACKUP_ENABLED", "0") == "1"
+DB_BACKUP_INTERVAL_SECONDS: int = max(60, int(os.getenv("DB_BACKUP_INTERVAL_SECONDS", "900")))
+DB_BACKUP_TIMEOUT_SECONDS: int = max(3, int(os.getenv("DB_BACKUP_TIMEOUT_SECONDS", "20")))
+# If set, may contain "{ts}" placeholder (UTC compact timestamp).
+DB_BACKUP_PRESIGNED_URL_TEMPLATE: str = (os.getenv("DB_BACKUP_PRESIGNED_URL_TEMPLATE", "") or "").strip()
+
 # --- JWT / cookie / CSRF ---------------------------------------------------
 JWT_SECRET: str = os.getenv("JWT_SECRET", "")
 # Dashboard session: HttpOnly cookie (preferred) + optional JSON access_token for scripts.

@@ -1,0 +1,43 @@
+---
+description: Strict scope lock for AI changes (only ownership cmd_key redundancy and sentinel.db object-storage backup)
+alwaysApply: true
+---
+
+# AI Scope Lock (Hard Guardrail)
+
+This repository is under strict scope control. The agent MUST follow all rules below.
+
+## Allowed Scope (Only Two Workstreams)
+
+1. Add/maintain `cmd_key` redundancy and consistency checks tied to `device_ownership`.
+2. Add/maintain automated backup for `sentinel.db` to object storage.
+
+Any change outside these two workstreams is out-of-scope unless user explicitly re-authorizes.
+
+## Forbidden Changes
+
+- MUST NOT change frontend/UI/CSS/dashboard routes/assets.
+- MUST NOT change firmware files (including `Croc Sentinel.ino`).
+- MUST NOT do unrelated modularization/refactors/cleanup.
+- MUST NOT add dependencies unless directly required by the two allowed workstreams.
+- MUST NOT perform destructive git operations.
+
+## File Discipline (No File Stuffing)
+
+- MUST NOT create new files/modules unless strictly necessary for the two allowed workstreams.
+- When creating a file is unavoidable, MUST keep it minimal and localized.
+- Prefer editing existing in-scope files over adding new files.
+
+## No-Drift Behavior
+
+- MUST preserve existing behavior outside the approved scope.
+- MUST NOT do silent logic rewrites, opportunistic rewrites, or broad “improvements”.
+- If a structural change is unavoidable, MUST explain: blocker, touched files, and why smaller edits are insufficient.
+
+## Execution Protocol
+
+- Before editing, MUST list target files and explain why each file is in-scope.
+- After each completed part, MUST run smoke checks and debug/fix issues before moving on.
+- Validation MUST focus on changed in-scope files and directly impacted paths.
+- If any request conflicts with this rule, MUST stop and ask for explicit user approval.
+
