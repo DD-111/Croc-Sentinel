@@ -1,0 +1,41 @@
+/**
+ * Visual refresh layer (loaded last). Component-level overrides only.
+ * Tokens (radius, gap, shadows, theme palettes) live in 00-tokens.css.
+ */
+
+.card {
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  border: 1px solid color-mix(in srgb, var(--border) 88%, transparent);
+}
+
+.view {
+  scroll-padding-top: calc(var(--topbar-h) + 8px);
+}
+
+/* Page chrome — use with mountView wrappers where applicable */
+.page-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.page-head h1,
+.page-head h2 {
+  margin: 0;
+  font-family: var(--font-display);
+  letter-spacing: -0.03em;
+}
+.page-head .muted {
+  flex: 1 1 100%;
+  max-width: 52ch;
+}
+
+@media (max-width: 520px) {
+  .page-head {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}

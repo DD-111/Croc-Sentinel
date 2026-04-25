@@ -1,0 +1,15 @@
+{
+  "name": "croc-sentinel-dashboard",
+  "private": true,
+  "type": "module",
+  "description": "Static SPA for Croc Sentinel console — build bundles src/ → assets/app.js",
+  "scripts": {
+    "build": "node scripts/build-dashboard.mjs",
+    "check": "node --check assets/app.js",
+    "smoke": "node scripts/smoke-routes.mjs",
+    "verify": "npm run build && npm run check && npm run smoke"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}

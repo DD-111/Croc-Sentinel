@@ -1,0 +1,4 @@
+node_modules/
+/build.tmp.mjs
+/build.tmp2.mjs
+/build.strip.mjs

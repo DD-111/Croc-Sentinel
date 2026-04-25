@@ -12,3 +12,7 @@ croc_sentinel_systems/certs b1/*.key
 
 # Never commit RSA private key used for dashboard password recovery
 password_recovery_keys/private.pem
+
+# Python bytecode caches
+__pycache__/
+*.pyc

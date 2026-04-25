@@ -294,9 +294,13 @@ DASHBOARD_PATH = os.getenv("DASHBOARD_PATH", "/console").strip() or "/console"
 if not DASHBOARD_PATH.startswith("/"):
     DASHBOARD_PATH = "/" + DASHBOARD_PATH
 DASHBOARD_PATH = DASHBOARD_PATH.rstrip("/") or "/console"
-# Guard: refuse to mount over known API prefixes.
+# Guard: refuse to mount over known API prefixes. `/api` is included so an
+# operator cannot accidentally point DASHBOARD_PATH at `/api`-style locations
+# and shadow `/api/group-cards/*` (the dashboard's `/api/...` alias surface).
 _RESERVED_PREFIXES = ("/auth", "/devices", "/commands", "/alerts", "/admin",
-                      "/provision", "/health", "/dashboard", "/logs", "/audit", "/ui")
+                      "/provision", "/health", "/dashboard", "/logs", "/audit",
+                      "/ui", "/api", "/events", "/ota", "/factory",
+                      "/integrations", "/ingest")
 if any(DASHBOARD_PATH == p or DASHBOARD_PATH.startswith(p + "/") for p in _RESERVED_PREFIXES):
     # Fallback silently to /console to avoid shadowing API routes.
     DASHBOARD_PATH = "/console"
@@ -4285,21 +4289,24 @@ def _clear_csrf_cookie(response: Response) -> None:
 # without a CSRF token. Auth endpoints issue the token so they can't require it
 # pre-login; device-side paths run over MQTT or per-device HMAC so the cookie
 # flow doesn't apply.
+#
+# Names here MUST mirror the paths the SPA actually calls (see
+# api/dashboard/src/console.raw.js). The previous `/auth/register`,
+# `/auth/forgot-password`, `/auth/account-activate`, `/auth/resend-activation`
+# entries never matched; today the SPA hits `/auth/signup/...`,
+# `/auth/forgot/...`, `/auth/activate`, `/auth/code/resend` instead.
 _CSRF_EXEMPT_PREFIXES: tuple[str, ...] = (
     "/auth/login",
-    "/auth/register",
-    "/auth/forgot-password",
-    "/auth/reset-password",
-    "/auth/account-activate",
-    "/auth/resend-activation",
     "/auth/logout",
-    "/api/device/",
-    "/api/devices/",  # device-side self-service endpoints
-    "/ingest/",
+    "/auth/signup/",       # signup/start, signup/verify, signup/approve, ...
+    "/auth/forgot/",       # forgot/email/start, forgot/start, ...
+    "/auth/activate",      # account activation (mirror SPA route)
+    "/auth/code/resend",   # OTP resend used by signup + activate
+    "/ingest/",            # device ingest; device-signed, no browser cookies
     "/integrations/telegram/webhook",
     "/health",
-    "/dashboard/",
-    "/ui/",
+    "/dashboard/",         # legacy SPA shell mount (pre-/console)
+    "/ui/",                # legacy static UI mount
 )
 
 
@@ -13118,9 +13125,12 @@ def _require_factory_auth(request: Request) -> str:
     if auth.lower().startswith("bearer "):
         try:
             token = auth.split(" ", 1)[1].strip()
-            claims = decode_jwt(token)
-            if claims and str(claims.get("role", "")) == "superadmin":
-                return str(claims.get("sub", "superadmin"))
+            # decode_jwt returns a Principal dataclass (not a dict). The earlier
+            # `.get("role")` form silently raised AttributeError under
+            # `except Exception: pass`, so the JWT path was effectively dead.
+            principal = decode_jwt(token)
+            if principal and str(getattr(principal, "role", "") or "") == "superadmin":
+                return str(getattr(principal, "username", "") or "superadmin")
         except Exception:
             pass
     token = request.headers.get("x-factory-token", "")

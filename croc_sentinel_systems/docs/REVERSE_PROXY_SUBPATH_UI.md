@@ -1,6 +1,6 @@
 # 子路径控制台 + API 反代（Traefik 或任意网关）
 
-`index.html` 中 **`croc-api-base` / `croc-dashboard-base`** 与 [`app.js`](../api/dashboard/assets/app.js) 的 `apiBase()` 共同决定：浏览器请求是 **`https://域名/根路径/...` 还是 `https://域名/api/...`**，控制台静态页在 **`/console`（可改 `DASHBOARD_PATH`）** 或你配置的子路径。
+`index.html` 中 **`croc-api-base` / `croc-dashboard-base`** 与 [`app.js`](../api/dashboard/assets/app.js)（由 `dashboard/src/` 构建）中的 `apiBase()` 共同决定：浏览器请求是 **`https://域名/根路径/...` 还是 `https://域名/api/...`**，控制台静态页在 **`/console`（可改 `DASHBOARD_PATH`）** 或你配置的子路径。
 
 - **`croc-api-base="/api"`** 时，REST 与 **WebSocket**（`/api/events/ws`）、**SSE**（`/api/events/stream`）都带 `/api` 前缀 —— 网关需 **`StripPrefix("/api")`** 再反代到 Uvicorn（后端路由仍是根上的 `/auth`、`/events/...`）。
 - **留空或不使用 `/api` 前缀** 时，与下列「**API 在站点根**」一致，无需 StripPrefix；`FACTORY_UI_API_BASE` 为浏览器能打开的 **同 scheme+host+port 根**（如 `https://x.com:443` 无尾斜杠）。

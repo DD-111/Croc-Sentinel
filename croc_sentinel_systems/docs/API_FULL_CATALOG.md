@@ -2,7 +2,7 @@
 
 This file consolidates both:
 - Backend API routes (`api/app.py`)
-- Frontend-in-use API calls (`api/dashboard/assets/app.js`)
+- Frontend-in-use API calls (compiled bundle `api/dashboard/assets/app.js`, sources under `api/dashboard/src/`)
 
 Base URL (pick what matches deployment):
 - Production (Traefik): `https://<host>/api` — StripPrefix leaves FastAPI routes as `/health`, `/factory/...`, etc.
