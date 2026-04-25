@@ -1,15 +1,18 @@
-"""Group-card settings + delete + capabilities (Phase-14, trimmed in Phase-66).
+"""Group-card settings + capabilities (Phase-14, trimmed P66 + P73).
 
 A "group card" is the dashboard widget that fans out a single click to
 every device sharing the same ``device_state.notification_group`` tag —
 think floor-level / building-level grouping. The original Phase-14
-extract carried 13 endpoints (the apply fan-out included). Phase 66
-moved the 2 *apply* routes into ``routers/group_cards_apply.py`` so
-this module now hosts the persistence half only:
+extract carried 13 endpoints. The lifecycle has now been split three
+ways for separation-of-concern:
 
+  * routers.group_cards          — settings CRUD + capabilities (this file)
+  * routers.group_cards_apply    — siren fan-out (Phase 66)
+  * routers.group_cards_delete   — delete + impl helper (Phase 73)
+
+Routes hosted here (all behind ``Depends(require_principal)``)
+--------------------------------------------------------------
   Canonical (no /api prefix):
-    DELETE /group-cards/{group_key}
-    POST   /group-cards/{group_key}/delete           — proxy-friendly alt
     GET    /group-cards/capabilities                 — feature discovery
     GET    /group-cards/settings                     — list owned/all
     GET    /group-cards/{group_key}/settings         — single
@@ -19,8 +22,6 @@ this module now hosts the persistence half only:
     GET    /api/group-cards/settings
     GET    /api/group-cards/{group_key}/settings
     PUT    /api/group-cards/{group_key}/settings
-    DELETE /api/group-cards/{group_key}
-    POST   /api/group-cards/{group_key}/delete
 
 The /api/ mirror routes exist so old proxies/firewalls that only allow
 ``/api/*`` can still reach the same logic. Keep them as thin wrappers —
@@ -34,17 +35,18 @@ Tenant model
   group_key reused across tenants. When omitted and devices span
   multiple tenants, write/apply require an explicit slice (we 400).
 
-Helpers and schemas (kept here, re-exported for group_cards_apply)
-------------------------------------------------------------------
+Helpers and schemas (kept here, re-exported for sibling modules)
+----------------------------------------------------------------
   Pydantic body: ``GroupCardSettingsBody``
-  Helpers:       ``_delete_group_card_impl``, ``_group_owner_scope``,
-                 ``_group_settings_defaults``, ``_group_devices_with_owner``
+  Helpers:       ``_group_owner_scope``,
+                 ``_group_settings_defaults``,
+                 ``_group_devices_with_owner``
 
-The three ``_group_*`` helpers (``_group_owner_scope``,
-``_group_settings_defaults``, ``_group_devices_with_owner``) are
-re-exported via ``__all__`` so ``routers/group_cards_apply.py`` can
-import them — apply needs to read the same settings rows we write
-and resolve the same device slice.
+The three ``_group_*`` helpers are re-exported via ``__all__`` so
+``routers/group_cards_apply.py`` can import them — apply needs to
+read the same settings rows we write and resolve the same device
+slice. ``routers/group_cards_delete.py`` owns its own
+``_delete_group_card_impl`` (no longer here).
 
 The following stay in ``app.py`` because non-group code paths use them
 (late-bound here):
@@ -64,7 +66,7 @@ from pydantic import BaseModel, Field
 import app as _app
 from audit import audit_event
 from config import DEFAULT_REMOTE_FANOUT_MS
-from db import cache_invalidate, db_lock, get_conn
+from db import db_lock, get_conn
 from helpers import utc_now_iso
 from security import Principal, assert_min_role
 
@@ -147,123 +149,6 @@ def _group_devices_with_owner(
         rows = [{"device_id": str(r["device_id"]), "owner_admin": str(r["owner_admin"] or "")} for r in cur.fetchall()]
         conn.close()
     return rows
-
-
-def _delete_group_card_impl(
-    group_key: str,
-    principal: Principal,
-    *,
-    tenant_owner: Optional[str] = None,
-) -> dict[str, Any]:
-    """Delete a group card by clearing notification_group on target devices.
-
-    Security rule:
-      - admin: can only delete groups fully owned by self (shared devices block deletion)
-      - superadmin: can delete any group; pass `tenant_owner` to clear only that admin's slice
-        (recommended when multiple tenants reuse the same group_key).
-    """
-    assert_min_role(principal, "admin")
-    g = (group_key or "").strip()
-    if not g:
-        raise HTTPException(status_code=400, detail="group_key required")
-    tenant = (tenant_owner or "").strip()
-    if principal.role != "superadmin" and tenant:
-        raise HTTPException(status_code=400, detail="owner_admin filter is superadmin-only")
-    slice_sql = ""
-    slice_args: list[Any] = []
-    if principal.role == "superadmin" and tenant:
-        slice_sql = " AND IFNULL(o.owner_admin,'') = ? "
-        slice_args.append(tenant)
-    zs, za = zone_sql_suffix(principal, "d.zone")
-    osf, osa = owner_scope_clause_for_device_state(principal, "d")
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            f"""
-            SELECT d.device_id, IFNULL(o.owner_admin,'') AS owner_admin
-            FROM device_state d
-            LEFT JOIN device_ownership o ON d.device_id = o.device_id
-            WHERE IFNULL(d.notification_group,'') = ? {zs} {osf} {slice_sql}
-            ORDER BY d.device_id ASC
-            """,
-            tuple([g] + za + osa + slice_args),
-        )
-        rows = [dict(r) for r in cur.fetchall()]
-        if not rows:
-            conn.close()
-            raise HTTPException(status_code=404, detail="group not found in your scope")
-        if principal.role != "superadmin":
-            for r in rows:
-                owner = str(r.get("owner_admin") or "")
-                if owner and owner != principal.username:
-                    conn.close()
-                    raise HTTPException(status_code=403, detail="shared group cannot be deleted")
-                if not owner:
-                    conn.close()
-                    raise HTTPException(status_code=403, detail="unowned group cannot be deleted by admin")
-        ids = [str(r["device_id"]) for r in rows if r.get("device_id")]
-        ph = ",".join(["?"] * len(ids))
-        cur.execute(
-            f"UPDATE device_state SET notification_group = '' WHERE device_id IN ({ph})",
-            tuple(ids),
-        )
-        changed = int(cur.rowcount or 0)
-        conn.commit()
-        conn.close()
-    cache_invalidate("devices")
-    cache_invalidate("overview")
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        if principal.role == "superadmin":
-            if tenant:
-                cur.execute(
-                    "DELETE FROM group_card_settings WHERE owner_admin = ? AND group_key = ?",
-                    (tenant, g),
-                )
-            else:
-                cur.execute("DELETE FROM group_card_settings WHERE group_key = ?", (g,))
-        else:
-            owner_scope = (
-                principal.username
-                if principal.role == "admin"
-                else (get_manager_admin(principal.username) or principal.username)
-            )
-            cur.execute(
-                "DELETE FROM group_card_settings WHERE owner_admin = ? AND group_key = ?",
-                (owner_scope, g),
-            )
-        conn.commit()
-        conn.close()
-    audit_event(
-        principal.username,
-        "group.delete",
-        g,
-        {"device_count": len(ids), "changed": changed, "tenant_owner": tenant or None},
-    )
-    return {"ok": True, "group_key": g, "device_count": len(ids), "changed": changed}
-
-
-# ─────────────────────────────────────────── routes: delete ────
-
-@router.delete("/group-cards/{group_key}")
-def delete_group_card(
-    group_key: str,
-    owner_admin: Optional[str] = Query(default=None, max_length=64),
-    principal: Principal = Depends(require_principal),
-) -> dict[str, Any]:
-    return _delete_group_card_impl(group_key, principal, tenant_owner=owner_admin)
-
-
-@router.post("/group-cards/{group_key}/delete")
-def delete_group_card_post(
-    group_key: str,
-    owner_admin: Optional[str] = Query(default=None, max_length=64),
-    principal: Principal = Depends(require_principal),
-) -> dict[str, Any]:
-    """Proxy-friendly delete route for environments that block HTTP DELETE."""
-    return _delete_group_card_impl(group_key, principal, tenant_owner=owner_admin)
 
 
 @router.get("/group-cards/capabilities")
@@ -538,24 +423,6 @@ def save_group_card_settings_api(
 # re-exported helpers.
 
 
-@router.delete("/api/group-cards/{group_key}")
-def delete_group_card_api(
-    group_key: str,
-    owner_admin: Optional[str] = Query(default=None, max_length=64),
-    principal: Principal = Depends(require_principal),
-) -> dict[str, Any]:
-    return _delete_group_card_impl(group_key, principal, tenant_owner=owner_admin)
-
-
-@router.post("/api/group-cards/{group_key}/delete")
-def delete_group_card_post_api(
-    group_key: str,
-    owner_admin: Optional[str] = Query(default=None, max_length=64),
-    principal: Principal = Depends(require_principal),
-) -> dict[str, Any]:
-    return _delete_group_card_impl(group_key, principal, tenant_owner=owner_admin)
-
-
 __all__ = (
     "router",
     "GroupCardSettingsBody",
@@ -566,5 +433,4 @@ __all__ = (
     "_group_owner_scope",
     "_group_settings_defaults",
     "_group_devices_with_owner",
-    "_delete_group_card_impl",
 )
