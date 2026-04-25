@@ -111,7 +111,27 @@ async function renderRoute() {
   }
   const aliasHash = "#/" + id;
   const routeId = ROUTE_ALIASES[aliasHash] || id;
-  document.body.dataset.layout = publicRoutes.has(routeId) ? "auth" : "app";
+  const isAuthRoute = publicRoutes.has(routeId);
+  document.body.dataset.layout = isAuthRoute ? "auth" : "app";
+  // Keep an explicit class for auth-shell CSS guards and legacy selectors.
+  document.body.classList.toggle("auth-route-active", isAuthRoute);
+  // Runtime hard guard: enforce auth/app chrome visibility directly so
+  // late-loaded styles or specificity collisions cannot re-show app chrome.
+  try {
+    const topbar = document.querySelector(".topbar");
+    const sidebar = document.querySelector(".sidebar");
+    const sidebarBackdrop = document.querySelector(".sidebar-backdrop");
+    for (const el of [topbar, sidebar, sidebarBackdrop]) {
+      if (!el) continue;
+      if (isAuthRoute) {
+        el.setAttribute("hidden", "");
+        el.style.display = "none";
+      } else {
+        el.removeAttribute("hidden");
+        el.style.display = "";
+      }
+    }
+  } catch (_) {}
   try { applySidebarRail(); } catch (_) {}
   const handler = routes[routeId] || routes["overview"];
   try {
