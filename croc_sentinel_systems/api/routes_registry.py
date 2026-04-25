@@ -160,9 +160,19 @@ def register_routers(app: FastAPI) -> None:
 
     app.include_router(_dashboard_read_router)
 
-    # Phase-29: provision-lifecycle (/provision/pending, /claim, /identify).
+    # Phase-29 / 70: provision-lifecycle split into two halves —
+    #   * routers.provision_lifecycle  — write-side claim flow
+    #                                    (GET /provision/pending,
+    #                                     POST /provision/claim)
+    #   * routers.provision_identify   — read-only inspection
+    #                                    (POST /provision/identify)
+    # No cross-module imports; identify-first matches the operator
+    # wizard order (identify -> pending -> claim) so log-grep follows
+    # the natural UX sequence.
+    from routers.provision_identify import router as _provision_identify_router
     from routers.provision_lifecycle import router as _provision_lifecycle_router
 
+    app.include_router(_provision_identify_router)
     app.include_router(_provision_lifecycle_router)
 
     # Phase-9: /audit, /logs/messages, /logs/file.
