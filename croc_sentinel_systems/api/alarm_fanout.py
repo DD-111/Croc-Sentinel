@@ -13,13 +13,13 @@ This module owns the alarm trigger pipeline that runs when an
   6. write the alarm row + audit log
 
 The implementation is mostly side effects (MQTT publish, email queue,
-event bus, audit log) so it depends on a number of symbols defined
+event bus, audit log) so it depends on three callables defined
 *later* in ``app.py`` (``publish_command``, ``get_cmd_keys_for_devices``,
-``emit_event``) and on three small lookups that still live in
-``app.py`` (``_device_notify_labels``, ``_trigger_policy_for``,
-``_notify_subject_prefix``). Those are accessed via ``import app as
-_app`` at call time so this module can import without triggering the
-cyclic import path.
+``emit_event``); those are accessed via ``import app as _app`` at
+call time so this module can import without triggering the cyclic
+import path. The trigger-policy lookups (``_device_notify_labels``,
+``_trigger_policy_for``, ``_notify_subject_prefix``) live in
+``trigger_policy.py`` (Phase-45) and are imported directly.
 
 Public API
 ----------
@@ -58,6 +58,11 @@ from config import (
 )
 from helpers import utc_now_iso
 from notifier import notifier, render_alarm_email
+from trigger_policy import (
+    _device_notify_labels,
+    _notify_subject_prefix,
+    _trigger_policy_for,
+)
 
 __all__ = (
     "_fan_out_alarm",
@@ -105,8 +110,8 @@ def _fan_out_alarm(device_id: str, payload: dict[str, Any]) -> None:
     local_trigger = bool(payload.get("local_trigger"))
     triggered_by = str(payload.get("trigger_kind") or ("remote_button" if local_trigger else "network"))
     owner_admin = _lookup_owner_admin(device_id)
-    source_group, _source_label = _app._device_notify_labels(device_id)
-    policy = _app._trigger_policy_for(owner_admin, source_group)
+    source_group, _source_label = _device_notify_labels(device_id)
+    policy = _trigger_policy_for(owner_admin, source_group)
 
     alarm_id = _insert_alarm(device_id, owner_admin, source_zone, triggered_by, payload)
     _app.emit_event(
@@ -242,7 +247,7 @@ def _fan_out_alarm(device_id: str, payload: dict[str, Any]) -> None:
     try:
         recipients = _recipients_for_admin(owner_admin)
         if recipients and notifier.enabled():
-            g, n = _app._device_notify_labels(device_id)
+            g, n = _device_notify_labels(device_id)
             subject, text, html = render_alarm_email({
                 "source_id": device_id,
                 "zone": source_zone,
@@ -251,7 +256,7 @@ def _fan_out_alarm(device_id: str, payload: dict[str, Any]) -> None:
                 "fanout_count": sent,
                 "notification_group": g,
                 "display_label": n,
-                "notify_prefix": _app._notify_subject_prefix(device_id),
+                "notify_prefix": _notify_subject_prefix(device_id),
             })
             email_sent = notifier.enqueue(recipients, subject, text, html)
             email_detail = f"queued={email_sent} to={len(recipients)}"

@@ -1090,144 +1090,28 @@ from alarm_db import (  # noqa: E402,F401  (re-exports for legacy callers)
 )
 
 
-def _log_signal_trigger(
-    kind: str,
-    device_id: str,
-    zone: str,
-    actor_username: str,
-    owner_admin: Optional[str],
-    duration_ms: Optional[int] = None,
-    target_count: int = 1,
-    detail: Optional[dict[str, Any]] = None,
-) -> None:
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO signal_triggers (
-                created_at, kind, device_id, owner_admin, zone, actor_username,
-                duration_ms, target_count, detail_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                utc_now_iso(),
-                kind,
-                device_id,
-                owner_admin,
-                zone,
-                actor_username,
-                duration_ms,
-                target_count,
-                json.dumps(detail or {}, ensure_ascii=True),
-            ),
-        )
-        conn.commit()
-        conn.close()
-
-
-def _device_notify_labels(device_id: str) -> tuple[str, str]:
-    """Returns (notification_group, display_label) from device_state; may be empty."""
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT IFNULL(notification_group,''), IFNULL(display_label,'') "
-            "FROM device_state WHERE device_id = ?",
-            (device_id,),
-        )
-        row = cur.fetchone()
-        conn.close()
-    if not row:
-        return "", ""
-    return str(row[0] or "").strip(), str(row[1] or "").strip()
-
-
-def _trigger_policy_defaults() -> dict[str, Any]:
-    return {
-        "panic_local_siren": True,
-        # MQTT fan-out of panic_button to same-group siblings (independent of remote loud link).
-        "panic_link_enabled": True,
-        "panic_fanout_duration_ms": int(DEFAULT_PANIC_FANOUT_MS),
-        "remote_silent_link_enabled": True,
-        "remote_loud_link_enabled": True,
-        "remote_loud_duration_ms": int(ALARM_FANOUT_DURATION_MS),
-        "fanout_exclude_self": True,
-    }
-
-
-def _trigger_policy_for(owner_admin: Optional[str], scope_group: str) -> dict[str, Any]:
-    base = _trigger_policy_defaults()
-    if not owner_admin:
-        return base
-    # Match-path normalization: siblings are resolved via _sibling_group_norm
-    # (case-fold + NFC + whitespace), so the policy lookup MUST use the same
-    # normalization — otherwise "Warehouse" and "warehouse" branch into
-    # different policies for what is the same sibling set.
-    group_key = _sibling_group_norm(scope_group)
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT panic_local_siren, remote_silent_link_enabled, remote_loud_link_enabled,
-                   remote_loud_duration_ms, fanout_exclude_self,
-                   panic_link_enabled, panic_fanout_duration_ms
-            FROM trigger_policies
-            WHERE owner_admin = ? AND scope_group = ?
-            """,
-            (owner_admin, group_key),
-        )
-        row = cur.fetchone()
-        conn.close()
-    if not row:
-        return base
-    base["panic_local_siren"] = bool(row["panic_local_siren"])
-    base["remote_silent_link_enabled"] = bool(row["remote_silent_link_enabled"])
-    base["remote_loud_link_enabled"] = bool(row["remote_loud_link_enabled"])
-    base["remote_loud_duration_ms"] = int(row["remote_loud_duration_ms"] or ALARM_FANOUT_DURATION_MS)
-    base["fanout_exclude_self"] = bool(row["fanout_exclude_self"])
-    base["panic_link_enabled"] = bool(row["panic_link_enabled"])
-    base["panic_fanout_duration_ms"] = int(row["panic_fanout_duration_ms"] or DEFAULT_PANIC_FANOUT_MS)
-    return base
-
-
-def _notify_subject_prefix(device_id: str) -> str:
-    """Prefix for emails / Telegram: '[Group] DisplayName · ' or fallback to device_id."""
-    grp, name = _device_notify_labels(device_id)
-    parts: list[str] = []
-    if grp:
-        parts.append(f"[{grp}]")
-    if name:
-        parts.append(name)
-    if parts:
-        return " ".join(parts) + " · "
-    return f"{device_id} · "
-
-
-def _remote_siren_notify_email(
-    *,
-    action: str,
-    device_id: str,
-    zone: str,
-    actor: str,
-    owner_admin: Optional[str],
-    duration_ms: Optional[int],
-) -> None:
-    recipients = _recipients_for_admin(owner_admin) if owner_admin else []
-    grp, disp = _device_notify_labels(device_id)
-    if not recipients or not notifier.enabled():
-        return
-    subject, text, html = render_remote_siren_email(
-        action=action,
-        device_id=device_id,
-        display_label=disp,
-        notification_group=grp,
-        zone=zone,
-        actor=actor,
-        duration_ms=duration_ms,
-    )
-    notifier.enqueue(recipients, subject, text, html)
+# Phase-45 modularization: 6 trigger-policy + signal-logging helpers
+# (audit row writer, device label reader, in-code policy defaults,
+# tenant-overridden policy reader with normalized group key, email
+# subject prefix renderer, remote-siren email queuer) live in
+# trigger_policy.py — pure SQLite + helpers + config + alarm_db +
+# notifier. Re-exported here so the in-module call sites (
+# ``emit_event`` for ``_notify_subject_prefix``,
+# ``_maybe_dispatch_fcm_for_ev`` for ``_device_notify_labels``) and
+# the routers' late-bind shims (``_app._log_signal_trigger`` in
+# device_commands / device_control / group_cards;
+# ``_app._trigger_policy_for`` in device_provision;
+# ``_app._remote_siren_notify_email`` in device_control;
+# ``_app._device_notify_labels`` / ``_app._notify_subject_prefix`` in
+# alarm_fanout) keep finding the same callables.
+from trigger_policy import (  # noqa: E402,F401  (re-exports for legacy callers)
+    _device_notify_labels,
+    _log_signal_trigger,
+    _notify_subject_prefix,
+    _remote_siren_notify_email,
+    _trigger_policy_defaults,
+    _trigger_policy_for,
+)
 
 
 # Phase-43 modularization: presence-probe subsystem (8 helpers across
