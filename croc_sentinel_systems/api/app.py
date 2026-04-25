@@ -4519,224 +4519,21 @@ def auth_logout(response: Response) -> dict[str, Any]:
     return {"ok": True}
 
 
-def _norm_mac_nocolon12(raw: str) -> str:
-    s = re.sub(r"[^0-9A-Fa-f]", "", raw or "")
-    return s[:12].upper() if len(s) >= 12 else ""
+# =====================================================================
+#  Device-side HTTP fallback (boot-sync, OTA report, command pull/ack)
+# =====================================================================
 
+# Phase-15 modularization: the four /device/* endpoints called by the
+# ESP32 firmware (NOT the dashboard) — they authenticate via
+# device_id+mac_nocolon+cmd_key, not JWT — plus their four request
+# schemas (DeviceBootSyncRequest, DeviceOtaReportRequest,
+# DeviceCommandsPendingRequest, DeviceCommandAckRequest) and the
+# three device-only auth helpers (_norm_mac_nocolon12,
+# _provision_row_for_device_mac, _auth_device_http) now live in
+# routers/device_http.py.
+from routers.device_http import router as _device_http_router  # noqa: E402
 
-def _provision_row_for_device_mac(device_id: str, mac12: str) -> Optional[sqlite3.Row]:
-    """Return provisioned_credentials row when device_id and MAC both match (anti impersonation)."""
-    if len(mac12) != 12:
-        return None
-    did = (device_id or "").strip()
-    if not did:
-        return None
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT device_id, mac_nocolon, mqtt_username, mqtt_password, cmd_key, zone, qr_code
-            FROM provisioned_credentials
-            WHERE UPPER(device_id) = UPPER(?) AND UPPER(mac_nocolon) = UPPER(?)
-            LIMIT 1
-            """,
-            (did, mac12),
-        )
-        row = cur.fetchone()
-        conn.close()
-    return row
-
-
-class DeviceBootSyncRequest(BaseModel):
-    device_id: str = Field(min_length=3, max_length=40)
-    mac_nocolon: str = Field(min_length=12, max_length=24)
-    cmd_key: str = Field(default="", max_length=32)
-    fw: str = Field(default="", max_length=48)
-
-
-class DeviceOtaReportRequest(BaseModel):
-    device_id: str = Field(min_length=3, max_length=40)
-    mac_nocolon: str = Field(min_length=12, max_length=24)
-    cmd_key: str = Field(default="", max_length=32)
-    ok: bool
-    detail: str = Field(default="", max_length=480)
-    campaign_id: str = Field(default="", max_length=120)
-    target_fw: str = Field(default="", max_length=48)
-    current_fw: str = Field(default="", max_length=48)
-
-
-@app.post("/device/boot-sync")
-def device_boot_sync(body: DeviceBootSyncRequest) -> dict[str, Any]:
-    """Device HTTP: verify NVS cmd_key vs DB; return resync payload when mismatched (MAC+device_id bound)."""
-    mac = _norm_mac_nocolon12(body.mac_nocolon)
-    if len(mac) != 12:
-        raise HTTPException(status_code=400, detail="invalid mac_nocolon")
-    row = _provision_row_for_device_mac(body.device_id, mac)
-    if not row:
-        return {"status": "unprovisioned"}
-    did = str(row["device_id"])
-    db_key = str(row["cmd_key"] or "").strip().upper()
-    rep = (body.cmd_key or "").strip().upper()
-    if rep and is_hex_16(rep) and rep == db_key:
-        return {"status": "ok"}
-    owner = _lookup_owner_admin(did) or ""
-    emit_event(
-        level="warn",
-        category="provision",
-        event_type="device.boot_sync.resync",
-        summary=f"boot-sync resync {did}",
-        actor=f"device:{did}",
-        target=did,
-        owner_admin=owner or None,
-        device_id=did,
-        detail={"fw": (body.fw or "").strip(), "had_cmd_key": bool(rep)},
-    )
-    audit_event(
-        f"device:{did}",
-        "device.boot_sync.resync",
-        did,
-        {"mac_nocolon": mac, "fw": (body.fw or "").strip()},
-    )
-    return {
-        "status": "resync",
-        "cmd_key": db_key,
-        "mqtt_username": str(row["mqtt_username"] or ""),
-        "mqtt_password": str(row["mqtt_password"] or ""),
-        "zone": str(row["zone"] or "all").strip() or "all",
-        "qr_code": str(row["qr_code"] or ""),
-    }
-
-
-@app.post("/device/ota/report")
-def device_ota_report(body: DeviceOtaReportRequest) -> dict[str, Any]:
-    """Device HTTP: OTA outcome (duplicate path alongside MQTT ota.result for post-OTA recovery)."""
-    mac = _norm_mac_nocolon12(body.mac_nocolon)
-    if len(mac) != 12:
-        raise HTTPException(status_code=400, detail="invalid mac_nocolon")
-    row = _provision_row_for_device_mac(body.device_id, mac)
-    if not row:
-        raise HTTPException(status_code=404, detail="device not provisioned")
-    did = str(row["device_id"])
-    db_key = str(row["cmd_key"] or "").strip().upper()
-    rep = (body.cmd_key or "").strip().upper()
-    if rep and (not is_hex_16(rep) or rep != db_key):
-        raise HTTPException(status_code=403, detail="cmd_key does not match server")
-    owner = _lookup_owner_admin(did) or ""
-    payload: dict[str, Any] = {
-        "type": "ota.result",
-        "ok": bool(body.ok),
-        "detail": (body.detail or "")[:240],
-        "campaign_id": (body.campaign_id or "").strip(),
-        "target_fw": (body.target_fw or "").strip(),
-        "current_fw": (body.current_fw or "").strip(),
-    }
-    cid = str(payload.get("campaign_id") or "")
-    if cid and not cid.endswith("#rollback"):
-        _handle_ota_result_safe(did, payload)
-    else:
-        emit_event(
-            level="info" if body.ok else "warn",
-            category="ota",
-            event_type="ota.device.http_report",
-            summary=f"{did} ota http report ok={body.ok}",
-            actor=f"device:{did}",
-            target=owner or None,
-            owner_admin=owner or None,
-            device_id=did,
-            detail=payload,
-        )
-    return {"ok": True, "status": "recorded"}
-
-
-class DeviceCommandsPendingRequest(BaseModel):
-    """Backup command-channel pull. The firmware only calls this when MQTT
-    has been offline longer than its fallback arm window (≥120s) so we
-    don't compete with the live MQTT path."""
-
-    device_id: str = Field(min_length=3, max_length=40)
-    mac_nocolon: str = Field(min_length=12, max_length=24)
-    cmd_key: str = Field(min_length=16, max_length=32)
-    limit: int = Field(default=8, ge=1, le=32)
-
-
-class DeviceCommandAckRequest(BaseModel):
-    """HTTP ACK for commands pulled from the backup channel."""
-
-    device_id: str = Field(min_length=3, max_length=40)
-    mac_nocolon: str = Field(min_length=12, max_length=24)
-    cmd_key: str = Field(min_length=16, max_length=32)
-    cmd_id: str = Field(min_length=8, max_length=64)
-    ok: bool = True
-    detail: str = Field(default="", max_length=240)
-
-
-def _auth_device_http(device_id: str, mac_nocolon: str, cmd_key: str) -> sqlite3.Row:
-    """Shared device-HTTP authenticator. Matches MAC+device_id to a
-    provisioned row and verifies the 16-hex cmd_key (same credential the
-    firmware uses to sign MQTT /cmd payloads). Any mismatch is a 403 —
-    we deliberately do not leak whether the device or the key was wrong."""
-    mac = _norm_mac_nocolon12(mac_nocolon)
-    if len(mac) != 12:
-        raise HTTPException(status_code=400, detail="invalid mac_nocolon")
-    row = _provision_row_for_device_mac(device_id, mac)
-    if not row:
-        raise HTTPException(status_code=404, detail="device not provisioned")
-    db_key = str(row["cmd_key"] or "").strip().upper()
-    rep = (cmd_key or "").strip().upper()
-    if not rep or not is_hex_16(rep) or rep != db_key:
-        raise HTTPException(status_code=403, detail="cmd_key mismatch")
-    return row
-
-
-@app.post("/device/commands/pending")
-def device_commands_pending(body: DeviceCommandsPendingRequest) -> dict[str, Any]:
-    """HTTP backup command pull. Returns unacked commands queued for the
-    device. This is deliberately a POST (not GET) so cmd_key auth rides
-    in the body, not in a querystring that could show up in access logs.
-
-    Contract (so firmware and server stay in lockstep):
-      * Server returns ``{"commands": [...]}`` — oldest first.
-      * Each entry is the exact /cmd payload the device would have seen
-        over MQTT (cmd, cmd_id, target_id, proto, params, cmd_key). The
-        firmware handler must be idempotent per cmd_id because the same
-        entry can be served again on the next pull until ACK'd.
-      * The server does NOT mark anything delivered on pull. Delivery is
-        confirmed only when the device POSTs /device/commands/ack — MQTT
-        remains the source of truth for delivery semantics.
-    """
-    row = _auth_device_http(body.device_id, body.mac_nocolon, body.cmd_key)
-    did = str(row["device_id"])
-    rows = _cmd_queue_pending_for_device(did, limit=int(body.limit))
-    # Shape mirrors the MQTT /cmd payload exactly so the firmware can
-    # pass each entry straight to handleCmdFromBody() without any
-    # transformation layer. ``key`` is the 16-hex cmd_key the device
-    # would have seen on MQTT, enabling the same auth check offline.
-    commands = []
-    for r in rows:
-        commands.append({
-            "proto": int(r["proto"] or CMD_PROTO),
-            "key": r["cmd_key"] or "",
-            "target_id": r["target_id"] or did,
-            "cmd": r["cmd"],
-            "params": r["params"] or {},
-            "cmd_id": r["cmd_id"],
-            "enqueued_at": r["created_at"],
-        })
-    return {"commands": commands, "count": len(commands)}
-
-
-@app.post("/device/commands/ack")
-def device_commands_ack(body: DeviceCommandAckRequest) -> dict[str, Any]:
-    """HTTP ACK for backup-channel commands. The device should still
-    publish its normal MQTT /ack when MQTT comes back; this endpoint
-    exists so an unack'd queue entry can be drained purely over HTTP
-    when the MQTT link never recovers."""
-    row = _auth_device_http(body.device_id, body.mac_nocolon, body.cmd_key)
-    did = str(row["device_id"])
-    updated = _cmd_queue_mark_acked(body.cmd_id, ok=bool(body.ok), detail=body.detail or "")
-    return {"ok": True, "settled": bool(updated), "device_id": did}
-
+app.include_router(_device_http_router)
 
 @app.get("/auth/me")
 def auth_me(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
@@ -6759,11 +6556,8 @@ class DeviceBulkProfileBody(BaseModel):
 # (GroupCardSettingsBody moved to routers/group_cards.py — see the
 # corresponding `from routers.group_cards import ...` block below.)
 
-class DeviceShareRequest(BaseModel):
-    grantee_username: str = Field(min_length=2, max_length=64)
-    can_view: bool = True
-    can_operate: bool = False
-
+# (DeviceShareRequest moved to routers/device_shares.py — see the
+# corresponding `from routers.device_shares import ...` block below.)
 
 # =====================================================================
 #  Group cards (siren fan-out by notification_group)
@@ -6993,213 +6787,17 @@ def bulk_patch_device_profile(
     }
 
 
-@app.get("/admin/devices/{device_id}/shares")
-def list_device_shares(device_id: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_min_role(principal, "admin")
-    if principal.role == "admin":
-        require_capability(principal, "can_manage_users")
-        assert_device_owner(principal, device_id)
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        if principal.role == "superadmin":
-            cur.execute(
-                """
-                SELECT a.device_id, a.grantee_username, u.role AS grantee_role,
-                       a.can_view, a.can_operate, a.granted_by, a.granted_at, a.revoked_at
-                FROM device_acl a
-                LEFT JOIN dashboard_users u ON u.username = a.grantee_username
-                WHERE a.device_id = ?
-                ORDER BY a.revoked_at IS NOT NULL ASC, a.granted_at DESC
-                """,
-                (device_id,),
-            )
-        else:
-            cur.execute(
-                """
-                SELECT a.device_id, a.grantee_username, u.role AS grantee_role,
-                       a.can_view, a.can_operate, a.granted_by, a.granted_at, a.revoked_at
-                FROM device_acl a
-                LEFT JOIN dashboard_users u ON u.username = a.grantee_username
-                WHERE a.device_id = ?
-                  AND u.role = 'user'
-                  AND IFNULL(u.manager_admin,'') = ?
-                ORDER BY a.revoked_at IS NOT NULL ASC, a.granted_at DESC
-                """,
-                (device_id, principal.username),
-            )
-        rows = [dict(r) for r in cur.fetchall()]
-        conn.close()
-    return {"items": rows}
+# =====================================================================
+#  Device sharing / ACL admin
+# =====================================================================
 
+# Phase-16 modularization: the four /admin/(devices/{id}/)?share(s)?/*
+# routes plus the DeviceShareRequest schema now live in
+# routers/device_shares.py. Late-binds assert_device_owner +
+# require_capability + require_principal from `app`.
+from routers.device_shares import router as _device_shares_router  # noqa: E402
 
-@app.get("/admin/shares")
-def list_all_shares(
-    principal: Principal = Depends(require_principal),
-    device_id: Optional[str] = Query(default=None, min_length=2, max_length=128),
-    grantee_username: Optional[str] = Query(default=None, min_length=2, max_length=64),
-    include_revoked: bool = Query(default=False),
-    limit: int = Query(default=500, ge=1, le=2000),
-) -> dict[str, Any]:
-    assert_min_role(principal, "admin")
-    if principal.role == "admin":
-        require_capability(principal, "can_manage_users")
-    clauses = ["1=1"]
-    args: list[Any] = []
-    if device_id:
-        clauses.append("a.device_id = ?")
-        args.append(device_id.strip())
-    if grantee_username:
-        clauses.append("a.grantee_username = ?")
-        args.append(grantee_username.strip())
-    if not include_revoked:
-        clauses.append("a.revoked_at IS NULL")
-    if principal.role == "admin":
-        clauses.append("IFNULL(o.owner_admin,'') = ?")
-        args.append(principal.username)
-        clauses.append("u.role = 'user'")
-        clauses.append("IFNULL(u.manager_admin,'') = ?")
-        args.append(principal.username)
-    where = " AND ".join(clauses)
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            f"""
-            SELECT a.device_id, a.grantee_username, u.role AS grantee_role,
-                   a.can_view, a.can_operate, a.granted_by, a.granted_at, a.revoked_at,
-                   o.owner_admin
-            FROM device_acl a
-            LEFT JOIN dashboard_users u ON u.username = a.grantee_username
-            LEFT JOIN device_ownership o ON o.device_id = a.device_id
-            WHERE {where}
-            ORDER BY a.revoked_at IS NOT NULL ASC, a.granted_at DESC
-            LIMIT ?
-            """,
-            tuple(args + [limit]),
-        )
-        rows = [dict(r) for r in cur.fetchall()]
-        conn.close()
-    return {"items": rows, "count": len(rows)}
-
-
-@app.post("/admin/devices/{device_id}/share")
-def share_device(
-    device_id: str,
-    req: DeviceShareRequest,
-    principal: Principal = Depends(require_principal),
-) -> dict[str, Any]:
-    assert_min_role(principal, "admin")
-    if principal.role == "admin":
-        require_capability(principal, "can_manage_users")
-        assert_device_owner(principal, device_id)
-    grantee = req.grantee_username.strip()
-    if not grantee:
-        raise HTTPException(status_code=400, detail="grantee_username required")
-    if not req.can_view and not req.can_operate:
-        raise HTTPException(status_code=400, detail="at least one permission is required")
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT 1 FROM device_state WHERE device_id = ?", (device_id,))
-        if not cur.fetchone():
-            conn.close()
-            raise HTTPException(status_code=404, detail="device not found")
-        cur.execute("SELECT role, status, manager_admin FROM dashboard_users WHERE username = ?", (grantee,))
-        ur = cur.fetchone()
-        if not ur:
-            conn.close()
-            raise HTTPException(status_code=404, detail="grantee not found")
-        role = str(ur["role"] or "")
-        status = str(ur["status"] or "active")
-        if principal.role == "superadmin":
-            if role not in ("admin", "user"):
-                conn.close()
-                raise HTTPException(status_code=400, detail="only admin/user can be shared")
-        else:
-            # Admin can only share to own managed users.
-            if role != "user":
-                conn.close()
-                raise HTTPException(status_code=400, detail="admin can only share to user")
-            if str(ur["manager_admin"] or "") != principal.username:
-                conn.close()
-                raise HTTPException(status_code=403, detail="target user is not under this admin")
-        if status not in ("active", ""):
-            conn.close()
-            raise HTTPException(status_code=400, detail=f"grantee is not active: {status}")
-        now = utc_now_iso()
-        cur.execute(
-            """
-            INSERT INTO device_acl (
-                device_id, grantee_username, can_view, can_operate, granted_by, granted_at, revoked_at
-            ) VALUES (?, ?, ?, ?, ?, ?, NULL)
-            ON CONFLICT(device_id, grantee_username) DO UPDATE SET
-                can_view = excluded.can_view,
-                can_operate = excluded.can_operate,
-                granted_by = excluded.granted_by,
-                granted_at = excluded.granted_at,
-                revoked_at = NULL
-            """,
-            (device_id, grantee, 1 if req.can_view else 0, 1 if req.can_operate else 0, principal.username, now),
-        )
-        conn.commit()
-        conn.close()
-    cache_invalidate("devices")
-    cache_invalidate("overview")
-    audit_event(
-        principal.username,
-        "device.share.grant",
-        device_id,
-        {"grantee_username": grantee, "can_view": bool(req.can_view), "can_operate": bool(req.can_operate)},
-    )
-    return {
-        "ok": True,
-        "device_id": device_id,
-        "grantee_username": grantee,
-        "can_view": bool(req.can_view),
-        "can_operate": bool(req.can_operate),
-    }
-
-
-@app.delete("/admin/devices/{device_id}/share/{grantee_username}")
-def unshare_device(
-    device_id: str,
-    grantee_username: str,
-    principal: Principal = Depends(require_principal),
-) -> dict[str, Any]:
-    assert_min_role(principal, "admin")
-    if principal.role == "admin":
-        require_capability(principal, "can_manage_users")
-        assert_device_owner(principal, device_id)
-        with db_lock:
-            conn = get_conn()
-            cur = conn.cursor()
-            cur.execute("SELECT role, manager_admin FROM dashboard_users WHERE username = ?", (grantee_username,))
-            ur = cur.fetchone()
-            conn.close()
-        if not ur or str(ur["role"] or "") != "user" or str(ur["manager_admin"] or "") != principal.username:
-            raise HTTPException(status_code=403, detail="cannot revoke share for this grantee")
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            UPDATE device_acl
-            SET revoked_at = ?
-            WHERE device_id = ? AND grantee_username = ? AND revoked_at IS NULL
-            """,
-            (utc_now_iso(), device_id, grantee_username),
-        )
-        changed = cur.rowcount
-        conn.commit()
-        conn.close()
-    if changed == 0:
-        raise HTTPException(status_code=404, detail="active share not found")
-    cache_invalidate("devices")
-    cache_invalidate("overview")
-    audit_event(principal.username, "device.share.revoke", device_id, {"grantee_username": grantee_username})
-    return {"ok": True, "device_id": device_id, "grantee_username": grantee_username}
-
+app.include_router(_device_shares_router)
 
 @app.get("/devices/{device_id}/messages")
 def get_device_messages(
