@@ -1,24 +1,39 @@
-"""
-Optional Firebase Cloud Messaging (HTTP v1) fan-out for mobile clients.
+"""Optional Firebase Cloud Messaging (HTTP v1) fan-out for mobile clients.
 
-Uses the service-account JWT → OAuth2 access token flow (PyJWT + cryptography;
-no extra google-* packages).
+This module owns the **transport** half of FCM delivery:
+
+  * The ``_FcmQueue`` singleton (thread-safe queue, worker thread,
+    lazy SSL context, ``access_token`` cache + 60s pre-expiry refresh).
+  * HTTP send via ``urllib.request`` (FCM v1 ``messages:send``).
+  * Public facade used by ``app.py`` and the dashboard
+    diagnostic endpoints (``start_fcm_worker``, ``stop_fcm_worker``,
+    ``fcm_status``, ``enqueue_alarm_payloads``,
+    ``set_invalid_token_handler``).
+
+The **service-account loading + OAuth2 JWT-bearer flow** lives in
+``fcm_oauth.py`` (Phase 76 split). The queue calls into that module
+on every config-reload (cheap; fingerprint-cached) and on every
+access-token refresh. The 60-second pre-expiry cushion stays here
+because that's where the cached token lives (under our own lock).
 
 Env (all optional — when unset, worker is idle and enqueue is a no-op):
-  FCM_PROJECT_ID              — Firebase / GCP project id (or taken from JSON "project_id")
-  FCM_SERVICE_ACCOUNT_JSON     — Absolute path to the service account JSON key file
+  FCM_PROJECT_ID               — Firebase / GCP project id
+                                 (or taken from JSON ``project_id``)
+  FCM_SERVICE_ACCOUNT_JSON     — Absolute path to the service-account
+                                 JSON key file
 
-The API process calls enqueue_alarm_payloads() from emit_event; the worker
-thread batches sends to FCM without blocking request handlers.
+The API process calls ``enqueue_alarm_payloads()`` from emit_event;
+the worker thread batches sends to FCM without blocking request
+handlers.
 
-Invalid / unregistered device tokens: optional handler (registered from app.py)
-removes stale rows from user_fcm_tokens so the next alarm does not retry forever.
+Invalid / unregistered device tokens: optional handler (registered
+from ``app.py``) removes stale rows from ``user_fcm_tokens`` so the
+next alarm does not retry forever.
 """
 from __future__ import annotations
 
 import json
 import logging
-import os
 import queue
 import ssl
 import threading
@@ -28,14 +43,13 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Optional
 
-import jwt
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import serialization
+from fcm_oauth import (
+    exchange_assertion_for_access_token,
+    load_service_account,
+    mint_jwt_assertion,
+)
 
 logger = logging.getLogger("croc-fcm")
-
-_TOKEN_URL = "https://oauth2.googleapis.com/token"
-_FCM_SCOPE = "https://www.googleapis.com/auth/firebase.messaging"
 
 # FCM `data` map: keep well under 4 KiB total; values must be strings.
 _MAX_DATA_KEY_LEN = 64
@@ -49,13 +63,6 @@ def set_invalid_token_handler(fn: Optional[Callable[[str], None]]) -> None:
     """Called from API bootstrap with a function that deletes one FCM token from SQLite."""
     global _invalid_token_handler
     _invalid_token_handler = fn
-
-
-def _strip_bom(s: str) -> str:
-    s = (s or "").strip()
-    if s.startswith("\ufeff"):
-        s = s[1:].strip()
-    return s.strip().strip('"').strip("'")
 
 
 def _sanitize_fcm_data(raw: dict[str, str]) -> dict[str, str]:
@@ -139,53 +146,29 @@ class _FcmQueue:
     def reload_config(self) -> tuple[bool, str]:
         """Load or refresh service account JSON. Returns (ok, detail).
 
-        Does **not** invalidate cached OAuth access tokens when the same file
-        (path + mtime + project id) is already loaded — critical for throughput.
+        Delegates the file IO + validation to
+        :func:`fcm_oauth.load_service_account`; this method only owns
+        the cache-invalidation policy: when the fingerprint
+        ``(path, mtime, project_id)`` changes (or there's no SA at
+        all yet), drop the access-token cache so the next refresh
+        re-mints from the new key. Identical fingerprint → no-op
+        (critical for throughput; we'd otherwise re-authenticate
+        every enqueue).
         """
-        path = _strip_bom(os.getenv("FCM_SERVICE_ACCOUNT_JSON", "") or "")
-        proj_env = _strip_bom(os.getenv("FCM_PROJECT_ID", "") or "")
-        if not path:
+        sa, pid, new_fp, detail = load_service_account()
+        if sa is None or new_fp is None:
             with self._lock:
                 self._clear_credentials()
-            return False, "FCM_SERVICE_ACCOUNT_JSON empty"
-        if not os.path.isfile(path):
-            with self._lock:
-                self._clear_credentials()
-            return False, f"FCM_SERVICE_ACCOUNT_JSON not a file: {path}"
-        try:
-            mtime = os.path.getmtime(path)
-        except OSError as exc:
-            with self._lock:
-                self._clear_credentials()
-            return False, f"FCM JSON stat failed: {exc}"
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                sa = json.load(f)
-        except Exception as exc:
-            with self._lock:
-                self._clear_credentials()
-            return False, f"FCM JSON read failed: {exc}"
-        if not isinstance(sa, dict) or not sa.get("private_key") or not sa.get("client_email"):
-            with self._lock:
-                self._clear_credentials()
-            return False, "FCM JSON missing private_key or client_email"
-        pid = proj_env or str(sa.get("project_id") or "").strip()
-        if not pid:
-            with self._lock:
-                self._clear_credentials()
-            return False, "FCM_PROJECT_ID empty and JSON has no project_id"
-
-        new_fp = (path, float(mtime), pid)
+            return False, detail
         with self._lock:
             if self._sa is not None and self._cfg_fp == new_fp:
                 return True, "ok"
-            # New or changed credentials — must drop OAuth cache.
             self._sa = sa
             self._project_id = pid
             self._access_token = ""
             self._access_expires_ts = 0.0
             self._cfg_fp = new_fp
-        return True, f"loaded project_id={pid}"
+        return True, detail
 
     def enabled(self) -> bool:
         with self._lock:
@@ -239,6 +222,15 @@ class _FcmQueue:
                 break
 
     def _access_token_refresh(self) -> tuple[bool, str]:
+        """Return a usable OAuth access token, refreshing when needed.
+
+        The 60-second pre-expiry cushion lives here (not in
+        ``fcm_oauth``) because that's the cache-policy concern of
+        the queue. The OAuth helper just hands us the raw
+        ``expires_in`` from Google's response; we apply
+        ``max(120, expires_in)`` as a defensive lower bound in
+        case the response value is suspiciously small.
+        """
         with self._lock:
             sa = self._sa
             if not sa:
@@ -247,72 +239,23 @@ class _FcmQueue:
             if self._access_token and now < self._access_expires_ts - 60:
                 return True, self._access_token
         try:
-            pem = str(sa["private_key"])
-            private_key = serialization.load_pem_private_key(
-                pem.encode("utf-8"),
-                password=None,
-                backend=default_backend(),
-            )
-            iat = int(time.time())
-            kid = sa.get("private_key_id")
-            headers: dict[str, str] = {}
-            if kid:
-                headers["kid"] = str(kid)
-            assertion = jwt.encode(
-                {
-                    "iss": sa["client_email"],
-                    "sub": sa["client_email"],
-                    "aud": _TOKEN_URL,
-                    "iat": iat,
-                    "exp": iat + 3500,
-                    "scope": _FCM_SCOPE,
-                },
-                private_key,
-                algorithm="RS256",
-                headers=headers or None,
-            )
-            if isinstance(assertion, bytes):
-                assertion = assertion.decode("ascii")
+            assertion = mint_jwt_assertion(sa)
         except Exception as exc:
             with self._lock:
                 self._last_error = f"jwt: {exc}"
             return False, str(exc)
-
-        body = urllib.parse.urlencode(
-            {
-                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-                "assertion": assertion,
-            }
-        ).encode("utf-8")
-        req = urllib.request.Request(
-            _TOKEN_URL,
-            data=body,
-            method="POST",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        ok, token_or_err, expires_in = exchange_assertion_for_access_token(
+            assertion,
+            ssl_ctx=self._ssl(),
         )
-        try:
-            with urllib.request.urlopen(req, timeout=20, context=self._ssl()) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
-            tok_json = json.loads(raw)
-            at = str(tok_json.get("access_token") or "")
-            if not at:
-                with self._lock:
-                    self._last_error = raw[:300]
-                return False, "no access_token in response"
-            exp = float(tok_json.get("expires_in") or 3600)
+        if not ok:
             with self._lock:
-                self._access_token = at
-                self._access_expires_ts = time.time() + max(120.0, exp)
-            return True, at
-        except urllib.error.HTTPError as exc:
-            err = exc.read().decode("utf-8", errors="replace")[:400]
-            with self._lock:
-                self._last_error = f"token HTTP {exc.code}: {err}"
-            return False, self._last_error
-        except Exception as exc:
-            with self._lock:
-                self._last_error = f"token: {exc}"
-            return False, str(exc)
+                self._last_error = token_or_err
+            return False, token_or_err
+        with self._lock:
+            self._access_token = token_or_err
+            self._access_expires_ts = time.time() + max(120.0, expires_in)
+        return True, token_or_err
 
     def _send_one(self, project_id: str, access_token: str, item: dict[str, str]) -> tuple[bool, str]:
         tok = str(item.get("token") or "").strip()
