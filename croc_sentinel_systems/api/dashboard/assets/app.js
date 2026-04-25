@@ -1617,7 +1617,13 @@ ${curFw} \u2192 ${fw}`)) return;
     }
     const aliasHash = "#/" + id;
     const routeId = ROUTE_ALIASES[aliasHash] || id;
-    document.body.dataset.layout = publicRoutes.has(routeId) ? "auth" : "app";
+    const isAuthRoute = publicRoutes.has(routeId);
+    document.body.dataset.layout = isAuthRoute ? "auth" : "app";
+    // Hard lock for auth chrome suppression. Some browsers/extensions can
+    // delay selector evaluation (`:has` / dataset flips) during route swaps,
+    // leaving a one-frame topbar/sidebar flash on login/register pages.
+    // Toggle a plain class so CSS can hide app chrome deterministically.
+    document.body.classList.toggle("auth-route-active", isAuthRoute);
     try {
       applySidebarRail();
     } catch (_2) {

@@ -111,12 +111,38 @@ body[data-layout="auth"] .sidebar-backdrop,
 body[data-layout="auth"] .topbar {
   display: none !important;
 }
+body.auth-route-active .sidebar,
+body.auth-route-active .sidebar-backdrop,
+body.auth-route-active .topbar {
+  display: none !important;
+}
+/* Extra hard guard: if auth-surface is mounted but data-layout was not
+   toggled in time, still hide app chrome to prevent sidebar bleed-through
+   on login/register/forgot/activate routes. */
+body:has(.auth-surface) .sidebar,
+body:has(.auth-surface) .sidebar-backdrop,
+body:has(.auth-surface) .topbar {
+  display: none !important;
+}
 body[data-layout="auth"].app-shell {
   height: auto;
   max-height: none;
   overflow: auto;
 }
+body:has(.auth-surface).app-shell {
+  grid-template-columns: 1fr;
+  height: auto;
+  max-height: none;
+  overflow: auto;
+}
 body[data-layout="auth"] .main {
+  min-height: 100dvh;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+body:has(.auth-surface) .main {
   min-height: 100dvh;
   min-height: 100vh;
   display: flex;

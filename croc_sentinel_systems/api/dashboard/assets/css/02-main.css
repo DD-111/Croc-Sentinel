@@ -1868,29 +1868,33 @@ body[data-layout="auth"] .site-footer__wordmark {
     min-height: 100dvh;
   }
   .auth-surface__side {
-    width: 40%;
-    min-width: 18rem;
-    max-width: 30rem;
+    /* Pull auth aside left and keep it compact so form column remains centered. */
+    width: 33%;
+    min-width: 16rem;
+    max-width: 22rem;
     min-height: 100dvh;
     border-bottom: none;
     border-right: 1px solid rgba(255, 255, 255, 0.08);
     display: flex;
     flex-direction: column;
     justify-content: flex-start;
-    padding-top: max(3.5rem, 8vh);
+    padding-top: max(3rem, 6vh);
+    padding-left: 14px;
+    padding-right: 14px;
   }
-  .auth-surface__side-content { margin: 0 1.5rem; width: 100%; }
+  .auth-surface__side-content { margin: 0; width: 100%; }
   .auth-surface__body {
-    flex: 1 1 55%;
+    flex: 1 1 auto;
     min-height: 100dvh;
     overflow-y: auto;
     -webkit-overflow-scrolling: touch;
+    display: flex;
+    justify-content: center;
   }
   .auth-surface__inner {
+    width: min(100%, 30rem);
     max-width: 30rem;
-    margin: 0;
-    margin-left: auto;
-    margin-right: auto;
+    margin: 0 auto;
     padding: max(2.5rem, 5vh) 1.5rem 2.5rem;
   }
 }
