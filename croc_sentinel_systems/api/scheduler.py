@@ -153,6 +153,79 @@ def _db_backup_tick(now: float, next_backup_at: float) -> float:
     return now + max(60, DB_BACKUP_INTERVAL_SECONDS)
 
 
+def _unbind_reset_compensation_tick(limit: int = 10) -> None:
+    """Retry device reset for server-unbound jobs waiting for device ACK.
+
+    Phase 95 Part 2: jobs in ``device_reset_pending`` are retried
+    periodically. Once ``_try_mqtt_unclaim_reset`` observes ACK, job is
+    promoted to ``completed``.
+    """
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT request_id, device_id, IFNULL(detail_json,'{}') AS detail_json
+            FROM device_unbind_jobs
+            WHERE state = 'device_reset_pending'
+            ORDER BY updated_at ASC
+            LIMIT ?
+            """,
+            (max(1, int(limit)),),
+        )
+        rows = cur.fetchall()
+        conn.close()
+    for row in rows:
+        req_id = str(row["request_id"])
+        did = str(row["device_id"])
+        raw_detail = str(row["detail_json"] or "{}")
+        try:
+            detail = json.loads(raw_detail) if raw_detail else {}
+        except Exception:
+            detail = {}
+        attempts = int(detail.get("reset_retry_attempts", 0) or 0) + 1
+        sent = False
+        acked = False
+        try:
+            sent, acked = _app._try_mqtt_unclaim_reset(did)
+        except Exception as exc:
+            logger.debug(
+                "unbind compensation dispatch failed req=%s dev=%s err=%s",
+                req_id,
+                did,
+                exc,
+            )
+        detail["reset_retry_attempts"] = attempts
+        detail["last_reset_retry_at"] = utc_now_iso()
+        detail["last_reset_retry_sent"] = bool(sent)
+        detail["last_reset_retry_acked"] = bool(acked)
+        new_state = "completed" if acked else "device_reset_pending"
+        with db_lock:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE device_unbind_jobs
+                SET state = ?,
+                    command_sent = CASE WHEN ? THEN 1 ELSE command_sent END,
+                    command_acked = CASE WHEN ? THEN 1 ELSE command_acked END,
+                    detail_json = ?,
+                    updated_at = ?
+                WHERE request_id = ?
+                """,
+                (
+                    new_state,
+                    1 if sent else 0,
+                    1 if acked else 0,
+                    json.dumps(detail, ensure_ascii=True),
+                    utc_now_iso(),
+                    req_id,
+                ),
+            )
+            conn.commit()
+            conn.close()
+
+
 def scheduler_loop() -> None:
     next_cleanup_at = time.time() + 60
     next_probe_at = time.time() + 30  # kick probe worker ~30s after boot
@@ -160,6 +233,7 @@ def scheduler_loop() -> None:
     next_pwd_prune_at = time.time() + 900
     next_pending_claim_prune_at = time.time() + 120
     next_db_backup_at = time.time() + 90
+    next_unbind_reset_retry_at = time.time() + 30
     while not scheduler_stop.is_set():
         now_ts = int(time.time())
         jobs: list[sqlite3.Row] = []
@@ -274,6 +348,13 @@ def scheduler_loop() -> None:
             except Exception as exc:
                 logger.warning("pending_claim prune failed: %s", exc)
             next_pending_claim_prune_at = now + 900
+
+        if now >= next_unbind_reset_retry_at:
+            try:
+                _unbind_reset_compensation_tick(limit=10)
+            except Exception as exc:
+                logger.warning("unbind reset compensation tick failed: %s", exc)
+            next_unbind_reset_retry_at = now + 30
 
         next_db_backup_at = _db_backup_tick(now, next_db_backup_at)
 

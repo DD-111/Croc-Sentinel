@@ -584,6 +584,39 @@ def init_db() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS ix_events_level_ts ON events(level, ts_epoch_ms DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_events_device_ts ON events(device_id, ts_epoch_ms DESC)")
 
+        # ── device_unbind_jobs: server-first unbind + async reset state ──────
+        # Records "Unbind & reset" lifecycle so UI/ops can distinguish:
+        #   - server-side unlink completed immediately
+        #   - device-side reset still pending ACK (offline / delayed)
+        # State machine (Phase 95, Part 0/1):
+        #   requested -> server_unbound -> device_reset_pending|completed
+        # Later phases can extend with retries / failed / cancelled.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS device_unbind_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL UNIQUE,
+                device_id TEXT NOT NULL,
+                requested_by TEXT NOT NULL,
+                mode TEXT NOT NULL,               -- delete_reset | factory_unclaim
+                state TEXT NOT NULL,              -- requested | server_unbound | device_reset_pending | completed | failed
+                command_sent INTEGER NOT NULL DEFAULT 0,
+                command_acked INTEGER NOT NULL DEFAULT 0,
+                detail_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS ix_unbind_jobs_device_state "
+            "ON device_unbind_jobs(device_id, state, updated_at DESC)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS ix_unbind_jobs_requested_by "
+            "ON device_unbind_jobs(requested_by, updated_at DESC)"
+        )
+
         # ── cmd_queue: persistent /cmd pending queue ────────────────────────
         # Every `publish_command` call writes a row here keyed on the
         # generated ``cmd_id``. MQTT remains primary: the row is purely a

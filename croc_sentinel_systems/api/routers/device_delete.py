@@ -31,7 +31,9 @@ Late-binding strategy
 
 from __future__ import annotations
 
+import json
 import logging
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -80,10 +82,40 @@ def _device_delete_reset_impl(
     else:
         assert_min_role(principal, "user")
         assert_device_owner(principal, device_id)
+    req_id = str(uuid.uuid4())
+    mode = "factory_unclaim" if super_unclaim else "delete_reset"
+    now = utc_now_iso()
+    # Phase 95 Part 0: lifecycle row starts at requested.
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO device_unbind_jobs (
+                request_id, device_id, requested_by, mode, state,
+                command_sent, command_acked, detail_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'requested', 0, 0, ?, ?, ?)
+            """,
+            (req_id, device_id, principal.username, mode, "{}", now, now),
+        )
+        conn.commit()
+        conn.close()
     nvs_purge_sent, nvs_purge_acked = _try_mqtt_unclaim_reset(device_id)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
+        # requested -> server_unbound
+        cur.execute(
+            """
+            UPDATE device_unbind_jobs
+            SET state='server_unbound',
+                command_sent=?,
+                command_acked=?,
+                updated_at=?
+            WHERE request_id=?
+            """,
+            (1 if nvs_purge_sent else 0, 1 if nvs_purge_acked else 0, utc_now_iso(), req_id),
+        )
         cur.execute("SELECT mac_nocolon FROM provisioned_credentials WHERE device_id = ?", (device_id,))
         p = cur.fetchone()
         mac_nocolon = str(p["mac_nocolon"]) if p and p["mac_nocolon"] else ""
@@ -112,6 +144,37 @@ def _device_delete_reset_impl(
                 "UPDATE factory_devices SET status='unclaimed', updated_at=? WHERE serial = ?",
                 (utc_now_iso(), device_id),
             )
+        final_state = "completed" if nvs_purge_acked else "device_reset_pending"
+        cur.execute(
+            """
+            UPDATE device_unbind_jobs
+            SET state=?,
+                command_sent=?,
+                command_acked=?,
+                detail_json=?,
+                updated_at=?
+            WHERE request_id=?
+            """,
+            (
+                final_state,
+                1 if nvs_purge_sent else 0,
+                1 if nvs_purge_acked else 0,
+                json.dumps(
+                    {
+                        "deleted_credentials": del_cred,
+                        "deleted_owner": del_owner,
+                        "deleted_acl": del_acl,
+                        "deleted_revoked": del_revoked,
+                        "deleted_state": del_state,
+                        "deleted_scheduled": del_sched,
+                        "factory_unclaimed": bool(super_unclaim),
+                    },
+                    ensure_ascii=True,
+                ),
+                utc_now_iso(),
+                req_id,
+            ),
+        )
         conn.commit()
         conn.close()
     cache_invalidate("devices")
@@ -122,6 +185,8 @@ def _device_delete_reset_impl(
         action,
         device_id,
         {
+            "request_id": req_id,
+            "unbind_state": "completed" if nvs_purge_acked else "device_reset_pending",
             "mac_nocolon": mac_nocolon or "",
             "nvs_purge_mqtt": nvs_purge_sent,
             "nvs_purge_ack": nvs_purge_acked,
@@ -137,11 +202,17 @@ def _device_delete_reset_impl(
     return {
         "ok": True,
         "device_id": device_id,
-        "mode": "factory_unclaim" if super_unclaim else "delete_reset",
+        "request_id": req_id,
+        "mode": mode,
+        "unbind_state": "completed" if nvs_purge_acked else "device_reset_pending",
         "factory_unclaimed": super_unclaim,
         "nvs_purge_sent": nvs_purge_sent,
         "nvs_purge_acked": nvs_purge_acked,
-        "nvs_purge_note": "sent=true means command reached broker; acked=true means device confirmed unclaim_reset before DB unlink.",
+        "nvs_purge_note": (
+            "sent=true means command reached broker; "
+            "acked=true means device confirmed unclaim_reset. "
+            "acked=false means server unlink is done but device reset is pending."
+        ),
     }
 
 
