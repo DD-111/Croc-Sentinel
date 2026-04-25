@@ -2757,10 +2757,8 @@ class DeviceChallengeVerifyRequest(BaseModel):
     challenge_id: int = Field(ge=1)
     signature_b64: str = Field(min_length=32, max_length=1024)
 
-
-class DeviceRevokeRequest(BaseModel):
-    reason: str = Field(default="manual revoke", min_length=3, max_length=200)
-
+# (DeviceRevokeRequest schema moved to routers/device_revoke.py — see the
+# corresponding `from routers.device_revoke import DeviceRevokeRequest` re-export below.)
 
 class DeviceDeleteRequest(BaseModel):
     confirm_text: str = Field(min_length=3, max_length=128)
@@ -3749,88 +3747,15 @@ def provision_challenge_verify(
     return {"ok": True, "device_id": row["device_id"], "challenge_id": req.challenge_id}
 
 
-@app.get("/devices/revoked")
-def list_revoked_devices(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_min_role(principal, "admin")
-    if principal.role == "admin":
-        require_capability(principal, "can_send_command")
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        if principal.role == "superadmin":
-            cur.execute("SELECT device_id, reason, revoked_by, revoked_at FROM revoked_devices ORDER BY revoked_at DESC")
-        else:
-            cur.execute(
-                """
-                SELECT r.device_id, r.reason, r.revoked_by, r.revoked_at
-                FROM revoked_devices r
-                JOIN device_ownership o ON r.device_id = o.device_id
-                WHERE o.owner_admin = ?
-                ORDER BY r.revoked_at DESC
-                """,
-                (principal.username,),
-            )
-        rows = [dict(r) for r in cur.fetchall()]
-        conn.close()
-    return {"items": rows}
+# =====================================================================
+#  Device revoke / unrevoke
+# =====================================================================
 
+# Phase-23 modularization: 3 routes + DeviceRevokeRequest now live in routers/device_revoke.py.
+from routers.device_revoke import DeviceRevokeRequest  # noqa: E402,F401  (re-export for legacy callers)
+from routers.device_revoke import router as _device_revoke_router  # noqa: E402
 
-@app.post("/devices/{device_id}/revoke")
-def revoke_device(
-    device_id: str,
-    req: DeviceRevokeRequest,
-    principal: Principal = Depends(require_principal),
-) -> dict[str, Any]:
-    assert_min_role(principal, "admin")
-    if principal.role == "admin":
-        require_capability(principal, "can_send_command")
-    assert_device_owner(principal, device_id)
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO revoked_devices (device_id, reason, revoked_by, revoked_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(device_id) DO UPDATE SET
-                reason = excluded.reason,
-                revoked_by = excluded.revoked_by,
-                revoked_at = excluded.revoked_at
-            """,
-            (device_id, req.reason, principal.username, utc_now_iso()),
-        )
-        cur.execute("DELETE FROM device_acl WHERE device_id = ?", (device_id,))
-        deleted_acl_rows = int(cur.rowcount or 0)
-        conn.commit()
-        conn.close()
-    cache_invalidate("devices")
-    cache_invalidate("overview")
-    audit_event(
-        principal.username,
-        "device.revoke",
-        device_id,
-        {"reason": req.reason, "deleted_device_acl_rows": deleted_acl_rows},
-    )
-    return {"ok": True, "device_id": device_id}
-
-
-@app.post("/devices/{device_id}/unrevoke")
-def unrevoke_device(device_id: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_min_role(principal, "admin")
-    if principal.role == "admin":
-        require_capability(principal, "can_send_command")
-    assert_device_owner(principal, device_id)
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM revoked_devices WHERE device_id = ?", (device_id,))
-        conn.commit()
-        conn.close()
-    cache_invalidate("devices")
-    cache_invalidate("overview")
-    audit_event(principal.username, "device.unrevoke", device_id, {})
-    return {"ok": True, "device_id": device_id}
-
+app.include_router(_device_revoke_router)
 
 def _delete_user_auxiliary_cur(cur: Any, username: str) -> None:
     """Remove dashboard user row and attached rows (not device ownership)."""
