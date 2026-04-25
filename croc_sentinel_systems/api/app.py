@@ -2735,11 +2735,8 @@ class ClaimDeviceRequest(BaseModel):
     zone: str = Field(default="all", min_length=1, max_length=31)
     qr_code: Optional[str] = Field(default=None, max_length=47)
 
-
-class ScheduleRebootRequest(BaseModel):
-    delay_s: Optional[int] = Field(default=None, ge=5, le=604800)
-    at_ts: Optional[int] = Field(default=None, ge=0)
-
+# (ScheduleRebootRequest moved to routers/device_control.py — see the
+# corresponding `from routers.device_control import ...` block below.)
 
 class BulkAlertRequest(BaseModel):
     action: str = Field(pattern="^(on|off)$")
@@ -7330,127 +7327,15 @@ def get_wifi_provision_task(
     }
 
 
-@app.post("/devices/{device_id}/alert/on")
-def device_alert_on(
-    device_id: str,
-    duration_ms: int = Query(default=DEFAULT_REMOTE_FANOUT_MS, ge=500, le=300000),
-    request: Request = None,
-    principal: Principal = Depends(require_principal),
-) -> dict[str, Any]:
-    assert_min_role(principal, "user")
-    require_capability(principal, "can_alert")
-    ensure_not_revoked(device_id)
-    assert_device_siren_access(principal, device_id)
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT zone FROM device_state WHERE device_id = ?", (device_id,))
-        zr = cur.fetchone()
-        conn.close()
-    if not zr:
-        raise HTTPException(status_code=404, detail="device not found")
-    assert_zone_for_device(principal, str(zr["zone"]) if zr["zone"] is not None else "")
-    topic = f"{TOPIC_ROOT}/{device_id}/cmd"
-    publish_command(
-        topic=topic,
-        cmd="siren_on",
-        params={"duration_ms": duration_ms},
-        target_id=device_id,
-        proto=CMD_PROTO,
-        cmd_key=get_cmd_key_for_device(device_id),
-    )
-    z = str(zr["zone"] if zr["zone"] is not None else "")
-    owner = _lookup_owner_admin(device_id)
-    ctx = _client_context(request) if request else {}
-    _log_signal_trigger(
-        "remote_siren_on",
-        device_id,
-        z,
-        principal.username,
-        owner,
-        duration_ms=duration_ms,
-        target_count=1,
-        detail=ctx,
-    )
-    _remote_siren_notify_email(
-        action="ON",
-        device_id=device_id,
-        zone=z,
-        actor=principal.username,
-        owner_admin=owner,
-        duration_ms=duration_ms,
-    )
-    emit_event(
-        level="warn",
-        category="alarm",
-        event_type="remote.siren_on",
-        summary=f"Remote siren ON {device_id} by {principal.username}",
-        actor=principal.username,
-        target=device_id,
-        owner_admin=owner or "",
-        device_id=device_id,
-        detail={"duration_ms": duration_ms, "zone": z, **ctx},
-    )
-    return {"ok": True}
+# =====================================================================
+#  Device control: alert on/off + self-test + schedule-reboot
+# =====================================================================
 
+# Phase-18 modularization: 5 single-device control routes + the
+# ScheduleRebootRequest schema now live in routers/device_control.py.
+from routers.device_control import router as _device_control_router  # noqa: E402
 
-@app.post("/devices/{device_id}/alert/off")
-def device_alert_off(device_id: str, request: Request, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_min_role(principal, "user")
-    require_capability(principal, "can_alert")
-    ensure_not_revoked(device_id)
-    assert_device_siren_access(principal, device_id)
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT zone FROM device_state WHERE device_id = ?", (device_id,))
-        zr = cur.fetchone()
-        conn.close()
-    if not zr:
-        raise HTTPException(status_code=404, detail="device not found")
-    assert_zone_for_device(principal, str(zr["zone"]) if zr["zone"] is not None else "")
-    topic = f"{TOPIC_ROOT}/{device_id}/cmd"
-    publish_command(
-        topic=topic,
-        cmd="siren_off",
-        params={},
-        target_id=device_id,
-        proto=CMD_PROTO,
-        cmd_key=get_cmd_key_for_device(device_id),
-    )
-    z = str(zr["zone"] if zr["zone"] is not None else "")
-    owner = _lookup_owner_admin(device_id)
-    _log_signal_trigger(
-        "remote_siren_off",
-        device_id,
-        z,
-        principal.username,
-        owner,
-        duration_ms=None,
-        target_count=1,
-        detail=_client_context(request),
-    )
-    _remote_siren_notify_email(
-        action="OFF",
-        device_id=device_id,
-        zone=z,
-        actor=principal.username,
-        owner_admin=owner,
-        duration_ms=None,
-    )
-    emit_event(
-        level="info",
-        category="alarm",
-        event_type="remote.siren_off",
-        summary=f"Remote siren OFF {device_id} by {principal.username}",
-        actor=principal.username,
-        target=device_id,
-        owner_admin=owner or "",
-        device_id=device_id,
-        detail={"zone": z, **_client_context(request)},
-    )
-    return {"ok": True}
-
+app.include_router(_device_control_router)
 
 @app.post("/alerts")
 def bulk_alert(req: BulkAlertRequest, request: Request, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
@@ -7541,95 +7426,7 @@ def bulk_alert(req: BulkAlertRequest, request: Request, principal: Principal = D
         "device_ids": targets,
     }
 
-
-@app.post("/devices/{device_id}/self-test")
-def device_self_test(device_id: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_device_command_actor(principal, device_id)
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT zone FROM device_state WHERE device_id = ?", (device_id,))
-        zr = cur.fetchone()
-        conn.close()
-    if not zr:
-        raise HTTPException(status_code=404, detail="device not found")
-    assert_zone_for_device(principal, str(zr["zone"]) if zr["zone"] is not None else "")
-    topic = f"{TOPIC_ROOT}/{device_id}/cmd"
-    publish_command(
-        topic=topic,
-        cmd="self_test",
-        params={},
-        target_id=device_id,
-        proto=CMD_PROTO,
-        cmd_key=get_cmd_key_for_device(device_id),
-    )
-    return {"ok": True}
-
-
-@app.post("/devices/{device_id}/schedule-reboot")
-def device_schedule_reboot(device_id: str, req: ScheduleRebootRequest, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_device_command_actor(principal, device_id)
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT zone FROM device_state WHERE device_id = ?", (device_id,))
-        zr = cur.fetchone()
-        conn.close()
-    if not zr:
-        raise HTTPException(status_code=404, detail="device not found")
-    assert_zone_for_device(principal, str(zr["zone"]) if zr["zone"] is not None else "")
-    now_ts = int(time.time())
-    execute_at = 0
-    if req.delay_s is not None:
-        execute_at = now_ts + req.delay_s
-    elif req.at_ts is not None and req.at_ts > now_ts + 5:
-        execute_at = req.at_ts
-    else:
-        raise HTTPException(status_code=400, detail="provide valid delay_s or at_ts")
-
-    job_id = enqueue_scheduled_command(
-        device_id=device_id,
-        cmd="reboot",
-        params={},
-        target_id=device_id,
-        proto=CMD_PROTO,
-        execute_at_ts=execute_at,
-    )
-    return {"ok": True, "job_id": job_id, "execute_at_ts": execute_at}
-
-
-@app.get("/devices/{device_id}/scheduled-jobs")
-def device_scheduled_jobs(device_id: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_device_command_actor(principal, device_id)
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT zone FROM device_state WHERE device_id = ?", (device_id,))
-        zr = cur.fetchone()
-        if not zr:
-            conn.close()
-            raise HTTPException(status_code=404, detail="device not found")
-        assert_zone_for_device(principal, str(zr["zone"]) if zr["zone"] is not None else "")
-        conn.close()
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT id, cmd, params_json, target_id, proto, execute_at_ts, status, created_at, executed_at
-            FROM scheduled_commands
-            WHERE device_id = ?
-            ORDER BY id DESC
-            LIMIT 200
-            """,
-            (device_id,),
-        )
-        rows = [dict(r) for r in cur.fetchall()]
-        conn.close()
-    for row in rows:
-        row["params"] = json.loads(row.pop("params_json"))
-    return {"items": rows}
-
+# (3 more device control routes moved with phase-18 — see include above.)
 
 @app.post("/commands/broadcast")
 def send_broadcast_command(req: BroadcastCommandRequest, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
