@@ -1587,90 +1587,23 @@ def _fail_stale_scheduled_commands(now_ts: int) -> None:
 #  OTA campaigns (superadmin -> admin accept -> per-device rollout)
 # ═══════════════════════════════════════════════
 
-def _append_ota_token_to_url(url: str) -> str:
-    """Append ?token=OTA_TOKEN when set — nginx OTA template requires it (SECURITY.md)."""
-    tok = (OTA_TOKEN or "").strip()
-    if not tok:
-        return url
-    p = urlparse(url)
-    q = dict(parse_qsl(p.query, keep_blank_values=True))
-    if q.get("token"):
-        return url
-    q["token"] = tok
-    new_query = urlencode(q)
-    return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
-
-
-def _effective_ota_verify_base() -> str:
-    """Prefer OTA_VERIFY_BASE_URL so the API can reach ota-nginx inside Docker."""
-    return (OTA_VERIFY_BASE_URL or OTA_PUBLIC_BASE_URL).rstrip("/")
-
-
-def _service_check_url_for_firmware(fname: str) -> str:
-    """URL the API uses for HTTP checks (may be internal Docker base)."""
-    base = _effective_ota_verify_base()
-    return _append_ota_token_to_url(f"{base}/fw/{fname}")
-
-
-def _public_firmware_url(fname: str) -> str:
-    """Canonical URL stored in campaigns / shown to devices (no token in DB; ESP adds token)."""
-    return f"{OTA_PUBLIC_BASE_URL}/fw/{fname}"
-
-
-def _http_probe_ota(url: str) -> tuple[bool, str]:
-    """HEAD first (with optional Range GET fallback). URL should already include token if required."""
-    if not url.startswith(("http://", "https://")):
-        return False, "scheme_not_http"
-
-    def _read_response(resp: Any) -> tuple[int, str]:
-        code = int(getattr(resp, "status", getattr(resp, "code", 200)))
-        length = resp.headers.get("content-length", "") if hasattr(resp, "headers") else ""
-        return code, length or "?"
-
-    try:
-        req = urllib.request.Request(url, method="HEAD")
-        with urllib.request.urlopen(req, timeout=OTA_URL_VERIFY_TIMEOUT_SECONDS) as resp:
-            code, length = _read_response(resp)
-            if 200 <= code < 400:
-                return True, f"HEAD http_{code} size={length}"
-            return False, f"HEAD http_{code}"
-    except urllib.error.HTTPError as exc:
-        if int(exc.code) == 405:
-            pass  # fall through to GET range
-        else:
-            return False, f"HEAD http_{exc.code}:{exc.reason}"
-    except Exception as exc:
-        return False, f"HEAD_err:{exc.__class__.__name__}:{exc}"
-
-    try:
-        req = urllib.request.Request(url, method="GET")
-        req.add_header("Range", "bytes=0-0")
-        with urllib.request.urlopen(req, timeout=OTA_URL_VERIFY_TIMEOUT_SECONDS) as resp:
-            code, length = _read_response(resp)
-            if code in (200, 206) or (200 <= code < 400):
-                return True, f"GET_range http_{code} size={length}"
-            return False, f"GET_range http_{code}"
-    except urllib.error.HTTPError as exc:
-        return False, f"GET http_{exc.code}:{exc.reason}"
-    except Exception as exc:
-        return False, f"GET_err:{exc.__class__.__name__}:{exc}"
-
-
-def _verify_ota_url(url: str) -> tuple[bool, str]:
-    """Verify the firmware URL responds (HEAD or byte-range GET). Appends OTA_TOKEN for nginx."""
-    return _http_probe_ota(_append_ota_token_to_url(url))
-
-
-def _verify_firmware_file_on_service(fname: str) -> tuple[bool, str, str]:
-    """Check reachability via OTA_VERIFY_BASE_URL or public base; returns (ok, detail, checked_url_masked)."""
-    safe = os.path.basename(fname.strip())
-    u = _service_check_url_for_firmware(safe)
-    ok, detail = _http_probe_ota(u)
-    masked = u
-    tok = (OTA_TOKEN or "").strip()
-    if tok:
-        masked = u.replace(tok, "***")
-    return ok, detail, masked
+# Phase-40 modularization: 10 OTA URL/file utilities (URL shaping +
+# reachability probes + disk retention) live in ota_files.py — pure
+# stdlib + config + db + ota_catalog cache invalidator. Re-exported
+# here so routers/ota.py's late-bind shims (`_app._public_firmware_url`,
+# `_app._effective_ota_verify_base`, `_app._verify_firmware_file_on_service`,
+# `_app._verify_ota_url`, `_app._ota_enforce_max_stored_bins`) keep
+# resolving, and so the in-module call site (`_blocking_api_bootstrap_inner`
+# at startup, the `/ota/upload` retention pass) keeps using the bare names.
+from ota_files import (  # noqa: E402,F401  (re-exports for legacy callers)
+    _append_ota_token_to_url,
+    _effective_ota_verify_base,
+    _http_probe_ota,
+    _public_firmware_url,
+    _service_check_url_for_firmware,
+    _verify_firmware_file_on_service,
+    _verify_ota_url,
+)
 
 
 # Phase-39 modularization: OTA campaign rollout / rollback / result
@@ -3825,112 +3758,16 @@ app.include_router(_ota_router)
 
 
 
-def _ota_delete_artifacts_for_stored_basename(basename: str) -> None:
-    """Delete .bin, .bin.sha256, .bin.version, and sidecar release notes (stem + .txt/.md/.notes)."""
-    if not str(basename).endswith(".bin") or ".." in basename or "/" in basename or "\\" in basename:
-        return
-    base_dir = os.path.realpath(OTA_FIRMWARE_DIR)
-    path = os.path.realpath(os.path.join(OTA_FIRMWARE_DIR, basename))
-    if not path.startswith(base_dir + os.sep) or not path.lower().endswith(".bin"):
-        return
-    stem_name = path[:-4]  # full path without ".bin" suffix; basename for sidecars
-    base_name = os.path.basename(stem_name)
-    to_try: list[str] = [path, path + ".sha256", path + ".version"]
-    for ext in (".txt", ".md", ".notes"):
-        to_try.append(os.path.join(OTA_FIRMWARE_DIR, base_name + ext))
-    for p in to_try:
-        try:
-            if p and os.path.isfile(p):
-                os.remove(p)
-        except OSError:
-            pass
-
-
-def _ota_in_use_basenames() -> set[str]:
-    """Set of .bin basenames currently referenced by a non-terminal OTA campaign.
-    We refuse to prune these so devices mid-download don't 404 on the artifact.
-    """
-    out: set[str] = set()
-    try:
-        with db_lock:
-            conn = get_conn()
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT url FROM ota_campaigns
-                WHERE state NOT IN ('success', 'failed', 'cancelled', 'rolled_back')
-                """
-            )
-            rows = cur.fetchall() or []
-            conn.close()
-    except Exception as exc:
-        logger.warning("in-use OTA campaign lookup failed: %s", exc)
-        return out
-    for r in rows:
-        url = str((r["url"] if r else "") or "")
-        if not url:
-            continue
-        try:
-            tail = url.rsplit("/", 1)[-1]
-            # Strip query string.
-            if "?" in tail:
-                tail = tail.split("?", 1)[0]
-            if tail.lower().endswith(".bin"):
-                out.add(tail)
-        except Exception:
-            continue
-    return out
-
-
-def _ota_enforce_max_stored_bins() -> None:
-    """Keep at most OTA_MAX_FIRMWARE_BINS .bin files; remove oldest by mtime first, with artifacts.
-
-    Never prunes a .bin that's currently referenced by an active OTA campaign — doing
-    so would cause in-flight devices to fail the download and fall back to rollback.
-    If the number of in-use bins alone already exceeds the limit, we keep them all and
-    warn so the operator can raise ``OTA_MAX_FIRMWARE_BINS``.
-    """
-    base = os.path.realpath(OTA_FIRMWARE_DIR)
-    if not os.path.isdir(base):
-        return
-    in_use = _ota_in_use_basenames()
-    items: list[tuple[int, str, str]] = []  # mtime, name, relpath join path
-    for name in os.listdir(OTA_FIRMWARE_DIR):
-        if not str(name).lower().endswith(".bin"):
-            continue
-        p = os.path.join(OTA_FIRMWARE_DIR, name)
-        if not os.path.isfile(p):
-            continue
-        try:
-            rp = os.path.realpath(p)
-        except OSError:
-            continue
-        if not str(rp).startswith(base + os.sep):
-            continue
-        try:
-            st = os.stat(p)
-        except OSError:
-            continue
-        items.append((int(st.st_mtime), str(name), p))
-    # Oldest mtime first; break ties by name for stable order
-    items.sort(key=lambda t: (t[0], t[1]))
-    # Remove oldest until count ≤ max — but skip any in-use .bin.
-    idx = 0
-    kept_protected = 0
-    while len(items) > OTA_MAX_FIRMWARE_BINS and idx < len(items):
-        _m, name, _p = items[idx]
-        if name in in_use:
-            kept_protected += 1
-            idx += 1
-            continue
-        items.pop(idx)
-        _ota_delete_artifacts_for_stored_basename(name)
-    if len(items) > OTA_MAX_FIRMWARE_BINS and kept_protected > 0:
-        logger.warning(
-            "OTA retention: %d artifact(s) kept above limit=%d because they are in-use by active campaigns",
-            kept_protected, OTA_MAX_FIRMWARE_BINS,
-        )
-    _invalidate_ota_firmware_catalog_cache()
+# Phase-40: disk-retention helpers (`_ota_delete_artifacts_for_stored_basename`,
+# `_ota_in_use_basenames`, `_ota_enforce_max_stored_bins`) live in
+# ota_files.py — see the re-export block above for the URL utilities.
+# These three are also re-exported from ota_files because the bootstrap
+# pass and routers/ota.py both call `_ota_enforce_max_stored_bins`.
+from ota_files import (  # noqa: E402,F401  (re-exports for legacy callers)
+    _ota_delete_artifacts_for_stored_basename,
+    _ota_enforce_max_stored_bins,
+    _ota_in_use_basenames,
+)
 
 
 # =====================================================================
