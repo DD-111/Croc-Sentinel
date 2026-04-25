@@ -151,22 +151,27 @@ def register_routers(app: FastAPI) -> None:
 
     app.include_router(_device_read_router)
 
-    # Phase-14 / 66 / 73: group-cards split into three halves —
-    #   * routers.group_cards          — settings CRUD + capabilities
-    #   * routers.group_cards_apply    — siren fan-out (apply route)
-    #   * routers.group_cards_delete   — delete + impl helper (Phase 73)
-    # group_cards must ship first because group_cards_apply imports
-    # ``_group_owner_scope`` / ``_group_settings_defaults`` /
-    # ``_group_devices_with_owner`` from it at module-load time.
-    # group_cards_delete has no module-load-time dependency on the
-    # other two (it pulls helpers from ``_app`` directly), so its
-    # ordering relative to apply is a wash; we register it last to
-    # keep the lifecycle reading like a story (read → apply → delete).
+    # Phase-14 / 66 / 73 / 81: group-cards lifecycle split into four modules —
+    #   * routers.group_cards          — capabilities + read routes +
+    #                                    shared helpers + schema (read).
+    #   * routers.group_cards_save     — PUT /settings (Phase 81 — save).
+    #   * routers.group_cards_apply    — siren fan-out (Phase 66 — apply).
+    #   * routers.group_cards_delete   — delete + impl (Phase 73 — delete).
+    # ``group_cards`` MUST ship first because both ``group_cards_save``
+    # and ``group_cards_apply`` import ``_group_owner_scope`` /
+    # ``_group_settings_defaults`` / ``_group_devices_with_owner`` /
+    # ``GroupCardSettingsBody`` from it at module-load time.
+    # ``group_cards_delete`` has no module-load-time dependency on the
+    # other three (it pulls helpers from ``_app`` directly), so its
+    # relative ordering is a wash; we register it last to keep the
+    # lifecycle reading like a story (read → save → apply → delete).
     from routers.group_cards import router as _group_cards_router
+    from routers.group_cards_save import router as _group_cards_save_router
     from routers.group_cards_apply import router as _group_cards_apply_router
     from routers.group_cards_delete import router as _group_cards_delete_router
 
     app.include_router(_group_cards_router)
+    app.include_router(_group_cards_save_router)
     app.include_router(_group_cards_apply_router)
     app.include_router(_group_cards_delete_router)
 

@@ -1,27 +1,27 @@
-"""Group-card settings + capabilities (Phase-14, trimmed P66 + P73).
+"""Group-card read routes + shared helpers (Phase-14, trimmed P66 / P73 / P81).
 
 A "group card" is the dashboard widget that fans out a single click to
 every device sharing the same ``device_state.notification_group`` tag —
 think floor-level / building-level grouping. The original Phase-14
-extract carried 13 endpoints. The lifecycle has now been split three
-ways for separation-of-concern:
+extract carried 13 endpoints. The lifecycle is now split four ways:
 
-  * routers.group_cards          — settings CRUD + capabilities (this file)
-  * routers.group_cards_apply    — siren fan-out (Phase 66)
-  * routers.group_cards_delete   — delete + impl helper (Phase 73)
+  * ``routers.group_cards``         — capabilities + read routes +
+                                      shared helpers + schema (this
+                                      file).
+  * ``routers.group_cards_save``    — PUT settings (Phase 81).
+  * ``routers.group_cards_apply``   — siren fan-out (Phase 66).
+  * ``routers.group_cards_delete``  — delete + impl helper (Phase 73).
 
 Routes hosted here (all behind ``Depends(require_principal)``)
 --------------------------------------------------------------
-  Canonical (no /api prefix):
-    GET    /group-cards/capabilities                 — feature discovery
-    GET    /group-cards/settings                     — list owned/all
-    GET    /group-cards/{group_key}/settings         — single
-    PUT    /group-cards/{group_key}/settings         — upsert
+  Canonical:
+    GET    /group-cards/capabilities          — feature discovery.
+    GET    /group-cards/settings              — list owned/all.
+    GET    /group-cards/{group_key}/settings  — single.
 
-  /api/ mirrors (delegate to the canonical handlers; same behavior):
+  /api/ mirrors (thin wrappers, same behavior):
     GET    /api/group-cards/settings
     GET    /api/group-cards/{group_key}/settings
-    PUT    /api/group-cards/{group_key}/settings
 
 The /api/ mirror routes exist so old proxies/firewalls that only allow
 ``/api/*`` can still reach the same logic. Keep them as thin wrappers —
@@ -42,11 +42,16 @@ Helpers and schemas (kept here, re-exported for sibling modules)
                  ``_group_settings_defaults``,
                  ``_group_devices_with_owner``
 
-The three ``_group_*`` helpers are re-exported via ``__all__`` so
-``routers/group_cards_apply.py`` can import them — apply needs to
-read the same settings rows we write and resolve the same device
-slice. ``routers/group_cards_delete.py`` owns its own
-``_delete_group_card_impl`` (no longer here).
+These are imported by ``routers/group_cards_save.py`` (PUT settings)
+and ``routers/group_cards_apply.py`` (apply fan-out) so all three
+mutation paths agree on the same device slice and owner-scope
+resolution. ``routers/group_cards_delete.py`` owns its own
+``_delete_group_card_impl`` and doesn't need these.
+
+``require_principal`` is also re-exported because ``group_cards_save``
+imports it from this module — that way test rigs that patch
+``app.require_principal`` propagate uniformly to every group-card
+router.
 
 The following stay in ``app.py`` because non-group code paths use them
 (late-bound here):
@@ -64,10 +69,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 import app as _app
-from audit import audit_event
 from config import DEFAULT_REMOTE_FANOUT_MS
 from db import db_lock, get_conn
-from helpers import utc_now_iso
 from security import Principal, assert_min_role
 
 require_principal = _app.require_principal
@@ -307,130 +310,32 @@ def get_group_card_settings_api(
     return get_group_card_settings(group_key, owner_admin=owner_admin, principal=principal)
 
 
-# ─────────────────────────────────────────── routes: settings save ────
-
-@router.put("/group-cards/{group_key}/settings")
-def save_group_card_settings(
-    group_key: str,
-    body: GroupCardSettingsBody,
-    principal: Principal = Depends(require_principal),
-) -> dict[str, Any]:
-    assert_min_role(principal, "user")
-    g = (group_key or "").strip()
-    if not g:
-        raise HTTPException(status_code=400, detail="group_key required")
-    owner_scope = _group_owner_scope(principal)
-    tenant_body = (body.owner_admin or "").strip()
-    if principal.role != "superadmin" and tenant_body:
-        raise HTTPException(status_code=400, detail="owner_admin in body is superadmin-only")
-    tenant_for_slice: Optional[str] = None
-    if principal.role == "superadmin" and tenant_body:
-        owner_scope = tenant_body
-        tenant_for_slice = tenant_body
-    rows = _group_devices_with_owner(g, principal, tenant_owner=tenant_for_slice)
-    if principal.role == "superadmin" and not tenant_body:
-        owners_set = {str(r.get("owner_admin") or "").strip() for r in rows}
-        owners_set.discard("")
-        if len(owners_set) > 1:
-            raise HTTPException(
-                status_code=400,
-                detail="owner_admin required in body (multiple tenants share this group_key)",
-            )
-        if len(owners_set) == 1:
-            owner_scope = next(iter(owners_set))
-    # Allow saving even when no devices are tagged yet: otherwise UI 404s before any
-    # `device_state.notification_group` is written (e.g. group name saved before members).
-    # Sibling fan-out and apply still require devices with matching notification_group.
-    # Shared groups are owner-managed: grantee cannot override owner strategy.
-    if principal.role != "superadmin":
-        for r in rows:
-            o = str(r.get("owner_admin") or "")
-            if o and o != owner_scope:
-                raise HTTPException(status_code=403, detail="shared group settings are managed by owner")
-    now = utc_now_iso()
-    resolved_mode = "delay" if int(body.delay_seconds) > 0 else "continuous"
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO group_card_settings (
-                owner_admin, group_key, trigger_mode, trigger_duration_ms, delay_seconds,
-                reboot_self_check, updated_by, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(owner_admin, group_key) DO UPDATE SET
-                trigger_mode=excluded.trigger_mode,
-                trigger_duration_ms=excluded.trigger_duration_ms,
-                delay_seconds=excluded.delay_seconds,
-                reboot_self_check=excluded.reboot_self_check,
-                updated_by=excluded.updated_by,
-                updated_at=excluded.updated_at
-            """,
-            (
-                owner_scope,
-                g,
-                resolved_mode,
-                int(body.trigger_duration_ms),
-                int(body.delay_seconds),
-                1 if body.reboot_self_check else 0,
-                principal.username,
-                now,
-            ),
-        )
-        conn.commit()
-        conn.close()
-    audit_event(
-        principal.username,
-        "group.settings.save",
-        g,
-        {
-            "trigger_mode": resolved_mode,
-            "trigger_duration_ms": int(body.trigger_duration_ms),
-            "delay_seconds": int(body.delay_seconds),
-            "reboot_self_check": bool(body.reboot_self_check),
-            "owner_admin": owner_scope,
-        },
-    )
-    return {
-        "ok": True,
-        "owner_admin": owner_scope,
-        "group_key": g,
-        "trigger_mode": resolved_mode,
-        "trigger_duration_ms": int(body.trigger_duration_ms),
-        "delay_seconds": int(body.delay_seconds),
-        "reboot_self_check": bool(body.reboot_self_check),
-        "updated_by": principal.username,
-        "updated_at": now,
-        "device_count": len(rows),
-    }
-
-
-@router.put("/api/group-cards/{group_key}/settings")
-def save_group_card_settings_api(
-    group_key: str,
-    body: GroupCardSettingsBody,
-    principal: Principal = Depends(require_principal),
-) -> dict[str, Any]:
-    return save_group_card_settings(group_key, body, principal)
-
-
-# Note: the /group-cards/.../apply siren fan-out lives in
+# Phase-81 split: the PUT /group-cards/{group_key}/settings save route
+# (and its /api/ mirror) lives in routers/group_cards_save.py. Both
+# routes import the three ``_group_*`` helpers + ``GroupCardSettingsBody``
+# from this module (re-exports below) so settings reads (here) and
+# settings writes (next door) agree on owner-scope + device slice.
+#
+# The /group-cards/.../apply siren fan-out lives in
 # routers/group_cards_apply.py — that route imports the three
-# `_group_*` helpers below, so the settings rows we persist here
-# and the device slice we resolve here are exactly the same set
-# the apply route reads. See ``__all__`` at the bottom for the
-# re-exported helpers.
+# ``_group_*`` helpers below, so the settings rows persisted by
+# group_cards_save and the device slice resolved here are exactly
+# the same set the apply route reads.
 
 
 __all__ = (
     "router",
     "GroupCardSettingsBody",
-    # Helpers re-exported for routers/group_cards_apply.py — single
-    # source of truth so the settings half (this module) and the
-    # apply half stay perfectly aligned on owner-scope / device
-    # slice resolution.
+    # Helpers re-exported for routers/group_cards_save.py +
+    # routers/group_cards_apply.py — single source of truth so the
+    # read half (this module), save half, and apply half stay
+    # perfectly aligned on owner-scope / device slice resolution.
     "_group_owner_scope",
     "_group_settings_defaults",
     "_group_devices_with_owner",
+    # Re-exported so group_cards_save.py can capture the same
+    # ``require_principal`` reference (so test patches on
+    # ``app.require_principal`` propagate uniformly across all
+    # group-card routers).
+    "require_principal",
 )
