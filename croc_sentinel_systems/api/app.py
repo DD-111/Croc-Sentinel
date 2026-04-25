@@ -3034,22 +3034,13 @@ async def _slow_request_log_middleware(request: Request, call_next):
     return resp
 
 
-@app.get("/", include_in_schema=False)
-def _root_redirect() -> RedirectResponse:
-    return RedirectResponse(url=DASHBOARD_PATH + "/", status_code=302)
+# Phase-33 modularization: the six tiny SPA-mount redirect routes
+# (/, /ui[/], /dashboard[/], /ui/{path:path}) now live in
+# routers/ui_mounts.py. Pure redirect-to-mount shape — no auth,
+# no DB, no shared state.
+from routers.ui_mounts import router as _ui_mounts_router  # noqa: E402
 
-
-@app.get("/ui", include_in_schema=False)
-@app.get("/ui/", include_in_schema=False)
-@app.get("/dashboard", include_in_schema=False)
-@app.get("/dashboard/", include_in_schema=False)
-def _legacy_ui_redirect() -> RedirectResponse:
-    return RedirectResponse(url=DASHBOARD_PATH + "/", status_code=301)
-
-
-@app.get("/ui/{path:path}", include_in_schema=False)
-def _legacy_ui_deep_redirect(path: str) -> RedirectResponse:
-    return RedirectResponse(url=f"{DASHBOARD_PATH}/{path}", status_code=301)
+app.include_router(_ui_mounts_router)
 
 
 def _telegram_enabled_safe() -> bool:
