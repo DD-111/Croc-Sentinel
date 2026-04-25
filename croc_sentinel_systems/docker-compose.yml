@@ -39,21 +39,19 @@ services:
     env_file:
       - .env
 
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
     depends_on:
       - mosquitto
       - ota-nginx
 
     expose:
       - "8088"
-    # Plain HTTP on host (no Traefik / no ACME). Point browser + FACTORY_UI_API_BASE at http://HOST:18999
+
     ports:
       - "18999:8088"
 
-    # Default: one process (MQTT client + in-memory bus). For horizontal scale,
-    # set REDIS_URL (event bridge) and run multiple API replicas or uvicorn
-    # --workers N behind a load balancer — do not use multiple workers without
-    # Redis or you will split SSE/WS sessions and duplicate MQTT connects.
-    # Do not add --loop uvloop unless uvloop is listed in api/requirements.txt.
     command: >
       uvicorn app:app
       --host 0.0.0.0
@@ -62,7 +60,6 @@ services:
     volumes:
       - ./data:/data
       - ./certs/ca.crt:/etc/sentinel/mqtt-ca.crt:ro
-      # Same host dir as ota-nginx so uploads and firmware list match /fw/ files.
       - ./firmware:/opt/sentinel/firmware
 
     networks:
@@ -86,7 +83,7 @@ services:
 
     expose:
       - "9231"
-    # Host nginx (e.g. ota.esasecure.com HTTPS) proxies to this — bind loopback only.
+
     ports:
       - "127.0.0.1:9231:9231"
 
