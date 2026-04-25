@@ -215,10 +215,18 @@ def register_routers(app: FastAPI) -> None:
     app.include_router(_ota_router)
     app.include_router(_ota_campaigns_router)
 
-    # Phase-8: event center (paginated /events, CSV, by-device, taxonomy, SSE, WS).
+    # Phase-8 / 68: event center split into two halves —
+    #   * routers.events         — paginated /events, CSV, by-device, taxonomy
+    #   * routers.events_stream  — SSE /events/stream + WebSocket /events/ws
+    # The two halves share *no* helpers (history filters via SQL,
+    # streaming filters via event_bus subscriber dicts), so order
+    # is irrelevant — registering events first matches the historical
+    # registration order for log-grep continuity.
     from routers.events import router as _events_router
+    from routers.events_stream import router as _events_stream_router
 
     app.include_router(_events_router)
+    app.include_router(_events_stream_router)
 
     # Phase-7: /factory/* (register / ping / list / block) + X-Factory-Token auth.
     from routers.factory import router as _factory_router
