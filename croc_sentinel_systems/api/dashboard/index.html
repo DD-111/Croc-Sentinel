@@ -4,8 +4,8 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="color-scheme" content="light dark" />
-    <meta name="theme-color" content="#0b1220" media="(prefers-color-scheme: dark)" />
-    <meta name="theme-color" content="#e8edfa" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#070b10" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#eef2f7" media="(prefers-color-scheme: light)" />
     <!-- API path when using Traefik (StripPrefix /api). Empty = same origin root (e.g. :8088). -->
     <meta name="croc-api-base" content="/api" />
     <!-- Must match server DASHBOARD_PATH (default /console). Fixes relative assets/ when URL is /console without trailing slash. -->
@@ -26,76 +26,10 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Outfit:wght@400..700&family=Source+Sans+3:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="assets/app.css?v=71" />
-    <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='14' fill='%230f172a' stroke='%233b82f6' stroke-width='2'/><circle cx='16' cy='16' r='4' fill='%233b82f6'/></svg>" />
-    <!-- First-paint safety net: CSS alone gives a readable background + spinner
-         even if app.js fails to load or crashes before renderBootSplash(). -->
-    <style>
-      /* Make sure the console never paints as an all-dark void while JS loads.
-         Falls back to CSS vars if app.css hasn't loaded yet. */
-      body.app-shell { background: #f4f7fb; color: #0f172a; }
-      @media (prefers-color-scheme: dark) {
-        body.app-shell { background: #0b1220; color: #e6edf5; }
-      }
-      html[data-theme="dark"] body.app-shell { background: #0b1220; color: #e6edf5; }
-      /* Static boot splash — shown before any script runs. Replaced by renderRoute(). */
-      #view.view { min-height: 40vh; }
-      .static-boot {
-        display: flex; flex-direction: column; align-items: center; justify-content: center;
-        gap: 12px; padding: 32px 20px; text-align: center; min-height: 40vh;
-      }
-      .static-boot__ring {
-        width: 42px; height: 42px; border-radius: 50%;
-        border: 3px solid rgba(127, 140, 160, 0.35);
-        border-top-color: #1d4ed8;
-        animation: static-spin 0.9s linear infinite;
-      }
-      @keyframes static-spin { to { transform: rotate(360deg); } }
-      @media (prefers-reduced-motion: reduce) {
-        .static-boot__ring { animation: none; border-top-color: transparent; }
-      }
-      .static-boot__title { margin: 0; font: 600 0.95rem/1.2 system-ui, sans-serif; }
-      .static-boot__hint  { margin: 0; font: 400 0.8rem/1.35 system-ui, sans-serif; opacity: 0.7; max-width: 36ch; }
-      .static-boot__retry {
-        display: none; margin-top: 8px; padding: 8px 14px; border-radius: 8px;
-        border: 1px solid rgba(127, 140, 160, 0.35); background: transparent;
-        color: inherit; font: 500 0.85rem/1 system-ui, sans-serif; cursor: pointer;
-      }
-      /* Shown by the inline error-boundary below if window.onerror fires early. */
-      body[data-boot-error="1"] .static-boot__ring   { display: none; }
-      body[data-boot-error="1"] .static-boot__retry  { display: inline-block; }
-    </style>
+    <link rel="stylesheet" href="assets/app.css?v=72" />
+    <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='14' fill='%23111827' stroke='%2338bdf8' stroke-width='2'/><circle cx='16' cy='16' r='4' fill='%2338bdf8'/></svg>" />
   </head>
   <body class="app-shell motion-ui comfort-ui" data-auth="unknown" data-layout="app">
-    <script>
-      /* Very thin error boundary. Any uncaught error BEFORE app.js finishes
-         booting the SPA flips the static boot splash into a retry card so the
-         user never stares at an unexplained blank/dark screen. */
-      (function () {
-        function flip(e) {
-          try {
-            document.body.setAttribute("data-boot-error", "1");
-            var t = document.querySelector(".static-boot__title");
-            var h = document.querySelector(".static-boot__hint");
-            if (t) t.textContent = "Console failed to start";
-            if (h) {
-              var msg = (e && (e.message || e.reason && e.reason.message)) || "Unknown error";
-              h.textContent = "Reload to try again. Details: " + String(msg).slice(0, 180);
-            }
-          } catch (_) {}
-        }
-        window.addEventListener("error", flip);
-        window.addEventListener("unhandledrejection", flip);
-        /* Watchdog: if #view still has the static boot after 20s, assume boot
-           never ran (script load failed, CSP blocked it, etc.) and surface retry. */
-        setTimeout(function () {
-          var v = document.getElementById("view");
-          if (v && v.querySelector(".static-boot") && !document.body.getAttribute("data-boot-error")) {
-            flip({ message: "Scripts did not initialise in time." });
-          }
-        }, 20000);
-      })();
-    </script>
     <aside class="sidebar" id="sidebar" aria-label="Main navigation">
       <div class="brand">
         <div class="brand-mark">
@@ -139,22 +73,7 @@
         </div>
       </header>
 
-      <section id="view" class="view">
-        <!-- Static first-paint content. Replaced by JS as soon as boot() runs.
-             Kept accessible for assistive tech via role="status". -->
-        <div class="static-boot" role="status" aria-live="polite">
-          <div class="static-boot__ring" aria-hidden="true"></div>
-          <p class="static-boot__title">Loading console…</p>
-          <p class="static-boot__hint">If this stays visible for 10+ seconds the API may be unreachable or scripts failed to load.</p>
-          <button type="button" class="static-boot__retry" onclick="location.reload()">Reload</button>
-          <noscript>
-            <p class="static-boot__hint" style="max-width:48ch;margin-top:8px">
-              JavaScript is disabled. Enable JavaScript and reload to use the console,
-              or open the legacy API at <code>/api/health</code> for diagnostics.
-            </p>
-          </noscript>
-        </div>
-      </section>
+      <section id="view" class="view"></section>
 
       <footer class="site-footer site-footer--shell" aria-label="Site">
         <div class="site-footer__row site-footer__row--main">
@@ -168,6 +87,6 @@
       <div id="toast" class="toast" role="status" aria-live="polite"></div>
     </main>
 
-    <script src="assets/app.js?v=71" />
+    <script src="assets/app.js?v=72"></script>
   </body>
 </html>

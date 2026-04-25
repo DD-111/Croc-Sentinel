@@ -133,8 +133,6 @@
     me: null,
     mqttConnected: false,
     health: null,
-    /** Last successful GET /health (ms); used to label pill staleness. */
-    healthFetchedAt: 0,
     overviewCache: null,
     routeSeq: 0,
   };
@@ -330,62 +328,6 @@
   /** Cleared when leaving Events; used to resume SSE when tab visible again. */
   window.__eventsStreamResume = null;
 
-  /**
-   * Central live-stream health flag used across all transports.
-   * Set by WS/SSE open+close hooks and consumed by:
-   *   - armHealthPoll (slows /health polling when stream is delivering)
-   *   - scheduleRouteTicker (slows per-route /devices etc. refresh)
-   *   - any ad-hoc code that wants to ask "is a live push channel open?"
-   *
-   * Shape:
-   *   { healthy: bool, transport: "ws"|"sse"|"", sinceMs: number, lastEventMs: number }
-   *
-   * healthy becomes true once OPEN + first real event arrives (stream.hello
-   * or any pushed event). It flips back to false on close/stall.
-   *
-   * The cross-tab consistency is deliberately loose — each tab keeps its own
-   * flag based on its own socket; this is about reducing pressure from THIS
-   * tab, not coordinating fleet-wide.
-   */
-  window.__streamHealth = window.__streamHealth || {
-    healthy: false,
-    transport: "",
-    sinceMs: 0,
-    lastEventMs: 0,
-  };
-  /** Mark the live stream as healthy (OPEN + first payload received). */
-  function markStreamHealthy(transport) {
-    const s = window.__streamHealth;
-    const now = Date.now();
-    const wasHealthy = !!s.healthy;
-    s.healthy = true;
-    s.transport = String(transport || s.transport || "");
-    if (!s.sinceMs) s.sinceMs = now;
-    s.lastEventMs = now;
-    if (!wasHealthy) {
-      // Re-arm dependent timers so they pick up the slower cadence immediately.
-      try { armHealthPoll(); } catch (_) {}
-      try { rearmVisibleRouteTickersForStreamHealth(); } catch (_) {}
-    }
-  }
-  /** Mark stream unhealthy (close / error / stall). */
-  function markStreamUnhealthy() {
-    const s = window.__streamHealth;
-    if (!s.healthy && !s.sinceMs) return;
-    const wasHealthy = !!s.healthy;
-    s.healthy = false;
-    s.sinceMs = 0;
-    if (wasHealthy) {
-      // Speed up pollers so the UI doesn't go stale while we reconnect.
-      try { armHealthPoll(); } catch (_) {}
-      try { rearmVisibleRouteTickersForStreamHealth(); } catch (_) {}
-    }
-  }
-  /** Called on each pushed event so staleness checks can use lastEventMs. */
-  function noteStreamActivity() {
-    window.__streamHealth.lastEventMs = Date.now();
-  }
-
   let healthPollTimer = null;
   /** Overview device search debounce. */
   let overviewFilterDebounce = null;
@@ -400,26 +342,15 @@
     loadHealth();
   }
 
-  /**
-   * /health polling cadences.
-   *   IDLE  = stream is healthy and MQTT is up → only a sanity check
-   *   SLOW  = default when stream unknown or just opened
-   *   FAST  = MQTT is DOWN → track green-dot reality (don't coast on stale)
-   * Stream being healthy is the "we already know live-state in real time" signal.
-   */
-  const HEALTH_POLL_IDLE_MS = 20000;
-  const HEALTH_POLL_SLOW_MS = 8000;
-  const HEALTH_POLL_FAST_MS = 3000;
+  /** When MQTT is down, poll faster so the green dot tracks reality (not a 30s stale snapshot). */
+  const HEALTH_POLL_SLOW_MS = 12000;
+  const HEALTH_POLL_FAST_MS = 3500;
 
   function armHealthPoll() {
     clearHealthPollTimer();
     if (!state.me) return;
-    const mqttDown = state.mqttConnected === false;
-    const streamOk = !!(window.__streamHealth && window.__streamHealth.healthy);
-    let ms;
-    if (mqttDown) ms = HEALTH_POLL_FAST_MS;
-    else if (streamOk) ms = HEALTH_POLL_IDLE_MS;
-    else ms = HEALTH_POLL_SLOW_MS;
+    const fast = state.mqttConnected === false;
+    const ms = fast ? HEALTH_POLL_FAST_MS : HEALTH_POLL_SLOW_MS;
     healthPollTimer = setInterval(tickHealthIfVisible, ms);
   }
 
@@ -462,14 +393,6 @@
       return location.origin + p;
     }
     return location.origin;
-  }
-
-  /** ws:// / wss:// base matching apiBase() (Phase 2: /events/ws). */
-  function apiBaseToWsBase(httpBase) {
-    const s = String(httpBase || "").trim();
-    if (s.startsWith("https://")) return "wss://" + s.slice(8);
-    if (s.startsWith("http://")) return "ws://" + s.slice(7);
-    return s;
   }
 
   /** Default ceiling so a stuck reverse-proxy / API cannot leave the SPA on “Loading…” forever. */
@@ -615,9 +538,7 @@
 
   /** Read chunked text/event-stream; invokes onFrame(type, payload) where type is "message"|"ping". */
   const SSE_PARSE_BUF_MAX = 262144;
-  /** If no bytes for this long while "live", abort fetch to recover half-open TCP (client-side). */
-  const SSE_STALL_ABORT_MS = 90000;
-  async function pumpSseBody(reader, signal, onFrame, onReadActivity) {
+  async function pumpSseBody(reader, signal, onFrame) {
     const dec = new TextDecoder();
     let buf = "";
     while (!signal.aborted) {
@@ -629,11 +550,6 @@
       }
       const { done, value } = chunk || {};
       if (done) break;
-      if (onReadActivity && value && value.byteLength) {
-        try {
-          onReadActivity();
-        } catch (_) {}
-      }
       buf += dec.decode(value, { stream: true });
       if (buf.length > SSE_PARSE_BUF_MAX) {
         const cut = buf.lastIndexOf("\n\n", buf.length - 65536);
@@ -683,35 +599,6 @@
     if (diff < 3600_000) return `${Math.floor(diff / 60000)}m ago`;
     if (diff < 86400_000) return `${Math.floor(diff / 3600000)}h ago`;
     return `${Math.floor(diff / 86400000)}d ago`;
-  }
-
-  function fmtAgeShort(secs) {
-    const n = Number(secs);
-    if (!Number.isFinite(n) || n < 0) return "—";
-    if (n < 60) return `${Math.floor(n)}s`;
-    if (n < 3600) return `${Math.floor(n / 60)}m`;
-    if (n < 86400) return `${Math.floor(n / 3600)}h`;
-    return `${Math.floor(n / 86400)}d`;
-  }
-
-  // Classify heartbeat freshness into a badge kind. Mirrors server-side
-  // OFFLINE_THRESHOLD_SECONDS=90 (warn early) + PRESENCE_PROBE_IDLE_SECONDS=600.
-  function heartbeatPillInfo(device) {
-    const age = Number(
-      device && device.last_heartbeat_age_s != null
-        ? device.last_heartbeat_age_s
-        : (device && device.last_signal_age_s != null ? device.last_signal_age_s : -1)
-    );
-    if (!Number.isFinite(age) || age < 0) {
-      return { kind: "unknown", label: "hb —", title: "No heartbeat recorded yet" };
-    }
-    if (age <= 120) {
-      return { kind: "ok", label: `hb ${fmtAgeShort(age)}`, title: `Last heartbeat ${fmtAgeShort(age)} ago` };
-    }
-    if (age <= 600) {
-      return { kind: "warn", label: `hb ${fmtAgeShort(age)}`, title: `Heartbeat idle ${fmtAgeShort(age)} ago — server will probe soon` };
-    }
-    return { kind: "stale", label: `hb ${fmtAgeShort(age)}`, title: `No heartbeat for ${fmtAgeShort(age)} — device may be offline` };
   }
 
   function maskPlatform(_raw) {
@@ -825,38 +712,6 @@
     el._t = setTimeout(() => { el.className = "toast"; }, 3200);
   }
 
-  // ------------------------------------------------------------------ csrf
-  const CSRF_COOKIE_NAME = "sentinel_csrf";
-  const CSRF_HEADER_NAME = "X-CSRF-Token";
-
-  function readCookie(name) {
-    try {
-      const needle = name + "=";
-      const parts = String(document.cookie || "").split(";");
-      for (let i = 0; i < parts.length; i++) {
-        const s = parts[i].trim();
-        if (s.startsWith(needle)) return decodeURIComponent(s.slice(needle.length));
-      }
-    } catch (_) {}
-    return "";
-  }
-
-  async function refreshCsrfToken() {
-    // Force-refresh the CSRF cookie from the server. Called after login and
-    // whenever a write gets rejected with code=csrf_invalid.
-    try {
-      const token = getToken();
-      const headers = {};
-      if (token) headers.Authorization = "Bearer " + token;
-      const r = await fetchWithDeadline(apiBase() + "/auth/csrf", { method: "GET", headers }, 8000);
-      if (!r.ok) return "";
-      const j = await r.json().catch(() => null);
-      return (j && j.csrf_token) ? String(j.csrf_token) : readCookie(CSRF_COOKIE_NAME);
-    } catch (_) {
-      return readCookie(CSRF_COOKIE_NAME);
-    }
-  }
-
   // ------------------------------------------------------------------ api
   async function api(path, opts) {
     opts = opts || {};
@@ -870,16 +725,8 @@
       body = JSON.stringify(body);
     }
     const method = String(opts.method || "GET").toUpperCase();
-    // Attach CSRF header to writes so the server's double-submit check passes
-    // for cookie-authenticated sessions. Bearer-token auth doesn't need it but
-    // sending the header is harmless.
-    if (method !== "GET" && method !== "HEAD" && method !== "OPTIONS") {
-      const csrf = readCookie(CSRF_COOKIE_NAME);
-      if (csrf && headers[CSRF_HEADER_NAME] == null) headers[CSRF_HEADER_NAME] = csrf;
-    }
     const retryable = opts.retryable != null ? !!opts.retryable : (method === "GET" || method === "HEAD");
     const retries = Number.isFinite(Number(opts.retries)) ? Math.max(0, Number(opts.retries)) : (retryable ? 2 : 0);
-    let csrfRetried = false;
     let lastErr;
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
@@ -896,26 +743,6 @@
           } catch (_) {}
           if (location.hash !== "#/login") location.hash = "#/login";
           throw new Error("401 Unauthorized or session expired");
-        }
-        if (r.status === 403 && !csrfRetried && method !== "GET" && method !== "HEAD" && method !== "OPTIONS") {
-          // Peek at the response body — if the server rejected us for a stale
-          // CSRF token, refresh it once and retry silently so routine writes
-          // don't bubble "403 forbidden" to the user for a solvable issue.
-          const peek = await r.clone().text().catch(() => "");
-          let isCsrf = false;
-          try {
-            const j = JSON.parse(peek);
-            isCsrf = (j && (j.code === "csrf_invalid" || /csrf/i.test(String(j.detail || ""))));
-          } catch (_) {}
-          if (isCsrf) {
-            csrfRetried = true;
-            const fresh = await refreshCsrfToken();
-            if (fresh) {
-              headers[CSRF_HEADER_NAME] = fresh;
-              await _sleep(100);
-              continue;
-            }
-          }
         }
         if (!r.ok) {
           if (retryable && attempt < retries && _isRetryableHttpStatus(Number(r.status))) {
@@ -1337,12 +1164,10 @@
     return j;
   }
 
-  async function loadMe(opts) {
+  async function loadMe() {
     try {
-      // Boot path uses a short ceiling so a slow API (DB lock, cold start) does
-      // not leave the SPA blank. Subsequent route-level auth checks still use api().
-      const timeoutMs = opts && opts.timeoutMs != null ? opts.timeoutMs : 8000;
-      state.me = await api("/auth/me", { timeoutMs, retries: 1 });
+      // Uses default API ceiling; slow Nginx/upstream still yields login page on failure.
+      state.me = await api("/auth/me");
     } catch (e) {
       state.me = null;
     }
@@ -1358,7 +1183,6 @@
       const h = await r.json();
       state.mqttConnected = !!h.mqtt_connected;
       state.health = h;
-      state.healthFetchedAt = Date.now();
     } catch {
       state.mqttConnected = false;
       state.health = null;
@@ -1463,11 +1287,8 @@
       setHtmlIfChanged(el, "");
       return;
     }
-    const h = state.health;
-    const smtpHidden = !Object.prototype.hasOwnProperty.call(h, "smtp");
-    const tgHidden = !Object.prototype.hasOwnProperty.call(h, "telegram");
-    const sm = h.smtp || {};
-    const tg = h.telegram || {};
+    const sm = state.health.smtp || {};
+    const tg = state.health.telegram || {};
     const mailOk = !!sm.configured && !!sm.worker_running;
     const tgOn = !!tg.enabled;
     const tgOk = tgOn && !!tg.worker_running;
@@ -1478,64 +1299,30 @@
     const mqLastUp = String(state.health.mqtt_last_connect_at || "");
     const mqLastDown = String(state.health.mqtt_last_disconnect_at || "");
     const mqLastReason = String(state.health.mqtt_last_disconnect_reason || "");
-    const ageSec =
-      state.healthFetchedAt > 0 ? Math.max(0, Math.round((Date.now() - state.healthFetchedAt) / 1000)) : null;
-    const staleHint = ageSec != null ? ` Health snapshot age ~${ageSec}s (browser polls /health).` : "";
-    const mqttLegHint =
-      " This pill is API→broker ingest (server-side), not your browser WebSocket.";
-    const mailTitle = smtpHidden
-      ? "Mail status not included in /health response — upgrade API or set HEALTH_PUBLIC_DETAIL=1 for full detail."
-      : sm.configured
-        ? (mailOk ? "Mail worker running — verification email can be sent" : "Mail channel configured but worker not running — check API logs")
-        : "Mail channel not configured on server";
-    const tgTitle = tgHidden
-      ? "Telegram status not included in /health response — upgrade API or set HEALTH_PUBLIC_DETAIL=1 for full detail."
-      : tgOn
-        ? (tgOk
-          ? (tgErr ? `Telegram worker up — last API error: ${tgErr}` : "Telegram worker running — events at min_level+ are queued")
-          : "Telegram enabled but worker not running — check API logs")
-        : "Telegram disabled — set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS (numeric chat id; start a chat with the bot first)";
-    const mqttTitle = (mqConn
+    const mailTitle = sm.configured
+      ? (mailOk ? "Mail worker running — verification email can be sent" : "Mail channel configured but worker not running — check API logs")
+      : "Mail channel not configured on server";
+    const tgTitle = tgOn
+      ? (tgOk
+        ? (tgErr ? `Telegram worker up — last API error: ${tgErr}` : "Telegram worker running — events at min_level+ are queued")
+        : "Telegram enabled but worker not running — check API logs")
+      : "Telegram disabled — set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS (numeric chat id; start a chat with the bot first)";
+    const mqttTitle = mqConn
       ? (mqDrop > 0
-        ? `MQTT ingest connected, but dropped ${mqDrop} message(s); queue depth=${mqQ}. last_up=${mqLastUp ? fmtTs(mqLastUp) : "—"}`
-        : `MQTT ingest connected; queue depth=${mqQ}. last_up=${mqLastUp ? fmtTs(mqLastUp) : "—"}`)
-      : `MQTT ingest disconnected — remote/device commands may fail until broker is back. last_down=${mqLastDown ? fmtTs(mqLastDown) : "—"} reason=${mqLastReason || "—"}`) +
-      staleHint +
-      mqttLegHint;
-    const mailPillClass = smtpHidden ? "neutral" : mailOk ? "ok" : sm.configured ? "warn" : "off";
-    const tgPillClass = tgHidden ? "neutral" : tgOk ? "ok" : tgOn ? "warn" : "off";
-    // DB pill (added in the reliability pass): shows the freshly-added
-    // /health.db probe — ok (fast), warn (slow), off (unreachable).
-    const db = h.db || null;
-    let dbPillClass = "neutral";
-    let dbTitle = "DB probe not reported by /health.";
-    if (db) {
-      const dbOk = !!db.ok;
-      const dbSlow = !!db.slow;
-      const dbLat = Number(db.latency_ms || 0);
-      dbPillClass = dbOk ? (dbSlow ? "warn" : "ok") : "off";
-      dbTitle = dbOk
-        ? (dbSlow
-          ? `SQLite reachable but slow (${dbLat}ms). Under load consider tuning SQLITE_BUSY_TIMEOUT_MS / scaling reads.`
-          : `SQLite reachable (${dbLat}ms).`)
-        : `SQLite probe failed${db.error ? `: ${db.error}` : ""}. Admin routes will degrade — check disk/host.`;
-    }
+        ? `MQTT connected, but ingest dropped ${mqDrop} message(s); queue depth=${mqQ}. last_up=${mqLastUp ? fmtTs(mqLastUp) : "—"}`
+        : `MQTT connected; ingest queue depth=${mqQ}. last_up=${mqLastUp ? fmtTs(mqLastUp) : "—"}`)
+      : `MQTT disconnected — check broker/TLS/network. last_down=${mqLastDown ? fmtTs(mqLastDown) : "—"} reason=${mqLastReason || "—"}`;
     setHtmlIfChanged(el, `
       <span class="health-pill ${mqConn ? (mqDrop > 0 ? "warn" : "ok") : "off"}" title="${escapeHtml(mqttTitle)}">MQTT</span>
-      <span class="health-pill ${dbPillClass}" title="${escapeHtml(dbTitle)}">DB</span>
-      <span class="health-pill ${mailPillClass}" title="${escapeHtml(mailTitle)}">MAIL</span>
-      <span class="health-pill ${tgPillClass}" title="${escapeHtml(tgTitle)}">TG</span>`);
+      <span class="health-pill ${mailOk ? "ok" : sm.configured ? "warn" : "off"}" title="${escapeHtml(mailTitle)}">MAIL</span>
+      <span class="health-pill ${tgOk ? "ok" : tgOn ? "warn" : "off"}" title="${escapeHtml(tgTitle)}">TG</span>`);
   }
 
   function renderMqttDot() {
     const dot = $("#mqttDot");
     if (!dot) return;
     dot.className = "dot-status " + (state.mqttConnected ? "ok" : "bad");
-    const age =
-      state.healthFetchedAt > 0 ? Math.max(0, Math.round((Date.now() - state.healthFetchedAt) / 1000)) : null;
-    dot.title = state.mqttConnected
-      ? `API MQTT ingest up (server→broker). Snapshot ~${age != null ? age + "s" : "?" } old — see /health poll.`
-      : `API MQTT ingest down. Snapshot ~${age != null ? age + "s" : "?" } old — remote commands may fail.`;
+    dot.title = state.mqttConnected ? "MQTT up" : "MQTT down";
   }
 
   function setCrumb(text) { const el = $("#crumb"); if (el) el.textContent = text; }
@@ -1606,161 +1393,39 @@
   function clearRouteTickers() {
     const ticks = window.__routeTickers;
     if (!ticks) return;
-    for (const entry of ticks.values()) {
-      // Entries are {tid, debounceTid, baseMs, fn, run, routeSeq, unsub}
-      // post-refactor. Legacy code paths might still put a raw timer id in
-      // the map; handle both. The unsub also tears down the stream-bus
-      // subscription so events arriving after a route change don't fire into
-      // a stale closure and schedule work against the old routeSeq.
-      try {
-        if (entry && typeof entry === "object" && entry.tid !== undefined) {
-          clearTimeout(entry.tid);
-          if (entry.debounceTid) clearTimeout(entry.debounceTid);
-          if (typeof entry.unsub === "function") entry.unsub();
-        } else {
-          clearTimeout(entry);
-        }
-      } catch (_) {}
+    for (const t of ticks.values()) {
+      try { clearTimeout(t); } catch (_) {}
     }
     ticks.clear();
   }
-  /**
-   * Tiny stream event bus. Populated by the WS/SSE read loops below (every
-   * decoded event is emitted here). Route handlers subscribe via
-   * `scheduleRouteTicker(..., { triggers: [...] })` to get an immediate refresh
-   * on matching events. This complements the slow periodic ticker: the ticker
-   * catches drift, the bus catches real changes (device.state, alarm, group).
-   */
-  window.__streamBus = window.__streamBus || (() => {
-    const subs = new Set();
-    return {
-      subscribe(fn) { subs.add(fn); return () => subs.delete(fn); },
-      emit(ev) {
-        if (!ev) return;
-        for (const fn of Array.from(subs)) {
-          try { fn(ev); } catch (_) {}
-        }
-      },
-      clear() { subs.clear(); },
-    };
-  })();
-  /** Test whether an event matches any of a list of prefix or wildcard patterns. */
-  function eventMatchesAny(ev, patterns) {
-    if (!patterns || !patterns.length) return false;
-    const t = String((ev && ev.event_type) || "");
-    const c = String((ev && ev.category) || "");
-    for (const p of patterns) {
-      if (!p) continue;
-      if (p === "*") return true;
-      if (p.endsWith(".*")) {
-        const head = p.slice(0, -2);
-        if (t === head || t.startsWith(head + ".")) return true;
-      } else if (p.startsWith("cat:")) {
-        if (c === p.slice(4)) return true;
-      } else if (t === p) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  /**
-   * Multiplier applied to every route ticker's base interval when the live
-   * stream is healthy. The stream pushes real-time deltas, so re-pulling the
-   * same REST endpoint every 10-22s is redundant — we slow to a "drift
-   * correction" cadence instead. Flips back to 1× the instant the stream
-   * drops or a tab-focus triggers a recheck.
-   */
-  const ROUTE_TICKER_STREAM_SLOWDOWN = 3;
-  function effectiveRouteInterval(baseMs) {
-    const streamOk = !!(window.__streamHealth && window.__streamHealth.healthy);
-    if (!streamOk) return baseMs;
-    return Math.max(baseMs, Math.floor(baseMs * ROUTE_TICKER_STREAM_SLOWDOWN));
-  }
-  /**
-   * @param {number} routeSeq  Current route sequence (timers auto-cancel on route change)
-   * @param {string} key       Unique key per (route, view)
-   * @param {Function} fn      Async loader
-   * @param {number} intervalMs Base periodic interval
-   * @param {Object} [options]
-   *   options.triggers  — array of event_type patterns that trigger an
-   *                       immediate (debounced) refresh. Supports exact match,
-   *                       "*" for any, "device.*" prefix wildcards, and
-   *                       "cat:auth" to match by event.category.
-   *   options.triggerDebounceMs — debounce coalesce window (default 400ms).
-   */
-  function scheduleRouteTicker(routeSeq, key, fn, intervalMs, options) {
+  function scheduleRouteTicker(routeSeq, key, fn, intervalMs) {
     window.__routeTickers = window.__routeTickers || new Map();
     const ticks = window.__routeTickers;
     const k = String(key || "");
     let running = false;
-    const baseMs = Math.max(1000, intervalMs);
-    const opts = options || {};
-    const triggers = Array.isArray(opts.triggers) ? opts.triggers : null;
-    const debounceMs = Math.max(100, opts.triggerDebounceMs || 400);
-    const entry = { baseMs, fn, run: null, routeSeq, tid: null, debounceTid: null, unsub: null };
-
     const run = async () => {
       if (!isRouteCurrent(routeSeq)) return;
       if (document.visibilityState !== "visible") {
-        entry.tid = setTimeout(run, effectiveRouteInterval(baseMs));
-        ticks.set(k, entry);
+        const tid = setTimeout(run, intervalMs);
+        ticks.set(k, tid);
         return;
       }
       if (running) {
-        entry.tid = setTimeout(run, effectiveRouteInterval(baseMs));
-        ticks.set(k, entry);
+        const tid = setTimeout(run, intervalMs);
+        ticks.set(k, tid);
         return;
       }
       running = true;
       try { await fn(); } catch (_) {}
       running = false;
       if (!isRouteCurrent(routeSeq)) return;
-      entry.tid = setTimeout(run, effectiveRouteInterval(baseMs));
-      ticks.set(k, entry);
+      const tid = setTimeout(run, intervalMs);
+      ticks.set(k, tid);
     };
-    entry.run = run;
-
     const old = ticks.get(k);
-    if (old && typeof old === "object") {
-      try { clearTimeout(old.tid); } catch (_) {}
-      try { clearTimeout(old.debounceTid); } catch (_) {}
-      try { if (typeof old.unsub === "function") old.unsub(); } catch (_) {}
-    } else if (old) {
-      try { clearTimeout(old); } catch (_) {}
-    }
-    entry.tid = setTimeout(run, effectiveRouteInterval(baseMs));
-
-    if (triggers && triggers.length && window.__streamBus) {
-      entry.unsub = window.__streamBus.subscribe((ev) => {
-        if (!isRouteCurrent(routeSeq)) return;
-        if (document.visibilityState !== "visible") return;
-        if (!eventMatchesAny(ev, triggers)) return;
-        // Debounce coalesces bursts (e.g. 20 alarm.fanout events in one tick).
-        if (entry.debounceTid) return;
-        entry.debounceTid = setTimeout(() => {
-          entry.debounceTid = null;
-          try { clearTimeout(entry.tid); } catch (_) {}
-          entry.tid = setTimeout(run, 0);
-        }, debounceMs);
-      });
-    }
-
-    ticks.set(k, entry);
-  }
-  /**
-   * Recompute all visible route tickers' next-fire time based on the current
-   * stream health. Called from markStreamHealthy / markStreamUnhealthy so the
-   * new cadence takes effect without waiting a full old interval.
-   */
-  function rearmVisibleRouteTickersForStreamHealth() {
-    const ticks = window.__routeTickers;
-    if (!ticks) return;
-    for (const entry of ticks.values()) {
-      if (!entry || typeof entry !== "object" || !entry.run) continue;
-      try { clearTimeout(entry.tid); } catch (_) {}
-      entry.tid = setTimeout(entry.run, effectiveRouteInterval(entry.baseMs));
-    }
+    if (old) { try { clearTimeout(old); } catch (_) {} }
+    const first = setTimeout(run, intervalMs);
+    ticks.set(k, first);
   }
 
   async function renderRoute() {
@@ -3714,11 +3379,7 @@
         renderGroups();
       } catch (_) {}
     };
-    scheduleRouteTicker(routeSeq, "overview-live", refreshOverviewLive, OVERVIEW_LIVE_MS, {
-      // Overview shows device presence + group counts — refresh on any
-      // device/alarm/group transition so the cards don't lag behind reality.
-      triggers: ["device.*", "alarm.*", "group.*", "device_state.*"],
-    });
+    scheduleRouteTicker(routeSeq, "overview-live", refreshOverviewLive, OVERVIEW_LIVE_MS);
     const ovOwnerInp = $("#ovOwnerFilter", view);
     const ovOwnerClr = $("#ovOwnerClear", view);
     if (ovOwnerInp && state.me && state.me.role === "superadmin") {
@@ -4070,9 +3731,7 @@
       ids = rows.map((d) => String(d.device_id || "")).filter(Boolean);
       renderGroupDevices();
     };
-    scheduleRouteTicker(routeSeq, `group-live-${g}`, refreshGroupLive, 10000, {
-      triggers: ["device.*", "alarm.*", "device_state.*", "group.*"],
-    });
+    scheduleRouteTicker(routeSeq, `group-live-${g}`, refreshGroupLive, 10000);
   });
 
   // Device list (no id) + device detail
@@ -4360,11 +4019,7 @@
       requestAnimationFrame(() => {
         setTimeout(() => { void loadDevicesAndHints(); }, 0);
       });
-      scheduleRouteTicker(routeSeq, "devices-list-live", loadDevicesAndHints, 22000, {
-        // Devices list needs to pick up claims, ownership, profile, and
-        // presence edges in near-real-time while still throttling via ticker.
-        triggers: ["device.*", "alarm.*", "ota.*", "device_state.*"],
-      });
+      scheduleRouteTicker(routeSeq, "devices-list-live", loadDevicesAndHints, 22000);
       return;
     }
     const isSuperViewer = !!(state.me && state.me.role === "superadmin");
@@ -4509,7 +4164,6 @@
               ${d.display_label ? `<div class="device-id-sub mono">${escapeHtml(id)}</div>` : ""}
             </div>
             <span class="badge ${dm.on ? "online" : "offline"}" id="devOnlineBadge">${dm.on ? "online" : "offline"}</span>
-            ${(() => { const hb = heartbeatPillInfo(d); return `<span class="chip device-hb-chip device-hb-chip--${hb.kind}" id="devHbChip" title="${escapeHtml(hb.title)}">${escapeHtml(hb.label)}</span>`; })()}
             <span class="chip" id="devReasonChip">${escapeHtml(reasonEn[dm.reason] || dm.reason)}</span>
             ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
           </div>
@@ -4622,12 +4276,7 @@
         <div class="device-drawer__body danger-zone-body">
           <p class="muted danger-zone-compact-lead">Removes this device from your tenant and sends <span class="mono">unclaim_reset</span> when online. Re-add from Activate.</p>
           <div class="danger-zone-single-action">
-            <button class="btn danger sm danger-zone-unbind-btn" type="button" id="deleteReset" ${can("can_send_command") && !d.is_shared && canOperateThisDevice ? "" : "disabled"} title="${(() => {
-              if (!canOperateThisDevice) return "Operate access required";
-              if (!can("can_send_command")) return "can_send_command required";
-              if (d.is_shared) return "Not available on shared devices";
-              return "";
-            })()}">Unbind &amp; reset</button>
+            <button class="btn danger sm danger-zone-unbind-btn" type="button" id="deleteReset" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Unbind &amp; reset</button>
           </div>
         </div>
       </details>
@@ -4659,13 +4308,11 @@
             <label class="field"><span>Loud (min)</span><input id="tpLoudMin" type="number" min="0.5" max="5" step="0.5" value="3" title="Remote / #2 sibling siren length" /></label>
             <label class="field"><span>Panic sibling (min)</span><input id="tpPanicMin" type="number" min="0.5" max="10" step="0.5" value="5" title="Panic MQTT sibling siren length" /></label>
             <div class="row wide" style="justify-content:flex-end;flex-basis:100%">
-              <button class="btn secondary btn-tap" type="button" id="tpPreviewSiblings" title="Show which devices would receive group fan-out right now">Preview siblings</button>
               <button class="btn secondary btn-tap" type="button" id="tpRefresh">Refresh</button>
               <button class="btn btn-tap" type="button" id="tpSave">Save</button>
             </div>
           </div>
-          <p class="muted" id="tpStatus" style="margin-top:8px;min-height:1.3em"></p>
-          <div id="tpSiblingBox" class="muted" style="margin-top:6px"></div>` : `<p class="muted">Requires <span class="mono">can_send_command</span> and <strong>operate</strong> access on this device.</p>`}
+          <p class="muted" id="tpStatus" style="margin-top:8px;min-height:1.3em"></p>` : `<p class="muted">Requires <span class="mono">can_send_command</span> and <strong>operate</strong> access on this device.</p>`}
         </div>
       </details>`}
 
@@ -4678,13 +4325,6 @@
       if (onlineBadge) {
         onlineBadge.textContent = m.on ? "online" : "offline";
         onlineBadge.className = `badge ${m.on ? "online" : "offline"}`;
-      }
-      const hbChip = $("#devHbChip", view);
-      if (hbChip) {
-        const info = heartbeatPillInfo(dev);
-        hbChip.textContent = info.label;
-        hbChip.className = `chip device-hb-chip device-hb-chip--${info.kind}`;
-        hbChip.title = info.title;
       }
       const reasonChip = $("#devReasonChip", view);
       if (reasonChip) reasonChip.textContent = String(reasonEn[m.reason] || m.reason);
@@ -4709,14 +4349,7 @@
       if (!isRouteCurrent(routeSeq) || !latest) return;
       d = latest;
       patchDeviceLive(latest);
-    }, 12000, {
-      // Device detail refreshes on any relevant event for THIS device id;
-      // the bus filter is additional — the trigger list matches broadly
-      // because event-type nomenclature has drifted over releases. The
-      // per-device match is the ticker's own cache key, so other devices'
-      // events just trigger a cheap (no-op when cache still warm) pull.
-      triggers: ["device.*", "alarm.*", "ota.*", "ack.*", "device_state.*"],
-    });
+    }, 12000);
     if (isSuperViewer) {
       const det = $("#mqttMsgDetails", view);
       const box = $("#devMsgsList", view);
@@ -4782,9 +4415,6 @@
         if (!confirm("Delete this device from current account records? You can re-add and reconfigure later.")) return;
         const typed = String(prompt(`Type device ID to confirm delete/reset:\n${id}`) || "").trim();
         if (typed.toUpperCase() !== String(id).toUpperCase()) { toast("Confirmation mismatch", "err"); return; }
-        deleteResetBtn.disabled = true;
-        toast("Unbind in progress (server may wait ~3s for device ack)…", "ok");
-        await new Promise((r) => requestAnimationFrame(() => r()));
         try {
           const dr = await api(`/devices/${encodeURIComponent(id)}/delete-reset`, {
             method: "POST",
@@ -4800,7 +4430,6 @@
           );
           location.hash = "#/devices";
         } catch (e) { toast(e.message || e, "err"); }
-        finally { deleteResetBtn.disabled = false; }
       });
     }
     const sendCmdBtn = $("#sendCmd");
@@ -4878,7 +4507,6 @@
           wifiApplyBtn.disabled = true;
           setWifiProgress(10);
           if (st) st.textContent = "Creating provision task…";
-          await new Promise((r) => requestAnimationFrame(() => r()));
           const chain = [];
           const cGi = $("#wifiChainGetInfo", view);
           const cPi = $("#wifiChainPing", view);
@@ -4894,14 +4522,9 @@
           });
           setWifiProgress(r.progress || 35);
           if (st) st.textContent = `Task ${r.task_id} running…`;
-          void pollWifiTask(r.task_id).finally(() => {
-            wifiApplyBtn.disabled = false;
-          });
-        } catch (e) {
-          toast(e.message || e, "err");
-          if (st) st.textContent = String(e.message || e);
-          wifiApplyBtn.disabled = false;
-        }
+          await pollWifiTask(r.task_id);
+        } catch (e) { toast(e.message || e, "err"); if (st) st.textContent = String(e.message || e); }
+        finally { wifiApplyBtn.disabled = false; }
       });
     }
     const tpPanicLocal = $("#tpPanicLocal");
@@ -4965,37 +4588,6 @@
         }
       });
       loadTriggerPolicy();
-    }
-
-    const tpPreviewBtn = $("#tpPreviewSiblings");
-    const tpSiblingBox = $("#tpSiblingBox");
-    if (tpPreviewBtn && tpSiblingBox) {
-      tpPreviewBtn.addEventListener("click", async () => {
-        tpPreviewBtn.disabled = true;
-        setChildMarkup(tpSiblingBox, `<span class="muted">Checking siblings…</span>`);
-        try {
-          const r = await api(`/devices/${encodeURIComponent(id)}/siblings-preview`, { timeoutMs: 12000 });
-          const group = r.notification_group || "";
-          const zone = r.zone || "";
-          const count = Number(r.target_count || 0);
-          const eligible = Number(r.eligible_total || count);
-          const capped = r.fanout_capped ? ` <span class="badge warn">capped at ${r.fanout_max}</span>` : "";
-          let reason = "";
-          if (!group) reason = ` <span class="badge offline">notification_group empty — no siblings will fire</span>`;
-          else if (count === 0) reason = ` <span class="badge offline">no peer devices share this group</span>`;
-          const items = Array.isArray(r.targets) ? r.targets.slice(0, 25) : [];
-          const list = items.length
-            ? `<ul class="kv" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:4px 10px;margin:6px 0 0;padding:0;list-style:none">${items
-                .map((t) => `<li class="mono" style="font-size:12px">${escapeHtml(String(t.device_id || "?"))}${t.zone ? ` · ${escapeHtml(String(t.zone))}` : ""}</li>`)
-                .join("")}${eligible > items.length ? `<li class="muted" style="grid-column:1 / -1">… +${eligible - items.length} more</li>` : ""}</ul>`
-            : "";
-          setChildMarkup(tpSiblingBox, `<div>Group <span class="mono">${escapeHtml(group || "(empty)")}</span> · zone <span class="mono">${escapeHtml(zone || "(none)")}</span> · <strong>${count}</strong> target${count === 1 ? "" : "s"} of ${eligible} eligible${capped}${reason}</div>${list}`);
-        } catch (e) {
-          setChildMarkup(tpSiblingBox, `<span class="badge offline">${escapeHtml(String(e.message || e))}</span>`);
-        } finally {
-          tpPreviewBtn.disabled = false;
-        }
-      });
     }
 
     const shareListEl = $("#shareList");
@@ -5502,8 +5094,7 @@
     const BUFFER_MAX = 180;
     const RENDER_LIMIT = 150;
     let evRenderTimer = 0;
-    let evReconnectBackoffMs = 500;
-    let evStallTimer = null;
+    let evReconnectBackoffMs = 800;
 
     function badgeClass(lvl) {
       return ({
@@ -5621,17 +5212,9 @@
     }
 
     function closeStream() {
-      if (evStallTimer) {
-        try { clearInterval(evStallTimer); } catch (_) {}
-        evStallTimer = null;
-      }
       if (window.__evReconnectTimer) {
         try { clearTimeout(window.__evReconnectTimer); } catch (_) {}
         window.__evReconnectTimer = 0;
-      }
-      if (window.__evWS) {
-        try { window.__evWS.close(); } catch (_) {}
-        window.__evWS = null;
       }
       if (window.__evSSE) {
         try { window.__evSSE.close(); } catch (_) {}
@@ -5641,13 +5224,13 @@
         try { window.__evFetchAbort.abort(); } catch (_) {}
         window.__evFetchAbort = null;
       }
-      markStreamUnhealthy();
       const live = $("#evLive");
       if (live) { live.textContent = "Offline"; live.className = "badge offline"; }
     }
     /**
-     * Live events: prefer WebSocket (/events/ws); fall back to fetch()+SSE stream (cookie/JWT).
-     * Force SSE only: localStorage.setItem("croc.events.transport","sse")
+     * Live events: use fetch() + ReadableStream instead of EventSource so we can send
+     * Authorization (JWT never appears in URL query — fewer proxy/logging issues).
+     * Server still emits ping keepalives for buffered proxies.
      */
     function openStream() {
       if (!isRouteCurrent(navTok)) return;
@@ -5657,222 +5240,72 @@
       p.set("backlog", String(Math.min(100, slack)));
       const qs = p.toString();
       const tok = getToken();
+      const ac = new AbortController();
+      window.__evFetchAbort = ac;
+      const shim = {
+        readyState: EventSource.CONNECTING,
+        close() {
+          try { ac.abort(); } catch (_) {}
+          window.__evFetchAbort = null;
+          this.readyState = EventSource.CLOSED;
+        },
+      };
+      window.__evSSE = shim;
 
       const scheduleReconnect = () => {
         if (!isRouteCurrent(navTok) || paused || window.__evReconnectTimer) return;
-        const wait = evReconnectBackoffMs + Math.floor(Math.random() * 400);
+        const wait = evReconnectBackoffMs + Math.floor(Math.random() * 480);
         window.__evReconnectTimer = setTimeout(() => {
           window.__evReconnectTimer = 0;
           if (!isRouteCurrent(navTok) || paused) return;
           openStream();
         }, wait);
-        evReconnectBackoffMs = Math.min(15000, Math.floor(evReconnectBackoffMs * 1.45));
+        evReconnectBackoffMs = Math.min(8000, Math.floor(evReconnectBackoffMs * 1.5));
       };
 
-      function startSseFetch() {
-        const ac = new AbortController();
-        window.__evFetchAbort = ac;
-        const shim = {
-          readyState: EventSource.CONNECTING,
-          close() {
-            try { ac.abort(); } catch (_) {}
-            window.__evFetchAbort = null;
-            this.readyState = EventSource.CLOSED;
-          },
+      const run = async () => {
+        const url = apiBase() + "/events/stream" + (qs ? "?" + qs : "");
+        const hdrs = {
+          Accept: "text/event-stream",
+          "Cache-Control": "no-store",
         };
-        window.__evSSE = shim;
-        const run = async () => {
-          const url = apiBase() + "/events/stream" + (qs ? "?" + qs : "");
-          const hdrs = {
-            Accept: "text/event-stream",
-            "Cache-Control": "no-store",
-          };
-          if (tok) hdrs.Authorization = "Bearer " + tok;
-          try {
-            let lastChunkAt = Date.now();
-            const r = await fetch(url, {
-              method: "GET",
-              credentials: "include",
-              headers: hdrs,
-              signal: ac.signal,
-              cache: "no-store",
-            });
-            if (!isRouteCurrent(navTok)) return;
-            if (!r.ok) {
-              const errText = await r.text().catch(() => "");
-              throw new Error(errText || String(r.status));
-            }
-            if (!r.body || typeof r.body.getReader !== "function") {
-              throw new Error("Event stream unsupported in this browser");
-            }
-            evReconnectBackoffMs = 500;
-            shim.readyState = EventSource.OPEN;
-            markStreamHealthy("sse");
-            const liveOn = $("#evLive");
-            if (liveOn) {
-              liveOn.textContent = "Live";
-              liveOn.className = "badge online";
-              liveOn.title = "Live stream connected (SSE)";
-            }
-            if (evStallTimer) {
-              try { clearInterval(evStallTimer); } catch (_) {}
-              evStallTimer = null;
-            }
-            evStallTimer = setInterval(() => {
-              if (paused || ac.signal.aborted || !isRouteCurrent(navTok)) return;
-              if (shim.readyState !== EventSource.OPEN) return;
-              if (Date.now() - lastChunkAt >= SSE_STALL_ABORT_MS) {
-                try {
-                  ac.abort();
-                } catch (_) {}
-              }
-            }, 4000);
-            await pumpSseBody(
-              r.body.getReader(),
-              ac.signal,
-              (kind, payload) => {
-                if (kind === "ping") return;
-                if (!isRouteCurrent(navTok)) return;
-                try {
-                  const ev = JSON.parse(payload);
-                  noteStreamActivity();
-                  if (ev.event_type === "stream.hello") return;
-                  pushEvent(ev);
-                  // Fan out to the stream bus so route handlers can do
-                  // targeted refreshes (see scheduleRouteTicker triggers).
-                  try { window.__streamBus && window.__streamBus.emit(ev); } catch (_) {}
-                } catch (_) {}
-              },
-              () => {
-                lastChunkAt = Date.now();
-              },
-            );
-            if (evStallTimer) {
-              try { clearInterval(evStallTimer); } catch (_) {}
-              evStallTimer = null;
-            }
-            if (ac.signal.aborted || !isRouteCurrent(navTok)) return;
-            shim.readyState = EventSource.CLOSED;
-            markStreamUnhealthy();
-            if (!paused && isRouteCurrent(navTok)) {
-              evReconnectBackoffMs = 500;
-              const live = $("#evLive");
-              if (live) {
-                live.textContent = "Reconnecting…";
-                live.className = "badge offline";
-              }
-              scheduleReconnect();
-            }
-          } catch (e) {
-            if (evStallTimer) {
-              try { clearInterval(evStallTimer); } catch (_) {}
-              evStallTimer = null;
-            }
-            if (e && e.name === "AbortError") {
-              markStreamUnhealthy();
-              return;
-            }
-            if (!isRouteCurrent(navTok)) {
-              markStreamUnhealthy();
-              return;
-            }
-            shim.readyState = EventSource.CLOSED;
-            markStreamUnhealthy();
-            const live = $("#evLive");
-            if (live && isRouteCurrent(navTok)) {
-              live.textContent = "Reconnecting…";
-              live.className = "badge offline";
-            }
-            if (!paused && isRouteCurrent(navTok)) scheduleReconnect();
+        if (tok) hdrs.Authorization = "Bearer " + tok;
+        try {
+          const r = await fetch(url, {
+            method: "GET",
+            credentials: "include",
+            headers: hdrs,
+            signal: ac.signal,
+          });
+          if (!isRouteCurrent(navTok)) return;
+          if (!r.ok) {
+            const errText = await r.text().catch(() => "");
+            throw new Error(errText || String(r.status));
           }
-        };
-        void run();
-      }
-
-      const tryWs =
-        localStorage.getItem("croc.events.transport") !== "sse" && typeof WebSocket !== "undefined";
-      if (tryWs) {
-        const wsUrl = apiBaseToWsBase(apiBase()) + "/events/ws" + (qs ? "?" + qs : "");
-        const ws = new WebSocket(wsUrl);
-        window.__evWS = ws;
-        let wsOpened = false;
-        const wsTimer = setTimeout(() => {
-          try { ws.close(); } catch (_) {}
-        }, 4800);
-        const shimWs = {
-          readyState: EventSource.CONNECTING,
-          close() {
-            clearTimeout(wsTimer);
-            try { ws.close(); } catch (_) {}
-            window.__evWS = null;
-            this.readyState = EventSource.CLOSED;
-          },
-        };
-        window.__evSSE = shimWs;
-        let lastChunkAt = Date.now();
-        ws.onopen = () => {
-          clearTimeout(wsTimer);
-          wsOpened = true;
-          evReconnectBackoffMs = 500;
-          shimWs.readyState = EventSource.OPEN;
-          markStreamHealthy("ws");
+          if (!r.body || typeof r.body.getReader !== "function") {
+            throw new Error("Event stream unsupported in this browser");
+          }
+          evReconnectBackoffMs = 800;
+          shim.readyState = EventSource.OPEN;
           const liveOn = $("#evLive");
           if (liveOn) {
             liveOn.textContent = "Live";
             liveOn.className = "badge online";
-            liveOn.title = "Live stream (WebSocket)";
+            liveOn.title = "Live stream connected";
           }
-          if (evStallTimer) {
-            try { clearInterval(evStallTimer); } catch (_) {}
-            evStallTimer = null;
-          }
-          evStallTimer = setInterval(() => {
-            if (paused || !isRouteCurrent(navTok)) return;
-            if (shimWs.readyState !== EventSource.OPEN) return;
-            if (Date.now() - lastChunkAt >= SSE_STALL_ABORT_MS) {
-              try { ws.close(); } catch (_) {}
-            }
-          }, 4000);
-        };
-        ws.onmessage = (mev) => {
-          lastChunkAt = Date.now();
-          noteStreamActivity();
-          let j;
-          try {
-            j = JSON.parse(mev.data);
-          } catch (_) {
-            return;
-          }
-          if (!isRouteCurrent(navTok)) return;
-          if (j.type === "ping" || j.type === "hello") return;
-          if (j.type === "event" && j.ev) {
-            pushEvent(j.ev);
-            try { window.__streamBus && window.__streamBus.emit(j.ev); } catch (_) {}
-            return;
-          }
-          if (j.event_type === "stream.hello") return;
-          if (j.summary || j.event_type) {
-            pushEvent(j);
-            try { window.__streamBus && window.__streamBus.emit(j); } catch (_) {}
-          }
-        };
-        ws.onclose = () => {
-          clearTimeout(wsTimer);
-          if (evStallTimer) {
-            try { clearInterval(evStallTimer); } catch (_) {}
-            evStallTimer = null;
-          }
-          window.__evWS = null;
-          shimWs.readyState = EventSource.CLOSED;
-          markStreamUnhealthy();
-          if (!wsOpened) {
-            window.__evSSE = null;
-            if (!isRouteCurrent(navTok) || paused) return;
-            startSseFetch();
-            return;
-          }
+          await pumpSseBody(r.body.getReader(), ac.signal, (kind, payload) => {
+            if (kind === "ping") return;
+            if (!isRouteCurrent(navTok)) return;
+            try {
+              const ev = JSON.parse(payload);
+              if (ev.event_type === "stream.hello") return;
+              pushEvent(ev);
+            } catch (_) {}
+          });
+          if (ac.signal.aborted || !isRouteCurrent(navTok)) return;
+          shim.readyState = EventSource.CLOSED;
           if (!paused && isRouteCurrent(navTok)) {
-            evReconnectBackoffMs = 500;
+            evReconnectBackoffMs = 800;
             const live = $("#evLive");
             if (live) {
               live.textContent = "Reconnecting…";
@@ -5880,12 +5313,19 @@
             }
             scheduleReconnect();
           }
-        };
-        ws.onerror = () => {};
-        return;
-      }
-
-      startSseFetch();
+        } catch (e) {
+          if (e && e.name === "AbortError") return;
+          if (!isRouteCurrent(navTok)) return;
+          shim.readyState = EventSource.CLOSED;
+          const live = $("#evLive");
+          if (live && isRouteCurrent(navTok)) {
+            live.textContent = "Reconnecting…";
+            live.className = "badge offline";
+          }
+          if (!paused && isRouteCurrent(navTok)) scheduleReconnect();
+        }
+      };
+      void run();
     }
 
     $("#evPause").addEventListener("click", () => {
@@ -7111,56 +6551,19 @@
   }
 
   // ------------------------------------------------------------------ boot
-  function renderBootSplash() {
-    const v = document.getElementById("view");
-    if (!v) return;
-    try {
-      v.innerHTML = `
-        <div class="boot-splash" role="status" aria-live="polite">
-          <div class="boot-splash__ring" aria-hidden="true"></div>
-          <p class="boot-splash__title">Loading console…</p>
-          <p class="boot-splash__hint muted">If this stays visible for 10+ seconds, the API is unreachable.</p>
-        </div>`;
-    } catch (_) {}
-  }
-
-  function _bootPanic(err) {
-    // Last-resort UI if boot() itself throws before it could render anything.
-    // Mirrors the static boot-error state the inline <body> guard sets.
-    try {
-      document.body.setAttribute("data-boot-error", "1");
-      const msg = (err && (err.message || String(err))) || "Unknown error";
-      const v = document.getElementById("view");
-      if (v) {
-        v.innerHTML =
-          `<div class="card"><h2>Console failed to start</h2>` +
-          `<p class="muted">${String(msg).replace(/[<>]/g, "")}</p>` +
-          `<p class="muted"><button class="btn sm" onclick="location.reload()">Reload</button> ` +
-          `or <a href="#/login">Sign in</a>.</p></div>`;
-      }
-    } catch (_) {}
-  }
-
   async function boot() {
-    // Replace the inline static splash with the dynamic one — same visual, but
-    // now owned by JS so renderRoute() can cleanly swap it out.
-    renderBootSplash();
-    try { initTheme(); } catch (e) { _bootPanic(e); return; }
+    initTheme();
 
-    const menuBtn = document.getElementById("menuBtn");
-    if (menuBtn) menuBtn.addEventListener("click", () => toggleNav());
-    const sbb = document.getElementById("sidebarBackdrop");
-    if (sbb) sbb.addEventListener("click", () => toggleNav(false));
+    $("#menuBtn").addEventListener("click", () => toggleNav());
+    $("#sidebarBackdrop").addEventListener("click", () => toggleNav(false));
     const railT = document.getElementById("sidebarRailToggle");
     if (railT) railT.addEventListener("click", () => toggleSidebarRail());
     window.addEventListener("resize", syncNavForViewport);
     window.addEventListener("orientationchange", syncNavForViewport);
-    const themeBtn = document.getElementById("themeBtn");
-    if (themeBtn) themeBtn.addEventListener("click", () => {
+    $("#themeBtn").addEventListener("click", () => {
       setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
     });
-    const logoutBtn = document.getElementById("logoutBtn");
-    if (logoutBtn) logoutBtn.addEventListener("click", async () => {
+    $("#logoutBtn").addEventListener("click", async () => {
       try {
         await fetchWithDeadline(apiBase() + "/auth/logout", { method: "POST" }, 12000);
       } catch (_) {}
@@ -7170,8 +6573,7 @@
       location.hash = "#/login";
       renderAuthState();
     });
-    const refreshBtn = document.getElementById("refreshBtn");
-    if (refreshBtn) refreshBtn.addEventListener("click", () => renderRoute());
+    $("#refreshBtn").addEventListener("click", () => renderRoute());
 
     document.addEventListener("click", (ev) => {
       const b = ev.target.closest(".btn-tap");
@@ -7182,33 +6584,11 @@
       } catch (_) {}
     }, true);
 
-    try {
-      await loadMe();
-    } catch (_) {
-      state.me = null;
-    }
-    // If we have a live session, make sure the CSRF cookie/header are in sync
-    // BEFORE any route tries to do a write. Safe to fire-and-forget.
-    if (state.me) {
-      refreshCsrfToken().catch(() => {});
-    }
+    await loadMe();
     syncNavForViewport();
     try { applySidebarRail(); } catch (_) {}
-    if (!location.hash) {
-      location.hash = state.me ? "#/overview" : "#/login";
-    } else {
-      try {
-        await renderRoute();
-      } catch (err) {
-        const v = document.getElementById("view");
-        if (v) {
-          v.innerHTML = `<div class="card"><h2>Console failed to start</h2><p class="muted">${String((err && err.message) || err || "")}</p>
-          <p class="muted">Try <button class="btn sm" id="bootRetry">retry</button> or open the login page directly: <a href="#/login">Sign in</a>.</p></div>`;
-          const rb = document.getElementById("bootRetry");
-          if (rb) rb.addEventListener("click", () => location.reload());
-        }
-      }
-    }
+    if (!location.hash) location.hash = state.me ? "#/overview" : "#/login";
+    else renderRoute();
     await loadHealth().catch(() => {});
     window.addEventListener("online", () => {
       loadHealth().catch(() => {});
@@ -7248,9 +6628,5 @@
     document.documentElement.classList.toggle("tab-hidden", document.visibilityState === "hidden");
   }
 
-  document.addEventListener("DOMContentLoaded", () => {
-    // Wrap the top-level boot so an async throw in any preboot wiring surfaces
-    // the retry card instead of leaving a silent splash.
-    Promise.resolve().then(boot).catch(_bootPanic);
-  });
+  document.addEventListener("DOMContentLoaded", boot);
 })();
