@@ -57,21 +57,32 @@ def register_routers(app: FastAPI) -> None:
 
     app.include_router(_ui_mounts_router)
 
-    # Phase-64 / 72: auth signup + recovery split into three halves —
-    #   * routers.auth_signup          — 7 signup/activate/approval routes
-    #                                    (3 schemas)
-    #   * routers.auth_recovery        — offline RSA-blob password reset flow
-    #                                    (3 routes, 2 schemas, 6 helpers)
-    #   * routers.auth_recovery_email  — email-OTP password reset flow
-    #                                    (4 routes, 2 schemas)
-    # All are unauthenticated-by-default. Signup goes first to keep the
-    # historical /auth/signup/* registration order from Phase-17.
-    # auth_recovery must be imported before auth_recovery_email because
-    # the email module imports ``_check_forgot_ip_rate`` from it at
-    # module-load time (the rate-limit budget is shared across both flows).
+    # Phase-64 / 72 / 82: auth signup + recovery split into four halves —
+    #   * routers.auth_signup           — 4 public OTP-flow routes (start
+    #                                     / verify / activate / resend)
+    #                                     + 3 schemas.
+    #   * routers.auth_signup_approval  — 3 superadmin approval routes
+    #                                     (Phase 82: pending / approve
+    #                                     / reject).
+    #   * routers.auth_recovery         — offline RSA-blob password
+    #                                     reset flow (3 routes, 2
+    #                                     schemas, 6 helpers).
+    #   * routers.auth_recovery_email   — email-OTP password reset flow
+    #                                     (4 routes, 2 schemas).
+    # The first two are unauthenticated-public + superadmin-gated;
+    # ``auth_recovery*`` are unauthenticated-by-default. Signup family
+    # goes first to keep the historical /auth/signup/* registration
+    # order from Phase-17. Public OTP before approval keeps reading
+    # the OpenAPI route list in lifecycle order (signup → approve →
+    # reject). ``auth_recovery`` must be imported before
+    # ``auth_recovery_email`` because the email module imports
+    # ``_check_forgot_ip_rate`` from it at module-load time (the
+    # rate-limit budget is shared across both flows).
     from routers.auth_signup import router as _auth_signup_router
+    from routers.auth_signup_approval import router as _auth_signup_approval_router
 
     app.include_router(_auth_signup_router)
+    app.include_router(_auth_signup_approval_router)
 
     # Re-export _prune_password_reset_tokens onto app so scheduler.py late-binds.
     from routers.auth_recovery import _prune_password_reset_tokens

@@ -1,22 +1,31 @@
-"""Auth signup + activation + superadmin approval routes.
+"""Auth signup + activation routes (Phase-64, trimmed Phase-82).
 
-Phase-64 split from ``routers/auth_recovery.py``. The original module
-covered both halves of the auth bootstrap pipeline (signup OTP + the
-RSA-blob / email-OTP password recovery); after 14 modularization
-phases the ``forgot/*`` half is unrelated to the ``signup/*`` half
-and they are now reviewed by different code owners. Splitting also
-shrinks each file to a manageable ~450 lines, which means a typical
-review fits on one screen.
+Surface evolution:
+  Phase 64 — split from ``routers/auth_recovery.py``: this module
+              owned 7 routes (signup OTP flow + admin approval queue).
+  Phase 82 — split the 3 superadmin approval routes
+              (``/auth/signup/pending``,
+              ``/auth/signup/approve/{username}``,
+              ``/auth/signup/reject/{username}``) into
+              ``routers/auth_signup_approval.py`` so the public OTP
+              surface and the superadmin approval surface have
+              independent reviewer groups.
 
-Routes (all unauthenticated except the three superadmin approvals)
--------------------------------------------------------------------
-  POST  /auth/signup/start
-  POST  /auth/signup/verify
-  POST  /auth/activate
-  POST  /auth/code/resend
-  GET   /auth/signup/pending             [superadmin]
-  POST  /auth/signup/approve/{username}  [superadmin]
-  POST  /auth/signup/reject/{username}   [superadmin]
+Routes (all unauthenticated public OTP flow)
+--------------------------------------------
+  POST  /auth/signup/start    — public admin self-signup → OTP.
+  POST  /auth/signup/verify   — verify the signup OTP →
+                                ``awaiting_approval`` or ``active``.
+  POST  /auth/activate        — admin-created user activates self
+                                via OTP from admin-trigger.
+  POST  /auth/code/resend     — re-send a pending OTP to a user.
+
+The 3 approval routes (``/auth/signup/pending`` /
+``/auth/signup/approve/{username}`` /
+``/auth/signup/reject/{username}``) live in
+``routers/auth_signup_approval.py`` (Phase 82). They share the
+``"auth-signup"`` OpenAPI tag so the OpenAPI doc still groups
+them together for human readers.
 
 Late binding
 ------------
@@ -35,7 +44,7 @@ import logging
 import sqlite3
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 import app as _app
@@ -49,9 +58,7 @@ from config import (
 )
 from db import db_lock, get_conn
 from helpers import default_policy_for_role, utc_now_iso
-from security import Principal, assert_min_role, hash_password
-
-require_principal = _app.require_principal
+from security import hash_password
 
 
 # ----- Late-bound helpers (resolved at call time off ``app``) -------------
@@ -349,62 +356,11 @@ def auth_code_resend(body: ResendCodeRequest) -> dict[str, Any]:
     return {"ok": True, "ttl_seconds": OTP_TTL_SECONDS}
 
 
-@router.get("/auth/signup/pending")
-def auth_signup_pending(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    """Superadmin queue: admins who passed OTP but await approval."""
-    assert_min_role(principal, "superadmin")
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """SELECT username, email, phone, created_at, email_verified_at
-               FROM dashboard_users
-               WHERE role = 'admin' AND status = 'awaiting_approval'
-               ORDER BY created_at ASC"""
-        )
-        items = [dict(r) for r in cur.fetchall()]
-        conn.close()
-    return {"items": items}
-
-
-@router.post("/auth/signup/approve/{username}")
-def auth_signup_approve(username: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_min_role(principal, "superadmin")
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE dashboard_users SET status='active' WHERE username = ? AND role='admin' AND status='awaiting_approval'",
-            (username,),
-        )
-        n = cur.rowcount
-        conn.commit()
-        conn.close()
-    if n == 0:
-        raise HTTPException(status_code=404, detail="no pending admin with that username")
-    audit_event(principal.username, "signup.approve", username, {})
-    return {"ok": True, "username": username}
-
-
-@router.post("/auth/signup/reject/{username}")
-def auth_signup_reject(username: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_min_role(principal, "superadmin")
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "DELETE FROM dashboard_users WHERE username = ? AND role='admin' AND status='awaiting_approval'",
-            (username,),
-        )
-        n = cur.rowcount
-        cur.execute("DELETE FROM role_policies WHERE username = ?", (username,))
-        cur.execute("DELETE FROM verifications WHERE username = ?", (username,))
-        conn.commit()
-        conn.close()
-    if n == 0:
-        raise HTTPException(status_code=404, detail="no pending admin with that username")
-    audit_event(principal.username, "signup.reject", username, {})
-    return {"ok": True}
+# Phase-82 split: the 3 superadmin approval routes
+# (/auth/signup/pending, /auth/signup/approve/{username},
+# /auth/signup/reject/{username}) live in
+# routers/auth_signup_approval.py. Both routers share the
+# "auth-signup" tag so the OpenAPI doc groups them together.
 
 
 __all__ = (
