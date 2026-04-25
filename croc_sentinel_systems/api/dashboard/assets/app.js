@@ -305,6 +305,122 @@
     return map[p] || "audit-pfx-other";
   }
 
+  // src/lib/api.js
+  var DEFAULT_API_TIMEOUT_MS = 45e3;
+  var ROUTE_RENDER_TIMEOUT_MS = 9e4;
+  function apiBase() {
+    const lp = location.port || "";
+    if (lp === "8088" || lp === "18088" || lp === "18999") {
+      return location.origin;
+    }
+    const m = document.querySelector('meta[name="croc-api-base"]');
+    const raw = m && m.getAttribute("content") != null ? String(m.getAttribute("content")).trim() : "";
+    if (raw.toLowerCase().startsWith("http")) {
+      return raw.replace(/\/$/, "");
+    }
+    if (raw && raw !== "/") {
+      const p = (raw.startsWith("/") ? raw : `/${raw}`).replace(/\/$/, "");
+      return location.origin + p;
+    }
+    return location.origin;
+  }
+  async function fetchWithDeadline(url, init, timeoutMs) {
+    const baseInit = Object.assign({ credentials: "include" }, init || {});
+    const limit = timeoutMs === false ? 0 : timeoutMs != null ? timeoutMs : DEFAULT_API_TIMEOUT_MS;
+    if (limit <= 0) return fetch(url, baseInit);
+    const ac = new AbortController();
+    const tid = setTimeout(() => ac.abort(), limit);
+    try {
+      return await fetch(url, Object.assign({}, baseInit, { signal: ac.signal }));
+    } catch (e) {
+      if (e && e.name === "AbortError") {
+        throw new Error(
+          `Request timed out after ${limit} ms \u2014 API slow or unreachable. Check browser Network tab, Nginx \`proxy_connect_timeout\` / \`proxy_read_timeout\`, and upstream service.`
+        );
+      }
+      throw e;
+    } finally {
+      clearTimeout(tid);
+    }
+  }
+  function _sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+  function _isTransientFetchError(err) {
+    const s = String(err && err.message || err || "").toLowerCase();
+    return s.includes("timed out") || s.includes("networkerror") || s.includes("failed to fetch") || s.includes("load failed") || s.includes("temporarily unavailable");
+  }
+  function _isRetryableHttpStatus(code) {
+    return code === 408 || code === 425 || code === 429 || code === 502 || code === 503 || code === 504;
+  }
+  function _isWriteMethod(m) {
+    const x = String(m || "GET").toUpperCase();
+    return x !== "GET" && x !== "HEAD" && x !== "OPTIONS";
+  }
+
+  // src/lib/csrf.js
+  var CSRF_COOKIE_NAME = (function() {
+    const m = document.querySelector('meta[name="croc-csrf-cookie"]');
+    return (m && m.getAttribute("content") || "sentinel_csrf").trim() || "sentinel_csrf";
+  })();
+  var CSRF_HEADER_NAME = (function() {
+    const m = document.querySelector('meta[name="croc-csrf-header"]');
+    return (m && m.getAttribute("content") || "X-CSRF-Token").trim() || "X-CSRF-Token";
+  })();
+  var _csrfTokenMemory = "";
+  function _readCsrfCookie() {
+    try {
+      const all = String(document.cookie || "");
+      const parts = all.split(/;\s*/);
+      for (let i = 0; i < parts.length; i++) {
+        const idx = parts[i].indexOf("=");
+        if (idx <= 0) continue;
+        if (parts[i].slice(0, idx) === CSRF_COOKIE_NAME) {
+          return decodeURIComponent(parts[i].slice(idx + 1));
+        }
+      }
+    } catch (_) {
+    }
+    return "";
+  }
+  function getCsrfToken() {
+    if (_csrfTokenMemory) return _csrfTokenMemory;
+    const c = _readCsrfCookie();
+    if (c) _csrfTokenMemory = c;
+    return _csrfTokenMemory;
+  }
+  function setCsrfToken(t) {
+    _csrfTokenMemory = String(t || "");
+  }
+  async function refreshCsrfToken() {
+    try {
+      const r = await fetchWithDeadline(apiBase() + "/auth/csrf", { method: "GET" }, 12e3);
+      if (r && r.ok) {
+        const j = await r.json().catch(() => ({}));
+        if (j && j.csrf_token) {
+          setCsrfToken(String(j.csrf_token));
+          return _csrfTokenMemory;
+        }
+      }
+    } catch (_) {
+    }
+    const c = _readCsrfCookie();
+    if (c) _csrfTokenMemory = c;
+    return _csrfTokenMemory;
+  }
+  function _isCsrfRejection(status, bodyText) {
+    if (Number(status) !== 403) return false;
+    const t = String(bodyText || "");
+    if (t.indexOf("csrf_invalid") >= 0) return true;
+    try {
+      const j = JSON.parse(t);
+      const code = j && (j.code || j.detail);
+      if (typeof code === "string" && code.toLowerCase().indexOf("csrf") >= 0) return true;
+    } catch (_) {
+    }
+    return false;
+  }
+
   // src/virtual-console.js
   function authSiteFooterHtml() {
     return `
@@ -582,53 +698,6 @@
       live.title = "SSE reconnecting";
     }
   }
-  function apiBase() {
-    const lp = location.port || "";
-    if (lp === "8088" || lp === "18088" || lp === "18999") {
-      return location.origin;
-    }
-    const m = document.querySelector('meta[name="croc-api-base"]');
-    const raw = m && m.getAttribute("content") != null ? String(m.getAttribute("content")).trim() : "";
-    if (raw.toLowerCase().startsWith("http")) {
-      return raw.replace(/\/$/, "");
-    }
-    if (raw && raw !== "/") {
-      const p = (raw.startsWith("/") ? raw : `/${raw}`).replace(/\/$/, "");
-      return location.origin + p;
-    }
-    return location.origin;
-  }
-  var DEFAULT_API_TIMEOUT_MS = 45e3;
-  var ROUTE_RENDER_TIMEOUT_MS = 9e4;
-  async function fetchWithDeadline(url, init, timeoutMs) {
-    const baseInit = Object.assign({ credentials: "include" }, init || {});
-    const limit = timeoutMs === false ? 0 : timeoutMs != null ? timeoutMs : DEFAULT_API_TIMEOUT_MS;
-    if (limit <= 0) return fetch(url, baseInit);
-    const ac = new AbortController();
-    const tid = setTimeout(() => ac.abort(), limit);
-    try {
-      return await fetch(url, Object.assign({}, baseInit, { signal: ac.signal }));
-    } catch (e) {
-      if (e && e.name === "AbortError") {
-        throw new Error(
-          `Request timed out after ${limit} ms \u2014 API slow or unreachable. Check browser Network tab, Nginx \`proxy_connect_timeout\` / \`proxy_read_timeout\`, and upstream service.`
-        );
-      }
-      throw e;
-    } finally {
-      clearTimeout(tid);
-    }
-  }
-  function _sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
-  function _isTransientFetchError(err) {
-    const s = String(err && err.message || err || "").toLowerCase();
-    return s.includes("timed out") || s.includes("networkerror") || s.includes("failed to fetch") || s.includes("load failed") || s.includes("temporarily unavailable");
-  }
-  function _isRetryableHttpStatus(code) {
-    return code === 408 || code === 425 || code === 429 || code === 502 || code === 503 || code === 504;
-  }
   function getToken() {
     return localStorage.getItem(LS.token) || "";
   }
@@ -637,71 +706,6 @@
     if (!t) {
       _groupMetaSyncChain = Promise.resolve();
     }
-  }
-  var CSRF_COOKIE_NAME = (function() {
-    const m = document.querySelector('meta[name="croc-csrf-cookie"]');
-    return (m && m.getAttribute("content") || "sentinel_csrf").trim() || "sentinel_csrf";
-  })();
-  var CSRF_HEADER_NAME = (function() {
-    const m = document.querySelector('meta[name="croc-csrf-header"]');
-    return (m && m.getAttribute("content") || "X-CSRF-Token").trim() || "X-CSRF-Token";
-  })();
-  var _csrfTokenMemory = "";
-  function _readCsrfCookie() {
-    try {
-      const all = String(document.cookie || "");
-      const parts = all.split(/;\s*/);
-      for (let i = 0; i < parts.length; i++) {
-        const idx = parts[i].indexOf("=");
-        if (idx <= 0) continue;
-        if (parts[i].slice(0, idx) === CSRF_COOKIE_NAME) {
-          return decodeURIComponent(parts[i].slice(idx + 1));
-        }
-      }
-    } catch (_) {
-    }
-    return "";
-  }
-  function getCsrfToken() {
-    if (_csrfTokenMemory) return _csrfTokenMemory;
-    const c = _readCsrfCookie();
-    if (c) _csrfTokenMemory = c;
-    return _csrfTokenMemory;
-  }
-  function setCsrfToken(t) {
-    _csrfTokenMemory = String(t || "");
-  }
-  async function refreshCsrfToken() {
-    try {
-      const r = await fetchWithDeadline(apiBase() + "/auth/csrf", { method: "GET" }, 12e3);
-      if (r && r.ok) {
-        const j = await r.json().catch(() => ({}));
-        if (j && j.csrf_token) {
-          setCsrfToken(String(j.csrf_token));
-          return _csrfTokenMemory;
-        }
-      }
-    } catch (_) {
-    }
-    const c = _readCsrfCookie();
-    if (c) _csrfTokenMemory = c;
-    return _csrfTokenMemory;
-  }
-  function _isWriteMethod(m) {
-    const x = String(m || "GET").toUpperCase();
-    return x !== "GET" && x !== "HEAD" && x !== "OPTIONS";
-  }
-  function _isCsrfRejection(status, bodyText) {
-    if (Number(status) !== 403) return false;
-    const t = String(bodyText || "");
-    if (t.indexOf("csrf_invalid") >= 0) return true;
-    try {
-      const j = JSON.parse(t);
-      const code = j && (j.code || j.detail);
-      if (typeof code === "string" && code.toLowerCase().indexOf("csrf") >= 0) return true;
-    } catch (_) {
-    }
-    return false;
   }
   function roleWeight(r) {
     return ROLE_WEIGHT[r] || 0;

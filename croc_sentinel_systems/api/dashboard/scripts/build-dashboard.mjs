@@ -24,57 +24,27 @@ import { LS, OFFLINE_MS, DEFAULT_REMOTE_SIREN_MS, DEFAULT_PANIC_FANOUT_MS, NAV_G
 import { $, $$, escapeHtml, hx, mountView, parseHtmlToFragment, setChildMarkup, prependChildMarkup, appendChildMarkup, setHtmlIfChanged, setTextIfChanged } from "./lib/dom.js";
 import { parseSseFields, pumpSseBody, SSE_PARSE_BUF_MAX } from "./lib/sse.js";
 import { fmtTs, fmtRel, maskPlatform, auditActionPrefix, auditDetailDedupedRows, eventDetailDedupedRows, messagePayloadRows, auditChipClass } from "./lib/format.js";
+import { DEFAULT_API_TIMEOUT_MS, ROUTE_RENDER_TIMEOUT_MS, apiBase, fetchWithDeadline, _sleep, _isTransientFetchError, _isRetryableHttpStatus, _isWriteMethod } from "./lib/api.js";
+import { CSRF_COOKIE_NAME, CSRF_HEADER_NAME, _readCsrfCookie, getCsrfToken, setCsrfToken, refreshCsrfToken, _isCsrfRejection } from "./lib/csrf.js";
 
 `;
 
 function spliceMonolith(raw) {
+  // console.raw.js used to ship literal copies of every block now exported
+  // from src/lib/*.js, and this function virtual-spliced them out at build
+  // time so esbuild only saw one copy. Those duplicates have since been
+  // physically removed from console.raw.js (see scripts/_strip_lib_dups.mjs),
+  // so all splice rules are gone — the only remaining transform is stripping
+  // the outer IIFE wrapper. esbuild re-adds an IIFE around the whole bundle.
+  //
+  // If anyone re-adds a duplicate lib/* declaration here (e.g. another
+  // `function escapeHtml(v) { ... }` in console.raw.js), esbuild will fail
+  // with a duplicate-binding error because HEADER already imports the same
+  // name — that is the desired behaviour, do not "fix" by re-introducing a
+  // splice; fix by deleting the duplicate.
   let body = raw.replace(/\r\n/g, "\n");
   body = body.replace(/\(function \(\) \{\s*\n  ["']use strict["'];\s*\n/, "");
   body = body.replace(/\n\}\)\(\);\s*$/, "");
-
-  const cMark = "  // ------------------------------------------------------------------ const\n";
-  const cStart = body.indexOf(cMark);
-  const cEnd = body.indexOf("  function authSiteFooterHtml()", cStart);
-  if (cStart === -1 || cEnd === -1) {
-    throw new Error("build-dashboard: could not splice const block (markers missing)");
-  }
-  body = body.slice(0, cStart) + body.slice(cEnd);
-
-  const r1Start = body.indexOf("  const $ = (sel, root) => (root || document).querySelector(sel);");
-  const r1End = body.indexOf("  /**\n   * REST base URL.", r1Start);
-  if (r1Start === -1 || r1End === -1) {
-    throw new Error("build-dashboard: could not find $/$$ block or REST comment marker");
-  }
-
-  const r2Start = body.indexOf("  function escapeHtml(v) {");
-  const r2End = body.indexOf("  /** Parse one SSE block", r2Start);
-  if (r2Start === -1 || r2End === -1) {
-    throw new Error("build-dashboard: could not find escapeHtml..mountView block or SSE marker");
-  }
-
-  const r3Start = body.indexOf("  /** Parse one SSE block");
-  const r3End = body.indexOf("  /** All dashboard clocks", r3Start);
-  if (r3Start === -1 || r3End === -1) {
-    throw new Error("build-dashboard: could not find SSE block or MY_TZ marker");
-  }
-
-  const r4Start = body.indexOf("  /** All dashboard clocks");
-  const r4End = body.indexOf("  function roleWeight(r) { return ROLE_WEIGHT[r] || 0; }", r4Start);
-  if (r4Start === -1 || r4End === -1) {
-    throw new Error("build-dashboard: could not find format block or roleWeight marker");
-  }
-
-  const ranges = [
-    [r4Start, r4End],
-    [r3Start, r3End],
-    [r2Start, r2End],
-    [r1Start, r1End],
-  ].sort((a, b) => b[0] - a[0]);
-
-  for (const [s, e] of ranges) {
-    body = body.slice(0, s) + body.slice(e);
-  }
-
   return HEADER + body;
 }
 
