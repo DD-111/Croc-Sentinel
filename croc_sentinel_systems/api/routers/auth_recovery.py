@@ -1,11 +1,20 @@
-"""Auth password-recovery routes (Phase-17, trimmed Phase-64 + Phase-72).
+"""Auth password-recovery routes
+(Phase-17, trimmed Phase-64 → Phase-72 → Phase-84).
 
-Originally this module covered both signup and password recovery.
-Phase 64 split the signup half into ``routers/auth_signup.py``.
-Phase 72 split the email-OTP password recovery flow into
-``routers/auth_recovery_email.py`` so this file now hosts only
-the offline-RSA-blob recovery flow plus the helpers shared
-between the two flows.
+Surface evolution:
+  Phase 17 — original module: signup + password recovery.
+  Phase 64 — split the signup half into ``routers/auth_signup.py``.
+  Phase 72 — split the email-OTP recovery flow into
+              ``routers/auth_recovery_email.py``; this file kept
+              the offline-RSA-blob flow plus the 6 helpers shared
+              with the email module.
+  Phase 84 — extract the 6 stateless helpers (4 RSA-blob crypto
+              + per-IP rate-limit + token sweeper) into
+              ``routers/auth_recovery_helpers.py`` and re-export
+              them here for backward compatibility.
+
+This module is now a pure routes module: 2 schemas + 3 routes +
+the late-binding wrappers it needs to call into ``app``.
 
 Routes (all unauthenticated)
 ----------------------------
@@ -17,19 +26,19 @@ Schemas
 -------
   ForgotStartRequest, ForgotCompleteRequest
 
-Helpers owned here
-------------------
-- 4 RSA-blob helpers
-  (``_password_recovery_load_public``,
-   ``_password_recovery_blob_byte_len``,
-   ``_encrypt_password_recovery_payload``,
-   ``_fake_password_recovery_hex``)
-- ``_check_forgot_ip_rate``      — re-exported and reused by
-  ``routers.auth_recovery_email`` so both flows count toward the
-  same per-IP rate-limit budget.
-- ``_prune_password_reset_tokens`` — re-exported back into
-  ``app.py`` (``routes_registry.register_routers`` binds it onto
-  ``_app._prune_password_reset_tokens``) so the scheduler thread
+Helpers re-exported (single source of truth in
+``routers/auth_recovery_helpers.py``)
+---------------------------------------------------
+- ``_password_recovery_load_public``,
+  ``_password_recovery_blob_byte_len``,
+  ``_encrypt_password_recovery_payload``,
+  ``_fake_password_recovery_hex`` — RSA-blob cipher.
+- ``_check_forgot_ip_rate`` — also imported by
+  ``routers.auth_recovery_email`` (both flows share the same
+  per-IP budget).
+- ``_prune_password_reset_tokens`` — bound onto
+  ``_app._prune_password_reset_tokens`` by
+  ``routes_registry.register_routers`` so the scheduler thread
   can call it without depending on this module's full import surface.
 
 Late binding
@@ -37,45 +46,39 @@ Late binding
 ``emit_event`` / ``get_manager_admin`` / ``_client_ip`` /
 ``_clear_login_failures`` / ``_clear_login_ip_state`` are
 late-bound at call time off ``app``. Validation/rate-limit helpers
-that the email flow needed (``_looks_like_email``, ``_issue_verification``,
-``_consume_verification``, ``_verification_resend_wait_seconds``,
-``_generate_sha_code``) were moved to the email module — this
-module no longer imports those.
+that the email flow needed (``_looks_like_email``,
+``_issue_verification``, ``_consume_verification``,
+``_verification_resend_wait_seconds``, ``_generate_sha_code``)
+were moved to the email module — this module no longer imports
+those.
 """
 
 from __future__ import annotations
 
 import base64
 import hashlib
-import json
 import logging
-import os
 import secrets
-import threading
 import time
 import uuid
 from typing import Any, Optional
 
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding, rsa
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 import app as _app
 from audit import audit_event
-from config import (
-    FORGOT_PASSWORD_IP_MAX,
-    FORGOT_PASSWORD_IP_WINDOW_SECONDS,
-    FORGOT_PASSWORD_TOKEN_TTL_SECONDS,
-    PASSWORD_RECOVERY_BLOB_MAGIC,
-    PASSWORD_RECOVERY_BLOB_VERSION,
-    PASSWORD_RECOVERY_PLAINTEXT_PAD,
-    PASSWORD_RECOVERY_PUBLIC_KEY_PATH,
-    PASSWORD_RECOVERY_PUBLIC_KEY_PEM,
-)
+from config import FORGOT_PASSWORD_TOKEN_TTL_SECONDS
 from db import db_lock, get_conn
 from helpers import utc_now_iso
+from routers.auth_recovery_helpers import (
+    _check_forgot_ip_rate,
+    _encrypt_password_recovery_payload,
+    _fake_password_recovery_hex,
+    _password_recovery_blob_byte_len,
+    _password_recovery_load_public,
+    _prune_password_reset_tokens,
+)
 from security import hash_password
 
 
@@ -120,117 +123,23 @@ class ForgotCompleteRequest(BaseModel):
 
 
 # ===========================================================================
-# Offline RSA password recovery (cipher / IP rate / prune)
+# Offline RSA password recovery (cipher / IP rate / prune) — Phase-84
 # ===========================================================================
-
-_pwrec_pubkey_lock = threading.Lock()
-_pwrec_pubkey_cache: Any = None  # None=unset, False=missing, else RSAPublicKey
-
-
-def _password_recovery_load_public() -> Optional[Any]:
-    """Lazy-load PEM from PASSWORD_RECOVERY_PUBLIC_KEY_PEM or *_PATH."""
-    global _pwrec_pubkey_cache
-    with _pwrec_pubkey_lock:
-        if _pwrec_pubkey_cache is not None:
-            if _pwrec_pubkey_cache is False:
-                return None
-            return _pwrec_pubkey_cache
-        pem = (PASSWORD_RECOVERY_PUBLIC_KEY_PEM or "").replace("\\n", "\n").strip()
-        if not pem and PASSWORD_RECOVERY_PUBLIC_KEY_PATH:
-            try:
-                from pathlib import Path
-
-                pem = Path(PASSWORD_RECOVERY_PUBLIC_KEY_PATH).expanduser().read_text(encoding="utf-8").strip()
-            except Exception as exc:
-                logger.warning("PASSWORD_RECOVERY_PUBLIC_KEY_PATH read failed: %s", exc)
-                pem = ""
-        if not pem:
-            _pwrec_pubkey_cache = False
-            return None
-        try:
-            key = serialization.load_pem_public_key(pem.encode("utf-8"))
-            if not isinstance(key, rsa.RSAPublicKey):
-                logger.warning("password recovery: PEM must be an RSA public key")
-                _pwrec_pubkey_cache = False
-                return None
-            if key.key_size < 2048:
-                logger.warning("password recovery: RSA key must be >= 2048 bits")
-                _pwrec_pubkey_cache = False
-                return None
-            _pwrec_pubkey_cache = key
-            return key
-        except Exception as exc:
-            logger.warning("password recovery: invalid PEM: %s", exc)
-            _pwrec_pubkey_cache = False
-            return None
-
-
-def _password_recovery_blob_byte_len(pub: rsa.RSAPublicKey) -> int:
-    rsa_len = pub.key_size // 8
-    return len(PASSWORD_RECOVERY_BLOB_MAGIC) + 1 + rsa_len + 12 + (PASSWORD_RECOVERY_PLAINTEXT_PAD + 16)
-
-
-def _encrypt_password_recovery_payload(pub: rsa.RSAPublicKey, inner: dict[str, Any]) -> bytes:
-    pad = int(PASSWORD_RECOVERY_PLAINTEXT_PAD)
-    pt = json.dumps(inner, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
-    if len(pt) > pad:
-        raise ValueError("inner JSON exceeds PASSWORD_RECOVERY_PLAINTEXT_PAD")
-    pt = pt + (b"\x00" * (pad - len(pt)))
-    aes_key = os.urandom(32)
-    iv = os.urandom(12)
-    aesgcm = AESGCM(aes_key)
-    ct = aesgcm.encrypt(iv, pt, None)
-    rsa_cipher = pub.encrypt(
-        aes_key,
-        padding.OAEP(
-            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-            algorithm=hashes.SHA256(),
-            label=None,
-        ),
-    )
-    if len(rsa_cipher) != pub.key_size // 8:
-        raise ValueError("RSA ciphertext length mismatch")
-    return PASSWORD_RECOVERY_BLOB_MAGIC + bytes([PASSWORD_RECOVERY_BLOB_VERSION]) + rsa_cipher + iv + ct
-
-
-def _fake_password_recovery_hex(pub: rsa.RSAPublicKey) -> str:
-    return secrets.token_bytes(_password_recovery_blob_byte_len(pub)).hex()
-
-
-def _check_forgot_ip_rate(ip: str) -> None:
-    now = int(time.time())
-    cut = now - FORGOT_PASSWORD_IP_WINDOW_SECONDS
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM forgot_password_attempts WHERE ts_epoch < ?", (cut,))
-        cur.execute(
-            "SELECT COUNT(*) AS c FROM forgot_password_attempts WHERE ip = ? AND ts_epoch >= ?",
-            (ip, cut),
-        )
-        c = int(cur.fetchone()["c"])
-        if c >= FORGOT_PASSWORD_IP_MAX:
-            conn.commit()
-            conn.close()
-            raise HTTPException(
-                status_code=429,
-                detail=f"too many recovery attempts from this IP — try again in {FORGOT_PASSWORD_IP_WINDOW_SECONDS}s",
-            )
-        cur.execute("INSERT INTO forgot_password_attempts (ip, ts_epoch) VALUES (?, ?)", (ip, now))
-        conn.commit()
-        conn.close()
-
-
-def _prune_password_reset_tokens() -> None:
-    """Drop expired rows (used or unused) older than 7 days past expiry."""
-    now = int(time.time())
-    cut = now - 7 * 86400
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM password_reset_tokens WHERE expires_at_ts < ?", (cut,))
-        conn.commit()
-        conn.close()
+#
+# The 6 helpers (4 RSA-blob crypto + per-IP rate-limit + token sweeper)
+# live in ``routers/auth_recovery_helpers.py``. They were imported at
+# the top of this file and are also exported via this module's
+# ``__all__`` for backward compatibility:
+#
+#   * ``routers.auth_recovery_email`` historically imports
+#     ``_check_forgot_ip_rate`` from ``routers.auth_recovery``.
+#   * ``routes_registry.register_routers`` historically imports
+#     ``_prune_password_reset_tokens`` from ``routers.auth_recovery``
+#     and pins it onto ``_app._prune_password_reset_tokens``.
+#
+# Either consumer can switch to importing directly from
+# ``routers.auth_recovery_helpers`` — the re-export here is purely a
+# transition convenience.
 
 
 # ===========================================================================
