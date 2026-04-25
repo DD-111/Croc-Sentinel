@@ -393,14 +393,28 @@ def _event_matches_filters(ev: dict[str, Any], filters: dict[str, Any]) -> bool:
 event_bus = _EventBus(ring_size=EVENT_RING_SIZE)
 
 # --- Multi-instance event bus (optional Redis Pub/Sub) ---
-BUS_INSTANCE_ID = str(uuid.uuid4())
-REDIS_URL = (os.getenv("REDIS_URL") or "").strip()
-EVENT_BUS_REDIS_CHANNEL = (os.getenv("EVENT_BUS_REDIS_CHANNEL") or "sentinel:event_bus").strip() or "sentinel:event_bus"
+# Phase-52 modularization: BUS_INSTANCE_ID, REDIS_URL,
+# EVENT_BUS_REDIS_CHANNEL, the listener-thread state, and the four
+# bridge functions (_redis_event_forward / _redis_listener_main /
+# _start_event_redis_bridge / _stop_event_redis_bridge) all moved to
+# redis_bridge.py. They are re-exported below alongside the bridge
+# helpers so the in-module call sites (emit_event() ->
+# _redis_event_forward, lifespan startup -> _start_event_redis_bridge,
+# lifespan shutdown -> _stop_event_redis_bridge) keep working.
 # EVENT_WS_ENABLED moved to config.py and re-imported via `from config import *` above.
 SLOW_REQUEST_LOG_MS = int(os.getenv("SLOW_REQUEST_LOG_MS", "0"))
-_redis_sync_client: Optional[Any] = None
-_redis_bridge_stop = threading.Event()
-_redis_listener_thread: Optional[threading.Thread] = None
+from redis_bridge import (  # noqa: E402,F401  (re-exports for legacy callers)
+    BUS_INSTANCE_ID,
+    EVENT_BUS_REDIS_CHANNEL,
+    REDIS_URL,
+    _redis_bridge_stop,
+    _redis_event_forward,
+    _redis_listener_main,
+    _redis_listener_thread,
+    _redis_sync_client,
+    _start_event_redis_bridge,
+    _stop_event_redis_bridge,
+)
 
 _superadmin_cache: set[str] = set()
 _superadmin_cache_ts = 0.0
@@ -581,97 +595,9 @@ def emit_event(
         logger.warning("fcm_notify skipped: %s", exc)
 
 
-def _redis_event_forward(ev: dict[str, Any]) -> None:
-    if _redis_sync_client is None:
-        return
-    try:
-        out = dict(ev)
-        out["_bus_origin"] = BUS_INSTANCE_ID
-        _redis_sync_client.publish(EVENT_BUS_REDIS_CHANNEL, json.dumps(out, default=str))
-    except Exception as exc:
-        logger.warning("redis event forward failed: %s", exc)
-
-
-def _redis_listener_main() -> None:
-    try:
-        import redis as redis_lib
-    except ImportError:
-        logger.error("redis package not installed; pip install redis")
-        return
-    try:
-        r2 = redis_lib.Redis.from_url(REDIS_URL, decode_responses=True)
-        pubsub = r2.pubsub()
-        pubsub.subscribe(EVENT_BUS_REDIS_CHANNEL)
-        while not _redis_bridge_stop.is_set():
-            msg = pubsub.get_message(timeout=1.0)
-            if not msg or msg.get("type") != "message":
-                continue
-            raw = msg.get("data")
-            if not raw or not isinstance(raw, str):
-                continue
-            try:
-                data = json.loads(raw)
-            except Exception:
-                logger.warning("redis event bus bad json")
-                continue
-            origin = str(data.pop("_bus_origin", "") or "")
-            if origin == BUS_INSTANCE_ID:
-                continue
-            try:
-                event_bus.publish_from_peer(data)
-            except Exception:
-                logger.exception("event_bus.publish_from_peer failed")
-        try:
-            pubsub.close()
-        except Exception:
-            pass
-        try:
-            r2.close()
-        except Exception:
-            pass
-    except Exception:
-        logger.exception("redis event bus listener exited")
-
-
-def _start_event_redis_bridge() -> None:
-    global _redis_sync_client, _redis_listener_thread
-    if not REDIS_URL:
-        logger.info("REDIS_URL unset — event bus is single-process memory only")
-        return
-    try:
-        import redis as redis_lib
-    except ImportError:
-        logger.error("REDIS_URL set but redis package missing; install redis or unset REDIS_URL")
-        return
-    try:
-        _redis_sync_client = redis_lib.Redis.from_url(REDIS_URL, decode_responses=True)
-        _redis_sync_client.ping()
-    except Exception as exc:
-        logger.error("redis connect failed (event bus): %s", exc)
-        _redis_sync_client = None
-        return
-    _redis_bridge_stop.clear()
-    _redis_listener_thread = threading.Thread(target=_redis_listener_main, name="redis-event-bus", daemon=True)
-    _redis_listener_thread.start()
-    logger.info(
-        "event bus redis bridge ok channel=%s instance=%s",
-        EVENT_BUS_REDIS_CHANNEL,
-        BUS_INSTANCE_ID[:8],
-    )
-
-
-def _stop_event_redis_bridge() -> None:
-    global _redis_sync_client, _redis_listener_thread
-    _redis_bridge_stop.set()
-    if _redis_listener_thread is not None:
-        _redis_listener_thread.join(timeout=4.0)
-        _redis_listener_thread = None
-    if _redis_sync_client is not None:
-        try:
-            _redis_sync_client.close()
-        except Exception:
-            pass
-        _redis_sync_client = None
+# _redis_event_forward, _redis_listener_main, _start_event_redis_bridge
+# and _stop_event_redis_bridge moved to redis_bridge.py (Phase 52);
+# see the re-export block at the top of this file for details.
 
 
 # FCM alarm-dispatch helpers (Phase-46 modularization). The four
