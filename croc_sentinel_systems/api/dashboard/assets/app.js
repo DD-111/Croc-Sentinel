@@ -1560,306 +1560,6 @@ ${curFw} \u2192 ${fw}`)) return;
     }
   }
   window.addEventListener("hashchange", renderRoute);
-  async function renderSignalsPage(view, _args, routeSeq) {
-    setCrumb("Signals");
-    mountView(view, `
-      <div class="card">
-        <div class="row" style="flex-wrap:wrap;align-items:flex-end;gap:12px">
-          <div style="flex:1;min-width:200px">
-            <h2 style="margin:0">Signal log</h2>
-            <p class="muted" style="margin:6px 0 0">Device alarms and dashboard/API siren events. Group comes from device notification settings.</p>
-          </div>
-          <label class="field" style="max-width:140px;margin:0"><span>Hours</span><input id="sig_hours" type="number" value="168" min="1" max="720"/></label>
-          <button class="btn secondary btn-tap" id="sig_reload">Refresh</button>
-        </div>
-        <div class="divider"></div>
-        <div class="stats" id="sigSummary"></div>
-        <div class="divider"></div>
-        <div id="sigList"><p class="muted">Loading\u2026</p></div>
-      </div>`);
-    const reload = async () => {
-      const hours = parseInt($("#sig_hours").value, 10) || 168;
-      const qs = new URLSearchParams({ limit: "200", since_hours: String(hours) });
-      try {
-        if (!isRouteCurrent(routeSeq)) return;
-        const [d, sumR] = await Promise.all([
-          api("/activity/signals?" + qs.toString(), { timeoutMs: 24e3 }),
-          api("/alarms/summary", { timeoutMs: 16e3 }).catch(() => ({ last_24h: 0, last_7d: 0, top_sources_7d: [] }))
-        ]);
-        if (!isRouteCurrent(routeSeq)) return;
-        const sigSummaryEl = $("#sigSummary", view);
-        const sigListEl = $("#sigList", view);
-        if (!sigSummaryEl || !sigListEl) return;
-        setHtmlIfChanged(sigSummaryEl, [
-          ["Alarms 24h", sumR.last_24h || 0, "device-side alarm rows"],
-          ["Alarms 7d", sumR.last_7d || 0, "same scope"],
-          ["Top source 7d", (sumR.top_sources_7d || []).slice(0, 1).map((x) => `${x.source_id} \xD7 ${x.c}`).join("") || "\u2014", "by count"]
-        ].map(([k, v, s]) => `<div class="stat"><div class="k">${escapeHtml(k)}</div><div class="v">${escapeHtml(v)}</div><div class="sub">${escapeHtml(s)}</div></div>`).join(""));
-        const items = d.items || [];
-        const whoLbl = (w) => ({
-          remote_button: "GPIO / local button",
-          network: "MQTT / network",
-          api: "API / automation"
-        })[w] || w;
-        setHtmlIfChanged(sigListEl, items.length === 0 ? `<p class="muted audit-empty">No rows in this window.</p>` : `<div class="audit-feed">${items.map((a) => {
-          const dev = a.device_id === "*" ? "(bulk)" : a.device_id;
-          const link = a.device_id && a.device_id !== "*" ? `<a class="mono audit-target" href="#/devices/${encodeURIComponent(a.device_id)}">${escapeHtml(dev)}</a>` : escapeHtml(dev);
-          const em = a.email_sent ? "queued" : a.email_detail || "\u2014";
-          const fo = a.kind && a.kind.startsWith("bulk") ? String(a.fanout_count || 0) : String(a.fanout_count ?? "\u2014");
-          const whoS = a.kind === "device_alarm" ? whoLbl(a.who) : a.who || "\u2014";
-          const tShort = fmtTs(a.ts);
-          return `<article class="audit-item">
-              <div class="audit-item-top">
-                <div class="audit-time">
-                  <span class="audit-ts mono">${escapeHtml(tShort)}</span>
-                  <span class="muted audit-rel">${escapeHtml(fmtRel(a.ts))}</span>
-                </div>
-                <span class="chip">${escapeHtml(a.what || a.kind || "")}</span>
-                <span class="chip">${escapeHtml(a.zone || "all")}</span>
-              </div>
-              <div class="audit-item-line" style="flex-wrap:wrap;align-items:center;gap:6px">
-                <span class="mono">${link}</span>
-                <span class="chip">${escapeHtml(a.display_label || "\u2014")}</span>
-                <span class="chip">${escapeHtml(a.notification_group || "\u2014")}</span>
-              </div>
-              <div class="audit-item-line muted" style="font-size:12.5px">Who: ${escapeHtml(String(whoS))} \xB7 Fan-out: ${escapeHtml(fo)} \xB7 Email: ${escapeHtml(em)}</div>
-            </article>`;
-        }).join("")}</div>`);
-      } catch (e) {
-        if (!isRouteCurrent(routeSeq)) return;
-        toast(e.message || e, "err");
-      }
-    };
-    $("#sig_reload").addEventListener("click", reload);
-    reload();
-    scheduleRouteTicker(routeSeq, "signals-live-reload", reload, 1e4);
-  }
-  registerRoute("signals", renderSignalsPage);
-  registerRoute("ota", async (view, _args, routeSeq) => {
-    await __renderOtaFirmwareRoute(view, routeSeq);
-  });
-  async function __renderOtaFirmwareRoute(view, routeSeq) {
-    setCrumb("OTA (ops)");
-    const me = state.me || { username: "", role: "user" };
-    const isSuper = me.role === "superadmin";
-    if (!isSuper) {
-      mountView(view, `
-        <div class="card">
-          <h2 class="ui-section-title" style="margin:0">OTA & firmware</h2>
-          <p class="muted" style="margin:8px 0 0">\u79DF\u6237\u4FA7 <strong>\u4E0D</strong>\u518D\u4F7F\u7528 Admin OTA \u63A7\u5236\u53F0\u3002\u8BF7\u5728 <a href="#/devices">\u5168\u90E8\u8BBE\u5907</a> \u4E0E\u8BBE\u5907\u8BE6\u60C5\u67E5\u770B\u7248\u672C\u65C1\u7684 <strong>\u2191 + \u7EA2\u70B9</strong>\uFF08\u6709\u53EF\u7528\u65B0\u56FA\u4EF6\u65F6\uFF09\u3002OTA \u4E0A\u4F20\u4E0E campaign \u4EC5 <strong>superadmin</strong> \u5728\u4FA7\u680F\u300COTA (ops)\u300D\u64CD\u4F5C\u3002</p>
-          <p class="muted" style="margin:8px 0 0">There is <strong>no</strong> admin OTA console in this product. Use <a href="#/devices">All devices</a> and device detail for the <strong>\u2191 + red dot</strong> when an upgrade is available. Staging and campaigns are <strong>superadmin</strong> only (sidebar <strong>OTA (ops)</strong>).</p>
-        </div>`);
-      return;
-    }
-    const helpCard = `
-      <div class="card ota-help-card">
-        <h2 class="ui-section-title" style="margin:0">OTA & firmware \xB7 \u4F7F\u7528\u8BF4\u660E</h2>
-        <div class="ota-help__cols">
-          <div>
-            <h3 class="ota-help__h">\u4E2D\u6587</h3>
-            <ul class="muted ota-help__ul">
-              <li><strong>\u5168\u5458\uFF08\u542B admin\uFF09</strong>\uFF1A\u53EA\u770B <a href="#/devices">\u5168\u90E8\u8BBE\u5907</a> / \u8BBE\u5907\u8BE6\u60C5\u4E0A\u7684 <strong>\u2191 + \u7EA2\u70B9</strong> \u4E0E\u8BF4\u660E\u5F39\u7A97\uFF1B\u4E0D\u5728\u6B64\u9875\u5BF9 campaign \u505A Accept\u3002</li>
-              <li><strong>\u68C0\u6D4B</strong>\uFF1A\u670D\u52A1\u5668\u6BD4\u8F83 <code>OTA_FIRMWARE_DIR</code> \u4E2D\u7684 <code>.bin</code> \u4E0E\u8BBE\u5907 <code>fw</code>\uFF1B\u9700 <code>OTA_PUBLIC_BASE_URL</code> \u624D\u80FD\u5728\u5F39\u7A97\u4E2D\u7ED9\u51FA\u4E0B\u8F7D URL\u3002</li>
-              <li><strong>\u6587\u4EF6</strong>\uFF1A\u63A8\u8350 <code>croc-\u7248\u672C\u53F7-8\u4F4Dhex.bin</code>\uFF1B\u540C\u540D <code>.txt</code> / <code>.md</code> \u4E3A release notes\u3002</li>
-              <li><strong>Superadmin</strong>\uFF1A\u5728\u672C\u9875\u4E0B\u65B9\u4E0A\u4F20 / \u4ECE\u5DF2\u5B58\u6587\u4EF6\u5EFA campaign\uFF08\u82E5\u4ECD\u4F7F\u7528\u540E\u7AEF campaign \u6D41\uFF0C\u7531 API \u6216\u5176\u5B83\u6D41\u7A0B\u8BA9\u5404\u79DF\u6237\u8BBE\u5907\u62C9\u53D6\uFF1B\u63A7\u5236\u53F0\u4E0D\u518D\u7ED9 admin \u63D0\u4F9B OTA \u5165\u53E3\uFF09\u3002</li>
-            </ul>
-          </div>
-          <div>
-            <h3 class="ota-help__h">English</h3>
-            <ul class="muted ota-help__ul">
-              <li><strong>Everyone (including admin)</strong>: use <a href="#/devices">All devices</a> / device detail <strong>\u2191 + red dot</strong> + notes dialog only \u2014 <strong>no</strong> tenant OTA Accept UI here.</li>
-              <li><strong>Detection</strong>: server compares <code>.bin</code> in <code>OTA_FIRMWARE_DIR</code> vs device <code>fw</code>; set <code>OTA_PUBLIC_BASE_URL</code> for URLs in the dialog.</li>
-              <li><strong>Files</strong>: prefer <code>croc-SEMVER-random8.bin</code>; sidecar <code>.txt</code>/<code>.md</code> for notes.</li>
-              <li><strong>Superadmin</strong>: upload / create-from-stored below. Campaign APIs may still exist server-side; this dashboard does not expose an admin OTA workflow.</li>
-            </ul>
-          </div>
-        </div>
-        <p class="muted" style="margin:12px 0 0">Fleet: <a href="#/devices">All devices</a></p>
-      </div>`;
-    const superCard = `
-      <div class="card">
-        <h2 class="ui-section-title">Superadmin \xB7 Upload & campaign</h2>
-        <p class="muted" style="margin:0 0 8px">Upload stages a <code>.bin</code> under <code>OTA_FIRMWARE_DIR</code> (upload password <code>OTA_UPLOAD_PASSWORD</code>). The API keeps at most <strong id="otaMaxBinsLbl">10</strong> <code>.bin</code> files and deletes the <strong>oldest by file mtime</strong> (and sidecars) when over limit \u2014 same rule as <code>POST /ota/firmware/upload</code>. The list below is <strong>fetched from this server</strong> (<code>GET /ota/firmwares</code>); click <strong>Refresh list</strong> after upload or if you copied files in by hand.</p>
-        <div class="inline-form">
-          <label class="field wide"><span>Upload password *</span><input type="password" id="otaStUploadPwd" autocomplete="off" placeholder="Server OTA_UPLOAD_PASSWORD" /></label>
-          <label class="field"><span>Firmware file (.bin)</span><input type="file" id="otaStFile" accept=".bin,application/octet-stream" /></label>
-          <label class="field"><span>Version label *</span><input id="otaStFw" placeholder="6.6.8" maxlength="40" /></label>
-          <div class="row wide" style="justify-content:flex-end">
-            <button type="button" class="btn btn-tap" id="otaStBtn">Upload & verify</button>
-          </div>
-        </div>
-        <p class="muted" id="otaRetentionInfo" style="margin-top:8px;min-height:1.2em"></p>
-        <p class="muted" id="otaStResult" style="margin-top:4px;min-height:1.2em"></p>
-        <div class="divider"></div>
-        <h3 style="margin:0 0 6px">Publish from server-staged firmware / \u4F7F\u7528\u670D\u52A1\u5668\u4E0A\u7684\u56FA\u4EF6</h3>
-        <p class="muted" style="margin:0 0 8px;font-size:12.5px">The dropdown is populated by <strong>pulling the current directory listing from the API</strong> (not from your PC). Pick a <code>.bin</code> already on the server, then create a campaign. <strong>Version</strong> is resolved on the server (<code>.version</code> sidecar or filename) \u2014 not hand-typed; it should match that build&rsquo;s <code>FW_VERSION</code>.</p>
-        <div class="row wide" style="align-items:flex-end;flex-wrap:wrap;gap:10px;margin-bottom:6px">
-          <label class="field wide" style="flex:1;min-width:220px;margin:0"><span>Firmware on server *</span><select id="otaFromSel"><option value="">Loading\u2026</option></select></label>
-          <button type="button" class="btn secondary btn-tap sm" id="otaFwListRefresh">Refresh list</button>
-        </div>
-        <label class="field wide"><span>Version (from server, read-only)</span><input type="text" id="otaFromResolvedVer" class="mono" readonly tabindex="-1" value="\u2014" style="background:var(--bg-muted);cursor:default" aria-live="polite" /></label>
-        <label class="field wide"><span>Notes</span><input id="otaFromNotes" maxlength="500" /></label>
-        <label class="checkbox"><input type="checkbox" id="otaFromAllAd" checked /><span>Target all admins</span></label>
-        <label class="field wide"><span>Or comma-separated admin usernames</span><input id="otaFromAdmTxt" placeholder="admin-a, admin-b (when not targeting all)" /></label>
-        <div class="row wide" style="justify-content:flex-end;margin-top:10px">
-          <button type="button" class="btn btn-tap" id="otaFromBtn">Create campaign</button>
-        </div>
-      </div>`;
-    mountView(view, helpCard + superCard);
-    const otaSyncFromStoredVersion = () => {
-      const sel = $("#otaFromSel", view);
-      const ro = $("#otaFromResolvedVer", view);
-      if (!ro) return;
-      if (!sel || !sel.value) {
-        ro.value = "\u2014";
-        return;
-      }
-      const i = Number(sel.selectedIndex);
-      const opt = sel.options[i];
-      const raw = opt && opt.getAttribute("data-fw-version");
-      const v = raw && String(raw).trim() || "";
-      ro.value = v || "\u2014";
-    };
-    const refreshFirmwareSelect = async () => {
-      if (!isSuper) return;
-      const sel = $("#otaFromSel", view);
-      if (!sel) return;
-      try {
-        const r = await api("/ota/firmwares", { timeoutMs: 2e4 });
-        if (!isRouteCurrent(routeSeq)) return;
-        const items = r.items || [];
-        const ret = r.retention;
-        const mx = $("#otaMaxBinsLbl", view);
-        if (mx && ret && ret.max_bins != null) mx.textContent = String(ret.max_bins);
-        const inf = $("#otaRetentionInfo", view);
-        if (inf) {
-          inf.textContent = ret ? `Server directory: ${ret.stored_count || 0} / max ${ret.max_bins} .bin files (oldest mtime removed when over limit). Upload password: ${ret.upload_password_configured ? "configured" : "not set on server"}.` : "";
-        }
-        const fmtM = (ts) => {
-          const t = Number(ts);
-          if (!Number.isFinite(t) || t <= 0) return "";
-          try {
-            const d = new Date(t * 1e3);
-            return d.toLocaleString(void 0, { dateStyle: "short", timeStyle: "short" });
-          } catch {
-            return "";
-          }
-        };
-        sel.innerHTML = items.length ? items.map((it) => {
-          const vRaw = it.fw_version && String(it.fw_version).trim() || "";
-          const dv = vRaw ? escapeHtml(vRaw) : "";
-          const fv = vRaw ? ` \xB7 v${escapeHtml(vRaw)}` : "";
-          const mt = fmtM(it.mtime);
-          const mtS = mt ? ` \xB7 ${escapeHtml(mt)}` : "";
-          return `<option value="${escapeHtml(it.name)}" data-fw-version="${dv}">${escapeHtml(it.name)}${fv} (${Math.round(Number(it.size || 0) / 1024)} KB${mtS})</option>`;
-        }).join("") : '<option value="">(no .bin in folder)</option>';
-        otaSyncFromStoredVersion();
-        sel.onchange = otaSyncFromStoredVersion;
-      } catch (e) {
-        const inf = $("#otaRetentionInfo", view);
-        if (inf) inf.textContent = "";
-        sel.innerHTML = `<option value="">${escapeHtml(e.message || "list failed")}</option>`;
-        otaSyncFromStoredVersion();
-        sel.onchange = otaSyncFromStoredVersion;
-      }
-    };
-    await refreshFirmwareSelect();
-    const otaFwListRefresh = $("#otaFwListRefresh", view);
-    if (otaFwListRefresh) {
-      otaFwListRefresh.addEventListener("click", async () => {
-        otaFwListRefresh.disabled = true;
-        try {
-          await refreshFirmwareSelect();
-          toast("Firmware list refreshed from server", "ok");
-        } catch (_) {
-        } finally {
-          otaFwListRefresh.disabled = false;
-        }
-      });
-    }
-    const stBtn = $("#otaStBtn", view);
-    if (stBtn) {
-      stBtn.addEventListener("click", async () => {
-        const inp = $("#otaStFile", view);
-        const f = inp && inp.files && inp.files[0];
-        const fw = String($("#otaStFw", view)?.value || "").trim();
-        const upw = String($("#otaStUploadPwd", view)?.value || "");
-        if (!f || !fw) {
-          toast("Choose file and version label", "err");
-          return;
-        }
-        if (!upw) {
-          toast("Enter the upload password (set OTA_UPLOAD_PASSWORD on the server).", "err");
-          return;
-        }
-        if (!confirm("Upload firmware to server (HEAD check against public /fw/ URL)?")) return;
-        try {
-          const fd = new FormData();
-          fd.append("file", f);
-          fd.append("fw_version", fw);
-          fd.append("upload_password", upw);
-          const r = await api("/ota/firmware/upload", { method: "POST", body: fd, timeoutMs: 18e4 });
-          if (!isRouteCurrent(routeSeq)) return;
-          const resEl = $("#otaStResult", view);
-          if (resEl) resEl.textContent = `Stored ${r.stored_as || ""} \xB7 head_ok=${r.head_ok} \xB7 ${r.verify || ""}`;
-          toast("Upload finished", r.head_ok ? "ok" : "err");
-          if (inp) inp.value = "";
-          refreshFirmwareSelect();
-        } catch (e) {
-          toast(e.message || e, "err");
-        }
-      });
-    }
-    const fromBtn = $("#otaFromBtn", view);
-    if (fromBtn) {
-      fromBtn.addEventListener("click", async () => {
-        const fn = String($("#otaFromSel", view)?.value || "").trim();
-        const notes = String($("#otaFromNotes", view)?.value || "").trim();
-        const allCh = $("#otaFromAllAd", view);
-        const rawAdm = String($("#otaFromAdmTxt", view)?.value || "").trim();
-        const target_admins = allCh && allCh.checked ? ["*"] : rawAdm ? rawAdm.split(/[\s,;]+/).filter(Boolean) : ["*"];
-        if (!fn) {
-          toast("Select a firmware package from the list", "err");
-          return;
-        }
-        if (!confirm("Create OTA campaign from this stored file? The campaign version will be taken from the server (staged .version / filename), not the UI.")) return;
-        try {
-          const out = await api("/ota/campaigns/from-stored", {
-            method: "POST",
-            body: { filename: fn, notes: notes || void 0, target_admins }
-          });
-          toast(
-            out && out.fw_version ? `Campaign created \xB7 v${out.fw_version}` : "Campaign created",
-            "ok"
-          );
-          try {
-            bustDeviceListCaches();
-          } catch (_) {
-          }
-        } catch (e) {
-          toast(e.message || e, "err");
-        }
-      });
-    }
-  }
-  function renderPolicyPanel(username, p) {
-    const row = (k, label, locked) => `
-      <label class="checkbox"><input type="checkbox" data-k="${k}" ${p[k] ? "checked" : ""} ${locked ? "disabled" : ""}/><span>${escapeHtml(label)}</span></label>`;
-    return `
-      <div class="stack">
-        <p class="muted" style="margin:0">Capabilities for <strong>${escapeHtml(username)}</strong> (user role).</p>
-        <div class="row">
-          ${row("can_alert", "Alarms (device + bulk + cancel)")}
-          ${row("can_send_command", "Send device commands")}
-          ${row("can_claim_device", "Claim / provision devices")}
-          ${row("can_manage_users", "Manage users (N/A for user role)", true)}
-          ${row("can_backup_restore", "Backup / restore (N/A for user role)", true)}
-        </div>
-        <div class="row" style="justify-content:flex-end">
-          <button class="btn js-save" type="button">Save</button>
-        </div>
-      </div>`;
-  }
   async function boot() {
     initTheme();
     $("#menuBtn").addEventListener("click", () => toggleNav());
@@ -5246,6 +4946,231 @@ ${id}`) || "").trim();
       }
     });
   });
+  registerRoute("ota", async (view, _args, routeSeq) => {
+    await __renderOtaFirmwareRoute(view, routeSeq);
+  });
+  async function __renderOtaFirmwareRoute(view, routeSeq) {
+    setCrumb("OTA (ops)");
+    const me = state.me || { username: "", role: "user" };
+    const isSuper = me.role === "superadmin";
+    if (!isSuper) {
+      mountView(view, `
+      <div class="card">
+        <h2 class="ui-section-title" style="margin:0">OTA & firmware</h2>
+        <p class="muted" style="margin:8px 0 0">\u79DF\u6237\u4FA7 <strong>\u4E0D</strong>\u518D\u4F7F\u7528 Admin OTA \u63A7\u5236\u53F0\u3002\u8BF7\u5728 <a href="#/devices">\u5168\u90E8\u8BBE\u5907</a> \u4E0E\u8BBE\u5907\u8BE6\u60C5\u67E5\u770B\u7248\u672C\u65C1\u7684 <strong>\u2191 + \u7EA2\u70B9</strong>\uFF08\u6709\u53EF\u7528\u65B0\u56FA\u4EF6\u65F6\uFF09\u3002OTA \u4E0A\u4F20\u4E0E campaign \u4EC5 <strong>superadmin</strong> \u5728\u4FA7\u680F\u300COTA (ops)\u300D\u64CD\u4F5C\u3002</p>
+        <p class="muted" style="margin:8px 0 0">There is <strong>no</strong> admin OTA console in this product. Use <a href="#/devices">All devices</a> and device detail for the <strong>\u2191 + red dot</strong> when an upgrade is available. Staging and campaigns are <strong>superadmin</strong> only (sidebar <strong>OTA (ops)</strong>).</p>
+      </div>`);
+      return;
+    }
+    const helpCard = `
+    <div class="card ota-help-card">
+      <h2 class="ui-section-title" style="margin:0">OTA & firmware \xB7 \u4F7F\u7528\u8BF4\u660E</h2>
+      <div class="ota-help__cols">
+        <div>
+          <h3 class="ota-help__h">\u4E2D\u6587</h3>
+          <ul class="muted ota-help__ul">
+            <li><strong>\u5168\u5458\uFF08\u542B admin\uFF09</strong>\uFF1A\u53EA\u770B <a href="#/devices">\u5168\u90E8\u8BBE\u5907</a> / \u8BBE\u5907\u8BE6\u60C5\u4E0A\u7684 <strong>\u2191 + \u7EA2\u70B9</strong> \u4E0E\u8BF4\u660E\u5F39\u7A97\uFF1B\u4E0D\u5728\u6B64\u9875\u5BF9 campaign \u505A Accept\u3002</li>
+            <li><strong>\u68C0\u6D4B</strong>\uFF1A\u670D\u52A1\u5668\u6BD4\u8F83 <code>OTA_FIRMWARE_DIR</code> \u4E2D\u7684 <code>.bin</code> \u4E0E\u8BBE\u5907 <code>fw</code>\uFF1B\u9700 <code>OTA_PUBLIC_BASE_URL</code> \u624D\u80FD\u5728\u5F39\u7A97\u4E2D\u7ED9\u51FA\u4E0B\u8F7D URL\u3002</li>
+            <li><strong>\u6587\u4EF6</strong>\uFF1A\u63A8\u8350 <code>croc-\u7248\u672C\u53F7-8\u4F4Dhex.bin</code>\uFF1B\u540C\u540D <code>.txt</code> / <code>.md</code> \u4E3A release notes\u3002</li>
+            <li><strong>Superadmin</strong>\uFF1A\u5728\u672C\u9875\u4E0B\u65B9\u4E0A\u4F20 / \u4ECE\u5DF2\u5B58\u6587\u4EF6\u5EFA campaign\uFF08\u82E5\u4ECD\u4F7F\u7528\u540E\u7AEF campaign \u6D41\uFF0C\u7531 API \u6216\u5176\u5B83\u6D41\u7A0B\u8BA9\u5404\u79DF\u6237\u8BBE\u5907\u62C9\u53D6\uFF1B\u63A7\u5236\u53F0\u4E0D\u518D\u7ED9 admin \u63D0\u4F9B OTA \u5165\u53E3\uFF09\u3002</li>
+          </ul>
+        </div>
+        <div>
+          <h3 class="ota-help__h">English</h3>
+          <ul class="muted ota-help__ul">
+            <li><strong>Everyone (including admin)</strong>: use <a href="#/devices">All devices</a> / device detail <strong>\u2191 + red dot</strong> + notes dialog only \u2014 <strong>no</strong> tenant OTA Accept UI here.</li>
+            <li><strong>Detection</strong>: server compares <code>.bin</code> in <code>OTA_FIRMWARE_DIR</code> vs device <code>fw</code>; set <code>OTA_PUBLIC_BASE_URL</code> for URLs in the dialog.</li>
+            <li><strong>Files</strong>: prefer <code>croc-SEMVER-random8.bin</code>; sidecar <code>.txt</code>/<code>.md</code> for notes.</li>
+            <li><strong>Superadmin</strong>: upload / create-from-stored below. Campaign APIs may still exist server-side; this dashboard does not expose an admin OTA workflow.</li>
+          </ul>
+        </div>
+      </div>
+      <p class="muted" style="margin:12px 0 0">Fleet: <a href="#/devices">All devices</a></p>
+    </div>`;
+    const superCard = `
+    <div class="card">
+      <h2 class="ui-section-title">Superadmin \xB7 Upload & campaign</h2>
+      <p class="muted" style="margin:0 0 8px">Upload stages a <code>.bin</code> under <code>OTA_FIRMWARE_DIR</code> (upload password <code>OTA_UPLOAD_PASSWORD</code>). The API keeps at most <strong id="otaMaxBinsLbl">10</strong> <code>.bin</code> files and deletes the <strong>oldest by file mtime</strong> (and sidecars) when over limit \u2014 same rule as <code>POST /ota/firmware/upload</code>. The list below is <strong>fetched from this server</strong> (<code>GET /ota/firmwares</code>); click <strong>Refresh list</strong> after upload or if you copied files in by hand.</p>
+      <div class="inline-form">
+        <label class="field wide"><span>Upload password *</span><input type="password" id="otaStUploadPwd" autocomplete="off" placeholder="Server OTA_UPLOAD_PASSWORD" /></label>
+        <label class="field"><span>Firmware file (.bin)</span><input type="file" id="otaStFile" accept=".bin,application/octet-stream" /></label>
+        <label class="field"><span>Version label *</span><input id="otaStFw" placeholder="6.6.8" maxlength="40" /></label>
+        <div class="row wide" style="justify-content:flex-end">
+          <button type="button" class="btn btn-tap" id="otaStBtn">Upload & verify</button>
+        </div>
+      </div>
+      <p class="muted" id="otaRetentionInfo" style="margin-top:8px;min-height:1.2em"></p>
+      <p class="muted" id="otaStResult" style="margin-top:4px;min-height:1.2em"></p>
+      <div class="divider"></div>
+      <h3 style="margin:0 0 6px">Publish from server-staged firmware / \u4F7F\u7528\u670D\u52A1\u5668\u4E0A\u7684\u56FA\u4EF6</h3>
+      <p class="muted" style="margin:0 0 8px;font-size:12.5px">The dropdown is populated by <strong>pulling the current directory listing from the API</strong> (not from your PC). Pick a <code>.bin</code> already on the server, then create a campaign. <strong>Version</strong> is resolved on the server (<code>.version</code> sidecar or filename) \u2014 not hand-typed; it should match that build&rsquo;s <code>FW_VERSION</code>.</p>
+      <div class="row wide" style="align-items:flex-end;flex-wrap:wrap;gap:10px;margin-bottom:6px">
+        <label class="field wide" style="flex:1;min-width:220px;margin:0"><span>Firmware on server *</span><select id="otaFromSel"><option value="">Loading\u2026</option></select></label>
+        <button type="button" class="btn secondary btn-tap sm" id="otaFwListRefresh">Refresh list</button>
+      </div>
+      <label class="field wide"><span>Version (from server, read-only)</span><input type="text" id="otaFromResolvedVer" class="mono" readonly tabindex="-1" value="\u2014" style="background:var(--bg-muted);cursor:default" aria-live="polite" /></label>
+      <label class="field wide"><span>Notes</span><input id="otaFromNotes" maxlength="500" /></label>
+      <label class="checkbox"><input type="checkbox" id="otaFromAllAd" checked /><span>Target all admins</span></label>
+      <label class="field wide"><span>Or comma-separated admin usernames</span><input id="otaFromAdmTxt" placeholder="admin-a, admin-b (when not targeting all)" /></label>
+      <div class="row wide" style="justify-content:flex-end;margin-top:10px">
+        <button type="button" class="btn btn-tap" id="otaFromBtn">Create campaign</button>
+      </div>
+    </div>`;
+    mountView(view, helpCard + superCard);
+    const otaSyncFromStoredVersion = () => {
+      const sel = $("#otaFromSel", view);
+      const ro = $("#otaFromResolvedVer", view);
+      if (!ro) return;
+      if (!sel || !sel.value) {
+        ro.value = "\u2014";
+        return;
+      }
+      const i = Number(sel.selectedIndex);
+      const opt = sel.options[i];
+      const raw = opt && opt.getAttribute("data-fw-version");
+      const v = raw && String(raw).trim() || "";
+      ro.value = v || "\u2014";
+    };
+    const refreshFirmwareSelect = async () => {
+      if (!isSuper) return;
+      const sel = $("#otaFromSel", view);
+      if (!sel) return;
+      try {
+        const r = await api("/ota/firmwares", { timeoutMs: 2e4 });
+        if (!isRouteCurrent(routeSeq)) return;
+        const items = r.items || [];
+        const ret = r.retention;
+        const mx = $("#otaMaxBinsLbl", view);
+        if (mx && ret && ret.max_bins != null) mx.textContent = String(ret.max_bins);
+        const inf = $("#otaRetentionInfo", view);
+        if (inf) {
+          inf.textContent = ret ? `Server directory: ${ret.stored_count || 0} / max ${ret.max_bins} .bin files (oldest mtime removed when over limit). Upload password: ${ret.upload_password_configured ? "configured" : "not set on server"}.` : "";
+        }
+        const fmtM = (ts) => {
+          const t = Number(ts);
+          if (!Number.isFinite(t) || t <= 0) return "";
+          try {
+            const d = new Date(t * 1e3);
+            return d.toLocaleString(void 0, { dateStyle: "short", timeStyle: "short" });
+          } catch {
+            return "";
+          }
+        };
+        sel.innerHTML = items.length ? items.map((it) => {
+          const vRaw = it.fw_version && String(it.fw_version).trim() || "";
+          const dv = vRaw ? escapeHtml(vRaw) : "";
+          const fv = vRaw ? ` \xB7 v${escapeHtml(vRaw)}` : "";
+          const mt = fmtM(it.mtime);
+          const mtS = mt ? ` \xB7 ${escapeHtml(mt)}` : "";
+          return `<option value="${escapeHtml(it.name)}" data-fw-version="${dv}">${escapeHtml(it.name)}${fv} (${Math.round(Number(it.size || 0) / 1024)} KB${mtS})</option>`;
+        }).join("") : '<option value="">(no .bin in folder)</option>';
+        otaSyncFromStoredVersion();
+        sel.onchange = otaSyncFromStoredVersion;
+      } catch (e) {
+        const inf = $("#otaRetentionInfo", view);
+        if (inf) inf.textContent = "";
+        sel.innerHTML = `<option value="">${escapeHtml(e.message || "list failed")}</option>`;
+        otaSyncFromStoredVersion();
+        sel.onchange = otaSyncFromStoredVersion;
+      }
+    };
+    await refreshFirmwareSelect();
+    const otaFwListRefresh = $("#otaFwListRefresh", view);
+    if (otaFwListRefresh) {
+      otaFwListRefresh.addEventListener("click", async () => {
+        otaFwListRefresh.disabled = true;
+        try {
+          await refreshFirmwareSelect();
+          toast("Firmware list refreshed from server", "ok");
+        } catch (_) {
+        } finally {
+          otaFwListRefresh.disabled = false;
+        }
+      });
+    }
+    const stBtn = $("#otaStBtn", view);
+    if (stBtn) {
+      stBtn.addEventListener("click", async () => {
+        const inp = $("#otaStFile", view);
+        const f = inp && inp.files && inp.files[0];
+        const fw = String($("#otaStFw", view)?.value || "").trim();
+        const upw = String($("#otaStUploadPwd", view)?.value || "");
+        if (!f || !fw) {
+          toast("Choose file and version label", "err");
+          return;
+        }
+        if (!upw) {
+          toast("Enter the upload password (set OTA_UPLOAD_PASSWORD on the server).", "err");
+          return;
+        }
+        if (!confirm("Upload firmware to server (HEAD check against public /fw/ URL)?")) return;
+        try {
+          const fd = new FormData();
+          fd.append("file", f);
+          fd.append("fw_version", fw);
+          fd.append("upload_password", upw);
+          const r = await api("/ota/firmware/upload", { method: "POST", body: fd, timeoutMs: 18e4 });
+          if (!isRouteCurrent(routeSeq)) return;
+          const resEl = $("#otaStResult", view);
+          if (resEl) resEl.textContent = `Stored ${r.stored_as || ""} \xB7 head_ok=${r.head_ok} \xB7 ${r.verify || ""}`;
+          toast("Upload finished", r.head_ok ? "ok" : "err");
+          if (inp) inp.value = "";
+          refreshFirmwareSelect();
+        } catch (e) {
+          toast(e.message || e, "err");
+        }
+      });
+    }
+    const fromBtn = $("#otaFromBtn", view);
+    if (fromBtn) {
+      fromBtn.addEventListener("click", async () => {
+        const fn = String($("#otaFromSel", view)?.value || "").trim();
+        const notes = String($("#otaFromNotes", view)?.value || "").trim();
+        const allCh = $("#otaFromAllAd", view);
+        const rawAdm = String($("#otaFromAdmTxt", view)?.value || "").trim();
+        const target_admins = allCh && allCh.checked ? ["*"] : rawAdm ? rawAdm.split(/[\s,;]+/).filter(Boolean) : ["*"];
+        if (!fn) {
+          toast("Select a firmware package from the list", "err");
+          return;
+        }
+        if (!confirm("Create OTA campaign from this stored file? The campaign version will be taken from the server (staged .version / filename), not the UI.")) return;
+        try {
+          const out = await api("/ota/campaigns/from-stored", {
+            method: "POST",
+            body: { filename: fn, notes: notes || void 0, target_admins }
+          });
+          toast(
+            out && out.fw_version ? `Campaign created \xB7 v${out.fw_version}` : "Campaign created",
+            "ok"
+          );
+          try {
+            bustDeviceListCaches();
+          } catch (_) {
+          }
+        } catch (e) {
+          toast(e.message || e, "err");
+        }
+      });
+    }
+  }
+  function renderPolicyPanel(username, p) {
+    const row = (k, label, locked) => `
+    <label class="checkbox"><input type="checkbox" data-k="${k}" ${p[k] ? "checked" : ""} ${locked ? "disabled" : ""}/><span>${escapeHtml(label)}</span></label>`;
+    return `
+    <div class="stack">
+      <p class="muted" style="margin:0">Capabilities for <strong>${escapeHtml(username)}</strong> (user role).</p>
+      <div class="row">
+        ${row("can_alert", "Alarms (device + bulk + cancel)")}
+        ${row("can_send_command", "Send device commands")}
+        ${row("can_claim_device", "Claim / provision devices")}
+        ${row("can_manage_users", "Manage users (N/A for user role)", true)}
+        ${row("can_backup_restore", "Backup / restore (N/A for user role)", true)}
+      </div>
+      <div class="row" style="justify-content:flex-end">
+        <button class="btn js-save" type="button">Save</button>
+      </div>
+    </div>`;
+  }
   registerRoute("overview", async (view, _args, routeSeq) => {
     setCrumb("Overview");
     const groupScope = state.me && state.me.username ? state.me.username : "anon";
@@ -6640,6 +6565,81 @@ ${id}`) || "").trim();
       }
     });
   });
+  async function renderSignalsPage(view, _args, routeSeq) {
+    setCrumb("Signals");
+    mountView(view, `
+    <div class="card">
+      <div class="row" style="flex-wrap:wrap;align-items:flex-end;gap:12px">
+        <div style="flex:1;min-width:200px">
+          <h2 style="margin:0">Signal log</h2>
+          <p class="muted" style="margin:6px 0 0">Device alarms and dashboard/API siren events. Group comes from device notification settings.</p>
+        </div>
+        <label class="field" style="max-width:140px;margin:0"><span>Hours</span><input id="sig_hours" type="number" value="168" min="1" max="720"/></label>
+        <button class="btn secondary btn-tap" id="sig_reload">Refresh</button>
+      </div>
+      <div class="divider"></div>
+      <div class="stats" id="sigSummary"></div>
+      <div class="divider"></div>
+      <div id="sigList"><p class="muted">Loading\u2026</p></div>
+    </div>`);
+    const reload = async () => {
+      const hours = parseInt($("#sig_hours").value, 10) || 168;
+      const qs = new URLSearchParams({ limit: "200", since_hours: String(hours) });
+      try {
+        if (!isRouteCurrent(routeSeq)) return;
+        const [d, sumR] = await Promise.all([
+          api("/activity/signals?" + qs.toString(), { timeoutMs: 24e3 }),
+          api("/alarms/summary", { timeoutMs: 16e3 }).catch(() => ({ last_24h: 0, last_7d: 0, top_sources_7d: [] }))
+        ]);
+        if (!isRouteCurrent(routeSeq)) return;
+        const sigSummaryEl = $("#sigSummary", view);
+        const sigListEl = $("#sigList", view);
+        if (!sigSummaryEl || !sigListEl) return;
+        setHtmlIfChanged(sigSummaryEl, [
+          ["Alarms 24h", sumR.last_24h || 0, "device-side alarm rows"],
+          ["Alarms 7d", sumR.last_7d || 0, "same scope"],
+          ["Top source 7d", (sumR.top_sources_7d || []).slice(0, 1).map((x) => `${x.source_id} \xD7 ${x.c}`).join("") || "\u2014", "by count"]
+        ].map(([k, v, s]) => `<div class="stat"><div class="k">${escapeHtml(k)}</div><div class="v">${escapeHtml(v)}</div><div class="sub">${escapeHtml(s)}</div></div>`).join(""));
+        const items = d.items || [];
+        const whoLbl = (w) => ({
+          remote_button: "GPIO / local button",
+          network: "MQTT / network",
+          api: "API / automation"
+        })[w] || w;
+        setHtmlIfChanged(sigListEl, items.length === 0 ? `<p class="muted audit-empty">No rows in this window.</p>` : `<div class="audit-feed">${items.map((a) => {
+          const dev = a.device_id === "*" ? "(bulk)" : a.device_id;
+          const link = a.device_id && a.device_id !== "*" ? `<a class="mono audit-target" href="#/devices/${encodeURIComponent(a.device_id)}">${escapeHtml(dev)}</a>` : escapeHtml(dev);
+          const em = a.email_sent ? "queued" : a.email_detail || "\u2014";
+          const fo = a.kind && a.kind.startsWith("bulk") ? String(a.fanout_count || 0) : String(a.fanout_count ?? "\u2014");
+          const whoS = a.kind === "device_alarm" ? whoLbl(a.who) : a.who || "\u2014";
+          const tShort = fmtTs(a.ts);
+          return `<article class="audit-item">
+            <div class="audit-item-top">
+              <div class="audit-time">
+                <span class="audit-ts mono">${escapeHtml(tShort)}</span>
+                <span class="muted audit-rel">${escapeHtml(fmtRel(a.ts))}</span>
+              </div>
+              <span class="chip">${escapeHtml(a.what || a.kind || "")}</span>
+              <span class="chip">${escapeHtml(a.zone || "all")}</span>
+            </div>
+            <div class="audit-item-line" style="flex-wrap:wrap;align-items:center;gap:6px">
+              <span class="mono">${link}</span>
+              <span class="chip">${escapeHtml(a.display_label || "\u2014")}</span>
+              <span class="chip">${escapeHtml(a.notification_group || "\u2014")}</span>
+            </div>
+            <div class="audit-item-line muted" style="font-size:12.5px">Who: ${escapeHtml(String(whoS))} \xB7 Fan-out: ${escapeHtml(fo)} \xB7 Email: ${escapeHtml(em)}</div>
+          </article>`;
+        }).join("")}</div>`);
+      } catch (e) {
+        if (!isRouteCurrent(routeSeq)) return;
+        toast(e.message || e, "err");
+      }
+    };
+    $("#sig_reload").addEventListener("click", reload);
+    reload();
+    scheduleRouteTicker(routeSeq, "signals-live-reload", reload, 1e4);
+  }
+  registerRoute("signals", renderSignalsPage);
   registerRoute("site", async (view, _args, routeSeq) => {
     setCrumb("Site \xB7 owners & groups / \u7AD9\u70B9");
     if (!(state.me && state.me.role === "superadmin")) {
