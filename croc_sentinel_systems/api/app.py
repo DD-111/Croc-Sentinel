@@ -8796,129 +8796,13 @@ def claim_device(req: ClaimDeviceRequest, principal: Principal = Depends(require
     return resp
 
 
-@app.get("/audit")
-def list_audit_events(
-    limit: int = Query(default=100, ge=1, le=500),
-    actor: Optional[str] = Query(default=None, max_length=64),
-    action: Optional[str] = Query(default=None, max_length=64),
-    target: Optional[str] = Query(default=None, max_length=128),
-    principal: Principal = Depends(require_principal),
-) -> dict[str, Any]:
-    assert_min_role(principal, "admin")
-    clauses: list[str] = ["1=1"]
-    args: list[Any] = []
-    if principal.role == "admin":
-        # admin only sees:
-        #   - own actions
-        #   - actions on users they manage
-        #   - actions on devices they own (or legacy unowned if allowed)
-        owned_sub = (
-            "SELECT username FROM dashboard_users WHERE manager_admin = ?"
-        )
-        clauses.append(
-            "(actor = ? OR target IN (" + owned_sub + ") OR target IN "
-            "(SELECT device_id FROM device_ownership WHERE owner_admin = ?))"
-        )
-        args.extend([principal.username, principal.username, principal.username])
-        clauses.append("actor NOT IN (SELECT username FROM dashboard_users WHERE role = 'superadmin')")
-    if actor:
-        clauses.append("actor = ?")
-        args.append(actor)
-    if action:
-        clauses.append("action LIKE ?")
-        args.append(f"{action}%")
-    if target:
-        clauses.append("target = ?")
-        args.append(target)
-    where = " AND ".join(clauses)
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            f"""
-            SELECT id, actor, action, target, detail_json, created_at
-            FROM audit_events
-            WHERE {where}
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            tuple(args + [limit]),
-        )
-        rows = [dict(r) for r in cur.fetchall()]
-        conn.close()
-    for r in rows:
-        try:
-            r["detail"] = json.loads(r.pop("detail_json") or "{}")
-        except Exception:
-            r["detail"] = {}
-    return {"items": rows}
+# Phase-9 modularization: /audit, /logs/messages, /logs/file moved to
+# routers/audit_logs.py. The router is imported and wired in here so it
+# sits at the same point in the route table as the original @app
+# decorators did.
+from routers.audit_logs import router as _audit_logs_router  # noqa: E402
 
-
-@app.get("/logs/messages")
-def get_logs_messages(
-    channel: Optional[str] = Query(default=None),
-    device_id: Optional[str] = Query(default=None),
-    limit: int = Query(default=100, ge=1, le=1000),
-    principal: Principal = Depends(require_principal),
-) -> dict[str, Any]:
-    assert_min_role(principal, "user")
-    if principal.role == "user" and not device_id:
-        raise HTTPException(status_code=403, detail="device_id is required for this role")
-    zs, za = zone_sql_suffix(principal, "d.zone")
-    osf, osa = owner_scope_clause_for_device_state(principal, "d")
-    query = """
-        SELECT m.id, m.topic, m.channel, m.device_id, m.payload_json, m.ts_device, m.ts_received
-        FROM messages m
-        JOIN device_state d ON m.device_id = d.device_id
-        WHERE 1=1
-    """
-    args: list[Any] = []
-    query += zs
-    args.extend(za)
-    query += osf
-    args.extend(osa)
-    if channel:
-        query += " AND m.channel = ?"
-        args.append(channel)
-    if device_id:
-        assert_device_view_access(principal, device_id)
-        query += " AND m.device_id = ?"
-        args.append(device_id)
-        with db_lock:
-            conn = get_conn()
-            cur = conn.cursor()
-            cur.execute("SELECT zone FROM device_state WHERE device_id = ?", (device_id,))
-            zr = cur.fetchone()
-            conn.close()
-        if not zr:
-            raise HTTPException(status_code=404, detail="device not found")
-        assert_zone_for_device(principal, str(zr["zone"]) if zr["zone"] is not None else "")
-    query += " ORDER BY m.id DESC LIMIT ?"
-    args.append(limit)
-
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(query, tuple(args))
-        rows = [dict(r) for r in cur.fetchall()]
-        conn.close()
-
-    for row in rows:
-        row["payload"] = json.loads(row.pop("payload_json"))
-    return {"items": rows}
-
-
-@app.get("/logs/file")
-def get_log_file_tail(
-    tail: int = Query(default=200, ge=10, le=5000),
-    principal: Principal = Depends(require_principal),
-) -> dict[str, Any]:
-    assert_min_role(principal, "superadmin")
-    if not os.path.exists(LOG_FILE_PATH):
-        return {"lines": []}
-    with open(LOG_FILE_PATH, "r", encoding="utf-8", errors="ignore") as f:
-        lines = f.readlines()
-    return {"lines": [ln.rstrip("\n") for ln in lines[-tail:]]}
+app.include_router(_audit_logs_router)
 
 
 @app.post("/devices/{device_id}/commands")
