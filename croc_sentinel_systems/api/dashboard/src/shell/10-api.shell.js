@@ -493,7 +493,7 @@ async function loadMe() {
   try {
     // Uses default API ceiling; slow Nginx/upstream still yields login page on failure.
     state.me = await api("/auth/me");
-  } catch (e) {
+  } catch (_) {
     state.me = null;
   }
   // Reuse the (still-valid) cookie-issued CSRF token across reloads, and

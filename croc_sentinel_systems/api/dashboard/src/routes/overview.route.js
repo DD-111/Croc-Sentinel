@@ -361,7 +361,6 @@ registerRoute("overview", async (view, _args, routeSeq) => {
   };
 
   let editingGroup = "";
-  const normalizeGroupKey = (v) => String(v == null ? "" : v).trim();
   let ownerFilterQ = "";
   const devicesForGroups = () => {
     if (!(state.me && state.me.role === "superadmin")) return devices;
@@ -444,29 +443,6 @@ registerRoute("overview", async (view, _args, routeSeq) => {
       return `<span class="badge accent" title="Device-level ACL: every device on this card is shared to you (same notification group)">ACL: full group · ${escapeHtml(o || "?")}</span>`;
     }
     return `<span class="badge partial" title="Device-level ACL: only some devices on this card are shared">ACL: partial devices (${sn}/${n})</span>`;
-  };
-  const renderDeviceCard = (d) => {
-    const on = isOnline(d);
-    const primary = escapeHtml(d.display_label || d.device_id || "unknown");
-    const subId = d.display_label ? `<div class="device-id-sub mono">${escapeHtml(d.device_id || "")}</div>` : "";
-    const showOwnerTag = !!(d.owner_admin && state.me && (state.me.role === "superadmin" || d.is_shared));
-    const ownerCorner = showOwnerTag
-      ? `<div class="device-card__corner-tr device-card__corner-tr--solo"><span class="card-owner-tag" title="Owning admin / 租户">${escapeHtml(String(d.owner_admin))}</span></div>`
-      : "";
-    return `<a class="device-card${showOwnerTag ? " device-card--has-owner-tag" : ""}" href="#/devices/${encodeURIComponent(d.device_id)}" style="text-decoration:none;color:inherit">
-      ${ownerCorner}
-      <h3><div class="device-primary-name">${primary}</div>${subId}</h3>
-      <div><span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>
-        ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
-        ${d.fw ? `<span class="chip">v${escapeHtml(d.fw)}</span>` : ""}
-        ${d.is_shared ? `<span class="badge accent" title="shared device">sharing by ${escapeHtml(d.shared_by || "?")}</span>` : ""}
-      </div>
-      <div class="meta">
-        Platform: ${escapeHtml(maskPlatform(`${d.chip_target || ""}/${d.board_profile || ""}`))}<br/>
-        Manufacturer: ESA Sibu<br/>
-        Updated: ${escapeHtml(fmtRel(d.updated_at))}
-      </div>
-    </a>`;
   };
   const buildGroupCardHtml = (slot) => {
     const g = slot.groupKey;

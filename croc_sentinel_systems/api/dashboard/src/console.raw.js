@@ -20,13 +20,7 @@
   // _isRetryableHttpStatus / DEFAULT_API_TIMEOUT_MS / ROUTE_RENDER_TIMEOUT_MS
   // → src/lib/api.js (imported by build-dashboard.mjs HEADER).
 
-  function getToken() { return localStorage.getItem(LS.token) || ""; }
-  function setToken(t) {
-    t ? localStorage.setItem(LS.token, t) : localStorage.removeItem(LS.token);
-    if (!t) {
-      _groupMetaSyncChain = Promise.resolve();
-    }
-  }
+  // getToken / setToken → src/shell/40-glue.shell.js.
 
   // ------------------------------------------------------------------ csrf
   // CSRF_COOKIE_NAME / CSRF_HEADER_NAME / _readCsrfCookie / getCsrfToken /
@@ -43,22 +37,7 @@
   // auditDetailDedupedRows / eventDetailDedupedRows / messagePayloadRows /
   // auditChipClass → src/lib/format.js.
 
-  function roleWeight(r) { return ROLE_WEIGHT[r] || 0; }
-  function hasRole(min) { return state.me && roleWeight(state.me.role) >= roleWeight(min); }
-  function can(cap) { return !!(state.me && state.me.policy && state.me.policy[cap]); }
-  function isOnline(d) {
-    if (typeof d.is_online === "boolean") return d.is_online;
-    return Date.now() - Date.parse(d.updated_at || 0) < OFFLINE_MS;
-  }
-
-  function toast(msg, kind) {
-    const el = $("#toast");
-    if (!el) return;
-    el.textContent = String(msg);
-    el.className = "toast show " + (kind || "");
-    clearTimeout(el._t);
-    el._t = setTimeout(() => { el.className = "toast"; }, 3200);
-  }
+  // roleWeight / hasRole / can / isOnline / toast → src/shell/40-glue.shell.js.
 
   // api / apiOr / apiGetCached / FW hint dialog / login / loadMe / loadHealth
   // and the group apply/delete + share matrix helpers →

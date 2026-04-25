@@ -7,7 +7,7 @@ The SPA is split across three layers, each with a different concatenation/bundle
 | **Lib (ESM)** | `src/lib/*.js` | `import { … }` in HEADER, real ES modules | Pure helpers — no shared state, no DOM tree refs (constants, formatters, HTTP/CSRF utilities, static HTML factories) |
 | **Shell (raw concat)** | `src/shell/<NN>-<name>.shell.js` | Concatenated as raw text after the monolith body, before the route files | State-coupled glue that needs to read/write the SPA `state` object, mutate the live DOM, or call other shell pieces directly |
 | **Routes (raw concat)** | `src/routes/*.route.js` | Concatenated last, after shell | One file per `registerRoute(...)` handler — the leaf of the bundle |
-| **Monolith shell** | `src/console.raw.js` | IIFE wrapper + 4-helper glue + `boot()` | Boot loop, glue functions that everyone calls (`toast`, `roleWeight`, `hasRole`, `can`, `isOnline`, `getToken`, `setToken`) |
+| **Monolith shell** | `src/console.raw.js` | IIFE wrapper + breadcrumb comments + `boot()` | Boot loop only. Every helper has been peeled into `lib/`, `shell/`, or `routes/`; this file just wires DOM listeners and kicks off `loadMe()` / `renderRoute()`. |
 
 ## Layer 1 — `src/lib/` (proper ES modules)
 
@@ -33,6 +33,7 @@ The numeric prefix forces concat order:
 | `10-api.shell.js` | `api`, `apiOr`, `apiGetCached` + cache; group apply/delete fallbacks (`runGroupApplyOnAction`, `runGroupDeleteAction`); `grantShareMatrix`; firmware hint dialog (`openGlobalFwHintDialog`, `firmwareHintStillValid`); auth lifecycle (`login`, `loadMe`, `loadHealth`) |
 | `20-layout.shell.js` | `renderAuthState`, `renderNav`, `renderHealthPills`, `renderMqttDot`, `setCrumb`, `setTheme`/`initTheme`, `toggleNav`, `applySidebarRail`/`toggleSidebarRail`, `syncNavForViewport` |
 | `30-router.shell.js` | The `routes` registry, `registerRoute`, `isRouteCurrent`, `clearRouteTickers`/`scheduleRouteTicker`, `renderRoute`, the `hashchange` listener |
+| `40-glue.shell.js` | Cross-cutting helpers everyone calls — `getToken`/`setToken`, `roleWeight`/`hasRole`/`can`, `isOnline(d)`, `toast(msg, kind)` |
 
 Function declarations in any shell file are hoisted to the top of the IIFE, so order between *functions* doesn't matter. Order between top-level `let`/`const` *does* matter — that's why `state` lives in `00-state.shell.js`.
 
@@ -66,6 +67,20 @@ Function declarations in any shell file are hoisted to the top of the IIFE, so o
 4. Appends every `src/routes/<id>.route.js` (sorted).
 5. Hands the result to **esbuild**, which `import`-bundles `lib/*.js` and re-wraps the whole thing in a single IIFE → `assets/app.js`.
 
-After edits, run **`npm run build`** (or **`npm run verify`**: build + `node --check` + smoke) before committing or shipping.
+After edits, run **`npm run build`** (or **`npm run verify`**: build + `node --check` + smoke + lint) before committing or shipping.
+
+## Static analysis (ESLint)
+
+`npm run lint` runs `node scripts/_derive-globals.mjs` first to regenerate `scripts/_globals.json` (the canonical list of names declared in `lib/*.js`, `shell/*.shell.js`, `routes/*.route.js`, and `console.raw.js`), then runs ESLint with `eslint.config.mjs`. The flat config has three layers:
+
+| Layer | Files | Source type | Globals |
+|---|---|---|---|
+| **ESM helpers** | `src/lib/**/*.js`, `src/routes/manifest.js` | `module` | `globals.browser` |
+| **Concat layer** | `src/shell/**/*.js`, `src/routes/*.route.js`, `src/console.raw.js` | `script` | `globals.browser` + `_globals.json#concatGlobals` |
+| **Build scripts** | `scripts/**/*.mjs` | `module` | `globals.node` |
+
+Active rules: `no-undef`, `no-unused-vars` (with `^_` ignore patterns; `vars: "local"` for the concat layer because top-level decls are the file's "exports"), `eqeqeq` (smart). Lint is part of `npm run verify`, so it runs on every full check.
+
+**Adding a new top-level shell/route helper:** just declare it. `_derive-globals.mjs` is regenerated at every `npm run lint`/`npm run verify`, so cross-file calls stop tripping `no-undef` automatically. Only check `_globals.json` into git so fresh clones can run `eslint` standalone.
 
 **Overrides:** you may patch `assets/app.js` directly for a hotfix, but always backport to `src/`. For CSS partition maintenance, **`node scripts/split-css.mjs --force`** bypasses the guard.

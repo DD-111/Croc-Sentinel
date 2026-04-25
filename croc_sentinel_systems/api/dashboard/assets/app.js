@@ -485,38 +485,6 @@
   }
 
   // src/virtual-console.js
-  function getToken() {
-    return localStorage.getItem(LS.token) || "";
-  }
-  function setToken(t) {
-    t ? localStorage.setItem(LS.token, t) : localStorage.removeItem(LS.token);
-    if (!t) {
-      _groupMetaSyncChain = Promise.resolve();
-    }
-  }
-  function roleWeight(r) {
-    return ROLE_WEIGHT[r] || 0;
-  }
-  function hasRole(min) {
-    return state.me && roleWeight(state.me.role) >= roleWeight(min);
-  }
-  function can(cap) {
-    return !!(state.me && state.me.policy && state.me.policy[cap]);
-  }
-  function isOnline(d) {
-    if (typeof d.is_online === "boolean") return d.is_online;
-    return Date.now() - Date.parse(d.updated_at || 0) < OFFLINE_MS;
-  }
-  function toast(msg, kind) {
-    const el = $("#toast");
-    if (!el) return;
-    el.textContent = String(msg);
-    el.className = "toast show " + (kind || "");
-    clearTimeout(el._t);
-    el._t = setTimeout(() => {
-      el.className = "toast";
-    }, 3200);
-  }
   async function boot() {
     initTheme();
     $("#menuBtn").addEventListener("click", () => toggleNav());
@@ -1282,7 +1250,7 @@ ${curFw} \u2192 ${fw}`)) return;
   async function loadMe() {
     try {
       state.me = await api("/auth/me");
-    } catch (e) {
+    } catch (_) {
       state.me = null;
     }
     if (state.me) {
@@ -1648,6 +1616,38 @@ ${curFw} \u2192 ${fw}`)) return;
     }
   }
   window.addEventListener("hashchange", renderRoute);
+  function getToken() {
+    return localStorage.getItem(LS.token) || "";
+  }
+  function setToken(t) {
+    t ? localStorage.setItem(LS.token, t) : localStorage.removeItem(LS.token);
+    if (!t) {
+      _groupMetaSyncChain = Promise.resolve();
+    }
+  }
+  function roleWeight(r) {
+    return ROLE_WEIGHT[r] || 0;
+  }
+  function hasRole(min) {
+    return state.me && roleWeight(state.me.role) >= roleWeight(min);
+  }
+  function can(cap) {
+    return !!(state.me && state.me.policy && state.me.policy[cap]);
+  }
+  function isOnline(d) {
+    if (typeof d.is_online === "boolean") return d.is_online;
+    return Date.now() - Date.parse(d.updated_at || 0) < OFFLINE_MS;
+  }
+  function toast(msg, kind) {
+    const el = $("#toast");
+    if (!el) return;
+    el.textContent = String(msg);
+    el.className = "toast show " + (kind || "");
+    clearTimeout(el._t);
+    el._t = setTimeout(() => {
+      el.className = "toast";
+    }, 3200);
+  }
   registerRoute("account-activate", async (view) => {
     setCrumb("Activate account");
     document.body.dataset.auth = "none";
@@ -4649,7 +4649,6 @@ ${id}`) || "").trim();
     const [listRes] = await Promise.allSettled([apiGetCached("/devices", { timeoutMs: 16e3 }, 3e3)]);
     if (!isRouteCurrent(routeSeq)) return;
     let list = listRes.status === "fulfilled" && listRes.value ? listRes.value : { items: [] };
-    let byId = new Map((list.items || []).map((d) => [String(d.device_id), d]));
     syncGroupMetaWithDevices(meta, list.items || []);
     try {
       localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(meta));
@@ -4858,7 +4857,6 @@ ${id}`) || "").trim();
       const latest = await apiGetCached("/devices", { timeoutMs: 16e3 }, 2e3);
       if (!isRouteCurrent(routeSeq)) return;
       list = latest || { items: [] };
-      byId = new Map((list.items || []).map((d) => [String(d.device_id), d]));
       syncGroupMetaWithDevices(meta, list.items || []);
       try {
         localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(meta));
@@ -5519,7 +5517,6 @@ ${id}`) || "").trim();
       return `<label class="grp-pick-item grp-pick-item--device"><input type="checkbox" class="grp-pick-chk" value="${escapeHtml(did)}"${ck}${di} /><span class="grp-pick-text"><span class="grp-pick-name">${escapeHtml(name)}</span><span class="grp-pick-id mono" title="Device ID / \u5E8F\u5217\u53F7">${escapeHtml(did)}</span></span></label>`;
     };
     let editingGroup = "";
-    const normalizeGroupKey = (v) => String(v == null ? "" : v).trim();
     let ownerFilterQ = "";
     const devicesForGroups = () => {
       if (!(state.me && state.me.role === "superadmin")) return devices;
@@ -5600,27 +5597,6 @@ ${id}`) || "").trim();
         return `<span class="badge accent" title="Device-level ACL: every device on this card is shared to you (same notification group)">ACL: full group \xB7 ${escapeHtml(o || "?")}</span>`;
       }
       return `<span class="badge partial" title="Device-level ACL: only some devices on this card are shared">ACL: partial devices (${sn}/${n})</span>`;
-    };
-    const renderDeviceCard = (d) => {
-      const on = isOnline(d);
-      const primary = escapeHtml(d.display_label || d.device_id || "unknown");
-      const subId = d.display_label ? `<div class="device-id-sub mono">${escapeHtml(d.device_id || "")}</div>` : "";
-      const showOwnerTag = !!(d.owner_admin && state.me && (state.me.role === "superadmin" || d.is_shared));
-      const ownerCorner = showOwnerTag ? `<div class="device-card__corner-tr device-card__corner-tr--solo"><span class="card-owner-tag" title="Owning admin / \u79DF\u6237">${escapeHtml(String(d.owner_admin))}</span></div>` : "";
-      return `<a class="device-card${showOwnerTag ? " device-card--has-owner-tag" : ""}" href="#/devices/${encodeURIComponent(d.device_id)}" style="text-decoration:none;color:inherit">
-      ${ownerCorner}
-      <h3><div class="device-primary-name">${primary}</div>${subId}</h3>
-      <div><span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>
-        ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
-        ${d.fw ? `<span class="chip">v${escapeHtml(d.fw)}</span>` : ""}
-        ${d.is_shared ? `<span class="badge accent" title="shared device">sharing by ${escapeHtml(d.shared_by || "?")}</span>` : ""}
-      </div>
-      <div class="meta">
-        Platform: ${escapeHtml(maskPlatform(`${d.chip_target || ""}/${d.board_profile || ""}`))}<br/>
-        Manufacturer: ESA Sibu<br/>
-        Updated: ${escapeHtml(fmtRel(d.updated_at))}
-      </div>
-    </a>`;
     };
     const buildGroupCardHtml = (slot) => {
       const g = slot.groupKey;

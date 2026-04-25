@@ -7,9 +7,12 @@
     "build": "node scripts/build-dashboard.mjs",
     "check": "node --check assets/app.js",
     "smoke": "node scripts/smoke-routes.mjs",
-    "verify": "npm run build && npm run check && npm run smoke"
+    "lint": "node scripts/_derive-globals.mjs && eslint .",
+    "verify": "npm run build && npm run check && npm run smoke && npm run lint"
   },
   "devDependencies": {
-    "esbuild": "^0.25.0"
+    "esbuild": "^0.25.0",
+    "eslint": "^10.2.1",
+    "globals": "^17.5.0"
   }
 }

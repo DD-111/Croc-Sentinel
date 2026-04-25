@@ -10,7 +10,6 @@
 import { readFileSync } from "node:fs";
 
 const src = readFileSync("src/console.raw.js", "utf8");
-const lines = src.split(/\r?\n/);
 
 // Find each registerRoute block. Two shapes are accepted:
 //   registerRoute("id", async (view, ...) => { ... })

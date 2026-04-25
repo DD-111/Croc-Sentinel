@@ -62,7 +62,6 @@ registerRoute("group", async (view, args, routeSeq) => {
   const [listRes] = await Promise.allSettled([apiGetCached("/devices", { timeoutMs: 16000 }, 3000)]);
   if (!isRouteCurrent(routeSeq)) return;
   let list = (listRes.status === "fulfilled" && listRes.value) ? listRes.value : { items: [] };
-  let byId = new Map((list.items || []).map((d) => [String(d.device_id), d]));
   syncGroupMetaWithDevices(meta, list.items || []);
   try { localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(meta)); } catch (_) {}
   const gm = meta[metaKey] || meta[g] || { display_name: g, owner_name: "", phone: "", email: "", device_ids: [] };
@@ -253,7 +252,6 @@ registerRoute("group", async (view, args, routeSeq) => {
     const latest = await apiGetCached("/devices", { timeoutMs: 16000 }, 2000);
     if (!isRouteCurrent(routeSeq)) return;
     list = latest || { items: [] };
-    byId = new Map((list.items || []).map((d) => [String(d.device_id), d]));
     syncGroupMetaWithDevices(meta, list.items || []);
     try { localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(meta)); } catch (_) {}
     rows = rowsByGroup();
