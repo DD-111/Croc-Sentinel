@@ -55,6 +55,49 @@ from email_templates import (
     render_welcome_email,
 )
 from tz_display import iso_timestamp_to_malaysia, malaysia_now_iso
+from db import (
+    CACHE_TTL_SECONDS,
+    DB_PATH,
+    SQLITE_BUSY_TIMEOUT_MS,
+    SQLITE_CONNECT_TIMEOUT_S,
+    _DbLockContext,
+    _SqliteRWLock,
+    _db_rw,
+    api_cache,
+    cache_get,
+    cache_invalidate,
+    cache_lock,
+    cache_put,
+    db_lock,
+    db_read_lock,
+    db_write_lock,
+    ensure_column,
+    get_conn,
+    init_db_pragmas,
+)
+
+# Re-export for any third party that already does ``from app import ...``;
+# the names below are kept stable across the db.py extraction.
+__all_db_reexports__ = (
+    "CACHE_TTL_SECONDS",
+    "DB_PATH",
+    "SQLITE_BUSY_TIMEOUT_MS",
+    "SQLITE_CONNECT_TIMEOUT_S",
+    "_DbLockContext",
+    "_SqliteRWLock",
+    "_db_rw",
+    "api_cache",
+    "cache_get",
+    "cache_invalidate",
+    "cache_lock",
+    "cache_put",
+    "db_lock",
+    "db_read_lock",
+    "db_write_lock",
+    "ensure_column",
+    "get_conn",
+    "init_db_pragmas",
+)
 
 
 def utc_now_iso() -> str:
@@ -89,18 +132,14 @@ CMD_PROTO = int(os.getenv("CMD_PROTO", "2"))
 API_TOKEN = os.getenv("API_TOKEN", "")
 # When 0 (default), the long-lived API_TOKEN bearer is not accepted — use JWT login only.
 LEGACY_API_TOKEN_ENABLED = os.getenv("LEGACY_API_TOKEN_ENABLED", "0") == "1"
-DB_PATH = os.getenv("DB_PATH", "/data/sentinel.db")
-# sqlite3.connect(timeout=…): seconds waiting to acquire DB lock at open.
-SQLITE_CONNECT_TIMEOUT_S = float(os.getenv("SQLITE_CONNECT_TIMEOUT_S", "10.0"))
-_sqlite_busy_ms = int(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "5000"))
-SQLITE_BUSY_TIMEOUT_MS = max(0, min(600_000, _sqlite_busy_ms))
+# DB_PATH / SQLITE_CONNECT_TIMEOUT_S / SQLITE_BUSY_TIMEOUT_MS now live in db.py
+# and are re-exported below; see ``from db import ...`` block.
 LOG_FILE_PATH = os.getenv("LOG_FILE_PATH", "/data/api.log")
 PROVISION_USE_SHARED_MQTT_CREDS = os.getenv("PROVISION_USE_SHARED_MQTT_CREDS", "1") == "1"
 SCHEDULER_POLL_SECONDS = float(os.getenv("SCHEDULER_POLL_SECONDS", "1.0"))
 CLAIM_RESPONSE_INCLUDE_SECRETS = os.getenv("CLAIM_RESPONSE_INCLUDE_SECRETS", "0") == "1"
 MAX_BULK_TARGETS = int(os.getenv("MAX_BULK_TARGETS", "500"))
-# Short TTL for dashboard list/overview JSON; higher = fewer DB hits on repeat views (good on flaky links).
-CACHE_TTL_SECONDS = float(os.getenv("CACHE_TTL_SECONDS", "18.0"))
+# CACHE_TTL_SECONDS now lives in db.py (re-exported below).
 MESSAGE_RETENTION_DAYS = int(os.getenv("MESSAGE_RETENTION_DAYS", "14"))
 STRICT_STARTUP_ENV_CHECK = os.getenv("STRICT_STARTUP_ENV_CHECK", "0") == "1"
 JWT_SECRET = os.getenv("JWT_SECRET", "")
@@ -312,97 +351,8 @@ TOPIC_ACK = f"{TOPIC_ROOT}/+/ack"
 TOPIC_BOOTSTRAP_REGISTER = f"{TOPIC_ROOT}/bootstrap/register"
 
 
-class _SqliteRWLock:
-    """Coordinates access across many short-lived ``sqlite3`` connections.
-
-    ``get_conn()`` opens a **new** connection per call and ``init_db_pragmas``
-    enables WAL, so multiple read transactions can run concurrently as long as
-    no writer holds the database. This replaces a single ``threading.Lock`` that
-    serialized every SELECT — a major source of dashboard slowness under load.
-
-    Writer preference: new readers block while a writer is waiting so we don't
-    starve writes behind a continuous stream of read-only dashboard polls.
-    """
-
-    __slots__ = ("_cv", "_readers", "_writer", "_writers_waiting")
-
-    def __init__(self) -> None:
-        self._cv = threading.Condition(threading.Lock())
-        self._readers = 0
-        self._writer = False
-        self._writers_waiting = 0
-
-    def acquire_read(self) -> None:
-        with self._cv:
-            while self._writer or self._writers_waiting > 0:
-                self._cv.wait()
-            self._readers += 1
-
-    def release_read(self) -> None:
-        with self._cv:
-            self._readers -= 1
-            if self._readers == 0:
-                self._cv.notify_all()
-
-    def acquire_write(self) -> None:
-        with self._cv:
-            self._writers_waiting += 1
-            try:
-                while self._readers > 0 or self._writer:
-                    self._cv.wait()
-                self._writer = True
-            finally:
-                self._writers_waiting -= 1
-
-    def release_write(self) -> None:
-        with self._cv:
-            self._writer = False
-            self._cv.notify_all()
-
-    def try_acquire_read(self) -> bool:
-        with self._cv:
-            if self._writer or self._writers_waiting > 0:
-                return False
-            self._readers += 1
-            return True
-
-
-class _DbLockContext:
-    __slots__ = ("_rw", "_read")
-
-    def __init__(self, rw: _SqliteRWLock, *, read: bool) -> None:
-        self._rw = rw
-        self._read = read
-
-    def __enter__(self) -> "_DbLockContext":
-        if self._read:
-            self._rw.acquire_read()
-        else:
-            self._rw.acquire_write()
-        return self
-
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        if self._read:
-            self._rw.release_read()
-        else:
-            self._rw.release_write()
-
-
-_db_rw = _SqliteRWLock()
-
-
-def db_read_lock() -> _DbLockContext:
-    """Use for pure SELECT paths (one connection per ``with`` body)."""
-    return _DbLockContext(_db_rw, read=True)
-
-
-def db_write_lock() -> _DbLockContext:
-    """Use for INSERT/UPDATE/DELETE/DDL or read+write in one critical section."""
-    return _DbLockContext(_db_rw, read=False)
-
-
-# Backwards compatible: ``with db_lock:`` remains exclusive write semantics.
-db_lock = _DbLockContext(_db_rw, read=False)
+# DB locks (`_SqliteRWLock`, `_DbLockContext`, `_db_rw`, `db_lock`,
+# `db_read_lock`, `db_write_lock`) live in ``db.py`` — see import below.
 mqtt_client: Optional[mqtt.Client] = None
 mqtt_connected = False
 mqtt_ingest_queue: _stdqueue.Queue[Optional[dict[str, Any]]] = _stdqueue.Queue(maxsize=MQTT_INGEST_QUEUE_MAX)
@@ -423,8 +373,7 @@ api_bootstrap_error: Optional[str] = None
 _bootstrap_thread: Optional[threading.Thread] = None
 scheduler_stop = threading.Event()
 scheduler_thread: Optional[threading.Thread] = None
-cache_lock = threading.Lock()
-api_cache: dict[str, tuple[float, Any]] = {}
+# cache_lock + api_cache moved to db.py and re-exported below.
 
 log_dir = os.path.dirname(LOG_FILE_PATH)
 if log_dir:
@@ -498,77 +447,10 @@ def validate_production_env() -> None:
         logger.warning("%s (startup allowed because STRICT_STARTUP_ENV_CHECK=0)", msg)
 
 
-def cache_get(key: str) -> Optional[Any]:
-    now = time.time()
-    with cache_lock:
-        item = api_cache.get(key)
-        if not item:
-            return None
-        exp, val = item
-        if exp < now:
-            api_cache.pop(key, None)
-            return None
-        return val
-
-
-def cache_put(key: str, val: Any, ttl: float = CACHE_TTL_SECONDS) -> None:
-    with cache_lock:
-        api_cache[key] = (time.time() + ttl, val)
-
-
-def cache_invalidate(prefix: str = "") -> None:
-    with cache_lock:
-        if not prefix:
-            api_cache.clear()
-            return
-        keys = [k for k in api_cache if k.startswith(prefix)]
-        for k in keys:
-            api_cache.pop(k, None)
-
-
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=max(1.0, SQLITE_CONNECT_TIMEOUT_S))
-    conn.row_factory = sqlite3.Row
-    # Per-connection pragmas. WAL + synchronous are set once in init_db_pragmas
-    # because they're persistent; these here are per-connection tuning.
-    try:
-        cur = conn.cursor()
-        cur.execute(f"PRAGMA busy_timeout = {int(SQLITE_BUSY_TIMEOUT_MS)}")
-        cur.execute("PRAGMA cache_size = -32768")   # 32 MB page cache / conn
-        cur.execute("PRAGMA temp_store = MEMORY")
-        cur.execute("PRAGMA foreign_keys = ON")
-    except Exception:
-        pass
-    return conn
-
-
-def init_db_pragmas() -> None:
-    """Persistent, one-shot PRAGMA setup. Called once from init_db() after
-    all CREATE TABLE statements so we don't race with schema migration.
-    Tuned for an 8 GB / 100 GB NVMe VPS: WAL mode is ~5x faster for the
-    write-heavy event pipeline and multi-reader friendly; mmap avoids
-    copying hot pages between kernel and user space.
-    """
-    try:
-        with db_lock:
-            conn = get_conn()
-            cur = conn.cursor()
-            cur.execute("PRAGMA journal_mode = WAL")
-            cur.execute("PRAGMA synchronous = NORMAL")
-            cur.execute("PRAGMA wal_autocheckpoint = 1000")
-            cur.execute("PRAGMA mmap_size = 268435456")  # 256 MB
-            conn.commit()
-            conn.close()
-    except Exception as exc:
-        logger.warning("init_db_pragmas failed: %s", exc)
-
-
-def ensure_column(conn: sqlite3.Connection, table: str, column: str, col_def: str) -> None:
-    cur = conn.cursor()
-    cur.execute(f"PRAGMA table_info({table})")
-    cols = [r[1] for r in cur.fetchall()]
-    if column not in cols:
-        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
+# cache_get / cache_put / cache_invalidate moved to db.py (re-exported below).
+# get_conn / init_db_pragmas / ensure_column moved to db.py (re-exported below).
+# init_db() stays here because schema-init calls helpers (default_policy_for_role,
+# _sibling_group_norm, hash_password) that live further down the file.
 
 
 def init_db() -> None:
