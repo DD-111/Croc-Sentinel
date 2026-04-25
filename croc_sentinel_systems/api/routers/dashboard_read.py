@@ -27,7 +27,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel  # noqa: F401  (kept for contract/import parity)
 
-import notifier
+from notifier import notifier
 import app as _app
 from db import cache_get, cache_put, db_lock, db_read_lock, get_conn
 from security import (

@@ -34,7 +34,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-import notifier
+from notifier import notifier
 import app as _app
 from audit import audit_event
 from config import CMD_PROTO, DEFAULT_REMOTE_FANOUT_MS, MAX_BULK_TARGETS, TOPIC_ROOT
