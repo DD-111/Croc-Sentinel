@@ -24,14 +24,48 @@ const GROUP_CARD_TENANT_SEP = "\u001e";
 function normalizeGroupKeyStr(v) {
   return String(v == null ? "" : v).trim();
 }
-/** One logical group per string: trim + NFC + collapse internal whitespace (avoids duplicate group cards). */
-function canonicalGroupKey(v) {
+/**
+ * Display-friendly normalization of a notification_group string.
+ * Trims, NFC-normalizes, collapses internal whitespace — but preserves
+ * the user's original casing. Use this for human-readable strings
+ * (group card titles, breadcrumbs, edit-form prefills).
+ */
+function displayGroupName(v) {
   let s = normalizeGroupKeyStr(v);
   if (!s) return "";
   try {
     s = s.normalize("NFC");
   } catch (_) {}
   return s.replace(/\s+/g, " ");
+}
+/**
+ * Sibling-matching key for a notification_group string.
+ *
+ * **Must mirror the backend ``helpers._sibling_group_norm`` exactly**
+ * so the dashboard groups devices the same way the MQTT fan-out
+ * resolves siblings. The backend does:
+ *
+ *     strip → NFC → collapse whitespace → casefold
+ *
+ * If this drifts, the dashboard will show phantom duplicate cards
+ * (e.g. "Warehouse A" and "warehouse a" rendered separately) while
+ * the server still treats them as one sibling group — operators
+ * see two cards but only one set of devices reacts to "Alarm ON".
+ *
+ * We use ``toLocaleLowerCase()`` as the JS-side equivalent of Python's
+ * ``str.casefold()``: case-folding is locale-aware and handles e.g.
+ * the German ß → ss collision the simple ``toLowerCase()`` misses.
+ * For the ASCII / Latin-1 names that 99% of group keys use these
+ * are equivalent.
+ */
+function canonicalGroupKey(v) {
+  const s = displayGroupName(v);
+  if (!s) return "";
+  try {
+    return s.toLocaleLowerCase();
+  } catch (_) {
+    return s.toLowerCase();
+  }
 }
 /** Stable localStorage / UI key for a group card; superadmin always prefixes owning admin (avoids duplicate cards vs plain group key). */
 function groupCardMetaKey(groupKey, tenantOwner) {
@@ -106,7 +140,11 @@ function reconcileGroupMetaForDevice(deviceId, newGroupKey, ownerHint) {
       const ck = groupCardMetaKey(ng, ownerHint);
       if (!ck) return;
       if (!meta[ck] || typeof meta[ck] !== "object") {
-        meta[ck] = { display_name: ng, owner_name: "", phone: "", email: "", device_ids: [] };
+        // Prefer the user-supplied (case-preserved) string for the title
+        // — case-folded ``ng`` would render as "warehouse a" instead of
+        // the "Warehouse A" the user just typed.
+        const human = displayGroupName(newGroupKey) || ng;
+        meta[ck] = { display_name: human, owner_name: "", phone: "", email: "", device_ids: [] };
       }
       const s = new Set((meta[ck].device_ids || []).map(String));
       s.add(id);
@@ -130,21 +168,56 @@ function syncGroupMetaWithDevices(meta, devices) {
   const list = Array.isArray(devices) ? devices : [];
   const isSuper = state.me && state.me.role === "superadmin";
   const notifMap = new Map();
+  // Pick a representative human-readable name for each canonical group.
+  // Prefer the first device's original (case-preserved) notification_group
+  // string so the card title stays "Warehouse A" even though the match
+  // key is folded to "warehouse a". Without this fallback, cards
+  // re-rendered after a fresh load would show the lowercase key.
+  const displayMap = new Map();
   for (const d of list) {
     const g = canonicalGroupKey(d && d.notification_group);
     if (!g) continue;
     const ck = groupCardMetaKey(g, isSuper ? d.owner_admin : "");
     if (!notifMap.has(ck)) notifMap.set(ck, []);
     notifMap.get(ck).push(String(d.device_id));
+    if (!displayMap.has(ck)) {
+      const human = displayGroupName(d && d.notification_group);
+      if (human) displayMap.set(ck, human);
+    }
+  }
+  // Migrate any pre-Phase-90 entries that were keyed by the old
+  // case-preserving canonicalGroupKey: when the new (case-folded) key
+  // collides with an old (cased) one for the same tenant, copy the
+  // user-editable fields forward so we don't drop display_name /
+  // owner_name / phone / email metadata silently.
+  for (const oldKey of Object.keys(meta)) {
+    if (notifMap.has(oldKey)) continue; // already canonical
+    const oldEntry = meta[oldKey];
+    if (!oldEntry || typeof oldEntry !== "object") continue;
+    const { tenantOwner: oldTenant, groupKey: oldGroup } = parseGroupMetaKey(oldKey);
+    if (!oldGroup) continue;
+    const folded = groupCardMetaKey(canonicalGroupKey(oldGroup), oldTenant);
+    if (!folded || !notifMap.has(folded) || folded === oldKey) continue;
+    const dest = (meta[folded] && typeof meta[folded] === "object") ? meta[folded] : {};
+    if (!dest.display_name && oldEntry.display_name) dest.display_name = oldEntry.display_name;
+    if (!dest.owner_name && oldEntry.owner_name) dest.owner_name = oldEntry.owner_name;
+    if (!dest.phone && oldEntry.phone) dest.phone = oldEntry.phone;
+    if (!dest.email && oldEntry.email) dest.email = oldEntry.email;
+    meta[folded] = dest;
   }
   for (const [ck, ids] of notifMap.entries()) {
     const prev = meta[ck] && typeof meta[ck] === "object" ? meta[ck] : {};
     let dn = (prev.display_name && String(prev.display_name).trim()) || "";
     if (!dn) {
-      const gOnly = isSuper && ck.includes(GROUP_CARD_TENANT_SEP)
-        ? ck.slice(ck.indexOf(GROUP_CARD_TENANT_SEP) + 1)
-        : ck;
-      dn = gOnly;
+      // Prefer the device-supplied case-preserved string over the
+      // case-folded canonical key so the card title is human-friendly.
+      dn = displayMap.get(ck) || "";
+      if (!dn) {
+        const gOnly = isSuper && ck.includes(GROUP_CARD_TENANT_SEP)
+          ? ck.slice(ck.indexOf(GROUP_CARD_TENANT_SEP) + 1)
+          : ck;
+        dn = gOnly;
+      }
     }
     meta[ck] = {
       display_name: dn,

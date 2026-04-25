@@ -578,7 +578,7 @@
   function normalizeGroupKeyStr(v) {
     return String(v == null ? "" : v).trim();
   }
-  function canonicalGroupKey(v) {
+  function displayGroupName(v) {
     let s = normalizeGroupKeyStr(v);
     if (!s) return "";
     try {
@@ -586,6 +586,15 @@
     } catch (_) {
     }
     return s.replace(/\s+/g, " ");
+  }
+  function canonicalGroupKey(v) {
+    const s = displayGroupName(v);
+    if (!s) return "";
+    try {
+      return s.toLocaleLowerCase();
+    } catch (_) {
+      return s.toLowerCase();
+    }
   }
   function groupCardMetaKey(groupKey, tenantOwner) {
     const gk = canonicalGroupKey(groupKey);
@@ -656,7 +665,8 @@
         const ck = groupCardMetaKey(ng, ownerHint);
         if (!ck) return;
         if (!meta[ck] || typeof meta[ck] !== "object") {
-          meta[ck] = { display_name: ng, owner_name: "", phone: "", email: "", device_ids: [] };
+          const human = displayGroupName(newGroupKey) || ng;
+          meta[ck] = { display_name: human, owner_name: "", phone: "", email: "", device_ids: [] };
         }
         const s = new Set((meta[ck].device_ids || []).map(String));
         s.add(id);
@@ -674,19 +684,42 @@
     const list = Array.isArray(devices) ? devices : [];
     const isSuper = state.me && state.me.role === "superadmin";
     const notifMap = /* @__PURE__ */ new Map();
+    const displayMap = /* @__PURE__ */ new Map();
     for (const d of list) {
       const g = canonicalGroupKey(d && d.notification_group);
       if (!g) continue;
       const ck = groupCardMetaKey(g, isSuper ? d.owner_admin : "");
       if (!notifMap.has(ck)) notifMap.set(ck, []);
       notifMap.get(ck).push(String(d.device_id));
+      if (!displayMap.has(ck)) {
+        const human = displayGroupName(d && d.notification_group);
+        if (human) displayMap.set(ck, human);
+      }
+    }
+    for (const oldKey of Object.keys(meta)) {
+      if (notifMap.has(oldKey)) continue;
+      const oldEntry = meta[oldKey];
+      if (!oldEntry || typeof oldEntry !== "object") continue;
+      const { tenantOwner: oldTenant, groupKey: oldGroup } = parseGroupMetaKey(oldKey);
+      if (!oldGroup) continue;
+      const folded = groupCardMetaKey(canonicalGroupKey(oldGroup), oldTenant);
+      if (!folded || !notifMap.has(folded) || folded === oldKey) continue;
+      const dest = meta[folded] && typeof meta[folded] === "object" ? meta[folded] : {};
+      if (!dest.display_name && oldEntry.display_name) dest.display_name = oldEntry.display_name;
+      if (!dest.owner_name && oldEntry.owner_name) dest.owner_name = oldEntry.owner_name;
+      if (!dest.phone && oldEntry.phone) dest.phone = oldEntry.phone;
+      if (!dest.email && oldEntry.email) dest.email = oldEntry.email;
+      meta[folded] = dest;
     }
     for (const [ck, ids] of notifMap.entries()) {
       const prev = meta[ck] && typeof meta[ck] === "object" ? meta[ck] : {};
       let dn = prev.display_name && String(prev.display_name).trim() || "";
       if (!dn) {
-        const gOnly = isSuper && ck.includes(GROUP_CARD_TENANT_SEP) ? ck.slice(ck.indexOf(GROUP_CARD_TENANT_SEP) + 1) : ck;
-        dn = gOnly;
+        dn = displayMap.get(ck) || "";
+        if (!dn) {
+          const gOnly = isSuper && ck.includes(GROUP_CARD_TENANT_SEP) ? ck.slice(ck.indexOf(GROUP_CARD_TENANT_SEP) + 1) : ck;
+          dn = gOnly;
+        }
       }
       meta[ck] = {
         display_name: dn,
@@ -4587,11 +4620,13 @@ ${id}`) || "").trim();
     });
   });
   registerRoute("group", async (view, args, routeSeq) => {
-    const g = canonicalGroupKey(decodeURIComponent(args[0] || ""));
+    const rawArg = decodeURIComponent(args[0] || "");
+    const g = canonicalGroupKey(rawArg);
     if (!g) {
       location.hash = "#/overview";
       return;
     }
+    const displayFromUrl = displayGroupName(rawArg);
     const tenantOwner = String(window.__routeQuery && window.__routeQuery.get("owner") || "").trim();
     const metaKey = groupCardMetaKey(g, tenantOwner);
     const groupScope = state.me && state.me.username ? state.me.username : "anon";
@@ -4636,11 +4671,12 @@ ${id}`) || "").trim();
     const meta = loadGroupMeta();
     const gsMap = loadGroupSettings();
     const groupApiCaps = loadGroupApiCaps();
-    setCrumb(`Group \xB7 ${(meta[metaKey] || meta[g] || {}).display_name || g}`);
+    const coldName = (meta[metaKey] || meta[g] || {}).display_name || displayFromUrl || g;
+    setCrumb(`Group \xB7 ${coldName}`);
     mountView(view, `
     <section class="card">
       <div class="row" style="align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
-        <h2 style="margin:0">${escapeHtml((meta[metaKey] || meta[g] || {}).display_name || g)}</h2>
+        <h2 style="margin:0">${escapeHtml(coldName)}</h2>
         <a href="#/overview" class="btn ghost right">\u2190 Back</a>
       </div>
       <p class="muted" style="margin-top:10px">Loading group\u2026</p>
@@ -4654,7 +4690,7 @@ ${id}`) || "").trim();
       localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(meta));
     } catch (_) {
     }
-    const gm = meta[metaKey] || meta[g] || { display_name: g, owner_name: "", phone: "", email: "", device_ids: [] };
+    const gm = meta[metaKey] || meta[g] || { display_name: displayFromUrl || g, owner_name: "", phone: "", email: "", device_ids: [] };
     const rowsByGroup = () => (list.items || []).filter((d) => {
       if (canonicalGroupKey(d.notification_group) !== g) return false;
       if (state.me && state.me.role === "superadmin" && tenantOwner) {

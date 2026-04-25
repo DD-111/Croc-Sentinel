@@ -8,8 +8,17 @@
  */
 
 registerRoute("group", async (view, args, routeSeq) => {
-  const g = canonicalGroupKey(decodeURIComponent(args[0] || ""));
+  // Two-key strategy (Phase 90): the URL carries whatever casing the
+  // user typed/clicked — preserve that for display, but match devices
+  // case-insensitively via the canonical key so siblings collide the
+  // same way the backend's _sibling_group_norm does. Without this, a
+  // route like "/group/Warehouse%20A" would not match a device whose
+  // notification_group is "warehouse a", even though they're siblings
+  // server-side.
+  const rawArg = decodeURIComponent(args[0] || "");
+  const g = canonicalGroupKey(rawArg);
   if (!g) { location.hash = "#/overview"; return; }
+  const displayFromUrl = displayGroupName(rawArg);
   const tenantOwner = String((window.__routeQuery && window.__routeQuery.get("owner")) || "").trim();
   const metaKey = groupCardMetaKey(g, tenantOwner);
   const groupScope = (state.me && state.me.username) ? state.me.username : "anon";
@@ -49,11 +58,13 @@ registerRoute("group", async (view, args, routeSeq) => {
   const gsMap = loadGroupSettings();
   const groupApiCaps = loadGroupApiCaps();
   // Show *something* immediately on cold loads — /devices may take seconds.
-  setCrumb(`Group · ${(meta[metaKey] || meta[g] || {}).display_name || g}`);
+  // Display priority: stored display_name > URL-supplied case > folded key.
+  const coldName = (meta[metaKey] || meta[g] || {}).display_name || displayFromUrl || g;
+  setCrumb(`Group · ${coldName}`);
   mountView(view, `
     <section class="card">
       <div class="row" style="align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
-        <h2 style="margin:0">${escapeHtml((meta[metaKey] || meta[g] || {}).display_name || g)}</h2>
+        <h2 style="margin:0">${escapeHtml(coldName)}</h2>
         <a href="#/overview" class="btn ghost right">← Back</a>
       </div>
       <p class="muted" style="margin-top:10px">Loading group…</p>
@@ -64,7 +75,7 @@ registerRoute("group", async (view, args, routeSeq) => {
   let list = (listRes.status === "fulfilled" && listRes.value) ? listRes.value : { items: [] };
   syncGroupMetaWithDevices(meta, list.items || []);
   try { localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(meta)); } catch (_) {}
-  const gm = meta[metaKey] || meta[g] || { display_name: g, owner_name: "", phone: "", email: "", device_ids: [] };
+  const gm = meta[metaKey] || meta[g] || { display_name: displayFromUrl || g, owner_name: "", phone: "", email: "", device_ids: [] };
   const rowsByGroup = () => (list.items || []).filter((d) => {
     if (canonicalGroupKey(d.notification_group) !== g) return false;
     if (state.me && state.me.role === "superadmin" && tenantOwner) {

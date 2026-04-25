@@ -58,7 +58,11 @@ import paho.mqtt.client as mqtt
 
 from alarm_db import _lookup_owner_admin
 from alarm_fanout import _fan_out_alarm_safe
-from auto_reconcile import _enqueue_auto_reconcile, _is_ack_key_mismatch
+from auto_reconcile import (
+    _enqueue_auto_reconcile,
+    _is_ack_key_mismatch,
+    _reissue_existing_assign_for_mac,
+)
 from cmd_queue import _cmd_queue_mark_acked, _maybe_replay_queue_on_reconnect
 from config import (
     MQTT_CLIENT_CA,
@@ -145,6 +149,20 @@ def _dispatch_mqtt_payload(topic: str, payload: dict[str, Any]) -> None:
             device_id=did_try,
             detail={"serial": payload.get("serial"), "mac": payload.get("mac"), "qr_code": payload.get("qr_code")},
         )
+        # Phase 89 self-heal: if this MAC is already provisioned (server has
+        # an existing cmd_key) but the device is still publishing
+        # bootstrap.register, the device's NVS got cleared (re-flash, NVS
+        # commit failure, etc.). Re-publish the existing bootstrap.assign
+        # with the device's *current* claim_nonce so the firmware accepts
+        # it and writes the existing cmd_key to NVS — no operator action
+        # needed. Cooldown is enforced inside the helper.
+        try:
+            _reissue_existing_assign_for_mac(
+                str(payload.get("mac_nocolon", "")),
+                str(payload.get("claim_nonce", "")),
+            )
+        except Exception:
+            logger.debug("bootstrap.register self-heal failed", exc_info=True)
         return
 
     device_id, channel = parse_topic(topic)
