@@ -1,12 +1,24 @@
 /**
  * Splices modular imports into console.raw.js (IIFE monolith) and bundles to assets/app.js.
  *
- * Route splitting: any file matching `src/routes/*.route.js` is appended after
- * the spliced monolith body (and before esbuild wraps everything in an IIFE).
- * Route files are NOT ES modules — they share scope with console.raw.js so
- * they can call `registerRoute`, `mountView`, `api`, `$`, etc. directly.
+ * Two parallel split mechanisms:
+ *   • src/lib/<name>.js  — proper ES modules. Imported by HEADER. Pure helpers
+ *                          (no shared state, no DOM-tree references).
+ *   • src/shell/<NN>-<name>.shell.js + src/routes/<id>.route.js — concatenated
+ *                          as raw text after the spliced monolith body. NOT
+ *                          ES modules. Share scope with console.raw.js so
+ *                          they can call `registerRoute`, `mountView`, `api`,
+ *                          `$`, mutate `state`, etc. directly. Numeric prefix
+ *                          on shell files forces concat order
+ *                          (00-state → 10-api → 20-layout → 30-router →
+ *                          routes/* alphabetic).
  *
- * Order: HEADER imports → spliced console.raw body → routes/*.route.js (sorted).
+ * Final order:
+ *   HEADER imports
+ *   → spliced console.raw body (auth chrome + glue + boot only)
+ *   → src/shell/*.shell.js  (sorted)
+ *   → src/routes/*.route.js (sorted)
+ *   → esbuild wraps the whole thing in an IIFE.
  */
 import * as esbuild from "esbuild";
 import { readFileSync, readdirSync, existsSync } from "node:fs";
@@ -16,6 +28,7 @@ import { dirname, join } from "node:path";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, "..");
 const rawPath = join(root, "src", "console.raw.js");
+const shellDir = join(root, "src", "shell");
 const routesDir = join(root, "src", "routes");
 
 const HEADER = `/* Croc Sentinel Console — bundled from dashboard/src/ (npm run build) */
@@ -26,6 +39,7 @@ import { parseSseFields, pumpSseBody, SSE_PARSE_BUF_MAX } from "./lib/sse.js";
 import { fmtTs, fmtRel, maskPlatform, auditActionPrefix, auditDetailDedupedRows, eventDetailDedupedRows, messagePayloadRows, auditChipClass } from "./lib/format.js";
 import { DEFAULT_API_TIMEOUT_MS, ROUTE_RENDER_TIMEOUT_MS, apiBase, fetchWithDeadline, _sleep, _isTransientFetchError, _isRetryableHttpStatus, _isWriteMethod } from "./lib/api.js";
 import { CSRF_COOKIE_NAME, CSRF_HEADER_NAME, _readCsrfCookie, getCsrfToken, setCsrfToken, refreshCsrfToken, _isCsrfRejection } from "./lib/csrf.js";
+import { authSiteFooterHtml, authAsideHtml } from "./lib/auth-chrome.js";
 
 `;
 
@@ -48,6 +62,24 @@ function spliceMonolith(raw) {
   return HEADER + body;
 }
 
+function loadShellFiles() {
+  if (!existsSync(shellDir)) return "";
+  const entries = readdirSync(shellDir, { withFileTypes: true })
+    .filter((e) => e.isFile() && e.name.endsWith(".shell.js"))
+    .map((e) => e.name)
+    .sort();
+  if (entries.length === 0) return "";
+  let out = "\n// ============================================================\n";
+  out += "// === Shell spliced from src/shell/*.shell.js ================\n";
+  out += "// === (state / api / layout / router; raw concat, shared) ====\n";
+  out += "// ============================================================\n";
+  for (const name of entries) {
+    const txt = readFileSync(join(shellDir, name), "utf8").replace(/\r\n/g, "\n");
+    out += `\n// ── ${name} ─────────────────────────────────────\n` + txt + "\n";
+  }
+  return out;
+}
+
 function loadRouteFiles() {
   if (!existsSync(routesDir)) return "";
   const entries = readdirSync(routesDir, { withFileTypes: true })
@@ -66,7 +98,7 @@ function loadRouteFiles() {
 }
 
 const raw = readFileSync(rawPath, "utf8");
-const contents = spliceMonolith(raw) + loadRouteFiles();
+const contents = spliceMonolith(raw) + loadShellFiles() + loadRouteFiles();
 
 const result = await esbuild.build({
   stdin: {

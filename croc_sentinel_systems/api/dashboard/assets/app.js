@@ -421,7 +421,7 @@
     return false;
   }
 
-  // src/virtual-console.js
+  // src/lib/auth-chrome.js
   function authSiteFooterHtml() {
     return `
       <footer class="site-footer site-footer--auth" aria-label="Page footer">
@@ -483,6 +483,122 @@
         </div>
       </aside>`;
   }
+
+  // src/virtual-console.js
+  function getToken() {
+    return localStorage.getItem(LS.token) || "";
+  }
+  function setToken(t) {
+    t ? localStorage.setItem(LS.token, t) : localStorage.removeItem(LS.token);
+    if (!t) {
+      _groupMetaSyncChain = Promise.resolve();
+    }
+  }
+  function roleWeight(r) {
+    return ROLE_WEIGHT[r] || 0;
+  }
+  function hasRole(min) {
+    return state.me && roleWeight(state.me.role) >= roleWeight(min);
+  }
+  function can(cap) {
+    return !!(state.me && state.me.policy && state.me.policy[cap]);
+  }
+  function isOnline(d) {
+    if (typeof d.is_online === "boolean") return d.is_online;
+    return Date.now() - Date.parse(d.updated_at || 0) < OFFLINE_MS;
+  }
+  function toast(msg, kind) {
+    const el = $("#toast");
+    if (!el) return;
+    el.textContent = String(msg);
+    el.className = "toast show " + (kind || "");
+    clearTimeout(el._t);
+    el._t = setTimeout(() => {
+      el.className = "toast";
+    }, 3200);
+  }
+  async function boot() {
+    initTheme();
+    $("#menuBtn").addEventListener("click", () => toggleNav());
+    $("#sidebarBackdrop").addEventListener("click", () => toggleNav(false));
+    const railT = document.getElementById("sidebarRailToggle");
+    if (railT) railT.addEventListener("click", () => toggleSidebarRail());
+    window.addEventListener("resize", syncNavForViewport);
+    window.addEventListener("orientationchange", syncNavForViewport);
+    $("#themeBtn").addEventListener("click", () => {
+      setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
+    });
+    $("#logoutBtn").addEventListener("click", async () => {
+      try {
+        await fetchWithDeadline(apiBase() + "/auth/logout", { method: "POST" }, 12e3);
+      } catch (_) {
+      }
+      setToken("");
+      state.me = null;
+      clearHealthPollTimer();
+      location.hash = "#/login";
+      renderAuthState();
+    });
+    $("#refreshBtn").addEventListener("click", () => renderRoute());
+    document.addEventListener("click", (ev) => {
+      const b = ev.target.closest(".btn-tap");
+      if (!b || b.disabled) return;
+      try {
+        if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+        if (typeof navigator !== "undefined" && navigator.vibrate) navigator.vibrate(10);
+      } catch (_) {
+      }
+    }, true);
+    await loadMe();
+    syncNavForViewport();
+    try {
+      applySidebarRail();
+    } catch (_) {
+    }
+    if (!location.hash) location.hash = state.me ? "#/overview" : "#/login";
+    else renderRoute();
+    await loadHealth().catch(() => {
+    });
+    window.addEventListener("online", () => {
+      loadHealth().catch(() => {
+      });
+      tickHealthIfVisible();
+      if (typeof window.__eventsStreamResume === "function") {
+        try {
+          if (!window.__evSSE || window.__evSSE.readyState === EventSource.CLOSED) {
+            window.__eventsStreamResume();
+          } else {
+            syncEventsLiveBadge();
+          }
+        } catch (_) {
+        }
+      }
+    });
+    document.addEventListener("visibilitychange", () => {
+      document.documentElement.classList.toggle("tab-hidden", document.visibilityState === "hidden");
+      if (document.visibilityState === "hidden") {
+        const live = document.getElementById("evLive");
+        if (live && window.__evSSE && window.__evSSE.readyState === EventSource.OPEN) {
+          live.textContent = "Background";
+          live.className = "badge neutral";
+          live.title = "Stream stays connected in background";
+        }
+        return;
+      }
+      tickHealthIfVisible();
+      syncEventsLiveBadge();
+      if (typeof window.__eventsStreamResume === "function") {
+        try {
+          if (!window.__evSSE || window.__evSSE.readyState === EventSource.CLOSED) {
+            window.__eventsStreamResume();
+          }
+        } catch (_) {
+        }
+      }
+    });
+    document.documentElement.classList.toggle("tab-hidden", document.visibilityState === "hidden");
+  }
+  document.addEventListener("DOMContentLoaded", boot);
   var state = {
     me: null,
     mqttConnected: false,
@@ -697,38 +813,6 @@
       live.className = "badge offline";
       live.title = "SSE reconnecting";
     }
-  }
-  function getToken() {
-    return localStorage.getItem(LS.token) || "";
-  }
-  function setToken(t) {
-    t ? localStorage.setItem(LS.token, t) : localStorage.removeItem(LS.token);
-    if (!t) {
-      _groupMetaSyncChain = Promise.resolve();
-    }
-  }
-  function roleWeight(r) {
-    return ROLE_WEIGHT[r] || 0;
-  }
-  function hasRole(min) {
-    return state.me && roleWeight(state.me.role) >= roleWeight(min);
-  }
-  function can(cap) {
-    return !!(state.me && state.me.policy && state.me.policy[cap]);
-  }
-  function isOnline(d) {
-    if (typeof d.is_online === "boolean") return d.is_online;
-    return Date.now() - Date.parse(d.updated_at || 0) < OFFLINE_MS;
-  }
-  function toast(msg, kind) {
-    const el = $("#toast");
-    if (!el) return;
-    el.textContent = String(msg);
-    el.className = "toast show " + (kind || "");
-    clearTimeout(el._t);
-    el._t = setTimeout(() => {
-      el.className = "toast";
-    }, 3200);
   }
   async function api(path, opts) {
     opts = opts || {};
@@ -996,17 +1080,17 @@
       dlg.className = "croc-fw-hint-dlg";
       dlg.setAttribute("aria-label", "Firmware update");
       dlg.innerHTML = `
-        <div class="croc-fw-hint-dlg__form">
-          <h3 class="croc-fw-hint-dlg__title">Firmware update</h3>
-          <div class="croc-fw-hint-dlg__compare" id="crocFwHintCompare" aria-live="polite"></div>
-          <p class="croc-fw-hint-dlg__release-label" id="crocFwHintRelLabel" style="display:none">Package notes (from .bin / sidecar)</p>
-          <pre class="croc-fw-hint-dlg__release" id="crocFwHintRelease" style="display:none"></pre>
-          <p class="croc-fw-hint-dlg__preflight muted" id="crocFwHintPreflight" style="margin:10px 0 0;min-height:1.2em"></p>
-          <div class="row" style="justify-content:flex-end;margin-top:14px;gap:8px;flex-wrap:wrap">
-            <button type="button" class="btn secondary btn-tap" id="crocFwHintClose">Close</button>
-            <button type="button" class="btn btn-tap" id="crocFwHintDoOta" style="display:none">Send OTA</button>
-          </div>
-        </div>`;
+      <div class="croc-fw-hint-dlg__form">
+        <h3 class="croc-fw-hint-dlg__title">Firmware update</h3>
+        <div class="croc-fw-hint-dlg__compare" id="crocFwHintCompare" aria-live="polite"></div>
+        <p class="croc-fw-hint-dlg__release-label" id="crocFwHintRelLabel" style="display:none">Package notes (from .bin / sidecar)</p>
+        <pre class="croc-fw-hint-dlg__release" id="crocFwHintRelease" style="display:none"></pre>
+        <p class="croc-fw-hint-dlg__preflight muted" id="crocFwHintPreflight" style="margin:10px 0 0;min-height:1.2em"></p>
+        <div class="row" style="justify-content:flex-end;margin-top:14px;gap:8px;flex-wrap:wrap">
+          <button type="button" class="btn secondary btn-tap" id="crocFwHintClose">Close</button>
+          <button type="button" class="btn btn-tap" id="crocFwHintDoOta" style="display:none">Send OTA</button>
+        </div>
+      </div>`;
       document.body.appendChild(dlg);
     }
     const curFw = String(ctx.currentFw != null ? ctx.currentFw : "").trim() || "\u2014";
@@ -1327,9 +1411,9 @@ ${curFw} \u2192 ${fw}`)) return;
     const tgTitle = tgOn ? tgOk ? tgErr ? `Telegram worker up \u2014 last API error: ${tgErr}` : "Telegram worker running \u2014 events at min_level+ are queued" : "Telegram enabled but worker not running \u2014 check API logs" : "Telegram disabled \u2014 set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS (numeric chat id; start a chat with the bot first)";
     const mqttTitle = mqConn ? mqDrop > 0 ? `MQTT connected, but ingest dropped ${mqDrop} message(s); queue depth=${mqQ}. last_up=${mqLastUp ? fmtTs(mqLastUp) : "\u2014"}` : `MQTT connected; ingest queue depth=${mqQ}. last_up=${mqLastUp ? fmtTs(mqLastUp) : "\u2014"}` : `MQTT disconnected \u2014 check broker/TLS/network. last_down=${mqLastDown ? fmtTs(mqLastDown) : "\u2014"} reason=${mqLastReason || "\u2014"}`;
     setHtmlIfChanged(el, `
-      <span class="health-pill ${mqConn ? mqDrop > 0 ? "warn" : "ok" : "off"}" title="${escapeHtml(mqttTitle)}">MQTT</span>
-      <span class="health-pill ${mailOk ? "ok" : sm.configured ? "warn" : "off"}" title="${escapeHtml(mailTitle)}">MAIL</span>
-      <span class="health-pill ${tgOk ? "ok" : tgOn ? "warn" : "off"}" title="${escapeHtml(tgTitle)}">TG</span>`);
+    <span class="health-pill ${mqConn ? mqDrop > 0 ? "warn" : "ok" : "off"}" title="${escapeHtml(mqttTitle)}">MQTT</span>
+    <span class="health-pill ${mailOk ? "ok" : sm.configured ? "warn" : "off"}" title="${escapeHtml(mailTitle)}">MAIL</span>
+    <span class="health-pill ${tgOk ? "ok" : tgOn ? "warn" : "off"}" title="${escapeHtml(tgTitle)}">TG</span>`);
   }
   function renderMqttDot() {
     const dot = $("#mqttDot");
@@ -1540,14 +1624,14 @@ ${curFw} \u2192 ${fw}`)) return;
     const handler = routes[routeId] || routes["overview"];
     try {
       mountView(view, `<div class="route-loading card" aria-busy="true" role="status">
-        <span class="sr-only">Loading page</span>
-        <div class="route-loading__head"></div>
-        <div class="route-loading__lines">
-          <span class="route-loading__bar route-loading__bar--90"></span>
-          <span class="route-loading__bar route-loading__bar--72"></span>
-          <span class="route-loading__bar route-loading__bar--84"></span>
-        </div>
-      </div>`);
+      <span class="sr-only">Loading page</span>
+      <div class="route-loading__head"></div>
+      <div class="route-loading__lines">
+        <span class="route-loading__bar route-loading__bar--90"></span>
+        <span class="route-loading__bar route-loading__bar--72"></span>
+        <span class="route-loading__bar route-loading__bar--84"></span>
+      </div>
+    </div>`);
       const swap = async () => {
         await handler(view, args, routeSeq);
       };
@@ -1564,88 +1648,6 @@ ${curFw} \u2192 ${fw}`)) return;
     }
   }
   window.addEventListener("hashchange", renderRoute);
-  async function boot() {
-    initTheme();
-    $("#menuBtn").addEventListener("click", () => toggleNav());
-    $("#sidebarBackdrop").addEventListener("click", () => toggleNav(false));
-    const railT = document.getElementById("sidebarRailToggle");
-    if (railT) railT.addEventListener("click", () => toggleSidebarRail());
-    window.addEventListener("resize", syncNavForViewport);
-    window.addEventListener("orientationchange", syncNavForViewport);
-    $("#themeBtn").addEventListener("click", () => {
-      setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
-    });
-    $("#logoutBtn").addEventListener("click", async () => {
-      try {
-        await fetchWithDeadline(apiBase() + "/auth/logout", { method: "POST" }, 12e3);
-      } catch (_) {
-      }
-      setToken("");
-      state.me = null;
-      clearHealthPollTimer();
-      location.hash = "#/login";
-      renderAuthState();
-    });
-    $("#refreshBtn").addEventListener("click", () => renderRoute());
-    document.addEventListener("click", (ev) => {
-      const b = ev.target.closest(".btn-tap");
-      if (!b || b.disabled) return;
-      try {
-        if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
-        if (typeof navigator !== "undefined" && navigator.vibrate) navigator.vibrate(10);
-      } catch (_) {
-      }
-    }, true);
-    await loadMe();
-    syncNavForViewport();
-    try {
-      applySidebarRail();
-    } catch (_) {
-    }
-    if (!location.hash) location.hash = state.me ? "#/overview" : "#/login";
-    else renderRoute();
-    await loadHealth().catch(() => {
-    });
-    window.addEventListener("online", () => {
-      loadHealth().catch(() => {
-      });
-      tickHealthIfVisible();
-      if (typeof window.__eventsStreamResume === "function") {
-        try {
-          if (!window.__evSSE || window.__evSSE.readyState === EventSource.CLOSED) {
-            window.__eventsStreamResume();
-          } else {
-            syncEventsLiveBadge();
-          }
-        } catch (_) {
-        }
-      }
-    });
-    document.addEventListener("visibilitychange", () => {
-      document.documentElement.classList.toggle("tab-hidden", document.visibilityState === "hidden");
-      if (document.visibilityState === "hidden") {
-        const live = document.getElementById("evLive");
-        if (live && window.__evSSE && window.__evSSE.readyState === EventSource.OPEN) {
-          live.textContent = "Background";
-          live.className = "badge neutral";
-          live.title = "Stream stays connected in background";
-        }
-        return;
-      }
-      tickHealthIfVisible();
-      syncEventsLiveBadge();
-      if (typeof window.__eventsStreamResume === "function") {
-        try {
-          if (!window.__evSSE || window.__evSSE.readyState === EventSource.CLOSED) {
-            window.__eventsStreamResume();
-          }
-        } catch (_) {
-        }
-      }
-    });
-    document.documentElement.classList.toggle("tab-hidden", document.visibilityState === "hidden");
-  }
-  document.addEventListener("DOMContentLoaded", boot);
   registerRoute("account-activate", async (view) => {
     setCrumb("Activate account");
     document.body.dataset.auth = "none";
