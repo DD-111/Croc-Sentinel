@@ -1560,6 +1560,459 @@ ${curFw} \u2192 ${fw}`)) return;
     }
   }
   window.addEventListener("hashchange", renderRoute);
+  async function renderSignalsPage(view, _args, routeSeq) {
+    setCrumb("Signals");
+    mountView(view, `
+      <div class="card">
+        <div class="row" style="flex-wrap:wrap;align-items:flex-end;gap:12px">
+          <div style="flex:1;min-width:200px">
+            <h2 style="margin:0">Signal log</h2>
+            <p class="muted" style="margin:6px 0 0">Device alarms and dashboard/API siren events. Group comes from device notification settings.</p>
+          </div>
+          <label class="field" style="max-width:140px;margin:0"><span>Hours</span><input id="sig_hours" type="number" value="168" min="1" max="720"/></label>
+          <button class="btn secondary btn-tap" id="sig_reload">Refresh</button>
+        </div>
+        <div class="divider"></div>
+        <div class="stats" id="sigSummary"></div>
+        <div class="divider"></div>
+        <div id="sigList"><p class="muted">Loading\u2026</p></div>
+      </div>`);
+    const reload = async () => {
+      const hours = parseInt($("#sig_hours").value, 10) || 168;
+      const qs = new URLSearchParams({ limit: "200", since_hours: String(hours) });
+      try {
+        if (!isRouteCurrent(routeSeq)) return;
+        const [d, sumR] = await Promise.all([
+          api("/activity/signals?" + qs.toString(), { timeoutMs: 24e3 }),
+          api("/alarms/summary", { timeoutMs: 16e3 }).catch(() => ({ last_24h: 0, last_7d: 0, top_sources_7d: [] }))
+        ]);
+        if (!isRouteCurrent(routeSeq)) return;
+        const sigSummaryEl = $("#sigSummary", view);
+        const sigListEl = $("#sigList", view);
+        if (!sigSummaryEl || !sigListEl) return;
+        setHtmlIfChanged(sigSummaryEl, [
+          ["Alarms 24h", sumR.last_24h || 0, "device-side alarm rows"],
+          ["Alarms 7d", sumR.last_7d || 0, "same scope"],
+          ["Top source 7d", (sumR.top_sources_7d || []).slice(0, 1).map((x) => `${x.source_id} \xD7 ${x.c}`).join("") || "\u2014", "by count"]
+        ].map(([k, v, s]) => `<div class="stat"><div class="k">${escapeHtml(k)}</div><div class="v">${escapeHtml(v)}</div><div class="sub">${escapeHtml(s)}</div></div>`).join(""));
+        const items = d.items || [];
+        const whoLbl = (w) => ({
+          remote_button: "GPIO / local button",
+          network: "MQTT / network",
+          api: "API / automation"
+        })[w] || w;
+        setHtmlIfChanged(sigListEl, items.length === 0 ? `<p class="muted audit-empty">No rows in this window.</p>` : `<div class="audit-feed">${items.map((a) => {
+          const dev = a.device_id === "*" ? "(bulk)" : a.device_id;
+          const link = a.device_id && a.device_id !== "*" ? `<a class="mono audit-target" href="#/devices/${encodeURIComponent(a.device_id)}">${escapeHtml(dev)}</a>` : escapeHtml(dev);
+          const em = a.email_sent ? "queued" : a.email_detail || "\u2014";
+          const fo = a.kind && a.kind.startsWith("bulk") ? String(a.fanout_count || 0) : String(a.fanout_count ?? "\u2014");
+          const whoS = a.kind === "device_alarm" ? whoLbl(a.who) : a.who || "\u2014";
+          const tShort = fmtTs(a.ts);
+          return `<article class="audit-item">
+              <div class="audit-item-top">
+                <div class="audit-time">
+                  <span class="audit-ts mono">${escapeHtml(tShort)}</span>
+                  <span class="muted audit-rel">${escapeHtml(fmtRel(a.ts))}</span>
+                </div>
+                <span class="chip">${escapeHtml(a.what || a.kind || "")}</span>
+                <span class="chip">${escapeHtml(a.zone || "all")}</span>
+              </div>
+              <div class="audit-item-line" style="flex-wrap:wrap;align-items:center;gap:6px">
+                <span class="mono">${link}</span>
+                <span class="chip">${escapeHtml(a.display_label || "\u2014")}</span>
+                <span class="chip">${escapeHtml(a.notification_group || "\u2014")}</span>
+              </div>
+              <div class="audit-item-line muted" style="font-size:12.5px">Who: ${escapeHtml(String(whoS))} \xB7 Fan-out: ${escapeHtml(fo)} \xB7 Email: ${escapeHtml(em)}</div>
+            </article>`;
+        }).join("")}</div>`);
+      } catch (e) {
+        if (!isRouteCurrent(routeSeq)) return;
+        toast(e.message || e, "err");
+      }
+    };
+    $("#sig_reload").addEventListener("click", reload);
+    reload();
+    scheduleRouteTicker(routeSeq, "signals-live-reload", reload, 1e4);
+  }
+  registerRoute("signals", renderSignalsPage);
+  registerRoute("ota", async (view, _args, routeSeq) => {
+    await __renderOtaFirmwareRoute(view, routeSeq);
+  });
+  async function __renderOtaFirmwareRoute(view, routeSeq) {
+    setCrumb("OTA (ops)");
+    const me = state.me || { username: "", role: "user" };
+    const isSuper = me.role === "superadmin";
+    if (!isSuper) {
+      mountView(view, `
+        <div class="card">
+          <h2 class="ui-section-title" style="margin:0">OTA & firmware</h2>
+          <p class="muted" style="margin:8px 0 0">\u79DF\u6237\u4FA7 <strong>\u4E0D</strong>\u518D\u4F7F\u7528 Admin OTA \u63A7\u5236\u53F0\u3002\u8BF7\u5728 <a href="#/devices">\u5168\u90E8\u8BBE\u5907</a> \u4E0E\u8BBE\u5907\u8BE6\u60C5\u67E5\u770B\u7248\u672C\u65C1\u7684 <strong>\u2191 + \u7EA2\u70B9</strong>\uFF08\u6709\u53EF\u7528\u65B0\u56FA\u4EF6\u65F6\uFF09\u3002OTA \u4E0A\u4F20\u4E0E campaign \u4EC5 <strong>superadmin</strong> \u5728\u4FA7\u680F\u300COTA (ops)\u300D\u64CD\u4F5C\u3002</p>
+          <p class="muted" style="margin:8px 0 0">There is <strong>no</strong> admin OTA console in this product. Use <a href="#/devices">All devices</a> and device detail for the <strong>\u2191 + red dot</strong> when an upgrade is available. Staging and campaigns are <strong>superadmin</strong> only (sidebar <strong>OTA (ops)</strong>).</p>
+        </div>`);
+      return;
+    }
+    const helpCard = `
+      <div class="card ota-help-card">
+        <h2 class="ui-section-title" style="margin:0">OTA & firmware \xB7 \u4F7F\u7528\u8BF4\u660E</h2>
+        <div class="ota-help__cols">
+          <div>
+            <h3 class="ota-help__h">\u4E2D\u6587</h3>
+            <ul class="muted ota-help__ul">
+              <li><strong>\u5168\u5458\uFF08\u542B admin\uFF09</strong>\uFF1A\u53EA\u770B <a href="#/devices">\u5168\u90E8\u8BBE\u5907</a> / \u8BBE\u5907\u8BE6\u60C5\u4E0A\u7684 <strong>\u2191 + \u7EA2\u70B9</strong> \u4E0E\u8BF4\u660E\u5F39\u7A97\uFF1B\u4E0D\u5728\u6B64\u9875\u5BF9 campaign \u505A Accept\u3002</li>
+              <li><strong>\u68C0\u6D4B</strong>\uFF1A\u670D\u52A1\u5668\u6BD4\u8F83 <code>OTA_FIRMWARE_DIR</code> \u4E2D\u7684 <code>.bin</code> \u4E0E\u8BBE\u5907 <code>fw</code>\uFF1B\u9700 <code>OTA_PUBLIC_BASE_URL</code> \u624D\u80FD\u5728\u5F39\u7A97\u4E2D\u7ED9\u51FA\u4E0B\u8F7D URL\u3002</li>
+              <li><strong>\u6587\u4EF6</strong>\uFF1A\u63A8\u8350 <code>croc-\u7248\u672C\u53F7-8\u4F4Dhex.bin</code>\uFF1B\u540C\u540D <code>.txt</code> / <code>.md</code> \u4E3A release notes\u3002</li>
+              <li><strong>Superadmin</strong>\uFF1A\u5728\u672C\u9875\u4E0B\u65B9\u4E0A\u4F20 / \u4ECE\u5DF2\u5B58\u6587\u4EF6\u5EFA campaign\uFF08\u82E5\u4ECD\u4F7F\u7528\u540E\u7AEF campaign \u6D41\uFF0C\u7531 API \u6216\u5176\u5B83\u6D41\u7A0B\u8BA9\u5404\u79DF\u6237\u8BBE\u5907\u62C9\u53D6\uFF1B\u63A7\u5236\u53F0\u4E0D\u518D\u7ED9 admin \u63D0\u4F9B OTA \u5165\u53E3\uFF09\u3002</li>
+            </ul>
+          </div>
+          <div>
+            <h3 class="ota-help__h">English</h3>
+            <ul class="muted ota-help__ul">
+              <li><strong>Everyone (including admin)</strong>: use <a href="#/devices">All devices</a> / device detail <strong>\u2191 + red dot</strong> + notes dialog only \u2014 <strong>no</strong> tenant OTA Accept UI here.</li>
+              <li><strong>Detection</strong>: server compares <code>.bin</code> in <code>OTA_FIRMWARE_DIR</code> vs device <code>fw</code>; set <code>OTA_PUBLIC_BASE_URL</code> for URLs in the dialog.</li>
+              <li><strong>Files</strong>: prefer <code>croc-SEMVER-random8.bin</code>; sidecar <code>.txt</code>/<code>.md</code> for notes.</li>
+              <li><strong>Superadmin</strong>: upload / create-from-stored below. Campaign APIs may still exist server-side; this dashboard does not expose an admin OTA workflow.</li>
+            </ul>
+          </div>
+        </div>
+        <p class="muted" style="margin:12px 0 0">Fleet: <a href="#/devices">All devices</a></p>
+      </div>`;
+    const superCard = `
+      <div class="card">
+        <h2 class="ui-section-title">Superadmin \xB7 Upload & campaign</h2>
+        <p class="muted" style="margin:0 0 8px">Upload stages a <code>.bin</code> under <code>OTA_FIRMWARE_DIR</code> (upload password <code>OTA_UPLOAD_PASSWORD</code>). The API keeps at most <strong id="otaMaxBinsLbl">10</strong> <code>.bin</code> files and deletes the <strong>oldest by file mtime</strong> (and sidecars) when over limit \u2014 same rule as <code>POST /ota/firmware/upload</code>. The list below is <strong>fetched from this server</strong> (<code>GET /ota/firmwares</code>); click <strong>Refresh list</strong> after upload or if you copied files in by hand.</p>
+        <div class="inline-form">
+          <label class="field wide"><span>Upload password *</span><input type="password" id="otaStUploadPwd" autocomplete="off" placeholder="Server OTA_UPLOAD_PASSWORD" /></label>
+          <label class="field"><span>Firmware file (.bin)</span><input type="file" id="otaStFile" accept=".bin,application/octet-stream" /></label>
+          <label class="field"><span>Version label *</span><input id="otaStFw" placeholder="6.6.8" maxlength="40" /></label>
+          <div class="row wide" style="justify-content:flex-end">
+            <button type="button" class="btn btn-tap" id="otaStBtn">Upload & verify</button>
+          </div>
+        </div>
+        <p class="muted" id="otaRetentionInfo" style="margin-top:8px;min-height:1.2em"></p>
+        <p class="muted" id="otaStResult" style="margin-top:4px;min-height:1.2em"></p>
+        <div class="divider"></div>
+        <h3 style="margin:0 0 6px">Publish from server-staged firmware / \u4F7F\u7528\u670D\u52A1\u5668\u4E0A\u7684\u56FA\u4EF6</h3>
+        <p class="muted" style="margin:0 0 8px;font-size:12.5px">The dropdown is populated by <strong>pulling the current directory listing from the API</strong> (not from your PC). Pick a <code>.bin</code> already on the server, then create a campaign. <strong>Version</strong> is resolved on the server (<code>.version</code> sidecar or filename) \u2014 not hand-typed; it should match that build&rsquo;s <code>FW_VERSION</code>.</p>
+        <div class="row wide" style="align-items:flex-end;flex-wrap:wrap;gap:10px;margin-bottom:6px">
+          <label class="field wide" style="flex:1;min-width:220px;margin:0"><span>Firmware on server *</span><select id="otaFromSel"><option value="">Loading\u2026</option></select></label>
+          <button type="button" class="btn secondary btn-tap sm" id="otaFwListRefresh">Refresh list</button>
+        </div>
+        <label class="field wide"><span>Version (from server, read-only)</span><input type="text" id="otaFromResolvedVer" class="mono" readonly tabindex="-1" value="\u2014" style="background:var(--bg-muted);cursor:default" aria-live="polite" /></label>
+        <label class="field wide"><span>Notes</span><input id="otaFromNotes" maxlength="500" /></label>
+        <label class="checkbox"><input type="checkbox" id="otaFromAllAd" checked /><span>Target all admins</span></label>
+        <label class="field wide"><span>Or comma-separated admin usernames</span><input id="otaFromAdmTxt" placeholder="admin-a, admin-b (when not targeting all)" /></label>
+        <div class="row wide" style="justify-content:flex-end;margin-top:10px">
+          <button type="button" class="btn btn-tap" id="otaFromBtn">Create campaign</button>
+        </div>
+      </div>`;
+    mountView(view, helpCard + superCard);
+    const otaSyncFromStoredVersion = () => {
+      const sel = $("#otaFromSel", view);
+      const ro = $("#otaFromResolvedVer", view);
+      if (!ro) return;
+      if (!sel || !sel.value) {
+        ro.value = "\u2014";
+        return;
+      }
+      const i = Number(sel.selectedIndex);
+      const opt = sel.options[i];
+      const raw = opt && opt.getAttribute("data-fw-version");
+      const v = raw && String(raw).trim() || "";
+      ro.value = v || "\u2014";
+    };
+    const refreshFirmwareSelect = async () => {
+      if (!isSuper) return;
+      const sel = $("#otaFromSel", view);
+      if (!sel) return;
+      try {
+        const r = await api("/ota/firmwares", { timeoutMs: 2e4 });
+        if (!isRouteCurrent(routeSeq)) return;
+        const items = r.items || [];
+        const ret = r.retention;
+        const mx = $("#otaMaxBinsLbl", view);
+        if (mx && ret && ret.max_bins != null) mx.textContent = String(ret.max_bins);
+        const inf = $("#otaRetentionInfo", view);
+        if (inf) {
+          inf.textContent = ret ? `Server directory: ${ret.stored_count || 0} / max ${ret.max_bins} .bin files (oldest mtime removed when over limit). Upload password: ${ret.upload_password_configured ? "configured" : "not set on server"}.` : "";
+        }
+        const fmtM = (ts) => {
+          const t = Number(ts);
+          if (!Number.isFinite(t) || t <= 0) return "";
+          try {
+            const d = new Date(t * 1e3);
+            return d.toLocaleString(void 0, { dateStyle: "short", timeStyle: "short" });
+          } catch {
+            return "";
+          }
+        };
+        sel.innerHTML = items.length ? items.map((it) => {
+          const vRaw = it.fw_version && String(it.fw_version).trim() || "";
+          const dv = vRaw ? escapeHtml(vRaw) : "";
+          const fv = vRaw ? ` \xB7 v${escapeHtml(vRaw)}` : "";
+          const mt = fmtM(it.mtime);
+          const mtS = mt ? ` \xB7 ${escapeHtml(mt)}` : "";
+          return `<option value="${escapeHtml(it.name)}" data-fw-version="${dv}">${escapeHtml(it.name)}${fv} (${Math.round(Number(it.size || 0) / 1024)} KB${mtS})</option>`;
+        }).join("") : '<option value="">(no .bin in folder)</option>';
+        otaSyncFromStoredVersion();
+        sel.onchange = otaSyncFromStoredVersion;
+      } catch (e) {
+        const inf = $("#otaRetentionInfo", view);
+        if (inf) inf.textContent = "";
+        sel.innerHTML = `<option value="">${escapeHtml(e.message || "list failed")}</option>`;
+        otaSyncFromStoredVersion();
+        sel.onchange = otaSyncFromStoredVersion;
+      }
+    };
+    await refreshFirmwareSelect();
+    const otaFwListRefresh = $("#otaFwListRefresh", view);
+    if (otaFwListRefresh) {
+      otaFwListRefresh.addEventListener("click", async () => {
+        otaFwListRefresh.disabled = true;
+        try {
+          await refreshFirmwareSelect();
+          toast("Firmware list refreshed from server", "ok");
+        } catch (_) {
+        } finally {
+          otaFwListRefresh.disabled = false;
+        }
+      });
+    }
+    const stBtn = $("#otaStBtn", view);
+    if (stBtn) {
+      stBtn.addEventListener("click", async () => {
+        const inp = $("#otaStFile", view);
+        const f = inp && inp.files && inp.files[0];
+        const fw = String($("#otaStFw", view)?.value || "").trim();
+        const upw = String($("#otaStUploadPwd", view)?.value || "");
+        if (!f || !fw) {
+          toast("Choose file and version label", "err");
+          return;
+        }
+        if (!upw) {
+          toast("Enter the upload password (set OTA_UPLOAD_PASSWORD on the server).", "err");
+          return;
+        }
+        if (!confirm("Upload firmware to server (HEAD check against public /fw/ URL)?")) return;
+        try {
+          const fd = new FormData();
+          fd.append("file", f);
+          fd.append("fw_version", fw);
+          fd.append("upload_password", upw);
+          const r = await api("/ota/firmware/upload", { method: "POST", body: fd, timeoutMs: 18e4 });
+          if (!isRouteCurrent(routeSeq)) return;
+          const resEl = $("#otaStResult", view);
+          if (resEl) resEl.textContent = `Stored ${r.stored_as || ""} \xB7 head_ok=${r.head_ok} \xB7 ${r.verify || ""}`;
+          toast("Upload finished", r.head_ok ? "ok" : "err");
+          if (inp) inp.value = "";
+          refreshFirmwareSelect();
+        } catch (e) {
+          toast(e.message || e, "err");
+        }
+      });
+    }
+    const fromBtn = $("#otaFromBtn", view);
+    if (fromBtn) {
+      fromBtn.addEventListener("click", async () => {
+        const fn = String($("#otaFromSel", view)?.value || "").trim();
+        const notes = String($("#otaFromNotes", view)?.value || "").trim();
+        const allCh = $("#otaFromAllAd", view);
+        const rawAdm = String($("#otaFromAdmTxt", view)?.value || "").trim();
+        const target_admins = allCh && allCh.checked ? ["*"] : rawAdm ? rawAdm.split(/[\s,;]+/).filter(Boolean) : ["*"];
+        if (!fn) {
+          toast("Select a firmware package from the list", "err");
+          return;
+        }
+        if (!confirm("Create OTA campaign from this stored file? The campaign version will be taken from the server (staged .version / filename), not the UI.")) return;
+        try {
+          const out = await api("/ota/campaigns/from-stored", {
+            method: "POST",
+            body: { filename: fn, notes: notes || void 0, target_admins }
+          });
+          toast(
+            out && out.fw_version ? `Campaign created \xB7 v${out.fw_version}` : "Campaign created",
+            "ok"
+          );
+          try {
+            bustDeviceListCaches();
+          } catch (_) {
+          }
+        } catch (e) {
+          toast(e.message || e, "err");
+        }
+      });
+    }
+  }
+  function renderPolicyPanel(username, p) {
+    const row = (k, label, locked) => `
+      <label class="checkbox"><input type="checkbox" data-k="${k}" ${p[k] ? "checked" : ""} ${locked ? "disabled" : ""}/><span>${escapeHtml(label)}</span></label>`;
+    return `
+      <div class="stack">
+        <p class="muted" style="margin:0">Capabilities for <strong>${escapeHtml(username)}</strong> (user role).</p>
+        <div class="row">
+          ${row("can_alert", "Alarms (device + bulk + cancel)")}
+          ${row("can_send_command", "Send device commands")}
+          ${row("can_claim_device", "Claim / provision devices")}
+          ${row("can_manage_users", "Manage users (N/A for user role)", true)}
+          ${row("can_backup_restore", "Backup / restore (N/A for user role)", true)}
+        </div>
+        <div class="row" style="justify-content:flex-end">
+          <button class="btn js-save" type="button">Save</button>
+        </div>
+      </div>`;
+  }
+  async function boot() {
+    initTheme();
+    $("#menuBtn").addEventListener("click", () => toggleNav());
+    $("#sidebarBackdrop").addEventListener("click", () => toggleNav(false));
+    const railT = document.getElementById("sidebarRailToggle");
+    if (railT) railT.addEventListener("click", () => toggleSidebarRail());
+    window.addEventListener("resize", syncNavForViewport);
+    window.addEventListener("orientationchange", syncNavForViewport);
+    $("#themeBtn").addEventListener("click", () => {
+      setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
+    });
+    $("#logoutBtn").addEventListener("click", async () => {
+      try {
+        await fetchWithDeadline(apiBase() + "/auth/logout", { method: "POST" }, 12e3);
+      } catch (_) {
+      }
+      setToken("");
+      state.me = null;
+      clearHealthPollTimer();
+      location.hash = "#/login";
+      renderAuthState();
+    });
+    $("#refreshBtn").addEventListener("click", () => renderRoute());
+    document.addEventListener("click", (ev) => {
+      const b = ev.target.closest(".btn-tap");
+      if (!b || b.disabled) return;
+      try {
+        if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+        if (typeof navigator !== "undefined" && navigator.vibrate) navigator.vibrate(10);
+      } catch (_) {
+      }
+    }, true);
+    await loadMe();
+    syncNavForViewport();
+    try {
+      applySidebarRail();
+    } catch (_) {
+    }
+    if (!location.hash) location.hash = state.me ? "#/overview" : "#/login";
+    else renderRoute();
+    await loadHealth().catch(() => {
+    });
+    window.addEventListener("online", () => {
+      loadHealth().catch(() => {
+      });
+      tickHealthIfVisible();
+      if (typeof window.__eventsStreamResume === "function") {
+        try {
+          if (!window.__evSSE || window.__evSSE.readyState === EventSource.CLOSED) {
+            window.__eventsStreamResume();
+          } else {
+            syncEventsLiveBadge();
+          }
+        } catch (_) {
+        }
+      }
+    });
+    document.addEventListener("visibilitychange", () => {
+      document.documentElement.classList.toggle("tab-hidden", document.visibilityState === "hidden");
+      if (document.visibilityState === "hidden") {
+        const live = document.getElementById("evLive");
+        if (live && window.__evSSE && window.__evSSE.readyState === EventSource.OPEN) {
+          live.textContent = "Background";
+          live.className = "badge neutral";
+          live.title = "Stream stays connected in background";
+        }
+        return;
+      }
+      tickHealthIfVisible();
+      syncEventsLiveBadge();
+      if (typeof window.__eventsStreamResume === "function") {
+        try {
+          if (!window.__evSSE || window.__evSSE.readyState === EventSource.CLOSED) {
+            window.__eventsStreamResume();
+          }
+        } catch (_) {
+        }
+      }
+    });
+    document.documentElement.classList.toggle("tab-hidden", document.visibilityState === "hidden");
+  }
+  document.addEventListener("DOMContentLoaded", boot);
+  registerRoute("account-activate", async (view) => {
+    setCrumb("Activate account");
+    document.body.dataset.auth = "none";
+    mountView(view, `
+    <div class="auth-surface" role="main">
+      ${authAsideHtml("activate")}
+      <div class="auth-surface__body">
+        <div class="auth-surface__inner">
+      <div class="auth-card auth-card--panel auth-card--wide" data-auth-card>
+        <header class="auth-card__head">
+          <h1 class="auth-card__title">Activate account</h1>
+          <p class="auth-card__lead">Use the code from your invitation email</p>
+        </header>
+        <div class="auth-card__body">
+          <p class="auth-card__note muted">An administrator created your user. Enter your <strong>username</strong> and the <strong>email code</strong> below.</p>
+          <label class="field"><span>Username</span><input id="a_user" autocomplete="username" placeholder="Your username"/></label>
+          <label class="field field--spaced"><span>Email code</span><input id="a_email_code" inputmode="numeric" maxlength="12" autocomplete="one-time-code" placeholder="From email"/></label>
+          <div class="auth-card__submit">
+            <button class="btn btn-tap btn-block" type="button" id="a_submit">Activate</button>
+            <button class="btn secondary btn-tap btn-block" type="button" id="a_resend">Resend code</button>
+            <a class="auth-link auth-link--center" href="#/login">Back to sign in</a>
+          </div>
+          <p class="auth-card__msg muted" id="a_msg" aria-live="polite"></p>
+        </div>
+      </div>
+      ${authSiteFooterHtml()}
+        </div>
+      </div>
+    </div>`);
+    const msg = $("#a_msg");
+    $("#a_submit").addEventListener("click", async () => {
+      const body = {
+        username: $("#a_user").value.trim(),
+        email_code: $("#a_email_code").value.trim()
+      };
+      msg.textContent = "";
+      try {
+        const r = await fetch(apiBase() + "/auth/activate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body)
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(j.detail || `${r.status}`);
+        setChildMarkup(msg, `<span class="badge online">Activated</span> Redirecting to sign in\u2026`);
+        scheduleRouteRedirect(1500, "#/login");
+      } catch (e) {
+        msg.textContent = String(e.message || e);
+      }
+    });
+    $("#a_resend").addEventListener("click", async () => {
+      msg.textContent = "";
+      const username = $("#a_user").value.trim();
+      if (!username) {
+        msg.textContent = "Enter username first";
+        return;
+      }
+      try {
+        const r = await fetch(apiBase() + "/auth/code/resend", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username, channel: "email", purpose: "activate" })
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(j.detail || `${r.status}`);
+        msg.textContent = "Resend requested \u2014 check inbox and spam.";
+      } catch (e) {
+        msg.textContent = String(e.message || e);
+      }
+    });
+  });
   registerRoute("account", async (view) => {
     setCrumb("Account");
     if (!hasRole("user")) {
@@ -1573,81 +2026,81 @@ ${curFw} \u2192 ${fw}`)) return;
     const deleteSection = (() => {
       if (roleNorm === "superadmin") {
         return `
-      <div class="card">
-        <h3>Delete account</h3>
-        <p class="muted">Superadmin accounts cannot be removed through this console (API blocks self-deletion).</p>
-      </div>`;
+    <div class="card">
+      <h3>Delete account</h3>
+      <p class="muted">Superadmin accounts cannot be removed through this console (API blocks self-deletion).</p>
+    </div>`;
       }
       if (roleNorm === "admin") {
         return `
-      <details class="card danger-zone">
-        <summary style="cursor:pointer;font-weight:700">Danger zone \xB7 Close tenant</summary>
-        <div style="margin-top:10px">
-        <h3>Close tenant account</h3>
-        <p class="muted" style="margin:0 0 10px">If you close this admin tenant:</p>
-        <ul class="muted" style="margin:0 0 12px;padding-left:1.25em;line-height:1.55">
-          <li><strong>Devices</strong> you own are <strong>factory-unclaimed</strong> (dashboard records removed; devices return to unregistered / reclaimable state).</li>
-          <li><strong>Subordinate users</strong> created under your account are <strong>deleted</strong>.</li>
-          <li>Your <strong>username</strong> and <strong>email</strong> become available for new registration.</li>
-        </ul>
-        <label class="checkbox" style="margin-bottom:12px;display:flex;gap:8px;align-items:flex-start">
-          <input id="accAckTenant" type="checkbox" />
-          <span>I understand all devices under this tenant will be released and sub-users removed.</span>
-        </label>
-        <p class="muted">Type <span class="mono">DELETE</span> and your password to confirm.</p>
-        <label class="field"><span>Current password</span><input id="accDelPw" type="password" autocomplete="current-password"/></label>
-        <label class="field field--spaced"><span>Type DELETE</span><input id="accDelText" placeholder="DELETE"/></label>
-        <div class="row" style="justify-content:flex-end;margin-top:10px">
-          <button class="btn danger" id="accDeleteSelf">Close tenant permanently</button>
-        </div>
-        </div>
-      </details>`;
+    <details class="card danger-zone">
+      <summary style="cursor:pointer;font-weight:700">Danger zone \xB7 Close tenant</summary>
+      <div style="margin-top:10px">
+      <h3>Close tenant account</h3>
+      <p class="muted" style="margin:0 0 10px">If you close this admin tenant:</p>
+      <ul class="muted" style="margin:0 0 12px;padding-left:1.25em;line-height:1.55">
+        <li><strong>Devices</strong> you own are <strong>factory-unclaimed</strong> (dashboard records removed; devices return to unregistered / reclaimable state).</li>
+        <li><strong>Subordinate users</strong> created under your account are <strong>deleted</strong>.</li>
+        <li>Your <strong>username</strong> and <strong>email</strong> become available for new registration.</li>
+      </ul>
+      <label class="checkbox" style="margin-bottom:12px;display:flex;gap:8px;align-items:flex-start">
+        <input id="accAckTenant" type="checkbox" />
+        <span>I understand all devices under this tenant will be released and sub-users removed.</span>
+      </label>
+      <p class="muted">Type <span class="mono">DELETE</span> and your password to confirm.</p>
+      <label class="field"><span>Current password</span><input id="accDelPw" type="password" autocomplete="current-password"/></label>
+      <label class="field field--spaced"><span>Type DELETE</span><input id="accDelText" placeholder="DELETE"/></label>
+      <div class="row" style="justify-content:flex-end;margin-top:10px">
+        <button class="btn danger" id="accDeleteSelf">Close tenant permanently</button>
+      </div>
+      </div>
+    </details>`;
       }
       return `
-      <details class="card danger-zone">
-        <summary style="cursor:pointer;font-weight:700">Danger zone \xB7 Delete account</summary>
-        <div style="margin-top:10px">
-        <h3>Delete account</h3>
-        <p class="muted">This action is irreversible. Type <span class="mono">DELETE</span> and confirm your password.</p>
-        <label class="field"><span>Current password</span><input id="accDelPw" type="password" autocomplete="current-password"/></label>
-        <label class="field field--spaced"><span>Type DELETE</span><input id="accDelText" placeholder="DELETE"/></label>
-        <div class="row" style="justify-content:flex-end;margin-top:10px">
-          <button class="btn danger" id="accDeleteSelf">Delete my account</button>
-        </div>
-        </div>
-      </details>`;
+    <details class="card danger-zone">
+      <summary style="cursor:pointer;font-weight:700">Danger zone \xB7 Delete account</summary>
+      <div style="margin-top:10px">
+      <h3>Delete account</h3>
+      <p class="muted">This action is irreversible. Type <span class="mono">DELETE</span> and confirm your password.</p>
+      <label class="field"><span>Current password</span><input id="accDelPw" type="password" autocomplete="current-password"/></label>
+      <label class="field field--spaced"><span>Type DELETE</span><input id="accDelText" placeholder="DELETE"/></label>
+      <div class="row" style="justify-content:flex-end;margin-top:10px">
+        <button class="btn danger" id="accDeleteSelf">Delete my account</button>
+      </div>
+      </div>
+    </details>`;
     })();
     const previewInner = avStored ? `<img src="${escapeHtml(avStored)}" alt="" width="48" height="48" loading="lazy" decoding="async" referrerpolicy="no-referrer" />` : `<span class="account-avatar-fallback" aria-hidden="true">${escapeHtml(uname0)}</span>`;
     mountView(view, `
-      <div class="card">
-        <h2>My account</h2>
-        <p class="muted">User: <span class="mono">${escapeHtml(me.username)}</span> \xB7 Role: <span class="mono">${escapeHtml(me.role)}</span></p>
+    <div class="card">
+      <h2>My account</h2>
+      <p class="muted">User: <span class="mono">${escapeHtml(me.username)}</span> \xB7 Role: <span class="mono">${escapeHtml(me.role)}</span></p>
+    </div>
+    <div class="card">
+      <h3>Profile picture</h3>
+      <p class="muted" style="margin:0 0 10px">Use an <strong>https</strong> image link you control (square works best). Shown in the left sidebar. If the image cannot load, your initial is used.</p>
+      <div class="row" style="align-items:flex-end;flex-wrap:wrap;gap:12px">
+        <label class="field" style="flex:1;min-width:200px;max-width:100%"><span>Image URL</span>
+          <input id="accAvatarUrl" type="url" inputmode="url" placeholder="https://\u2026" value="${escapeHtml(avStored)}" autocomplete="off" />
+        </label>
+        <div class="account-avatar-preview" id="accAvatarPreview" aria-hidden="true">${previewInner}</div>
       </div>
-      <div class="card">
-        <h3>Profile picture</h3>
-        <p class="muted" style="margin:0 0 10px">Use an <strong>https</strong> image link you control (square works best). Shown in the left sidebar. If the image cannot load, your initial is used.</p>
-        <div class="row" style="align-items:flex-end;flex-wrap:wrap;gap:12px">
-          <label class="field" style="flex:1;min-width:200px;max-width:100%"><span>Image URL</span>
-            <input id="accAvatarUrl" type="url" inputmode="url" placeholder="https://\u2026" value="${escapeHtml(avStored)}" autocomplete="off" />
-          </label>
-          <div class="account-avatar-preview" id="accAvatarPreview" aria-hidden="true">${previewInner}</div>
-        </div>
-        <div class="row" style="justify-content:flex-end;margin-top:10px;gap:8px;flex-wrap:wrap">
-          <button class="btn secondary" type="button" id="accAvatarClear">Use initial only</button>
-          <button class="btn" type="button" id="accAvatarSave">Save</button>
-        </div>
+      <div class="row" style="justify-content:flex-end;margin-top:10px;gap:8px;flex-wrap:wrap">
+        <button class="btn secondary" type="button" id="accAvatarClear">Use initial only</button>
+        <button class="btn" type="button" id="accAvatarSave">Save</button>
       </div>
-      <div class="card">
-        <h3>Change password</h3>
-        <label class="field"><span>Current password</span><input id="acc_old" type="password" autocomplete="current-password"/></label>
-        <label class="field field--spaced"><span>New password</span><input id="acc_new1" type="password" autocomplete="new-password"/></label>
-        <label class="field field--spaced"><span>Confirm new password</span><input id="acc_new2" type="password" autocomplete="new-password"/></label>
-        <div class="row" style="justify-content:flex-end;margin-top:10px">
-          <button class="btn" id="accChangePw">Update password</button>
-        </div>
+    </div>
+    <div class="card">
+      <h3>Change password</h3>
+      <label class="field"><span>Current password</span><input id="acc_old" type="password" autocomplete="current-password"/></label>
+      <label class="field field--spaced"><span>New password</span><input id="acc_new1" type="password" autocomplete="new-password"/></label>
+      <label class="field field--spaced"><span>Confirm new password</span><input id="acc_new2" type="password" autocomplete="new-password"/></label>
+      <div class="row" style="justify-content:flex-end;margin-top:10px">
+        <button class="btn" id="accChangePw">Update password</button>
       </div>
-      ${deleteSection}
-    `);
+    </div>
+    ${deleteSection}
+  `);
     const accPre = $("#accAvatarPreview", view);
     const accUrl = $("#accAvatarUrl", view);
     const setAccPreview = () => {
@@ -1748,6 +2201,3050 @@ ${curFw} \u2192 ${fw}`)) return;
         }
       });
     }
+  });
+  registerRoute("activate", async (view) => {
+    setCrumb("Activate device");
+    if (!hasRole("admin")) {
+      mountView(view, `<div class="card"><p class="muted">Admins only.</p></div>`);
+      return;
+    }
+    const canClaim = can("can_claim_device");
+    mountView(view, `
+    <div class="activate-shell">
+      <section class="card activate-hero">
+        <p class="activate-kicker">Field \xB7 Claim</p>
+        <h2 class="activate-title">Claim device</h2>
+        <p class="muted activate-lead">
+          A serial appears as <strong>claimable</strong> only after the unit is <strong>powered and has contacted the server</strong>. Optionally save a <strong>target Wi\u2011Fi</strong> here (stored in this browser only); after claim we pre-fill the device page Wi\u2011Fi form for MQTT provisioning when online.
+        </p>
+        <ol class="activate-steps">
+          <li><span class="n">1</span>Optional: save target Wi\u2011Fi (recommended)</li>
+          <li><span class="n">2</span>Enter sticker serial or paste full <span class="mono">CROC|\u2026</span></li>
+          <li><span class="n">3</span>Identify \u2192 if claimable, confirm and complete claim</li>
+        </ol>
+        ${canClaim ? "" : `<p class="badge revoked" style="margin-top:12px">Your account lacks <span class="mono">can_claim_device</span>; ask an administrator.</p>`}
+      </section>
+
+      <section class="card activate-main">
+        <div class="activate-wifi-row">
+          <button type="button" class="btn secondary btn-tap" style="width:100%" id="activateWifiOpenBtn">\u2460 Target Wi\u2011Fi (SSID / password)</button>
+          <p class="muted activate-wifi-status" id="activateWifiStatus"></p>
+        </div>
+        <div class="inline-form activate-serial-block">
+          <label class="field wide"><span>\u2461 Serial or full QR line (CROC|\u2026)</span>
+            <input id="idn_input" class="activate-serial-input" placeholder="SN-\u2026 or paste full CROC|\u2026 line" autocomplete="off"/>
+          </label>
+          <div class="row wide activate-actions">
+            <button class="btn btn-tap activate-id-btn" id="idn_go" ${canClaim ? "" : "disabled"}>\u2462 Identify</button>
+          </div>
+        </div>
+        <div id="idnResult" class="activate-result"></div>
+      </section>
+
+      <dialog id="activateWifiDialog" class="activate-wifi-dlg">
+        <form class="activate-wifi-dlg__inner" onsubmit="return false">
+          <h3 class="activate-wifi-dlg__title">Target Wi\u2011Fi</h3>
+          <p class="muted activate-wifi-dlg__lead">
+            If the device has <strong>never been online</strong>, the server cannot push Wi\u2011Fi to it directly. SSID/password here are saved only in <strong>this browser</strong>; after claim, paste them into the device page for MQTT delivery. Leave password empty on open networks.
+          </p>
+          <label class="field wide"><span>SSID</span>
+            <input type="text" id="activateDlgSsid" maxlength="32" autocomplete="off" placeholder="2.4 GHz network name" />
+          </label>
+          <label class="field wide"><span>Password</span>
+            <input type="password" id="activateDlgPass" maxlength="64" autocomplete="new-password" placeholder="Empty if open network" />
+          </label>
+          <label class="field" style="margin-bottom:0"><span></span>
+            <span><input type="checkbox" id="activateDlgShowPass" /> Show password</span>
+          </label>
+          <div class="activate-wifi-dlg__actions">
+            <button type="button" class="btn ghost" id="activateWifiDlgClose">Close</button>
+            <button type="button" class="btn" id="activateWifiDlgSave">Save to this browser</button>
+            <button type="button" class="btn secondary" id="activateWifiDlgClear">Clear draft</button>
+          </div>
+        </form>
+      </dialog>
+
+      <section class="card activate-pending-card">
+        <div class="row between" style="flex-wrap:wrap;gap:8px;align-items:center">
+          <h3 style="margin:0">Recently reported (pending claim)</h3>
+          <span class="muted" style="font-size:13px">MQTT <span class="mono">bootstrap.register</span></span>
+          <button class="btn secondary btn-tap" id="reload">Refresh</button>
+        </div>
+        <div class="divider"></div>
+        <div id="pendList"></div>
+      </section>
+    </div>`);
+    const ACTIVATE_WIFI_STORE = "croc.activateWifiDraft.v1";
+    const DEVICE_WIFI_PREFILL_KEY = "croc.deviceWifiPrefill.v1";
+    const readWifiDraft = () => {
+      try {
+        const raw = sessionStorage.getItem(ACTIVATE_WIFI_STORE);
+        const o = raw ? JSON.parse(raw) : null;
+        if (o && typeof o.ssid === "string" && o.ssid.trim()) {
+          return { ssid: o.ssid.trim(), password: typeof o.password === "string" ? o.password : "" };
+        }
+      } catch (_) {
+      }
+      return null;
+    };
+    const refreshWifiBanner = () => {
+      const el = $("#activateWifiStatus", view);
+      const d = readWifiDraft();
+      if (!el) return;
+      el.textContent = d ? `Saved target Wi\u2011Fi \u201C${d.ssid}\u201D. After claim we open the device page with Wi\u2011Fi (device) prefilled (requires device online to push).` : "Optionally save the Wi\u2011Fi you plan to use (this browser only), or skip and fill it later on the device page.";
+    };
+    const dlgWifi = $("#activateWifiDialog", view);
+    const openActivateWifiDialog = () => {
+      const d = readWifiDraft();
+      const s = $("#activateDlgSsid", view);
+      const p = $("#activateDlgPass", view);
+      if (s) s.value = d ? d.ssid : "";
+      if (p) p.value = d ? d.password : "";
+      if (dlgWifi && typeof dlgWifi.showModal === "function") dlgWifi.showModal();
+    };
+    const closeActivateWifiDialog = () => {
+      if (dlgWifi && typeof dlgWifi.close === "function") dlgWifi.close();
+    };
+    const wifiOpenBtn = $("#activateWifiOpenBtn", view);
+    if (wifiOpenBtn) wifiOpenBtn.addEventListener("click", openActivateWifiDialog);
+    const wifiSaveBtn = $("#activateWifiDlgSave", view);
+    if (wifiSaveBtn) {
+      wifiSaveBtn.addEventListener("click", () => {
+        const ssid = ($("#activateDlgSsid", view).value || "").trim();
+        const password = $("#activateDlgPass", view).value || "";
+        if (!ssid) {
+          toast("Enter Wi\u2011Fi name (SSID)", "err");
+          return;
+        }
+        sessionStorage.setItem(ACTIVATE_WIFI_STORE, JSON.stringify({ ssid, password }));
+        refreshWifiBanner();
+        closeActivateWifiDialog();
+        toast("Saved (this browser only)", "ok");
+      });
+    }
+    const wifiClrDlg = $("#activateWifiDlgClear", view);
+    if (wifiClrDlg) {
+      wifiClrDlg.addEventListener("click", () => {
+        sessionStorage.removeItem(ACTIVATE_WIFI_STORE);
+        refreshWifiBanner();
+        closeActivateWifiDialog();
+        toast("Wi\u2011Fi draft cleared", "ok");
+      });
+    }
+    const wifiClsDlg = $("#activateWifiDlgClose", view);
+    if (wifiClsDlg) wifiClsDlg.addEventListener("click", closeActivateWifiDialog);
+    const showPassEl = $("#activateDlgShowPass", view);
+    if (showPassEl) {
+      showPassEl.addEventListener("change", () => {
+        const p = $("#activateDlgPass", view);
+        if (p) p.type = showPassEl.checked ? "text" : "password";
+      });
+    }
+    refreshWifiBanner();
+    const resultBox = $("#idnResult");
+    const drawBadge = (kind, label) => `<span class="badge ${kind === "ok" ? "online" : kind === "err" ? "offline" : ""}">${escapeHtml(label)}</span>`;
+    const showClaimForm = (serial, mac, qr) => {
+      const draft = readWifiDraft();
+      const draftNote = draft ? `<p class="muted" style="margin:0 0 12px">Saved target Wi\u2011Fi <span class="mono">${escapeHtml(draft.ssid)}</span> \u2014 after claim we jump to the device page with Wi\u2011Fi (device) prefilled.</p>` : "";
+      appendChildMarkup(
+        resultBox,
+        `
+      <div class="card" style="margin-top:10px">
+        <h4 style="margin-top:0">Confirm claim</h4>
+        ${draftNote}
+        <div class="inline-form">
+          <label class="field"><span>device_id (usually serial)</span><input id="c_id" value="${escapeHtml(serial)}"/></label>
+          <label class="field"><span>mac_nocolon</span><input id="c_mac" value="${escapeHtml(mac)}"/></label>
+          <label class="field"><span>zone</span><input id="c_zone" value="all"/></label>
+          <label class="field wide"><span>qr_code (optional)</span><input id="c_qr" value="${escapeHtml(qr || "")}"/></label>
+          <div class="row wide" style="justify-content:flex-end">
+            <button class="btn btn-tap" id="c_submit">Confirm claim</button>
+          </div>
+        </div>
+      </div>`
+      );
+      $("#c_submit").addEventListener("click", async () => {
+        const body = {
+          mac_nocolon: ($("#c_mac").value || "").trim().toUpperCase(),
+          device_id: ($("#c_id").value || "").trim().toUpperCase(),
+          zone: ($("#c_zone").value || "all").trim()
+        };
+        const q = ($("#c_qr").value || "").trim();
+        if (q) body.qr_code = q;
+        const preWifi = readWifiDraft();
+        try {
+          await api("/provision/claim", { method: "POST", body });
+          const did = String(body.device_id || "").toUpperCase();
+          if (preWifi && preWifi.ssid) {
+            sessionStorage.setItem(
+              DEVICE_WIFI_PREFILL_KEY,
+              JSON.stringify({ device_id: did, ssid: preWifi.ssid, password: preWifi.password || "" })
+            );
+          }
+          sessionStorage.removeItem(ACTIVATE_WIFI_STORE);
+          refreshWifiBanner();
+          toast("Claim completed", "ok");
+          location.hash = `#/devices/${encodeURIComponent(did)}`;
+        } catch (e) {
+          toast(e.message || e, "err");
+        }
+      });
+    };
+    $("#idn_go").addEventListener("click", async () => {
+      setChildMarkup(resultBox, `<p class="muted">Identifying\u2026</p>`);
+      const raw = ($("#idn_input").value || "").trim();
+      if (!raw) {
+        setChildMarkup(resultBox, `<p class="muted">Enter serial or QR payload</p>`);
+        return;
+      }
+      const body = raw.startsWith("CROC|") ? { qr_code: raw } : { serial: raw.toUpperCase() };
+      try {
+        const r = await api("/provision/identify", { method: "POST", body });
+        const kv = (k, v) => `<dt>${escapeHtml(k)}</dt><dd class="mono">${escapeHtml(v)}</dd>`;
+        switch (r.status) {
+          case "ready":
+            setChildMarkup(
+              resultBox,
+              `${drawBadge("ok", "Ready to claim")}
+            <dl class="kv">${kv("Serial", r.serial)}${kv("MAC", r.mac_nocolon)}${kv("Firmware", r.fw || "\u2014")}${kv("Last seen", r.last_seen_at ? fmtTs(r.last_seen_at) : "\u2014")}</dl>
+            <p>${escapeHtml(r.message)}</p>`
+            );
+            showClaimForm(r.serial, r.mac_nocolon, raw.startsWith("CROC|") ? raw : "");
+            break;
+          case "already_registered":
+            const canSeeOwner = !!(state.me && state.me.role === "superadmin");
+            const ownerKv = canSeeOwner ? kv("Owner admin", r.owner_admin || "\u2014") : "";
+            const byYou = !!r.by_you;
+            setChildMarkup(
+              resultBox,
+              `${drawBadge("err", byYou ? "Already yours" : "Already registered")}
+            <dl class="kv">${kv("Serial", r.serial)}${kv("device_id", r.device_id)}${ownerKv}${kv("Claimed at", r.claimed_at ? fmtTs(r.claimed_at) : "\u2014")}</dl>
+            <p class="muted">${escapeHtml(r.message)}</p>
+            ${byYou ? `<a class="btn secondary" href="#/devices/${encodeURIComponent(r.device_id)}">Open device</a>` : ""}`
+            );
+            break;
+          case "offline": {
+            const dw = readWifiDraft();
+            const draftNote = dw ? `<p class="muted" style="margin-top:10px">Saved Wi\u2011Fi on this machine: <strong>${escapeHtml(dw.ssid)}</strong>. After the unit is online and claimed, push credentials from the device page.</p>` : "";
+            setChildMarkup(
+              resultBox,
+              `${drawBadge("", "Waiting for device")}
+            <dl class="kv">${kv("Serial", r.serial)}${r.mac_hint ? kv("Factory MAC", r.mac_hint) : ""}</dl>
+            <p>${escapeHtml(r.message)}</p>
+            ${draftNote}
+            <div class="activate-offline-actions">
+              <button type="button" class="btn secondary btn-tap" id="activateOfflineWifiBtn">Edit target Wi\u2011Fi</button>
+              <button type="button" class="btn btn-tap" id="idn_retry_offline">Powered & online \u2014 retry identify</button>
+            </div>`
+            );
+            break;
+          }
+          case "blocked":
+            setChildMarkup(resultBox, `${drawBadge("err", "Factory blocked")}<p>${escapeHtml(r.message)}</p>`);
+            break;
+          case "unknown_serial":
+            setChildMarkup(resultBox, `${drawBadge("err", "Unknown serial")}<p>${escapeHtml(r.message)}</p>`);
+            break;
+          default:
+            setChildMarkup(resultBox, `<p class="muted">Unknown status: ${escapeHtml(r.status)}</p>`);
+        }
+      } catch (e) {
+        setChildMarkup(resultBox, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
+      }
+    });
+    view.addEventListener("click", (ev) => {
+      if (ev.target.closest("#activateOfflineWifiBtn")) {
+        openActivateWifiDialog();
+        return;
+      }
+      if (ev.target.closest("#idn_retry_offline")) {
+        const go = $("#idn_go", view);
+        if (go) go.click();
+      }
+    });
+    $("#reload").addEventListener("click", () => renderRoute());
+    try {
+      const rq = window.__routeQuery || new URLSearchParams("");
+      const pre = (rq.get("q") || rq.get("serial") || "").trim();
+      if (pre) {
+        const el = $("#idn_input");
+        if (el) el.value = pre;
+      }
+    } catch (_) {
+    }
+    let pendingErr = "";
+    const data = await apiOr("/provision/pending", (e) => {
+      pendingErr = String(e && e.message || e || "load failed");
+      return { items: [] };
+    }, { timeoutMs: 16e3 });
+    const items = data.items || [];
+    const pendListEl = view.querySelector("#pendList");
+    if (!pendListEl) return;
+    setChildMarkup(
+      pendListEl,
+      `
+    <div class="table-wrap"><table class="t">
+      <thead><tr><th>MAC</th><th>Serial / proposed ID</th><th>QR</th><th>Firmware</th><th>Last seen</th></tr></thead>
+      <tbody>${items.length === 0 ? `<tr><td colspan="5" class="muted">${pendingErr ? "Load failed (retry with Refresh)." : "None"}</td></tr>` : items.map((p) => `<tr>
+          <td class="mono">${escapeHtml(p.mac_nocolon || p.mac || "")}</td>
+          <td class="mono">${escapeHtml(p.proposed_device_id || "\u2014")}</td>
+          <td class="mono">${escapeHtml(p.qr_code || "\u2014")}</td>
+          <td>${escapeHtml(p.fw || "\u2014")}</td>
+          <td>${escapeHtml(fmtTs(p.last_seen_at))}</td>
+        </tr>`).join("")}</tbody>
+    </table></div>`
+    );
+  });
+  registerRoute("admin", async (view) => {
+    setCrumb("Admin");
+    if (!hasRole("admin")) {
+      mountView(view, `<div class="card"><p class="muted">Admins only.</p></div>`);
+      return;
+    }
+    const isSuper = state.me.role === "superadmin";
+    let admins = [];
+    if (isSuper) {
+      try {
+        admins = (await api("/auth/admins", { timeoutMs: 16e3 })).items || [];
+      } catch {
+        admins = [];
+      }
+    }
+    mountView(view, `
+    <div class="card">
+      <h2>Users</h2>
+      <p class="muted">${isSuper ? "Superadmin: create admin/user, assign manager_admin and policies." : "Admin: manage users under you and toggle their capabilities."}</p>
+      <p class="muted" style="margin-top:8px">Registration and reset codes are sent via your configured mail channel on server <span class="mono">.env</span>. Telegram alerts need <span class="mono">TELEGRAM_BOT_TOKEN</span> and <span class="mono">TELEGRAM_CHAT_IDS</span>; restart the API after changing those. Status: top bar pills (from <span class="mono">/health</span>).</p>
+      <div class="row right-end" style="justify-content:flex-end;flex-wrap:wrap;gap:10px">
+        <button class="btn btn-tap" id="showCreate" type="button">New user</button>
+        <button class="btn secondary btn-tap" id="reloadUsers" type="button">Refresh</button>
+      </div>
+      <div class="divider"></div>
+      <div id="userTable"></div>
+    </div>
+
+    ${isSuper ? `<div class="card">
+      <h3>Global sharing</h3>
+      <p class="muted">Search all share grants, create/update a grant, or revoke directly.</p>
+      <div class="inline-form">
+        <label class="field"><span>Device ID</span><input id="gs_device" placeholder="SN-..." /></label>
+        <label class="field"><span>Grantee</span><input id="gs_user" placeholder="admin_x / user_x" /></label>
+        <label class="field"><span>View</span><input id="gs_view" type="checkbox" checked /></label>
+        <label class="field"><span>Operate</span><input id="gs_operate" type="checkbox" /></label>
+        <div class="row wide" style="justify-content:flex-end;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-tap" id="gs_grant" type="button">Grant / Update</button>
+          <button class="btn secondary btn-tap" id="gs_query" type="button">Query</button>
+          <label class="field" style="margin:0"><span>Include revoked</span><input id="gs_inc_rev" type="checkbox" /></label>
+        </div>
+      </div>
+      <div id="gsList" style="margin-top:10px"></div>
+    </div>` : ""}
+
+    <div class="card" id="createPanel" style="display:none">
+      <h3>New user</h3>
+      <div class="inline-form">
+        <label class="field"><span>Username</span><input id="u_name" autocomplete="off" /></label>
+        <label class="field"><span>Password (min 8)</span><input id="u_pass" type="password" autocomplete="new-password" /></label>
+        <label class="field"><span>Role</span><select id="u_role">
+          ${isSuper ? `<option value="user">user</option><option value="admin">admin</option>` : `<option value="user">user</option>`}
+        </select></label>
+        <label class="field" id="u_mgr_wrap" ${isSuper ? "" : 'style="display:none"'}>
+          <span>Manager admin</span>
+          <select id="u_mgr">${admins.map((a) => `<option value="${escapeHtml(a)}">${escapeHtml(a)}</option>`).join("")}</select>
+        </label>
+        <label class="field"><span>Email (required)</span><input id="u_email" type="email" autocomplete="off"/></label>
+        <label class="field"><span>Tenant (optional)</span><input id="u_tenant" /></label>
+        <div class="row wide" style="justify-content:flex-end;flex-wrap:wrap;gap:10px">
+          <button class="btn ghost btn-tap" id="u_cancel" type="button">Cancel</button>
+          <button class="btn btn-tap" id="u_submit" type="button">Create & send activation email</button>
+        </div>
+        <p class="muted" style="margin:8px 0 0">
+          New users start as <span class="mono">pending</span>. They must finish
+          <a href="#/account-activate">Activate account</a> with the email code before sign-in.
+        </p>
+      </div>
+    </div>
+
+    ${isSuper ? `<div class="card">
+      <h3>Pending admin signups</h3>
+      <p class="muted">Public registration + email verified; awaiting your approval.</p>
+      <div id="pendAdmins"></div>
+    </div>` : ""}
+
+    <div class="card">
+      <h3>Alert email recipients</h3>
+      <p class="muted">Inbox list for alarm emails when mail channel is configured on the server.</p>
+      <div id="smtpStatus" class="row" style="gap:6px"></div>
+      <div class="divider"></div>
+      <div class="inline-form">
+        <label class="field wide"><span>Email</span><input id="r_email" type="email" autocomplete="off" placeholder="you@company.com"/></label>
+        <label class="field"><span>Label</span><input id="r_label" autocomplete="off" placeholder="on-call"/></label>
+        <div class="row wide" style="justify-content:flex-end">
+          <button class="btn" id="r_add">Add</button>
+          <button class="btn ghost" id="r_test">Send test mail</button>
+        </div>
+      </div>
+      <div id="recipientList" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card">
+      <h3>Telegram</h3>
+      <p class="muted">Forwards <span class="mono">emit_event</span> from server env (<span class="mono">TELEGRAM_BOT_TOKEN</span>, <span class="mono">TELEGRAM_CHAT_IDS</span>). Test does not use the queue.</p>
+      <div id="tgStatus" class="row" style="gap:6px;flex-wrap:wrap"></div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn secondary" id="tgTest" type="button">Send test to all chats</button>
+      </div>
+      <div class="divider"></div>
+      <h4 style="margin:0 0 8px">Command chat binding</h4>
+      <p class="muted" style="margin:0 0 8px">User sends <span class="mono">/start</span> to bot, copies <span class="mono">chat_id</span>, then binds here. No password in Telegram.</p>
+      <div class="inline-form">
+        <label class="field"><span>chat_id</span><input id="tgBindChatId" placeholder="e.g. 2082431201 or -100xxxx" /></label>
+        <label class="field"><span>Enabled</span><input id="tgBindEnabled" type="checkbox" checked /></label>
+        <div class="row wide" style="justify-content:flex-end">
+          <button class="btn" id="tgBindSelf" type="button">Bind this chat</button>
+          <button class="btn secondary" id="tgReloadBindings" type="button">Refresh bindings</button>
+        </div>
+      </div>
+      <div id="tgBindings" style="margin-top:10px"></div>
+    </div>
+
+    ${isSuper ? `<div class="card">
+      <h3>Database backup / restore</h3>
+      <p class="muted">Uses <span class="mono">/admin/backup/export</span> and <span class="mono">/admin/backup/import</span>: full SQLite encrypted to <span class="mono">.enc</span>. Import writes <span class="mono">*.restored</span> \u2014 follow ops runbook to swap files.</p>
+      <label class="field" style="max-width:420px">
+        <span>Encryption key <span class="muted">X-Backup-Encryption-Key</span></span>
+        <input id="bk_key" type="password" autocomplete="off" />
+      </label>
+      <div class="row" style="margin-top:10px">
+        <button class="btn" id="bk_export">Export .enc</button>
+        <input type="file" id="bk_file" accept=".enc,application/octet-stream" />
+        <button class="btn secondary" id="bk_import">Upload & decrypt</button>
+      </div>
+    </div>` : ""}`);
+    const $v = (sel) => $(sel, view);
+    const loadUsers = async () => {
+      try {
+        const d = await api("/auth/users", { timeoutMs: 16e3 });
+        const users = d.items || [];
+        const userTableEl = $v("#userTable");
+        if (!userTableEl) return;
+        setChildMarkup(
+          userTableEl,
+          users.length === 0 ? `<p class="muted">No users.</p>` : `<div class="table-wrap"><table class="t">
+            <thead><tr><th>User</th><th>Role</th><th>manager</th><th>tenant</th><th>Created</th><th></th></tr></thead>
+            <tbody>${users.map((u) => {
+            const isUser = u.role === "user";
+            const isAdminRow = u.role === "admin";
+            const self = u.username === (state.me && state.me.username);
+            const closeTenantBtn = isSuper && isAdminRow && !self ? `<button type="button" class="btn sm danger js-close-admin" data-u="${escapeHtml(u.username)}">Close tenant</button>` : "";
+            return `<tr>
+                <td><strong>${escapeHtml(u.username)}</strong></td>
+                <td><span class="chip">${escapeHtml(u.role)}</span></td>
+                <td class="mono">${escapeHtml(u.manager_admin || "\u2014")}</td>
+                <td class="mono">${escapeHtml(u.tenant || "\u2014")}</td>
+                <td>${escapeHtml(fmtTs(u.created_at))}</td>
+                <td>
+                  <div class="table-actions">
+                    <details class="toolbar-collapse">
+                      <summary>Actions</summary>
+                      <div class="table-actions">
+                        ${isUser ? `<button type="button" class="btn sm secondary js-pol" data-u="${escapeHtml(u.username)}">Policy</button>` : ""}
+                        ${closeTenantBtn}
+                        ${self ? "" : isAdminRow ? "" : `<button type="button" class="btn sm danger js-del" data-u="${escapeHtml(u.username)}">Delete</button>`}
+                      </div>
+                    </details>
+                  </div>
+                </td>
+              </tr><tr class="sub" style="display:none" data-pol-row="${escapeHtml(u.username)}"><td colspan="6"></td></tr>`;
+          }).join("")}</tbody></table></div>`
+        );
+      } catch (e) {
+        const userTableEl = $v("#userTable");
+        if (userTableEl) setChildMarkup(userTableEl, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
+      }
+    };
+    const loadGlobalShares = async () => {
+      if (!isSuper) return;
+      const listEl = $v("#gsList");
+      if (!listEl) return;
+      const qs = new URLSearchParams();
+      const device = ($v("#gs_device").value || "").trim();
+      const user = ($v("#gs_user").value || "").trim();
+      if (device) qs.set("device_id", device);
+      if (user) qs.set("grantee_username", user);
+      if ($v("#gs_inc_rev") && $v("#gs_inc_rev").checked) qs.set("include_revoked", "true");
+      qs.set("limit", "500");
+      setChildMarkup(listEl, `<p class="muted">Loading shares\u2026</p>`);
+      try {
+        const d = await api("/admin/shares?" + qs.toString(), { timeoutMs: 16e3 });
+        const items = d.items || [];
+        setChildMarkup(
+          listEl,
+          items.length === 0 ? `<p class="muted">No matching shares.</p>` : `<div class="table-wrap"><table class="t">
+            <thead><tr><th>Device</th><th>Owner</th><th>Grantee</th><th>Role</th><th>View</th><th>Operate</th><th>Granted by</th><th>Status</th><th></th></tr></thead>
+            <tbody>${items.map((it) => `
+              <tr>
+                <td class="mono">${escapeHtml(it.device_id || "")}</td>
+                <td class="mono">${escapeHtml(it.owner_admin || "\u2014")}</td>
+                <td class="mono">${escapeHtml(it.grantee_username || "")}</td>
+                <td>${escapeHtml(it.grantee_role || "\u2014")}</td>
+                <td>${it.can_view ? "yes" : "no"}</td>
+                <td>${it.can_operate ? "yes" : "no"}</td>
+                <td class="mono">${escapeHtml(it.granted_by || "")}</td>
+                <td>${it.revoked_at ? `<span class="badge offline">revoked</span>` : `<span class="badge online">active</span>`}</td>
+                <td><div class="table-actions">${it.revoked_at ? "" : `<button class="btn sm danger js-gs-revoke" data-device="${escapeHtml(it.device_id || "")}" data-user="${escapeHtml(it.grantee_username || "")}">Revoke</button>`}</div></td>
+              </tr>`).join("")}</tbody></table></div>`
+        );
+      } catch (e) {
+        setChildMarkup(listEl, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
+      }
+    };
+    $v("#reloadUsers").addEventListener("click", loadUsers);
+    $v("#showCreate").addEventListener("click", () => {
+      $v("#createPanel").style.display = "";
+      $v("#createPanel").scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+    $v("#u_cancel").addEventListener("click", () => {
+      $v("#createPanel").style.display = "none";
+    });
+    $v("#u_submit").addEventListener("click", async () => {
+      const body = {
+        username: $v("#u_name").value.trim(),
+        password: $v("#u_pass").value,
+        role: $v("#u_role").value
+      };
+      if (!body.username || !body.password) {
+        toast("Username and password required", "err");
+        return;
+      }
+      const email = $v("#u_email").value.trim();
+      if (!email) {
+        toast("Email required for activation", "err");
+        return;
+      }
+      body.email = email;
+      const tenant = $v("#u_tenant").value.trim();
+      if (tenant) body.tenant = tenant;
+      if (isSuper && body.role === "user") body.manager_admin = $v("#u_mgr").value;
+      try {
+        const resp = await api("/auth/users", { method: "POST", body });
+        toast(`Created: ${resp.message || "activation email sent"}`, "ok");
+        $v("#createPanel").style.display = "none";
+        $v("#u_name").value = "";
+        $v("#u_pass").value = "";
+        $v("#u_tenant").value = "";
+        $v("#u_email").value = "";
+        loadUsers();
+      } catch (e) {
+        toast(e.message || e, "err");
+      }
+    });
+    if (isSuper) {
+      $v("#gs_query").addEventListener("click", loadGlobalShares);
+      $v("#gs_grant").addEventListener("click", async () => {
+        const device = ($v("#gs_device").value || "").trim();
+        const user = ($v("#gs_user").value || "").trim();
+        const canView = !!$v("#gs_view").checked;
+        const canOperate = !!$v("#gs_operate").checked;
+        if (!device || !user) {
+          toast("Device ID and grantee required", "err");
+          return;
+        }
+        if (!canView && !canOperate) {
+          toast("Select view and/or operate", "err");
+          return;
+        }
+        try {
+          await api(`/admin/devices/${encodeURIComponent(device)}/share`, {
+            method: "POST",
+            body: { grantee_username: user, can_view: canView, can_operate: canOperate }
+          });
+          toast("Share updated", "ok");
+          loadGlobalShares();
+        } catch (e) {
+          toast(e.message || e, "err");
+        }
+      });
+      $v("#gsList").addEventListener("click", async (ev) => {
+        const btn = ev.target.closest(".js-gs-revoke");
+        if (!btn) return;
+        const device = btn.dataset.device || "";
+        const user = btn.dataset.user || "";
+        if (!device || !user) return;
+        if (!confirm(`Revoke ${user} from ${device}?`)) return;
+        try {
+          await api(`/admin/devices/${encodeURIComponent(device)}/share/${encodeURIComponent(user)}`, { method: "DELETE" });
+          toast("Share revoked", "ok");
+          loadGlobalShares();
+        } catch (e) {
+          toast(e.message || e, "err");
+        }
+      });
+      loadGlobalShares();
+    }
+    const openPolicy = async (username, trRow) => {
+      const cell = trRow.querySelector("td");
+      setChildMarkup(cell, `<span class="muted">Loading\u2026</span>`);
+      trRow.style.display = "";
+      try {
+        const p = await api(`/auth/users/${encodeURIComponent(username)}/policy`, { timeoutMs: 16e3 });
+        setChildMarkup(cell, renderPolicyPanel(username, p));
+        cell.querySelector(".js-save").addEventListener("click", async () => {
+          const body = {};
+          cell.querySelectorAll("input[type=checkbox][data-k]").forEach((i) => body[i.dataset.k] = !!i.checked);
+          try {
+            const r = await api(`/auth/users/${encodeURIComponent(username)}/policy`, { method: "PUT", body });
+            toast(`Policy updated for ${username}`, "ok");
+            setChildMarkup(cell, renderPolicyPanel(username, r.policy || r));
+            cell.querySelector(".js-save").addEventListener("click", () => openPolicy(username, trRow));
+          } catch (e) {
+            toast(e.message || e, "err");
+          }
+        });
+      } catch (e) {
+        setChildMarkup(cell, `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`);
+      }
+    };
+    $v("#userTable").addEventListener("click", async (ev) => {
+      const t = ev.target.closest("button");
+      if (!t) return;
+      const u = t.dataset.u;
+      if (t.classList.contains("js-del")) {
+        if (!confirm(`Delete user ${u}?`)) return;
+        try {
+          await api(`/auth/users/${encodeURIComponent(u)}`, { method: "DELETE" });
+          toast("Deleted", "ok");
+          loadUsers();
+        } catch (e) {
+          toast(e.message || e, "err");
+        }
+      }
+      if (t.classList.contains("js-pol")) {
+        const row = view.querySelector(`tr[data-pol-row="${CSS.escape(u)}"]`);
+        if (!row) return;
+        if (row.style.display === "") {
+          row.style.display = "none";
+          return;
+        }
+        openPolicy(u, row);
+      }
+      if (t.classList.contains("js-close-admin")) {
+        if (!isSuper) return;
+        if (!u) return;
+        if (!confirm(
+          `Close admin tenant "${u}"?
+
+\xB7 Devices: factory-unclaim all, OR transfer to another admin in the next prompt.
+\xB7 All subordinate users under this admin will be deleted.
+\xB7 That username and email are released for new signups.`
+        )) return;
+        const transfer = window.prompt(
+          "Optional: target admin username to receive ALL this admin\u2019s devices (leave empty to unclaim every device):"
+        );
+        if (transfer === null) return;
+        const transferTo = String(transfer).trim() || null;
+        const confirmText = window.prompt("Type exactly: CLOSE TENANT");
+        if (confirmText === null) return;
+        if (String(confirmText).trim() !== "CLOSE TENANT") {
+          toast("Confirmation must be exactly: CLOSE TENANT", "err");
+          return;
+        }
+        try {
+          const r = await api(`/auth/admins/${encodeURIComponent(u)}/close`, {
+            method: "POST",
+            body: { confirm_text: "CLOSE TENANT", transfer_devices_to: transferTo }
+          });
+          toast(
+            `Tenant closed \u2014 unclaimed ${Number(r.devices_unclaimed || 0)}, transferred ${Number(r.devices_transferred || 0)}, removed ${Number(r.subordinate_users_deleted || 0)} user(s).`,
+            "ok"
+          );
+          loadUsers();
+        } catch (e) {
+          toast(e.message || e, "err");
+        }
+      }
+    });
+    if (isSuper) {
+      $v("#bk_export").addEventListener("click", async () => {
+        const key = ($v("#bk_key").value || "").trim();
+        if (!key) {
+          toast("Enter backup encryption key", "err");
+          return;
+        }
+        const btn = $v("#bk_export");
+        const orig = btn ? btn.textContent : "";
+        if (btn) {
+          btn.disabled = true;
+          btn.textContent = "Exporting\u2026";
+        }
+        try {
+          const _h = { "X-Backup-Encryption-Key": key };
+          const _tb = getToken();
+          if (_tb) _h.Authorization = "Bearer " + _tb;
+          const r = await fetchWithDeadline(apiBase() + "/admin/backup/export", {
+            method: "GET",
+            credentials: "include",
+            headers: _h
+          }, 3e5);
+          if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+          const blob = new Blob([await r.arrayBuffer()], { type: "application/octet-stream" });
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(blob);
+          a.download = "sentinel-backup.enc";
+          a.click();
+          URL.revokeObjectURL(a.href);
+          toast("Downloaded", "ok");
+        } catch (e) {
+          toast(e.message || e, "err");
+        } finally {
+          if (btn) {
+            btn.disabled = false;
+            btn.textContent = orig || "Export";
+          }
+        }
+      });
+      $v("#bk_import").addEventListener("click", async () => {
+        const key = ($v("#bk_key").value || "").trim();
+        const f = $v("#bk_file").files[0];
+        if (!key || !f) {
+          toast("Pick a file and enter the encryption key", "err");
+          return;
+        }
+        const fd = new FormData();
+        fd.append("file", f, f.name || "sentinel-backup.enc");
+        const btn = $v("#bk_import");
+        const orig = btn ? btn.textContent : "";
+        if (btn) {
+          btn.disabled = true;
+          btn.textContent = "Importing\u2026";
+        }
+        try {
+          const _hi = { "X-Backup-Encryption-Key": key };
+          const _ti = getToken();
+          if (_ti) _hi.Authorization = "Bearer " + _ti;
+          else {
+            let _ctok = getCsrfToken();
+            if (!_ctok) _ctok = await refreshCsrfToken();
+            if (_ctok) _hi[CSRF_HEADER_NAME] = _ctok;
+          }
+          const r = await fetchWithDeadline(apiBase() + "/admin/backup/import", {
+            method: "POST",
+            credentials: "include",
+            headers: _hi,
+            body: fd
+          }, 3e5);
+          const j = await r.json().catch(() => ({}));
+          if (!r.ok) throw new Error(`${r.status} ${j.detail || ""}`);
+          toast("Written: " + (j.written_path || "done"), "ok");
+        } catch (e) {
+          toast(e.message || e, "err");
+        } finally {
+          if (btn) {
+            btn.disabled = false;
+            btn.textContent = orig || "Import";
+          }
+        }
+      });
+    }
+    const loadSmtpStatus = async () => {
+      try {
+        const s = await api("/admin/smtp/status", { timeoutMs: 16e3 });
+        const smtpEl = $v("#smtpStatus");
+        if (!smtpEl) return;
+        const okBadge = s.enabled ? `<span class="badge online">Mail on</span>` : `<span class="badge offline">Mail off</span>`;
+        const last = s.last_error ? `<span class="chip" title="last error">${escapeHtml(s.last_error)}</span>` : "";
+        setChildMarkup(
+          smtpEl,
+          `${okBadge}
+        <span class="chip">host: ${escapeHtml(s.host || "\u2014")}:${escapeHtml(String(s.port || "\u2014"))}</span>
+        <span class="chip">mode: ${escapeHtml(s.mode || "\u2014")}</span>
+        <span class="chip">from: ${escapeHtml(s.sender || "\u2014")}</span>
+        <span class="chip">sent: ${s.sent_count || 0}</span>
+        <span class="chip">failed: ${s.failed_count || 0}</span>
+        <span class="chip">queue: ${s.queue_size ?? 0}/${s.queue_max ?? ""}</span>${last}`
+        );
+      } catch (e) {
+        const smtpEl = $v("#smtpStatus");
+        if (!smtpEl) return;
+        setChildMarkup(smtpEl, `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`);
+      }
+    };
+    const loadRecipients = async () => {
+      try {
+        const d = await api("/admin/alert-recipients", { timeoutMs: 16e3 });
+        const items = d.items || [];
+        const listEl = $v("#recipientList");
+        if (!listEl) return;
+        setChildMarkup(
+          listEl,
+          items.length === 0 ? `<p class="muted">No recipients yet.</p>` : `<div class="table-wrap"><table class="t">
+            <thead><tr><th>Email</th><th>Label</th><th>Enabled</th><th>Tenant</th><th></th></tr></thead>
+            <tbody>${items.map((r) => `
+              <tr>
+                <td class="mono">${escapeHtml(r.email)}</td>
+                <td>${escapeHtml(r.label || "\u2014")}</td>
+                <td>${r.enabled ? `<span class="badge online">On</span>` : `<span class="badge offline">Off</span>`}</td>
+                <td class="mono">${escapeHtml(r.owner_admin || "")}</td>
+                <td><div class="table-actions">
+                  <button class="btn sm secondary js-rtoggle" data-id="${r.id}" data-en="${r.enabled ? 1 : 0}">${r.enabled ? "Disable" : "Enable"}</button>
+                  <button class="btn sm danger js-rdel" data-id="${r.id}">Delete</button>
+                </div></td>
+              </tr>`).join("")}</tbody></table></div>`
+        );
+      } catch (e) {
+        const listEl = $v("#recipientList");
+        if (!listEl) return;
+        setChildMarkup(listEl, `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`);
+      }
+    };
+    $v("#r_add").addEventListener("click", async () => {
+      const email = ($v("#r_email").value || "").trim();
+      const label = ($v("#r_label").value || "").trim();
+      if (!email) {
+        toast("Enter email", "err");
+        return;
+      }
+      try {
+        await api("/admin/alert-recipients", { method: "POST", body: { email, label } });
+        $v("#r_email").value = "";
+        $v("#r_label").value = "";
+        toast("Added", "ok");
+        loadRecipients();
+      } catch (e) {
+        toast(e.message || e, "err");
+      }
+    });
+    $v("#r_test").addEventListener("click", async () => {
+      const email = ($v("#r_email").value || "").trim();
+      if (!email) {
+        toast("Enter recipient email first", "err");
+        return;
+      }
+      try {
+        await api("/admin/smtp/test", { method: "POST", body: { to: email } });
+        toast("Mail test sent", "ok");
+        loadSmtpStatus();
+      } catch (e) {
+        toast(e.message || e, "err");
+      }
+    });
+    const loadTgStatus = async () => {
+      try {
+        const t = await api("/admin/telegram/status", { timeoutMs: 16e3 });
+        const tgEl = $v("#tgStatus");
+        if (!tgEl) return;
+        const badge = t.enabled ? `<span class="badge online">enabled</span>` : `<span class="badge offline">disabled</span>`;
+        const wk = t.worker_running ? "yes" : "no";
+        const th = t.token_hint ? `<span class="chip mono" title="Token prefix/suffix only">${escapeHtml(t.token_hint)}</span>` : "";
+        const modErr = t.status_module_error ? `<p class="badge revoked" style="margin-top:8px">Telegram module failed \u2014 see <span class="mono">last_error</span> and API logs.</p>` : "";
+        const le = (t.last_error || "").trim() ? `<p class="muted" style="margin-top:8px;word-break:break-word"><strong>Last error:</strong> ${escapeHtml(t.last_error)}</p>` : "";
+        setChildMarkup(
+          tgEl,
+          `${badge}
+        ${th}
+        <span class="chip">worker: ${wk}</span>
+        <span class="chip">chats: ${t.chats ?? 0}</span>
+        <span class="chip">min_level: ${escapeHtml(t.min_level || "")}</span>
+        <span class="chip">queue: ${t.queue_size ?? 0}</span>${modErr}${le}`
+        );
+      } catch (e) {
+        const tgEl = $v("#tgStatus");
+        if (!tgEl) return;
+        setChildMarkup(tgEl, `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`);
+      }
+    };
+    const loadTgBindings = async () => {
+      const el = $v("#tgBindings");
+      if (!el) return;
+      setChildMarkup(el, `<p class="muted">Loading bindings\u2026</p>`);
+      try {
+        const d = await api("/admin/telegram/bindings", { timeoutMs: 16e3 });
+        const items = d.items || [];
+        setChildMarkup(
+          el,
+          items.length === 0 ? `<p class="muted">No bindings yet.</p>` : `<div class="table-wrap"><table class="t">
+            <thead><tr><th>chat_id</th><th>username</th><th>enabled</th><th>updated</th><th></th></tr></thead>
+            <tbody>${items.map((it) => `
+              <tr>
+                <td class="mono">${escapeHtml(it.chat_id || "")}</td>
+                <td>${escapeHtml(it.username || "")}</td>
+                <td>${it.enabled ? `<span class="badge online">on</span>` : `<span class="badge offline">off</span>`}</td>
+                <td>${escapeHtml(fmtTs(it.updated_at || it.created_at))}</td>
+                <td><div class="table-actions"><button class="btn sm danger js-tg-unbind" data-chat="${escapeHtml(String(it.chat_id || ""))}">Unbind</button></div></td>
+              </tr>`).join("")}</tbody></table></div>`
+        );
+      } catch (e) {
+        setChildMarkup(el, `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`);
+      }
+    };
+    $v("#tgTest").addEventListener("click", async () => {
+      try {
+        const r = await api("/admin/telegram/test", { method: "POST", body: { text: "Croc Sentinel UI test" } });
+        toast(r.detail || "ok", "ok");
+        loadTgStatus();
+      } catch (e) {
+        toast(e.message || e, "err");
+      }
+    });
+    $v("#tgBindSelf").addEventListener("click", async () => {
+      const chat_id = ($v("#tgBindChatId").value || "").trim();
+      const enabled = !!$v("#tgBindEnabled").checked;
+      if (!chat_id) {
+        toast("Enter chat_id", "err");
+        return;
+      }
+      try {
+        await api("/admin/telegram/bind-self", { method: "POST", body: { chat_id, enabled } });
+        toast("Chat bound", "ok");
+        loadTgBindings();
+      } catch (e) {
+        toast(e.message || e, "err");
+      }
+    });
+    $v("#tgReloadBindings").addEventListener("click", loadTgBindings);
+    $v("#tgBindings").addEventListener("click", async (ev) => {
+      const btn = ev.target.closest(".js-tg-unbind");
+      if (!btn) return;
+      const chat = btn.dataset.chat || "";
+      if (!chat) return;
+      if (!confirm(`Unbind chat ${chat}?`)) return;
+      try {
+        await api(`/admin/telegram/bindings/${encodeURIComponent(chat)}`, { method: "DELETE" });
+        toast("Unbound", "ok");
+        loadTgBindings();
+      } catch (e) {
+        toast(e.message || e, "err");
+      }
+    });
+    $v("#recipientList").addEventListener("click", async (ev) => {
+      const b = ev.target.closest("button");
+      if (!b) return;
+      const id = b.dataset.id;
+      if (b.classList.contains("js-rdel")) {
+        if (!confirm("Remove this recipient?")) return;
+        try {
+          await api(`/admin/alert-recipients/${id}`, { method: "DELETE" });
+          toast("Removed", "ok");
+          loadRecipients();
+        } catch (e) {
+          toast(e.message || e, "err");
+        }
+      }
+      if (b.classList.contains("js-rtoggle")) {
+        const en = b.dataset.en === "1" ? 0 : 1;
+        try {
+          await api(`/admin/alert-recipients/${id}`, { method: "PATCH", body: { enabled: !!en } });
+          loadRecipients();
+        } catch (e) {
+          toast(e.message || e, "err");
+        }
+      }
+    });
+    loadSmtpStatus();
+    loadRecipients();
+    loadTgStatus();
+    loadTgBindings();
+    const loadPendAdmins = async () => {
+      if (!isSuper) return;
+      try {
+        const d = await api("/auth/signup/pending", { timeoutMs: 16e3 });
+        const items = d.items || [];
+        const pendEl = $v("#pendAdmins");
+        if (!pendEl) return;
+        setChildMarkup(
+          pendEl,
+          items.length === 0 ? `<p class="muted">No pending signups.</p>` : `<div class="table-wrap"><table class="t">
+            <thead><tr><th>Username</th><th>Email</th><th>Submitted</th><th>Email OK</th><th></th></tr></thead>
+            <tbody>${items.map((u) => `<tr>
+              <td><strong>${escapeHtml(u.username)}</strong></td>
+              <td class="mono">${escapeHtml(u.email || "\u2014")}</td>
+              <td>${escapeHtml(fmtTs(u.created_at))}</td>
+              <td>${u.email_verified_at ? "\u2713" : "\u2014"}</td>
+              <td>
+                <button class="btn sm js-ok" data-u="${escapeHtml(u.username)}">Approve</button>
+                <button class="btn sm danger js-reject" data-u="${escapeHtml(u.username)}">Reject</button>
+              </td>
+            </tr>`).join("")}</tbody></table></div>`
+        );
+      } catch (e) {
+        const pendEl = $v("#pendAdmins");
+        if (!pendEl) return;
+        setChildMarkup(pendEl, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
+      }
+    };
+    if (isSuper) {
+      $v("#pendAdmins").addEventListener("click", async (ev) => {
+        const b = ev.target.closest("button");
+        if (!b) return;
+        const u = b.dataset.u;
+        if (b.classList.contains("js-ok")) {
+          try {
+            await api(`/auth/signup/approve/${encodeURIComponent(u)}`, { method: "POST" });
+            toast("Approved", "ok");
+            loadPendAdmins();
+            loadUsers();
+          } catch (e) {
+            toast(e.message || e, "err");
+          }
+        } else if (b.classList.contains("js-reject")) {
+          if (!confirm(`Reject and delete signup for ${u}?`)) return;
+          try {
+            await api(`/auth/signup/reject/${encodeURIComponent(u)}`, { method: "POST" });
+            toast("Rejected", "ok");
+            loadPendAdmins();
+          } catch (e) {
+            toast(e.message || e, "err");
+          }
+        }
+      });
+      loadPendAdmins();
+    }
+    loadUsers();
+  });
+  registerRoute("alerts", async (view) => {
+    setCrumb("Siren");
+    const enabled = can("can_alert");
+    mountView(view, `
+    <div class="card">
+      <h2>Bulk siren</h2>
+      <p class="muted">MQTT <span class="mono">siren_on</span> / <span class="mono">siren_off</span>. Requires <span class="mono">can_alert</span>.</p>
+      ${enabled ? "" : `<p class="badge revoked">No can_alert \u2014 ask admin (Policies).</p>`}
+      <p id="alertsLoadMsg" class="muted" aria-live="polite">Loading device list\u2026</p>
+      <div class="inline-form inline-form--bulk-siren" style="margin-top:12px">
+        <label class="field"><span>Action</span>
+          <select id="action"><option value="on">ON</option><option value="off">OFF</option></select>
+        </label>
+        <label class="field"><span>Duration (ms)</span>
+          <input id="dur" type="number" value="${DEFAULT_REMOTE_SIREN_MS}" min="500" max="300000" step="1000" />
+        </label>
+        <label class="field wide"><span>Targets (empty = all visible)</span>
+          <select id="targets" multiple size="6" disabled></select>
+        </label>
+        <div class="row wide" style="justify-content:flex-end">
+          <button class="btn danger" id="fire" disabled>Run</button>
+        </div>
+      </div>
+    </div>`);
+    const sel = $("#targets");
+    const fireBtn = $("#fire");
+    const loadMsg = $("#alertsLoadMsg");
+    let list;
+    try {
+      list = await apiGetCached("/devices", { timeoutMs: 16e3 }, 4e3);
+      if (loadMsg) loadMsg.remove();
+    } catch (e) {
+      const detail = String(e && e.message || e || "load failed");
+      if (loadMsg) {
+        loadMsg.className = "badge offline";
+        loadMsg.textContent = `Device list fallback: ${detail}`;
+      }
+      list = { items: [] };
+    }
+    const devices = list.items || [];
+    setChildMarkup(sel, devices.map((d) => {
+      const lab = d.display_label ? `${escapeHtml(d.display_label)}` : escapeHtml(d.device_id);
+      const serial = d.display_label ? ` \xB7 ${escapeHtml(d.device_id)}` : "";
+      const grp = d.notification_group ? `[${escapeHtml(d.notification_group)}] ` : "";
+      const z = d.zone ? ` \xB7 ${escapeHtml(d.zone)}` : "";
+      return `<option value="${escapeHtml(d.device_id)}">${grp}${lab}${serial}${z}</option>`;
+    }).join(""));
+    sel.disabled = false;
+    if (enabled) fireBtn.disabled = false;
+    fireBtn.addEventListener("click", async () => {
+      const action = $("#action").value;
+      const dur = parseInt($("#dur").value, 10) || DEFAULT_REMOTE_SIREN_MS;
+      const ids = Array.from(sel.selectedOptions).map((o) => o.value);
+      if (action === "on" && !confirm(`Siren ON for ${ids.length === 0 ? "ALL visible devices" : ids.length + " device(s)"}?`)) return;
+      try {
+        const r = await api("/alerts", { method: "POST", body: { action, duration_ms: dur, device_ids: ids } });
+        toast(`${action === "on" ? "ON" : "OFF"} \u2192 ${r.sent_count} device(s)`, "ok");
+      } catch (e) {
+        toast(e.message || e, "err");
+      }
+    });
+  });
+  registerRoute("audit", async (view, _args, routeSeq) => {
+    setCrumb("Audit");
+    if (!hasRole("admin")) {
+      mountView(view, `<div class="card"><p class="muted">Admins only.</p></div>`);
+      return;
+    }
+    mountView(view, `
+    <div class="ui-shell card audit-page">
+      <div class="ui-section-head">
+        <div>
+          <h2 class="ui-section-title">Audit</h2>
+          <p class="ui-section-sub">Who did what, when \u2014 extra fields only when they add information beyond actor / target.</p>
+        </div>
+        <div class="ui-section-actions audit-filters">
+          <label class="field compact"><span>Actor</span><input id="f_actor" type="search" autocomplete="off" placeholder="username" /></label>
+          <label class="field compact"><span>Action</span><input id="f_action" type="search" autocomplete="off" placeholder="prefix e.g. provision" /></label>
+          <label class="field compact"><span>Target</span><input id="f_target" type="search" autocomplete="off" placeholder="device or user" /></label>
+          <button class="btn secondary btn-tap" id="f_reload" type="button">Apply</button>
+        </div>
+      </div>
+      <div class="ui-status-strip" id="auditStrip">
+        <span class="ui-status-item"><strong id="auditCount">\u2014</strong> entries</span>
+        <span class="ui-status-item muted">Newest first \xB7 max 200</span>
+      </div>
+      <div class="divider"></div>
+      <div id="auditList" class="audit-feed-wrap"><p class="muted">Loading\u2026</p></div>
+    </div>`);
+    const reload = async () => {
+      const qs = new URLSearchParams();
+      const elA = $("#f_actor", view);
+      const elAc = $("#f_action", view);
+      const elT = $("#f_target", view);
+      const a = (elA && elA.value ? String(elA.value) : "").trim();
+      const ac = (elAc && elAc.value ? String(elAc.value) : "").trim();
+      const t = (elT && elT.value ? String(elT.value) : "").trim();
+      if (a) qs.set("actor", a);
+      if (ac) qs.set("action", ac);
+      if (t) qs.set("target", t);
+      qs.set("limit", "200");
+      let d;
+      try {
+        d = await api("/audit?" + qs.toString(), { timeoutMs: 24e3 });
+      } catch (e) {
+        toast(e.message || e, "err");
+        return;
+      }
+      if (!isRouteCurrent(routeSeq)) return;
+      const items = d.items || [];
+      const auditListEl = $("#auditList", view);
+      const countEl = $("#auditCount", view);
+      if (!auditListEl) return;
+      if (countEl) setTextIfChanged(countEl, String(items.length));
+      if (items.length === 0) {
+        setHtmlIfChanged(auditListEl, `<p class="muted audit-empty">No matching entries.</p>`);
+        return;
+      }
+      setHtmlIfChanged(auditListEl, `<div class="audit-feed">${items.map((e) => {
+        const actor = e.actor || "";
+        const tgt = e.target || "";
+        const action = e.action || "";
+        const extras = auditDetailDedupedRows(e.detail || {}, actor, tgt);
+        const extrasHtml = extras.length ? `<div class="audit-extra">${extras.map(
+          (row) => `<div class="audit-extra-row"><span class="audit-k">${escapeHtml(row.k)}</span><span class="audit-v mono">${escapeHtml(row.v)}</span></div>`
+        ).join("")}</div>` : "";
+        const tgtHtml = tgt ? `<span class="audit-target mono" title="target">${escapeHtml(tgt)}</span>` : `<span class="muted">\u2014</span>`;
+        return `
+        <article class="audit-item">
+          <div class="audit-item-top">
+            <div class="audit-time">
+              <span class="audit-ts">${escapeHtml(fmtTs(e.created_at))}</span>
+              <span class="muted audit-rel">${escapeHtml(fmtRel(e.created_at))}</span>
+            </div>
+            <span class="audit-action-chip ${auditChipClass(action)}" title="${escapeHtml(action)}">${escapeHtml(action)}</span>
+          </div>
+          <div class="audit-item-line">
+            <span class="audit-actor">${escapeHtml(actor)}</span>
+            <span class="audit-arrow" aria-hidden="true">\u2192</span>
+            ${tgtHtml}
+          </div>
+          ${extrasHtml}
+        </article>`;
+      }).join("")}</div>`);
+    };
+    const onFilterKey = (ev) => {
+      if (ev.key === "Enter") reload();
+    };
+    $("#f_reload", view).addEventListener("click", reload);
+    const fa = $("#f_actor", view);
+    const fac = $("#f_action", view);
+    const ft = $("#f_target", view);
+    if (fa) fa.addEventListener("keydown", onFilterKey);
+    if (fac) fac.addEventListener("keydown", onFilterKey);
+    if (ft) ft.addEventListener("keydown", onFilterKey);
+    reload();
+    scheduleRouteTicker(routeSeq, "audit-live-reload", reload, 12e3);
+  });
+  registerRoute("devices", async (view, args, routeSeq) => {
+    const id = decodeURIComponent(args[0] || "");
+    if (!id) {
+      setCrumb("All devices");
+      let allItems = [];
+      const hintById = /* @__PURE__ */ new Map();
+      const selectedIds = /* @__PURE__ */ new Set();
+      const filteredItems = () => {
+        const inp = $("#allDevFilter", view);
+        const q = inp ? String(inp.value || "").trim().toLowerCase() : "";
+        return allItems.filter((d2) => {
+          if (!q) return true;
+          const did = String(d2.device_id || "").toLowerCase();
+          const nm = String(d2.display_label || "").toLowerCase();
+          const grp = String(d2.notification_group || "").toLowerCase();
+          const zn = String(d2.zone || "").toLowerCase();
+          return did.includes(q) || nm.includes(q) || grp.includes(q) || zn.includes(q);
+        });
+      };
+      const bulkBarState = () => {
+        const c = selectedIds.size;
+        const stat = $("#bulkSelStat", view);
+        const grpBtn2 = $("#bulkApplyGroup", view);
+        const zoBtn = $("#bulkApplyZone", view);
+        const zcBtn = $("#bulkClearZone", view);
+        const selVisBtn = $("#bulkSelectVisible", view);
+        const clrBtn = $("#bulkClearSel", view);
+        const totalVisible = filteredItems().length;
+        if (stat) stat.textContent = `${c} selected \xB7 ${totalVisible} visible`;
+        const disable = c === 0;
+        if (grpBtn2) grpBtn2.disabled = disable;
+        if (zoBtn) zoBtn.disabled = disable;
+        if (zcBtn) zcBtn.disabled = disable;
+        if (clrBtn) clrBtn.disabled = disable;
+        if (selVisBtn) selVisBtn.disabled = totalVisible === 0;
+      };
+      const deviceListCard = (d2) => {
+        const on = isOnline(d2);
+        const did = String(d2.device_id || "");
+        const checked = selectedIds.has(did);
+        const hasLabel = !!(d2.display_label && String(d2.display_label).trim());
+        const titleHtml = hasLabel ? `<div class="device-card__title-row"><span class="device-primary-name device-card__title-name">${escapeHtml(String(d2.display_label).trim())}</span><span class="device-card__sn mono" title="${escapeHtml(did)}">${escapeHtml(did)}</span></div>` : `<div class="device-card__title-row device-card__title-row--mono"><span class="device-primary-name mono device-card__sn" title="${escapeHtml(did)}">${escapeHtml(did || "unknown")}</span></div>`;
+        const letter = escapeHtml((d2.display_label || d2.device_id || "?").slice(0, 1).toUpperCase());
+        const spLine = d2.status_preview && d2.status_preview.line ? escapeHtml(String(d2.status_preview.line)) : "\u2014";
+        const showOwnerTag = !!(d2.owner_admin && state.me && (state.me.role === "superadmin" || d2.is_shared));
+        const scopeLead = d2.is_shared && d2.shared_by ? `<span class="device-card__meta-k">Shared</span><span class="device-card__meta-scope">${escapeHtml(String(d2.shared_by))}</span><span class="device-card__meta-sep" aria-hidden="true"> \xB7 </span>` : "";
+        const needFw = !!(d2.firmware_hint && d2.firmware_hint.update_available && firmwareHintStillValid(d2.fw, d2.firmware_hint));
+        const fwBlock = d2.fw ? `<div class="device-card__firmware"><span class="device-fw-inline" role="group" aria-label="Firmware"><span class="chip device-fw-chip" title="Reported firmware">v${escapeHtml(d2.fw)}</span>` + (needFw ? `<span class="device-fw-pill" title="Newer build on server / \u670D\u52A1\u5668\u4E0A\u6709\u8F83\u65B0\u7248\u672C">Update / \u6709\u66F4\u65B0</span><button type="button" class="btn sm secondary fw-hint-cta fw-hint-cta--sm js-fw-hint" data-did="${escapeHtml(did)}" title="View update details / \u67E5\u770B\u66F4\u65B0" aria-label="Firmware update">\u66F4\u65B0</button>` : "") + `</span></div>` : "";
+        const listCorner = `<div class="device-card__corner-tr device-card__corner-tr--list-bulk" role="group" aria-label="Selection">` + (showOwnerTag ? `<span class="card-owner-tag" title="Owning admin / \u79DF\u6237">${escapeHtml(String(d2.owner_admin))}</span>` : "") + `<label class="device-card__pick-wrap muted"><input type="checkbox" class="bulk-dev-pick" data-device-id="${escapeHtml(did)}" ${checked ? "checked" : ""} /><span>Pick</span></label></div>`;
+        return `<div class="device-card device-card--row-thumb${showOwnerTag ? " device-card--row-thumb--wide-pad" : ""}" style="position:relative">` + listCorner + `<a href="#/devices/${encodeURIComponent(d2.device_id)}" style="display:flex;gap:10px;text-decoration:none;color:inherit;flex:1;min-width:0"><div class="device-thumb device-thumb--list" aria-hidden="true">${letter}</div><div class="device-card--row-body"><h3 class="device-card__h3">${titleHtml}</h3><div class="device-card__status"><div class="device-card__pills"><span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>` + (d2.zone ? `<span class="chip device-zone-chip">${escapeHtml(d2.zone)}</span>` : "") + (d2.is_shared ? `<span class="badge accent" title="shared device">shared</span>` : "") + `</div>${fwBlock}</div><div class="device-card__meta-compact meta"><div class="device-card__meta-row"><span class="device-card__meta-k">Live</span><span class="device-card__meta-v">${spLine}</span></div><div class="device-card__meta-row">${scopeLead}<span class="device-card__meta-k">Updated</span><span class="device-card__meta-v">${escapeHtml(fmtRel(d2.updated_at))}</span></div></div></div></a></div>`;
+      };
+      const applyFilter = () => {
+        const items = filteredItems();
+        const grid2 = $("#allDevicesGrid", view);
+        if (!grid2) return;
+        try {
+          grid2.classList.remove("device-grid--skeleton");
+          grid2.removeAttribute("aria-busy");
+        } catch (_) {
+        }
+        if (allItems.length === 0) {
+          setChildMarkup(grid2, `<p class="muted" style="padding:8px 0">No devices in your scope.</p>`);
+          bulkBarState();
+          return;
+        }
+        setChildMarkup(
+          grid2,
+          items.length === 0 ? `<p class="muted" style="padding:8px 0">No matches.</p>` : items.map(deviceListCard).join("")
+        );
+        bulkBarState();
+      };
+      const runBulkProfile = async (payload) => {
+        if (!selectedIds.size) {
+          toast("Select at least one device", "err");
+          return;
+        }
+        const ids = Array.from(selectedIds.values());
+        const r = await api("/devices/bulk/profile", {
+          method: "POST",
+          body: Object.assign({ device_ids: ids }, payload || {})
+        });
+        bustDeviceListCaches();
+        toast(`Bulk done \xB7 ${Number(r.count || ids.length)} devices`, "ok");
+        await loadDevicesAndHints();
+      };
+      const mergeFirmwareHintsObject = (raw) => {
+        const o = raw && typeof raw === "object" ? raw : {};
+        hintById.clear();
+        for (const k of Object.keys(o)) hintById.set(k, o[k]);
+        for (const it of allItems) {
+          const k = String(it.device_id);
+          const h = o[k];
+          it.firmware_hint = h && h.update_available && firmwareHintStillValid(it.fw, h) ? h : null;
+        }
+      };
+      const loadDevicesAndHints = async () => {
+        if (!isRouteCurrent(routeSeq)) return;
+        let r;
+        try {
+          r = await api("/devices", { timeoutMs: 2e4, retries: 2 });
+        } catch (e) {
+          if (isRouteCurrent(routeSeq)) toast(String(e && e.message) || "Failed to load devices", "err");
+          return;
+        }
+        if (!isRouteCurrent(routeSeq)) return;
+        allItems = Array.isArray(r.items) ? r.items : [];
+        for (const did of Array.from(selectedIds)) {
+          if (!allItems.some((x) => String(x.device_id) === did)) selectedIds.delete(did);
+        }
+        for (const it of allItems) {
+          it.firmware_hint = null;
+        }
+        applyFilter();
+        try {
+          const hintRes = await api("/devices/firmware-hints", { timeoutMs: 25e3, retries: 0 });
+          if (!isRouteCurrent(routeSeq)) return;
+          mergeFirmwareHintsObject(hintRes && hintRes.hints || {});
+        } catch (_) {
+        }
+        if (isRouteCurrent(routeSeq)) applyFilter();
+      };
+      mountView(view, `
+      <header class="page-head">
+        <h2>All devices</h2>
+        <p class="muted">Thumbnails and quick status. Multi-select for production bulk updates.</p>
+      </header>
+      <div class="card" style="margin:0 0 12px">
+        <div class="inline-form" style="margin-top:4px">
+          <label class="field" style="max-width:min(100%, 360px)">
+            <span>Filter</span>
+            <input type="search" id="allDevFilter" placeholder="id / name / group / zone" autocomplete="off" />
+          </label>
+        </div>
+        <div class="action-bar" style="margin-top:12px">
+          <span class="chip" id="bulkSelStat">0 selected \xB7 0 visible</span>
+          <button class="btn sm secondary" id="bulkSelectVisible" type="button">Select visible</button>
+          <button class="btn sm secondary" id="bulkClearSel" type="button" disabled>Clear selection</button>
+          <details class="toolbar-collapse" style="min-width:260px;flex:1 1 420px">
+            <summary>Bulk actions</summary>
+            <div class="inline-form" style="margin-top:2px">
+              <label class="field">
+                <span>Bulk group</span>
+                <input id="bulkGroupValue" maxlength="80" placeholder="empty = clear group" />
+              </label>
+              <button class="btn sm" id="bulkApplyGroup" type="button" disabled>Apply group</button>
+              <label class="field">
+                <span>Zone override</span>
+                <input id="bulkZoneValue" maxlength="31" placeholder="e.g. all / Zone-A" />
+              </label>
+              <div class="row" style="gap:8px;justify-content:flex-end;flex-wrap:wrap">
+                <button class="btn sm" id="bulkApplyZone" type="button" disabled>Apply zone</button>
+                <button class="btn sm secondary" id="bulkClearZone" type="button" disabled>Clear zone override</button>
+              </div>
+            </div>
+          </details>
+        </div>
+      </div>
+      <div id="allDevicesGrid" class="device-grid device-grid--skeleton" aria-busy="true">
+        ${[1, 2, 3, 4, 5, 6].map(() => `<div class="device-card device-card--skeleton" role="presentation"><div class="device-card--skeleton__thumb"></div><div class="device-card--skeleton__body"><div class="device-card--skeleton__line device-card--skeleton__line--w80"></div><div class="device-card--skeleton__line device-card--skeleton__line--w40"></div><div class="device-card--skeleton__line device-card--skeleton__line--w90"></div></div></div>`).join("")}
+      </div>
+    `);
+      const f = $("#allDevFilter", view);
+      if (f) f.addEventListener("input", () => {
+        applyFilter();
+      });
+      const grid = $("#allDevicesGrid", view);
+      if (grid) {
+        grid.addEventListener("change", (ev) => {
+          const el = ev.target;
+          if (!(el instanceof HTMLInputElement)) return;
+          if (!el.classList.contains("bulk-dev-pick")) return;
+          const did = String(el.dataset.deviceId || "").trim();
+          if (!did) return;
+          if (el.checked) selectedIds.add(did);
+          else selectedIds.delete(did);
+          bulkBarState();
+        });
+      }
+      const selVis = $("#bulkSelectVisible", view);
+      if (selVis) {
+        selVis.addEventListener("click", () => {
+          for (const d2 of filteredItems()) {
+            const did = String(d2.device_id || "").trim();
+            if (did) selectedIds.add(did);
+          }
+          applyFilter();
+        });
+      }
+      const clrSel = $("#bulkClearSel", view);
+      if (clrSel) {
+        clrSel.addEventListener("click", () => {
+          selectedIds.clear();
+          applyFilter();
+        });
+      }
+      const grpBtn = $("#bulkApplyGroup", view);
+      if (grpBtn) {
+        grpBtn.addEventListener("click", async () => {
+          const rawG = String($("#bulkGroupValue", view)?.value || "").trim();
+          const grpVal = rawG ? canonicalGroupKey(rawG) : "";
+          const promptTxt = grpVal ? `Apply group "${grpVal}" to ${selectedIds.size} selected device(s)?` : `Clear group for ${selectedIds.size} selected device(s)?`;
+          if (!confirm(promptTxt)) return;
+          try {
+            await runBulkProfile({ set_notification_group: true, notification_group: grpVal });
+          } catch (e) {
+            toast(e.message || e, "err");
+          }
+        });
+      }
+      const zoneBtn = $("#bulkApplyZone", view);
+      if (zoneBtn) {
+        zoneBtn.addEventListener("click", async () => {
+          const z = String($("#bulkZoneValue", view)?.value || "").trim();
+          if (!z) {
+            toast("Enter zone value", "err");
+            return;
+          }
+          if (!confirm(`Apply zone override "${z}" to ${selectedIds.size} selected device(s)?`)) return;
+          try {
+            await runBulkProfile({ set_zone_override: true, zone_override: z });
+          } catch (e) {
+            toast(e.message || e, "err");
+          }
+        });
+      }
+      const clrZoneBtn = $("#bulkClearZone", view);
+      if (clrZoneBtn) {
+        clrZoneBtn.addEventListener("click", async () => {
+          if (!confirm(`Clear zone override for ${selectedIds.size} selected device(s)?`)) return;
+          try {
+            await runBulkProfile({ clear_zone_override: true });
+          } catch (e) {
+            toast(e.message || e, "err");
+          }
+        });
+      }
+      view.addEventListener("click", (ev) => {
+        const t = ev.target && ev.target.closest && ev.target.closest(".js-fw-hint");
+        if (!t) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        const did0 = t.getAttribute("data-did");
+        const h = did0 && hintById.get(did0);
+        const row = did0 ? allItems.find((x) => String(x.device_id) === String(did0)) : null;
+        if (h) {
+          openGlobalFwHintDialog(h, {
+            currentFw: row && row.fw != null ? String(row.fw) : "",
+            deviceId: String(did0 || ""),
+            canOperateThisDevice: void 0
+          });
+        }
+      });
+      requestAnimationFrame(() => {
+        setTimeout(() => {
+          void loadDevicesAndHints();
+        }, 0);
+      });
+      scheduleRouteTicker(routeSeq, "devices-list-live", loadDevicesAndHints, 22e3);
+      return;
+    }
+    const isSuperViewer = !!(state.me && state.me.role === "superadmin");
+    let d = await api(`/devices/${encodeURIComponent(id)}`);
+    const canOperateThisDevice = !!(d.can_operate ?? (state.me && (state.me.role === "superadmin" || state.me.role === "admin")));
+    window.__devicePollLocks = window.__devicePollLocks || /* @__PURE__ */ new Map();
+    const runPollDedup = (key, worker) => {
+      const k = String(key || "");
+      if (!k) return worker();
+      const locks = window.__devicePollLocks;
+      if (locks.has(k)) return locks.get(k);
+      const p = (async () => {
+        try {
+          return await worker();
+        } finally {
+          if (locks.get(k) === p) locks.delete(k);
+        }
+      })();
+      locks.set(k, p);
+      return p;
+    };
+    setCrumb(d.display_label ? `Device \xB7 ${d.display_label}` : `Device \xB7 ${id}`);
+    const bps = (v) => {
+      v = Number(v || 0);
+      if (v < 1024) return v.toFixed(0) + " B/s";
+      if (v < 1024 * 1024) return (v / 1024).toFixed(1) + " KB/s";
+      return (v / 1024 / 1024).toFixed(2) + " MB/s";
+    };
+    const reasonEn = {
+      none: "OK",
+      power_low: "Power low",
+      network_lost: "Network lost",
+      signal_weak: "Weak signal"
+    };
+    const deviceLiveModel = (dev) => {
+      const on = isOnline(dev);
+      const s = dev.last_status_json || {};
+      const reason = s.disconnect_reason || (on ? "none" : "network_lost");
+      const outV = s.vbat == null || s.vbat < 0 ? "\u2014" : `${Number(s.vbat).toFixed(2)} V`;
+      const rssi = s.rssi == null || s.rssi === -127 ? "\u2014" : `${s.rssi} dBm`;
+      const netT = String(s.net_type || dev.net_type || "");
+      const wifiSsidDd = netT === "wifi" ? s.wifi_ssid != null && String(s.wifi_ssid).length > 0 ? escapeHtml(String(s.wifi_ssid)) : `<span class="muted">Not associated</span>` : `<span class="muted">N/A (${escapeHtml(netT || "\u2014")})</span>`;
+      const wifiChDd = netT === "wifi" && s.wifi_channel != null && Number(s.wifi_channel) > 0 ? escapeHtml(String(s.wifi_channel)) : "\u2014";
+      return { on, s, reason, outV, rssi, wifiSsidDd, wifiChDd };
+    };
+    const dm = deviceLiveModel(d);
+    const rawCommandDrawer = state.me && state.me.role === "superadmin" ? `
+    <details class="card device-drawer">
+      <summary class="device-drawer__summary">
+        <span class="device-drawer__title">Raw command</span>
+        <span class="device-drawer__hint muted">Superadmin \xB7 manual MQTT cmd</span>
+      </summary>
+      <div class="device-drawer__body">
+        <label class="field"><span>cmd</span><input id="cmdName" placeholder="get_info / ota" ${can("can_send_command") ? "" : "disabled"} /></label>
+        <label class="field" style="margin-top:8px"><span>params (JSON)</span><textarea id="cmdParams" placeholder='{"key":"value"}' ${can("can_send_command") ? "" : "disabled"}></textarea></label>
+        <div class="row" style="margin-top:8px;justify-content:flex-end">
+          <button class="btn" id="sendCmd" ${can("can_send_command") ? "" : "disabled"}>Send</button>
+        </div>
+      </div>
+    </details>` : "";
+    const canUseSharePanel = !!(state.me && (state.me.role === "superadmin" || state.me.role === "admin" && can("can_manage_users")) && (!d.is_shared || state.me.role === "superadmin"));
+    const sharePanel = canUseSharePanel ? `
+    <details class="card device-drawer" id="sharePanel">
+      <summary class="device-drawer__summary">
+        <span class="device-drawer__title">Sharing</span>
+        <span class="device-drawer__hint muted">Grant / revoke \xB7 expand</span>
+      </summary>
+      <div class="device-drawer__body">
+        <div class="row" style="justify-content:flex-end;margin-bottom:8px">
+          <button class="btn secondary btn-tap sm" type="button" id="shareRefresh">Refresh</button>
+        </div>
+        <p class="muted" style="margin:0 0 10px">Grant or revoke per-account access (admin: your users only).</p>
+        <div class="inline-form" style="margin-top:4px">
+          <label class="field grow"><span>Grantee username</span>
+            <input id="shareUser" placeholder="admin_x or user_x" />
+          </label>
+          <label class="field"><span>View</span>
+            <input id="shareCanView" type="checkbox" checked />
+          </label>
+          <label class="field"><span>Operate</span>
+            <input id="shareCanOperate" type="checkbox" />
+          </label>
+          <div class="row wide" style="justify-content:flex-end">
+            <button class="btn btn-tap" id="shareGrant">Grant / Update</button>
+          </div>
+        </div>
+        <div id="shareList" style="margin-top:12px"></div>
+      </div>
+    </details>
+  ` : "";
+    const renderMsgFeed = (items) => {
+      const msgItems = Array.isArray(items) ? items : [];
+      if (msgItems.length === 0) return `<p class="muted audit-empty">No messages.</p>`;
+      return `<div class="audit-feed">${msgItems.map((m) => {
+        const plRows = messagePayloadRows(m.payload || {});
+        const extra = plRows.length ? `<div class="audit-extra">${plRows.map(
+          (row) => `<div class="audit-extra-row"><span class="audit-k">${escapeHtml(row.k)}</span><span class="audit-v mono">${escapeHtml(row.v)}</span></div>`
+        ).join("")}</div>` : "";
+        return `<article class="audit-item">
+        <div class="audit-item-top">
+          <div class="audit-time">
+            <span class="audit-ts mono">${escapeHtml(fmtTs(m.ts_received))}</span>
+            <span class="muted audit-rel">${escapeHtml(fmtRel(m.ts_received))}</span>
+          </div>
+          <span class="chip">${escapeHtml(m.channel || "\u2014")}</span>
+        </div>
+        ${extra}
+      </article>`;
+      }).join("")}</div>`;
+    };
+    const mqttMsgPanel = isSuperViewer ? `
+    <div class="card">
+      <details id="mqttMsgDetails">
+        <summary style="cursor:pointer;font-weight:600">MQTT debug messages (latest 25)</summary>
+        <p class="muted" style="margin:8px 0 0">Debug-only raw device uplink snapshots. Hidden by default to keep the page clean.</p>
+        <div class="divider"></div>
+        <div class="audit-feed-wrap" id="devMsgsList"><p class="muted">Expand to load\u2026</p></div>
+      </details>
+    </div>` : "";
+    mountView(view, `
+    <nav class="device-page-back-nav" aria-label="Device navigation">
+      <a href="#/devices" class="btn secondary sm btn-tap device-page-back">\u2190 Back</a>
+    </nav>
+    <div class="card device-focus-layout">
+      <div class="device-focus-left">
+        <div class="row" style="align-items:flex-start;flex-wrap:wrap;gap:10px">
+          <div class="device-page-head" style="flex:1;min-width:0">
+            <div class="device-primary-name">${escapeHtml(d.display_label || id)}</div>
+            ${d.display_label ? `<div class="device-id-sub mono">${escapeHtml(id)}</div>` : ""}
+          </div>
+          <span class="badge ${dm.on ? "online" : "offline"}" id="devOnlineBadge">${dm.on ? "online" : "offline"}</span>
+          <span class="chip" id="devReasonChip">${escapeHtml(reasonEn[dm.reason] || dm.reason)}</span>
+          ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
+        </div>
+        <div class="device-hero-card">
+          <div class="device-thumb">${escapeHtml((d.display_label || id || "?").slice(0, 1).toUpperCase())}</div>
+          <div class="device-hero-meta">
+            <div class="device-hero-line device-hero-line--fw">
+              <span class="muted">Firmware</span>
+              <div class="device-hero-fw">
+                <span class="mono" id="devFwVer">${escapeHtml(d.fw || "\u2014")}</span>
+                <span class="device-fw-state" id="devFwStatus" aria-live="polite">\u2014</span>
+                <button type="button" class="btn sm secondary fw-hint-cta" id="devFwHintBtn" style="display:${d.firmware_hint && d.firmware_hint.update_available && firmwareHintStillValid(d.fw, d.firmware_hint) ? "inline-flex" : "none"}" title="New firmware on server / \u670D\u52A1\u5668\u6709\u65B0\u56FA\u4EF6">\u66F4\u65B0</button>
+              </div>
+            </div>
+            <div class="device-hero-line"><span class="muted">Platform</span><span class="mono">${escapeHtml(maskPlatform(`${d.chip_target || ""}/${d.board_profile || ""}`))}</span></div>
+            <div class="device-hero-line"><span class="muted">Network</span><span class="mono" id="devNetRow">${escapeHtml(d.net_type || "\u2014")} \xB7 ${escapeHtml(dm.s.ip || "\u2014")}</span></div>
+            <div class="device-hero-line"><span class="muted">Wi\u2011Fi</span><span id="devWifiSsid">${dm.wifiSsidDd}</span></div>
+            <div class="device-hero-line"><span class="muted">Output V</span><span class="mono" id="devOutV">${escapeHtml(dm.outV)}</span></div>
+            <div class="device-hero-line"><span class="muted">Tx / Rx</span><span class="mono" id="devTxRx">${escapeHtml(bps(dm.s.tx_bps))} / ${escapeHtml(bps(dm.s.rx_bps))}</span></div>
+            <div class="device-hero-line"><span class="muted">RSSI</span><span class="mono" id="devRssi">${escapeHtml(dm.rssi)}</span></div>
+            <div class="device-hero-line"><span class="muted">Wi\u2011Fi CH</span><span class="mono" id="devWifiCh">${dm.wifiChDd}</span></div>
+            <div class="device-hero-line"><span class="muted">Uptime</span><span class="mono" id="devUptime">${escapeHtml(dm.s.uptime_s ? `${Math.floor(dm.s.uptime_s / 3600)}h ${Math.floor(dm.s.uptime_s % 3600 / 60)}m` : "\u2014")}</span></div>
+            <div class="device-hero-line"><span class="muted">Heap</span><span class="mono" id="devHeap">${escapeHtml(dm.s.free_heap ? `${dm.s.free_heap} B (min ${dm.s.min_free_heap || "?"} B)` : "\u2014")}</span></div>
+            <div class="device-hero-line"><span class="muted">Disconnect</span><span class="mono" id="devDisconnect">${escapeHtml(dm.reason)}</span></div>
+            <div class="device-hero-line"><span class="muted">Updated</span><span id="devUpdated">${escapeHtml(fmtTs(d.updated_at))} (${escapeHtml(fmtRel(d.updated_at))})</span></div>
+          </div>
+        </div>
+      </div>
+      <aside class="device-focus-right">
+        <div class="card" style="margin:0">
+          <h3 style="margin:0 0 8px">Ownership</h3>
+          <p class="muted" style="margin:0 0 8px">Current account binding for this device.</p>
+          <div class="device-owner-kv">
+            <div><span class="muted">Account</span><span class="mono">${escapeHtml(d.owner_admin || d.shared_by || "\u2014")}</span></div>
+            <div><span class="muted">Email</span><span class="mono">${escapeHtml(d.owner_email || "\u2014")}</span></div>
+            <div><span class="muted">Shared</span><span class="mono">${d.is_shared ? `yes \xB7 by ${escapeHtml(d.shared_by || "?")}` : "no"}</span></div>
+          </div>
+        </div>
+        <div class="card" style="margin:12px 0 0">
+          <h3 style="margin:0 0 8px;font-size:13px;color:var(--text-muted)">Notifications</h3>
+          ${d.is_shared ? `<p class="muted" style="margin:0 0 8px">Device share is <strong>device-scoped</strong> only. You cannot see or edit the owner&rsquo;s notification group; use your own tenant group cards or single-device actions.</p>` : ""}
+          <div class="row" style="gap:10px;align-items:flex-end;flex-wrap:wrap">
+            <label class="field grow"><span>Display name</span>
+              <input id="dispLabel" value="${escapeHtml(d.display_label || "")}" maxlength="80" />
+            </label>
+            <label class="field grow"><span>Notification group</span>
+              <input id="notifGroup" value="${escapeHtml(d.notification_group || "")}" maxlength="80" placeholder="e.g. Warehouse A" ${d.is_shared ? 'disabled title="Owner tenant only"' : ""} />
+            </label>
+            <button class="btn secondary btn-tap" type="button" id="saveProfile">Save</button>
+          </div>
+        </div>
+      </aside>
+    </div>
+
+    <div class="split device-quick-split">
+      <div class="card">
+        <h3>Quick actions</h3>
+        ${d.is_shared ? `<p class="muted" style="margin:0 0 8px">Shared by <span class="mono">${escapeHtml(d.shared_by || "?")}</span>. Delete/Revoke actions are disabled for shared devices.</p>` : ""}
+        <div class="row">
+          <button class="btn" id="alertOn" ${can("can_alert") ? "" : "disabled"}>Siren ON</button>
+          <button class="btn secondary" id="alertOff" ${can("can_alert") ? "" : "disabled"}>Siren OFF</button>
+          <button class="btn secondary" id="selfTest" ${can("can_send_command") && canOperateThisDevice ? "" : "disabled"}>Self-test</button>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <input id="rebootDelay" placeholder="Delay seconds (e.g. 30)" style="max-width:200px" />
+          <button class="btn secondary" id="doReboot" ${can("can_send_command") && canOperateThisDevice ? "" : "disabled"}>Schedule reboot</button>
+        </div>
+        <div class="row" style="margin-top:14px">
+          <button class="btn secondary" id="unrevoke" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Unrevoke</button>
+        </div>
+      </div>
+    </div>
+    ${sharePanel}
+
+    <details class="card device-drawer" id="wifiCtlCard">
+      <summary class="device-drawer__summary">
+        <span class="device-drawer__title">Wi\u2011Fi (device)</span>
+        <span class="device-drawer__hint muted">Provision \xB7 NVS \xB7 expand</span>
+      </summary>
+      <div class="device-drawer__body">
+        <p class="muted" style="margin:0 0 10px">Credentials are written to device NVS, then the board reboots. Optional <strong>follow\u2011up commands</strong> are stored in NVS and run <strong>in order</strong> after Wi\u2011Fi + MQTT reconnect \u2014 no second dashboard click (safe cmds only: get_info, ping, self_test, set_param).</p>
+        ${can("can_send_command") && canOperateThisDevice ? `
+        <div class="inline-form" style="margin-top:4px">
+          <label class="field grow"><span>New SSID</span><input id="wifiNewSsid" maxlength="32" autocomplete="off" placeholder="2.4 GHz network name" /></label>
+          <label class="field grow"><span>Password</span><input id="wifiNewPass" type="password" maxlength="64" autocomplete="new-password" placeholder="empty if open network" /></label>
+          <div class="field" style="margin-top:10px">
+            <span>After reconnect (stored on device, sequential)</span>
+            <div class="row" style="gap:14px;flex-wrap:wrap;margin-top:6px">
+              <label><input type="checkbox" id="wifiChainGetInfo" checked /> <span class="mono">get_info</span> (status)</label>
+              <label><input type="checkbox" id="wifiChainPing" checked /> <span class="mono">ping</span></label>
+              <label><input type="checkbox" id="wifiChainSelfTest" /> <span class="mono">self_test</span></label>
+            </div>
+          </div>
+          <div class="row wide" style="justify-content:flex-end;flex-wrap:wrap;gap:8px">
+            <button class="btn btn-tap" type="button" id="wifiApplyBtn">Start provision task</button>
+          </div>
+        </div>
+        <div style="margin-top:8px">
+          <progress id="wifiTaskProgress" value="0" max="100" style="width:100%;height:12px"></progress>
+        </div>
+        <p class="muted" id="wifiScanStatus" style="margin-top:8px;min-height:1.3em"></p>` : `<p class="muted">Requires <span class="mono">can_send_command</span> and <strong>operate</strong> access on this device (tenant owner, admin, or shared grant with Operate).</p>`}
+      </div>
+    </details>
+
+    <details class="card danger-zone danger-zone--compact device-drawer">
+      <summary class="device-drawer__summary">
+        <span class="device-drawer__title">Danger zone</span>
+        <span class="device-drawer__hint muted">Unbind &amp; reset</span>
+      </summary>
+      <div class="device-drawer__body danger-zone-body">
+        <p class="muted danger-zone-compact-lead">Removes this device from your tenant and sends <span class="mono">unclaim_reset</span> when online. Re-add from Activate.</p>
+        <div class="danger-zone-single-action">
+          <button class="btn danger sm danger-zone-unbind-btn" type="button" id="deleteReset" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Unbind &amp; reset</button>
+        </div>
+      </div>
+    </details>
+
+    ${d.is_shared ? `
+    <details class="card device-drawer" id="triggerPolicyCard">
+      <summary class="device-drawer__summary">
+        <span class="device-drawer__title">Trigger policy</span>
+        <span class="device-drawer__hint muted">Owner tenant only</span>
+      </summary>
+      <div class="device-drawer__body">
+        <p class="muted" style="margin:0">Sibling / group trigger policy is managed by the <strong>owning tenant</strong> only. Device share does not expose group policy.</p>
+      </div>
+    </details>` : `
+    <details class="card device-drawer" id="triggerPolicyCard">
+      <summary class="device-drawer__summary">
+        <span class="device-drawer__title">Trigger policy</span>
+        <span class="device-drawer__hint muted">Server \xB7 group scope \xB7 expand</span>
+      </summary>
+      <div class="device-drawer__body">
+        <p class="muted" style="margin:0 0 10px">Scope: owner account + group <span class="mono">${escapeHtml(d.notification_group || "(default)")}</span>. Siblings = same tenant + same <span class="mono">notification_group</span> (server normalizes spacing/case). Remote #1 = silent; #2 = loud to siblings; panic = local + optional sibling siren.</p>
+        ${can("can_send_command") && canOperateThisDevice ? `
+        <div class="inline-form" style="margin-top:4px;gap:12px;flex-wrap:wrap;align-items:flex-end">
+          <label class="field"><span>Panic local</span><input type="checkbox" id="tpPanicLocal" title="Sound on device that pressed panic" /></label>
+          <label class="field"><span>Panic \u2192 siblings</span><input type="checkbox" id="tpPanicLink" title="MQTT siren to same-group devices" /></label>
+          <label class="field"><span>Remote silent link</span><input type="checkbox" id="tpSilentLink" /></label>
+          <label class="field"><span>Remote loud link</span><input type="checkbox" id="tpLoudLink" /></label>
+          <label class="field"><span>Exclude self</span><input type="checkbox" id="tpExcludeSelf" /></label>
+          <label class="field"><span>Loud (min)</span><input id="tpLoudMin" type="number" min="0.5" max="5" step="0.5" value="3" title="Remote / #2 sibling siren length" /></label>
+          <label class="field"><span>Panic sibling (min)</span><input id="tpPanicMin" type="number" min="0.5" max="10" step="0.5" value="5" title="Panic MQTT sibling siren length" /></label>
+          <div class="row wide" style="justify-content:flex-end;flex-basis:100%">
+            <button class="btn secondary btn-tap" type="button" id="tpRefresh">Refresh</button>
+            <button class="btn btn-tap" type="button" id="tpSave">Save</button>
+          </div>
+        </div>
+        <p class="muted" id="tpStatus" style="margin-top:8px;min-height:1.3em"></p>` : `<p class="muted">Requires <span class="mono">can_send_command</span> and <strong>operate</strong> access on this device.</p>`}
+      </div>
+    </details>`}
+
+    ${rawCommandDrawer}
+
+    ${mqttMsgPanel}`);
+    const patchDeviceLive = (dev) => {
+      const m = deviceLiveModel(dev);
+      const onlineBadge = $("#devOnlineBadge", view);
+      if (onlineBadge) {
+        onlineBadge.textContent = m.on ? "online" : "offline";
+        onlineBadge.className = `badge ${m.on ? "online" : "offline"}`;
+      }
+      const reasonChip = $("#devReasonChip", view);
+      if (reasonChip) reasonChip.textContent = String(reasonEn[m.reason] || m.reason);
+      const setText = (idSel, txt) => {
+        const el = $(idSel, view);
+        if (el) el.textContent = String(txt);
+      };
+      const setHtml = (idSel, txt) => {
+        const el = $(idSel, view);
+        if (el) setChildMarkup(el, String(txt));
+      };
+      setText("#devNetRow", `${dev.net_type || "\u2014"} \xB7 ${m.s.ip || "\u2014"}`);
+      setHtml("#devWifiSsid", m.wifiSsidDd);
+      setHtml("#devWifiCh", m.wifiChDd);
+      setText("#devRssi", m.rssi);
+      setText("#devOutV", m.outV);
+      setText("#devTxRx", `${bps(m.s.tx_bps)} / ${bps(m.s.rx_bps)}`);
+      setText("#devDisconnect", m.reason);
+      setText("#devUptime", m.s.uptime_s ? `${Math.floor(m.s.uptime_s / 3600)}h ${Math.floor(m.s.uptime_s % 3600 / 60)}m` : "\u2014");
+      setText("#devHeap", m.s.free_heap ? `${m.s.free_heap} B (min ${m.s.min_free_heap || "?"} B)` : "\u2014");
+      setText("#devUpdated", `${fmtTs(dev.updated_at)} (${fmtRel(dev.updated_at)})`);
+      syncDevicePageFirmwareHint(view, dev, id);
+    };
+    patchDeviceLive(d);
+    scheduleRouteTicker(routeSeq, `device-live-${id}`, async () => {
+      if (!isRouteCurrent(routeSeq)) return;
+      const latest = await apiGetCached(`/devices/${encodeURIComponent(id)}`, { timeoutMs: 16e3 }, 5e3);
+      if (!isRouteCurrent(routeSeq) || !latest) return;
+      d = latest;
+      patchDeviceLive(latest);
+    }, 12e3);
+    if (isSuperViewer) {
+      const det = $("#mqttMsgDetails", view);
+      const box = $("#devMsgsList", view);
+      let loaded = false;
+      const loadDebugMsgs = async () => {
+        if (loaded || !box) return;
+        loaded = true;
+        setChildMarkup(box, `<p class="muted">Loading\u2026</p>`);
+        try {
+          const msgs = await api(`/devices/${encodeURIComponent(id)}/messages?limit=25`, { timeoutMs: 16e3 });
+          setChildMarkup(box, renderMsgFeed(msgs.items || []));
+        } catch (e) {
+          setChildMarkup(box, `<p class="badge offline">${escapeHtml(e.message || e)}</p>`);
+        }
+      };
+      if (det) {
+        det.addEventListener("toggle", () => {
+          if (det.open) loadDebugMsgs();
+        });
+      }
+    }
+    $("#saveProfile").addEventListener("click", async () => {
+      try {
+        const body = { display_label: ($("#dispLabel").value || "").trim() };
+        if (!d.is_shared) {
+          body.notification_group = canonicalGroupKey($("#notifGroup") && $("#notifGroup").value || "");
+        }
+        await api(`/devices/${encodeURIComponent(id)}/profile`, {
+          method: "PATCH",
+          body
+        });
+        if (!d.is_shared) {
+          reconcileGroupMetaForDevice(id, body.notification_group || "", d.owner_admin);
+        }
+        toast("Saved", "ok");
+      } catch (e) {
+        toast(e.message || e, "err");
+      }
+    });
+    const withDev = (fn) => async () => {
+      try {
+        await fn();
+        toast("Sent", "ok");
+      } catch (e) {
+        toast(e.message || e, "err");
+      }
+    };
+    $("#alertOn").addEventListener("click", withDev(() => api(`/devices/${encodeURIComponent(id)}/alert/on?duration_ms=${DEFAULT_REMOTE_SIREN_MS}`, { method: "POST" })));
+    $("#alertOff").addEventListener("click", withDev(() => api(`/devices/${encodeURIComponent(id)}/alert/off`, { method: "POST" })));
+    $("#selfTest").addEventListener("click", withDev(() => api(`/devices/${encodeURIComponent(id)}/self-test`, { method: "POST" })));
+    $("#doReboot").addEventListener("click", withDev(() => {
+      const v = parseInt($("#rebootDelay").value, 10);
+      if (!Number.isFinite(v) || v < 5) throw new Error("delay must be >= 5 seconds");
+      return api(`/devices/${encodeURIComponent(id)}/schedule-reboot`, { method: "POST", body: { delay_s: v } });
+    }));
+    $("#unrevoke").addEventListener("click", withDev(async () => {
+      await api(`/devices/${encodeURIComponent(id)}/unrevoke`, { method: "POST" });
+      bustDeviceListCaches();
+    }));
+    const deleteResetBtn = $("#deleteReset", view);
+    if (deleteResetBtn) {
+      deleteResetBtn.addEventListener("click", async () => {
+        if (!confirm("Delete this device from current account records? You can re-add and reconfigure later.")) return;
+        const typed = String(prompt(`Type device ID to confirm delete/reset:
+${id}`) || "").trim();
+        if (typed.toUpperCase() !== String(id).toUpperCase()) {
+          toast("Confirmation mismatch", "err");
+          return;
+        }
+        try {
+          const dr = await api(`/devices/${encodeURIComponent(id)}/delete-reset`, {
+            method: "POST",
+            body: { confirm_text: typed }
+          });
+          removeDeviceIdFromAllGroupMeta(id);
+          bustDeviceListCaches();
+          const sentNv = dr && dr.nvs_purge_sent === true;
+          const ackNv = dr && dr.nvs_purge_acked === true;
+          toast(
+            `Device removed from account.${ackNv ? " Device confirmed unclaim_reset (WiFi+claim cleared, rebooting)." : sentNv ? " Command was dispatched but device ack not confirmed before unlink." : " Command dispatch failed/offline."} Re-add from Activate.`,
+            ackNv ? "ok" : "err"
+          );
+          location.hash = "#/devices";
+        } catch (e) {
+          toast(e.message || e, "err");
+        }
+      });
+    }
+    const sendCmdBtn = $("#sendCmd");
+    if (sendCmdBtn) {
+      sendCmdBtn.addEventListener("click", async () => {
+        const name = ($("#cmdName").value || "").trim();
+        if (!name) {
+          toast("Enter cmd", "err");
+          return;
+        }
+        let params = {};
+        const raw = ($("#cmdParams").value || "").trim();
+        if (raw) {
+          try {
+            params = JSON.parse(raw);
+          } catch {
+            toast("Invalid JSON in params", "err");
+            return;
+          }
+        }
+        try {
+          await api(`/devices/${encodeURIComponent(id)}/commands`, { method: "POST", body: { cmd: name, params } });
+          toast("Command sent", "ok");
+        } catch (e) {
+          toast(e.message || e, "err");
+        }
+      });
+    }
+    const wifiApplyBtn = $("#wifiApplyBtn");
+    try {
+      const rawPf = sessionStorage.getItem("croc.deviceWifiPrefill.v1");
+      if (rawPf) {
+        const pf = JSON.parse(rawPf);
+        const match = pf && String(pf.device_id || "").toUpperCase() === String(id).toUpperCase();
+        if (match && pf.ssid) {
+          const wS = $("#wifiNewSsid", view);
+          const wP = $("#wifiNewPass", view);
+          const card = $("#wifiCtlCard", view);
+          if (wS) wS.value = String(pf.ssid);
+          if (wP) wP.value = String(pf.password || "");
+          sessionStorage.removeItem("croc.deviceWifiPrefill.v1");
+          if (card) card.open = true;
+          toast("Prefilled Wi\u2011Fi from Activate page \u2014 start provision below when the device is online.", "ok");
+        }
+      }
+    } catch (_) {
+    }
+    const wifiTaskProgress = $("#wifiTaskProgress");
+    const setWifiProgress = (n) => {
+      if (!wifiTaskProgress) return;
+      const v = Math.max(0, Math.min(100, Number(n || 0)));
+      wifiTaskProgress.value = v;
+    };
+    const pollWifiTask = async (taskId) => runPollDedup(`wifi-task:${id}:${String(taskId || "")}`, async () => {
+      const st = $("#wifiScanStatus");
+      for (let i = 0; i < 120; i++) {
+        await new Promise((r) => setTimeout(r, 1e3));
+        try {
+          const t = await api(`/devices/${encodeURIComponent(id)}/provision/wifi-task/${encodeURIComponent(taskId)}`, { timeoutMs: 16e3 });
+          setWifiProgress(t.progress || 0);
+          if (st) st.textContent = String(t.message || t.status || "");
+          if (t.status === "success") {
+            toast("Provision success", "ok");
+            return;
+          }
+          if (t.status === "failed") {
+            toast(t.message || "Provision failed", "err");
+            return;
+          }
+        } catch (e) {
+          if (st) st.textContent = String(e.message || e);
+        }
+      }
+      if (st) st.textContent = "Timed out waiting task result";
+      toast("Provision task timeout", "err");
+    });
+    if (wifiApplyBtn) {
+      wifiApplyBtn.addEventListener("click", async () => {
+        const ssid = ($("#wifiNewSsid", view).value || "").trim();
+        const password = $("#wifiNewPass", view).value || "";
+        const st = $("#wifiScanStatus", view);
+        if (!ssid) {
+          toast("Enter SSID", "err");
+          return;
+        }
+        if (!confirm("Save Wi\u2011Fi on device and reboot? You may lose contact until it joins the new network.")) return;
+        try {
+          wifiApplyBtn.disabled = true;
+          setWifiProgress(10);
+          if (st) st.textContent = "Creating provision task\u2026";
+          const chain = [];
+          const cGi = $("#wifiChainGetInfo", view);
+          const cPi = $("#wifiChainPing", view);
+          const cSt = $("#wifiChainSelfTest", view);
+          if (cGi && cGi.checked) chain.push({ cmd: "get_info", params: {} });
+          if (cPi && cPi.checked) chain.push({ cmd: "ping", params: {} });
+          if (cSt && cSt.checked) chain.push({ cmd: "self_test", params: {} });
+          const body = { ssid, password };
+          if (chain.length) body.chain = chain;
+          const r = await api(`/devices/${encodeURIComponent(id)}/provision/wifi-task`, {
+            method: "POST",
+            body
+          });
+          setWifiProgress(r.progress || 35);
+          if (st) st.textContent = `Task ${r.task_id} running\u2026`;
+          await pollWifiTask(r.task_id);
+        } catch (e) {
+          toast(e.message || e, "err");
+          if (st) st.textContent = String(e.message || e);
+        } finally {
+          wifiApplyBtn.disabled = false;
+        }
+      });
+    }
+    const tpPanicLocal = $("#tpPanicLocal");
+    const tpPanicLink = $("#tpPanicLink");
+    const tpSilentLink = $("#tpSilentLink");
+    const tpLoudLink = $("#tpLoudLink");
+    const tpExcludeSelf = $("#tpExcludeSelf");
+    const tpLoudMin = $("#tpLoudMin");
+    const tpPanicMin = $("#tpPanicMin");
+    const tpStatus = $("#tpStatus");
+    const loadTriggerPolicy = async () => {
+      if (!tpPanicLocal || !tpPanicLink || !tpSilentLink || !tpLoudLink || !tpExcludeSelf || !tpLoudMin || !tpPanicMin) return;
+      try {
+        if (tpStatus) tpStatus.textContent = "Loading policy\u2026";
+        const r = await api(`/devices/${encodeURIComponent(id)}/trigger-policy`, { timeoutMs: 16e3 });
+        const p = r.policy || {};
+        tpPanicLocal.checked = !!p.panic_local_siren;
+        if (tpPanicLink) tpPanicLink.checked = p.panic_link_enabled !== false;
+        tpSilentLink.checked = !!p.remote_silent_link_enabled;
+        tpLoudLink.checked = !!p.remote_loud_link_enabled;
+        tpExcludeSelf.checked = !!p.fanout_exclude_self;
+        const loudMs = Number(p.remote_loud_duration_ms || DEFAULT_REMOTE_SIREN_MS);
+        const panicMs = Number(p.panic_fanout_duration_ms || DEFAULT_PANIC_FANOUT_MS);
+        tpLoudMin.value = String(Math.round(Math.max(0.5, Math.min(5, loudMs / 6e4)) * 10) / 10);
+        tpPanicMin.value = String(Math.round(Math.max(0.5, Math.min(10, panicMs / 6e4)) * 10) / 10);
+        if (tpStatus) tpStatus.textContent = `Loaded for group ${r.scope_group || "(default)"}`;
+      } catch (e) {
+        if (tpStatus) tpStatus.textContent = String(e.message || e);
+      }
+    };
+    const tpRefresh = $("#tpRefresh");
+    if (tpRefresh) tpRefresh.addEventListener("click", () => loadTriggerPolicy());
+    const tpSave = $("#tpSave");
+    if (tpSave) {
+      tpSave.addEventListener("click", async () => {
+        try {
+          const lm = parseFloat(tpLoudMin && tpLoudMin.value || "3", 10);
+          const pm = parseFloat(tpPanicMin && tpPanicMin.value || "5", 10);
+          if (!Number.isFinite(lm) || lm < 0.5 || lm > 5) throw new Error("Loud duration must be 0.5\u20135 minutes");
+          if (!Number.isFinite(pm) || pm < 0.5 || pm > 10) throw new Error("Panic sibling duration must be 0.5\u201310 minutes");
+          const remote_loud_duration_ms = Math.round(lm * 6e4);
+          const panic_fanout_duration_ms = Math.round(pm * 6e4);
+          if (tpStatus) tpStatus.textContent = "Saving policy\u2026";
+          await api(`/devices/${encodeURIComponent(id)}/trigger-policy`, {
+            method: "PUT",
+            body: {
+              panic_local_siren: !!(tpPanicLocal && tpPanicLocal.checked),
+              panic_link_enabled: !!(tpPanicLink && tpPanicLink.checked),
+              remote_silent_link_enabled: !!(tpSilentLink && tpSilentLink.checked),
+              remote_loud_link_enabled: !!(tpLoudLink && tpLoudLink.checked),
+              fanout_exclude_self: !!(tpExcludeSelf && tpExcludeSelf.checked),
+              remote_loud_duration_ms,
+              panic_fanout_duration_ms
+            }
+          });
+          if (tpStatus) tpStatus.textContent = "Policy saved";
+          toast("Trigger policy saved", "ok");
+        } catch (e) {
+          if (tpStatus) tpStatus.textContent = String(e.message || e);
+          toast(e.message || e, "err");
+        }
+      });
+      loadTriggerPolicy();
+    }
+    const shareListEl = $("#shareList");
+    const renderShares = async () => {
+      if (!shareListEl) return;
+      setChildMarkup(shareListEl, `<p class="muted">Loading shares\u2026</p>`);
+      try {
+        const r = await api(`/admin/devices/${encodeURIComponent(id)}/shares`, { timeoutMs: 16e3 });
+        const items = r.items || [];
+        setChildMarkup(
+          shareListEl,
+          `
+        <div class="table-wrap"><table class="t">
+          <thead><tr><th>User</th><th>Role</th><th>View</th><th>Operate</th><th>Granted by</th><th>Granted at</th><th>Status</th><th></th></tr></thead>
+          <tbody>${items.length === 0 ? `<tr><td colspan="8" class="muted">No shares</td></tr>` : items.map((it) => `
+                <tr>
+                  <td class="mono">${escapeHtml(it.grantee_username || "")}</td>
+                  <td>${escapeHtml(it.grantee_role || "\u2014")}</td>
+                  <td>${it.can_view ? "yes" : "no"}</td>
+                  <td>${it.can_operate ? "yes" : "no"}</td>
+                  <td class="mono">${escapeHtml(it.granted_by || "")}</td>
+                  <td>${escapeHtml(fmtTs(it.granted_at))}</td>
+                  <td>${it.revoked_at ? `<span class="badge offline">revoked</span>` : `<span class="badge online">active</span>`}</td>
+                  <td>${it.revoked_at ? "" : `<button class="btn ghost shareRevokeBtn" data-user="${escapeHtml(it.grantee_username || "")}">Revoke</button>`}</td>
+                </tr>
+              `).join("")}</tbody>
+        </table></div>
+      `
+        );
+        $$(".shareRevokeBtn", shareListEl).forEach((btn) => {
+          btn.addEventListener("click", async () => {
+            const u = btn.getAttribute("data-user") || "";
+            if (!u) return;
+            if (!confirm(`Revoke share for ${u}?`)) return;
+            try {
+              await api(`/admin/devices/${encodeURIComponent(id)}/share/${encodeURIComponent(u)}`, { method: "DELETE" });
+              toast("Share revoked", "ok");
+              await renderShares();
+            } catch (e) {
+              toast(e.message || e, "err");
+            }
+          });
+        });
+      } catch (e) {
+        setChildMarkup(shareListEl, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
+      }
+    };
+    const shareGrantBtn = $("#shareGrant");
+    if (shareGrantBtn) {
+      shareGrantBtn.addEventListener("click", async () => {
+        const grantee = ($("#shareUser").value || "").trim();
+        const canView = !!$("#shareCanView").checked;
+        const canOperate = !!$("#shareCanOperate").checked;
+        if (!grantee) {
+          toast("Enter grantee username", "err");
+          return;
+        }
+        if (!canView && !canOperate) {
+          toast("Select view and/or operate", "err");
+          return;
+        }
+        try {
+          await api(`/admin/devices/${encodeURIComponent(id)}/share`, {
+            method: "POST",
+            body: { grantee_username: grantee, can_view: canView, can_operate: canOperate }
+          });
+          toast("Share granted", "ok");
+          await renderShares();
+        } catch (e) {
+          toast(e.message || e, "err");
+        }
+      });
+    }
+    const shareRefreshBtn = $("#shareRefresh");
+    if (shareRefreshBtn) {
+      shareRefreshBtn.addEventListener("click", () => renderShares());
+      renderShares();
+    }
+  });
+  registerRoute("events", async (view, _args) => {
+    const navTok = state.routeSeq;
+    setCrumb("Events");
+    const me = state.me || { username: "", role: "" };
+    const isSuper = me.role === "superadmin";
+    const scopeLabel = isSuper ? "System-wide" : me.role === "admin" ? "Your tenant" : "Your account";
+    mountView(view, `
+    <div class="ui-shell card audit-page" style="margin:0">
+      <div class="row between" style="flex-wrap:wrap;gap:10px">
+        <div>
+          <h2 class="ui-section-title" style="margin:0">Event center</h2>
+          <p class="muted" style="margin:4px 0 0">Visibility: ${scopeLabel}.</p>
+        </div>
+        <div class="row" style="gap:8px;align-items:center">
+          <span id="evLive" class="badge offline" title="Live stream">Offline</span>
+          <button class="btn sm secondary" id="evPause">Pause</button>
+          <button class="btn sm secondary" id="evClear">Clear</button>
+        </div>
+      </div>
+      <div class="divider"></div>
+      <div class="inline-form" style="margin-bottom:10px">
+        <label class="field"><span>Min level</span>
+          <select id="evLevel">
+            <option value="">All</option>
+            <option value="debug">debug+</option>
+            <option value="info" selected>info+</option>
+            <option value="warn">warn+</option>
+            <option value="error">error+</option>
+            <option value="critical">critical</option>
+          </select>
+        </label>
+        <label class="field"><span>Category</span>
+          <select id="evCategory">
+            <option value="">All</option>
+            <option value="alarm">alarm</option>
+            <option value="ota">ota</option>
+            <option value="presence">presence</option>
+            <option value="provision">provision</option>
+            <option value="device">device</option>
+            <option value="auth">auth</option>
+            <option value="audit">audit</option>
+            <option value="system">system</option>
+          </select>
+        </label>
+        <label class="field"><span>Device ID</span><input id="evDevice" placeholder="SN-\u2026 or id" /></label>
+        <label class="field wide"><span>Search</span><input id="evQ" placeholder="summary / actor / event_type" /></label>
+        <div class="row wide action-bar" style="justify-content:flex-end;gap:8px;flex-wrap:wrap">
+          <button class="btn sm" id="evApply">Apply & reload</button>
+          <details class="toolbar-collapse" style="min-width:160px">
+            <summary>More tools</summary>
+            <div class="table-actions">
+              <button class="btn sm secondary" id="evStats">By device (7d)</button>
+              <button class="btn sm secondary" id="evCsv">Export CSV</button>
+              <button class="btn sm secondary" id="evReload">Last 200</button>
+            </div>
+          </details>
+        </div>
+      </div>
+    </div>
+    <div id="evStatsBox" class="card" style="margin-top:12px;display:none">
+      <h3 style="margin:0 0 8px">Events per device (7 days)</h3>
+      <div id="evStatsInner" class="muted">\u2014</div>
+    </div>
+    <div class="ui-shell card audit-page" style="margin-top:12px">
+      <div id="evList" class="audit-feed-wrap muted">Connecting\u2026</div>
+    </div>`);
+    let paused = false;
+    let buffer = [];
+    const BUFFER_MAX = 180;
+    const RENDER_LIMIT = 150;
+    let evRenderTimer = 0;
+    let evReconnectBackoffMs = 800;
+    function badgeClass(lvl) {
+      return {
+        debug: "neutral",
+        info: "accent",
+        warn: "partial",
+        error: "failed",
+        critical: "revoked"
+      }[lvl] || "neutral";
+    }
+    function catClass(cat) {
+      return {
+        alarm: "failed",
+        ota: "accent",
+        presence: "partial",
+        provision: "accent",
+        device: "neutral",
+        auth: "partial",
+        audit: "neutral",
+        system: "neutral"
+      }[cat] || "neutral";
+    }
+    function rowHtml(e) {
+      const primary = e.summary && String(e.summary).trim() || (e.event_type || "\u2014");
+      const tsShort = fmtTs(e.ts_malaysia || e.ts);
+      const typeDiffers = e.event_type && String(e.event_type) !== String(primary);
+      const extras = eventDetailDedupedRows(
+        e.detail && typeof e.detail === "object" && !Array.isArray(e.detail) ? e.detail : {},
+        e
+      );
+      const devLink = e.device_id ? `<a class="mono audit-target" href="#/devices/${encodeURIComponent(e.device_id)}">${escapeHtml(e.device_id)}</a>` : "";
+      const targetStr = e.target && e.target !== e.device_id ? String(e.target) : "";
+      const typeTag = typeDiffers ? ` \xB7 <span class="mono" style="font-size:12px;opacity:0.88">${escapeHtml(e.event_type)}</span>` : "";
+      const extraBlock = extras.length ? `<div class="audit-extra">${extras.map(
+        (row) => `<div class="audit-extra-row"><span class="audit-k">${escapeHtml(row.k)}</span><span class="audit-v mono">${escapeHtml(row.v)}</span></div>`
+      ).join("")}</div>` : "";
+      return `<details class="audit-item audit-item--foldable" data-level="${escapeHtml(e.level || "")}">
+      <summary class="audit-item__fold-sum">
+      <div class="audit-item-top">
+        <div class="audit-time">
+          <span class="audit-ts mono">${escapeHtml(tsShort)}</span>
+          <span class="muted audit-rel">${escapeHtml(fmtRel(e.ts))}</span>
+        </div>
+        <span class="badge ${badgeClass(e.level)}">${escapeHtml(e.level || "")}</span>
+        <span class="badge ${catClass(e.category)}">${escapeHtml(e.category || "")}</span>
+      </div>
+      <div class="audit-item-line audit-item__fold-primary" style="font-weight:600;margin-top:8px">${escapeHtml(primary)}${typeTag}</div>
+      </summary>
+      <div class="audit-item__fold-body">
+      <div class="audit-item-line" style="font-size:12.5px;flex-wrap:wrap">
+        <span class="audit-actor">${e.actor ? escapeHtml(e.actor) : "\u2014"}</span>
+        ${targetStr ? ` <span class="audit-arrow">\u2192</span> <span class="mono audit-target">${escapeHtml(targetStr)}</span>` : ""}
+        ${devLink ? ` \xB7 ${devLink}` : ""}
+        ${e.owner_admin ? ` <span class="chip" title="owner_admin">@${escapeHtml(e.owner_admin)}</span>` : ""}
+      </div>
+      ${extraBlock}
+      </div>
+    </details>`;
+    }
+    function flushEvRender() {
+      evRenderTimer = 0;
+      const listEl = document.getElementById("evList");
+      if (!listEl) return;
+      if (buffer.length === 0) {
+        setHtmlIfChanged(listEl, `<p class="muted audit-empty">No events.</p>`);
+        return;
+      }
+      const visible = buffer.slice(0, RENDER_LIMIT);
+      setHtmlIfChanged(listEl, `<div class="audit-feed">${visible.map(rowHtml).join("")}</div>`);
+    }
+    function scheduleEvRender() {
+      if (evRenderTimer) return;
+      evRenderTimer = setTimeout(flushEvRender, 120);
+    }
+    function pushEvent(ev) {
+      if (paused) return;
+      let row = ev;
+      try {
+        if (ev && ev.detail != null && typeof ev.detail === "object") {
+          const sj = JSON.stringify(ev.detail);
+          if (sj.length > 12e3) {
+            row = Object.assign({}, ev, {
+              detail: { _truncated: true, _approx_bytes: sj.length }
+            });
+          }
+        }
+      } catch (_) {
+      }
+      buffer.unshift(row);
+      if (buffer.length > BUFFER_MAX) buffer.length = BUFFER_MAX;
+      scheduleEvRender();
+    }
+    function currentFilters() {
+      const p = new URLSearchParams();
+      const lvl = $("#evLevel").value.trim();
+      if (lvl) p.set("min_level", lvl);
+      const cat = $("#evCategory").value.trim();
+      if (cat) p.set("category", cat);
+      const dev = $("#evDevice").value.trim();
+      if (dev) p.set("device_id", dev);
+      const q = $("#evQ").value.trim();
+      if (q) p.set("q", q);
+      return p;
+    }
+    async function loadHistory() {
+      try {
+        if (!isRouteCurrent(navTok)) return;
+        const p = currentFilters();
+        p.set("limit", "200");
+        const r = await api("/events?" + p.toString(), { timeoutMs: 16e3 });
+        if (!isRouteCurrent(navTok)) return;
+        buffer = (r.items || []).slice();
+        if (buffer.length > BUFFER_MAX) buffer = buffer.slice(0, BUFFER_MAX);
+        if (evRenderTimer) {
+          clearTimeout(evRenderTimer);
+          evRenderTimer = 0;
+        }
+        flushEvRender();
+      } catch (e) {
+        if (!isRouteCurrent(navTok)) return;
+        const listEl = document.getElementById("evList");
+        if (listEl) mountView(listEl, hx`<p class="badge offline">${e.message || e}</p>`);
+        toast(e.message || e, "err");
+      }
+    }
+    function closeStream() {
+      if (window.__evReconnectTimer) {
+        try {
+          clearTimeout(window.__evReconnectTimer);
+        } catch (_) {
+        }
+        window.__evReconnectTimer = 0;
+      }
+      if (window.__evSSE) {
+        try {
+          window.__evSSE.close();
+        } catch (_) {
+        }
+        window.__evSSE = null;
+      }
+      if (window.__evFetchAbort) {
+        try {
+          window.__evFetchAbort.abort();
+        } catch (_) {
+        }
+        window.__evFetchAbort = null;
+      }
+      const live = $("#evLive");
+      if (live) {
+        live.textContent = "Offline";
+        live.className = "badge offline";
+      }
+    }
+    function openStream() {
+      if (!isRouteCurrent(navTok)) return;
+      closeStream();
+      const p = currentFilters();
+      const slack = Math.max(0, BUFFER_MAX - buffer.length);
+      p.set("backlog", String(Math.min(100, slack)));
+      const qs = p.toString();
+      const tok = getToken();
+      const ac = new AbortController();
+      window.__evFetchAbort = ac;
+      const shim = {
+        readyState: EventSource.CONNECTING,
+        close() {
+          try {
+            ac.abort();
+          } catch (_) {
+          }
+          window.__evFetchAbort = null;
+          this.readyState = EventSource.CLOSED;
+        }
+      };
+      window.__evSSE = shim;
+      const scheduleReconnect = () => {
+        if (!isRouteCurrent(navTok) || paused || window.__evReconnectTimer) return;
+        const wait = evReconnectBackoffMs + Math.floor(Math.random() * 480);
+        window.__evReconnectTimer = setTimeout(() => {
+          window.__evReconnectTimer = 0;
+          if (!isRouteCurrent(navTok) || paused) return;
+          openStream();
+        }, wait);
+        evReconnectBackoffMs = Math.min(8e3, Math.floor(evReconnectBackoffMs * 1.5));
+      };
+      const run = async () => {
+        const url = apiBase() + "/events/stream" + (qs ? "?" + qs : "");
+        const hdrs = {
+          Accept: "text/event-stream",
+          "Cache-Control": "no-store"
+        };
+        if (tok) hdrs.Authorization = "Bearer " + tok;
+        try {
+          const r = await fetch(url, {
+            method: "GET",
+            credentials: "include",
+            headers: hdrs,
+            signal: ac.signal
+          });
+          if (!isRouteCurrent(navTok)) return;
+          if (!r.ok) {
+            const errText = await r.text().catch(() => "");
+            throw new Error(errText || String(r.status));
+          }
+          if (!r.body || typeof r.body.getReader !== "function") {
+            throw new Error("Event stream unsupported in this browser");
+          }
+          evReconnectBackoffMs = 800;
+          shim.readyState = EventSource.OPEN;
+          const liveOn = $("#evLive");
+          if (liveOn) {
+            liveOn.textContent = "Live";
+            liveOn.className = "badge online";
+            liveOn.title = "Live stream connected";
+          }
+          await pumpSseBody(r.body.getReader(), ac.signal, (kind, payload) => {
+            if (kind === "ping") return;
+            if (!isRouteCurrent(navTok)) return;
+            try {
+              const ev = JSON.parse(payload);
+              if (ev.event_type === "stream.hello") return;
+              pushEvent(ev);
+            } catch (_) {
+            }
+          });
+          if (ac.signal.aborted || !isRouteCurrent(navTok)) return;
+          shim.readyState = EventSource.CLOSED;
+          if (!paused && isRouteCurrent(navTok)) {
+            evReconnectBackoffMs = 800;
+            const live = $("#evLive");
+            if (live) {
+              live.textContent = "Reconnecting\u2026";
+              live.className = "badge offline";
+            }
+            scheduleReconnect();
+          }
+        } catch (e) {
+          if (e && e.name === "AbortError") return;
+          if (!isRouteCurrent(navTok)) return;
+          shim.readyState = EventSource.CLOSED;
+          const live = $("#evLive");
+          if (live && isRouteCurrent(navTok)) {
+            live.textContent = "Reconnecting\u2026";
+            live.className = "badge offline";
+          }
+          if (!paused && isRouteCurrent(navTok)) scheduleReconnect();
+        }
+      };
+      void run();
+    }
+    $("#evPause").addEventListener("click", () => {
+      paused = !paused;
+      $("#evPause").textContent = paused ? "Resume" : "Pause";
+    });
+    $("#evClear").addEventListener("click", () => {
+      buffer = [];
+      if (evRenderTimer) {
+        clearTimeout(evRenderTimer);
+        evRenderTimer = 0;
+      }
+      flushEvRender();
+    });
+    $("#evApply").addEventListener("click", () => {
+      loadHistory().then(openStream);
+    });
+    $("#evReload").addEventListener("click", loadHistory);
+    $("#evStats").addEventListener("click", async () => {
+      try {
+        if (!isRouteCurrent(navTok)) return;
+        const r = await api("/events/stats/by-device?hours=168&limit=200", { timeoutMs: 16e3 });
+        const items = r.items || [];
+        const evStatsBoxEl = $("#evStatsBox", view);
+        const evStatsInnerEl = $("#evStatsInner", view);
+        if (!evStatsBoxEl || !evStatsInnerEl || !isRouteCurrent(navTok)) return;
+        evStatsBoxEl.style.display = "block";
+        if (items.length === 0) {
+          setChildMarkup(evStatsInnerEl, "<p class='muted'>No rows with device_id.</p>");
+          return;
+        }
+        setChildMarkup(
+          evStatsInnerEl,
+          `<div class="table-wrap"><table class="t"><thead><tr><th>Device</th><th>Count</th></tr></thead><tbody>${items.map((x) => `<tr><td class="mono">${escapeHtml(x.device_id)}</td><td>${x.count}</td></tr>`).join("")}</tbody></table></div>`
+        );
+      } catch (e) {
+        toast(e.message || e, "err");
+      }
+    });
+    $("#evCsv").addEventListener("click", async () => {
+      try {
+        const p = currentFilters();
+        p.set("limit", "8000");
+        const url = apiBase() + "/events/export.csv?" + p.toString();
+        const _ex = {};
+        const _t = getToken();
+        if (_t) _ex.Authorization = "Bearer " + _t;
+        const r = await fetch(url, { credentials: "include", headers: _ex });
+        if (!r.ok) {
+          const t = await r.text();
+          throw new Error(t || r.statusText);
+        }
+        const blob = await r.blob();
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "croc_sentinel_events.csv";
+        a.click();
+        URL.revokeObjectURL(a.href);
+        toast("CSV downloaded", "ok");
+      } catch (e) {
+        toast(e.message || e, "err");
+      }
+    });
+    await loadHistory();
+    openStream();
+    window.__eventsStreamResume = () => {
+      if (paused) return;
+      if (!isRouteCurrent(navTok)) return;
+      openStream();
+    };
+  });
+  registerRoute("forgot-password", async (view) => {
+    setCrumb("Forgot password");
+    document.body.dataset.auth = "none";
+    let enabled = true;
+    try {
+      const r = await fetch(apiBase() + "/auth/forgot/email/enabled");
+      const j = await r.json();
+      enabled = !!j.enabled;
+    } catch {
+      enabled = false;
+    }
+    mountView(view, `
+    <div class="auth-surface" role="main">
+      ${authAsideHtml("recovery")}
+      <div class="auth-surface__body">
+        <div class="auth-surface__inner auth-surface__inner--wide">
+      <div class="auth-card auth-card--panel auth-card--wide auth-card--prose" data-auth-card>
+        <header class="auth-card__head">
+          <h1 class="auth-card__title">Account recovery</h1>
+          <p class="auth-card__lead">Reset via email verification code</p>
+        </header>
+        <div class="auth-card__body">
+        <p class="muted auth-card__prose">
+          Enter your username and the same email used at registration.
+          The server sends a SHA-style verification code to that email.
+          Enter the code to set a new password (saved permanently on server).
+        </p>
+        ${enabled ? "" : `<p class="badge revoked" style="margin:10px 0">Email sender is not configured on server.</p>`}
+        <div id="fpStep1">
+          <label class="field"><span>Username</span><input id="fp_user" autocomplete="username" /></label>
+          <label class="field field--spaced"><span>Registered email</span><input id="fp_email" autocomplete="email" /></label>
+          <div class="auth-card__submit">
+            <button class="btn btn-tap btn-block" type="button" id="fp_go" ${enabled ? "" : "disabled"}>Send SHA code</button>
+            <a class="auth-link auth-link--center" href="#/login">Back to sign in</a>
+          </div>
+          <p class="auth-card__msg muted" id="fp_msg1" aria-live="polite"></p>
+        </div>
+        <div id="fpStep2" style="display:none">
+          <label class="field"><span>SHA code (from email)</span>
+            <input id="fp_sha_code" class="mono" maxlength="32" autocomplete="one-time-code" />
+          </label>
+          <label class="field field--spaced"><span>New password (\u22658)</span><input id="fp_p1" type="password" autocomplete="new-password" /></label>
+          <label class="field field--spaced"><span>Confirm password</span><input id="fp_p2" type="password" autocomplete="new-password" /></label>
+          <div class="auth-card__submit">
+            <button class="btn btn-tap btn-block" type="button" id="fp_done">Update password</button>
+            <button class="btn secondary btn-tap btn-block" type="button" id="fp_resend">Resend SHA code</button>
+            <button class="btn secondary btn-tap btn-block" type="button" id="fp_back">Back</button>
+          </div>
+          <p class="auth-card__msg muted" id="fp_msg2" aria-live="polite"></p>
+        </div>
+        </div>
+      </div>
+      ${authSiteFooterHtml()}
+        </div>
+      </div>
+    </div>`);
+    const m1 = $("#fp_msg1"), m2 = $("#fp_msg2");
+    let fpCooldown = 0;
+    let fpCooldownTimer = 0;
+    const fpGoBtn = $("#fp_go");
+    const fpResendBtn = $("#fp_resend");
+    const applyFpCooldownUi = () => {
+      const left = Math.max(0, Number(fpCooldown || 0));
+      if (fpGoBtn) {
+        fpGoBtn.disabled = !enabled || left > 0;
+        fpGoBtn.textContent = left > 0 ? `Resend in ${left}s` : "Send SHA code";
+      }
+      if (fpResendBtn) {
+        fpResendBtn.disabled = left > 0;
+        fpResendBtn.textContent = left > 0 ? `Resend in ${left}s` : "Resend SHA code";
+      }
+    };
+    const startFpCooldown = (seconds) => {
+      fpCooldown = Math.max(0, Number(seconds || 0));
+      applyFpCooldownUi();
+      if (fpCooldownTimer) clearInterval(fpCooldownTimer);
+      if (window.__fpCooldownTimer) {
+        try {
+          clearInterval(window.__fpCooldownTimer);
+        } catch (_) {
+        }
+        window.__fpCooldownTimer = 0;
+      }
+      if (fpCooldown <= 0) return;
+      fpCooldownTimer = setInterval(() => {
+        fpCooldown = Math.max(0, fpCooldown - 1);
+        applyFpCooldownUi();
+        if (fpCooldown <= 0) {
+          clearInterval(fpCooldownTimer);
+          fpCooldownTimer = 0;
+          window.__fpCooldownTimer = 0;
+        }
+      }, 1e3);
+      window.__fpCooldownTimer = fpCooldownTimer;
+    };
+    const parseCooldownFromMessage = (msg) => {
+      const m = String(msg || "").match(/wait\s+(\d+)s/i);
+      return m ? Math.max(1, Number(m[1])) : 0;
+    };
+    const doForgotSend = async () => {
+      m1.textContent = "";
+      const username = $("#fp_user").value.trim();
+      const email = ($("#fp_email").value || "").trim().toLowerCase();
+      if (!username || !email) {
+        m1.textContent = "Enter username and email";
+        return false;
+      }
+      if (fpCooldown > 0) {
+        m1.textContent = `Please wait ${fpCooldown}s before resending.`;
+        return false;
+      }
+      const check = await fetch(apiBase() + "/auth/forgot/email/check", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, email })
+      });
+      const cj = await check.json().catch(() => ({}));
+      if (!check.ok) {
+        const det = cj.detail;
+        const msg = Array.isArray(det) ? det.map((x) => x.msg || JSON.stringify(x)).join("; ") : det || check.statusText;
+        throw new Error(msg);
+      }
+      if (!cj.matched) {
+        m1.textContent = "Username and registered email do not match.";
+        return false;
+      }
+      const preWait = Number(cj.resend_after_seconds || 0);
+      if (preWait > 0) {
+        startFpCooldown(preWait);
+        m1.textContent = `Please wait ${preWait}s before sending again.`;
+        return false;
+      }
+      const r = await fetch(apiBase() + "/auth/forgot/email/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, email })
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        const det = d.detail;
+        const msg = Array.isArray(det) ? det.map((x) => x.msg || JSON.stringify(x)).join("; ") : det || r.statusText;
+        const wait = parseCooldownFromMessage(msg);
+        if (wait > 0) startFpCooldown(wait);
+        throw new Error(msg);
+      }
+      const cd = Number(d.resend_after_seconds || 60);
+      startFpCooldown(cd);
+      m1.textContent = `Code sent. TTL ${(Number(d.ttl_seconds || 0) / 60).toFixed(0)} min.`;
+      return true;
+    };
+    applyFpCooldownUi();
+    $("#fp_go").addEventListener("click", async () => {
+      try {
+        const ok = await doForgotSend();
+        if (!ok) return;
+        $("#fpStep1").style.display = "none";
+        $("#fpStep2").style.display = "block";
+      } catch (e) {
+        m1.textContent = String(e.message || e);
+      }
+    });
+    if (fpResendBtn) {
+      fpResendBtn.addEventListener("click", async () => {
+        try {
+          const ok = await doForgotSend();
+          if (ok) m2.textContent = `Code resent. Wait ${fpCooldown}s before next resend.`;
+        } catch (e) {
+          m2.textContent = String(e.message || e);
+        }
+      });
+    }
+    $("#fp_back").addEventListener("click", () => {
+      $("#fpStep2").style.display = "none";
+      $("#fpStep1").style.display = "block";
+      m2.textContent = "";
+    });
+    $("#fp_done").addEventListener("click", async () => {
+      m2.textContent = "";
+      const username = $("#fp_user").value.trim();
+      const email = ($("#fp_email").value || "").trim().toLowerCase();
+      const sha_code = ($("#fp_sha_code").value || "").trim().toUpperCase();
+      const password = $("#fp_p1").value;
+      const password_confirm = $("#fp_p2").value;
+      if (!email || !sha_code || !password) {
+        m2.textContent = "Enter email, SHA code, and password";
+        return;
+      }
+      if (password !== password_confirm) {
+        m2.textContent = "Passwords do not match";
+        return;
+      }
+      try {
+        const r = await fetch(apiBase() + "/auth/forgot/email/complete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username, email, sha_code, password, password_confirm })
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          const det = d.detail;
+          const msg = Array.isArray(det) ? det.map((x) => x.msg || JSON.stringify(x)).join("; ") : det || r.statusText;
+          throw new Error(msg);
+        }
+        setChildMarkup(m2, `<span class="badge online">Password updated</span> Redirecting to sign in\u2026`);
+        toast("Password updated", "ok");
+        scheduleRouteRedirect(1500, "#/login");
+      } catch (e) {
+        m2.textContent = String(e.message || e);
+      }
+    });
+  });
+  registerRoute("group", async (view, args, routeSeq) => {
+    const g = canonicalGroupKey(decodeURIComponent(args[0] || ""));
+    if (!g) {
+      location.hash = "#/overview";
+      return;
+    }
+    const tenantOwner = String(window.__routeQuery && window.__routeQuery.get("owner") || "").trim();
+    const metaKey = groupCardMetaKey(g, tenantOwner);
+    const groupScope = state.me && state.me.username ? state.me.username : "anon";
+    const GROUP_META_LS_KEY = `croc.group.meta.v2.${groupScope}`;
+    const GROUP_SETTINGS_LS_KEY = `croc.group.settings.v1.${groupScope}`;
+    const GROUP_API_CAPS_LS_KEY = `croc.group.api.caps.v2.${groupScope}`;
+    const loadGroupMeta = () => {
+      try {
+        const raw = localStorage.getItem(GROUP_META_LS_KEY);
+        const obj = raw ? JSON.parse(raw) : {};
+        return obj && typeof obj === "object" ? obj : {};
+      } catch {
+        return {};
+      }
+    };
+    const loadGroupSettings = () => {
+      try {
+        const raw = localStorage.getItem(GROUP_SETTINGS_LS_KEY);
+        const obj = raw ? JSON.parse(raw) : {};
+        return obj && typeof obj === "object" ? obj : {};
+      } catch {
+        return {};
+      }
+    };
+    const loadGroupApiCaps = () => {
+      try {
+        const raw = localStorage.getItem(GROUP_API_CAPS_LS_KEY);
+        const obj = raw ? JSON.parse(raw) : {};
+        return {
+          apply: obj && obj.apply === false ? false : true,
+          delete: obj && obj.delete === false ? false : true
+        };
+      } catch {
+        return { apply: true, delete: true };
+      }
+    };
+    const saveGroupApiCaps = (caps) => localStorage.setItem(GROUP_API_CAPS_LS_KEY, JSON.stringify({
+      apply: !!(caps && caps.apply),
+      delete: !!(caps && caps.delete)
+    }));
+    window.__groupDelayTimers = window.__groupDelayTimers || /* @__PURE__ */ new Map();
+    const meta = loadGroupMeta();
+    const gsMap = loadGroupSettings();
+    const groupApiCaps = loadGroupApiCaps();
+    setCrumb(`Group \xB7 ${(meta[metaKey] || meta[g] || {}).display_name || g}`);
+    mountView(view, `
+    <section class="card">
+      <div class="row" style="align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
+        <h2 style="margin:0">${escapeHtml((meta[metaKey] || meta[g] || {}).display_name || g)}</h2>
+        <a href="#/overview" class="btn ghost right">\u2190 Back</a>
+      </div>
+      <p class="muted" style="margin-top:10px">Loading group\u2026</p>
+    </section>`);
+    if (!isRouteCurrent(routeSeq)) return;
+    const [listRes] = await Promise.allSettled([apiGetCached("/devices", { timeoutMs: 16e3 }, 3e3)]);
+    if (!isRouteCurrent(routeSeq)) return;
+    let list = listRes.status === "fulfilled" && listRes.value ? listRes.value : { items: [] };
+    let byId = new Map((list.items || []).map((d) => [String(d.device_id), d]));
+    syncGroupMetaWithDevices(meta, list.items || []);
+    try {
+      localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(meta));
+    } catch (_) {
+    }
+    const gm = meta[metaKey] || meta[g] || { display_name: g, owner_name: "", phone: "", email: "", device_ids: [] };
+    const rowsByGroup = () => (list.items || []).filter((d) => {
+      if (canonicalGroupKey(d.notification_group) !== g) return false;
+      if (state.me && state.me.role === "superadmin" && tenantOwner) {
+        return String(d.owner_admin || "").trim() === tenantOwner;
+      }
+      return true;
+    });
+    let rows = rowsByGroup();
+    let ids = rows.map((d) => String(d.device_id || "")).filter(Boolean);
+    const isSharedGroup = rows.some((d) => !!d.is_shared);
+    const online = rows.filter((d) => isOnline(d)).length;
+    const offline = Math.max(0, rows.length - online);
+    setCrumb(`Group \xB7 ${gm.display_name || g}`);
+    mountView(view, `
+    <section class="card">
+      <div class="row" style="align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap">
+        <h2 style="margin:0;flex:1;min-width:0">${escapeHtml(gm.display_name || g)}</h2>
+        <div class="row" style="gap:8px;align-items:center;flex-shrink:0;margin-left:auto">
+          ${tenantOwner ? `<span class="card-owner-tag" title="Owning admin / \u6240\u5C5E\u79DF\u6237">${escapeHtml(tenantOwner)}</span>` : ""}
+          <a href="#/overview" class="btn ghost right">\u2190 Back</a>
+        </div>
+      </div>
+      <div class="divider"></div>
+      <div class="row" style="gap:6px;flex-wrap:wrap">
+        <span class="badge neutral">total <span id="grpTotal">${rows.length}</span></span>
+        <span class="badge online">online <span id="grpOnline">${online}</span></span>
+        <span class="badge offline">offline <span id="grpOffline">${offline}</span></span>
+        <span class="chip">${escapeHtml(g)}</span>
+      </div>
+      <p class="muted" style="margin-top:8px">Owner: ${escapeHtml(gm.owner_name || "\u2014")} \xB7 ${escapeHtml(gm.phone || "\u2014")} \xB7 ${escapeHtml(gm.email || "\u2014")}</p>
+      <div class="row" style="margin-top:8px;gap:8px;justify-content:flex-end">
+        <button class="btn sm danger" id="grpAlarmOn" ${can("can_alert") ? "" : "disabled"}>Alarm ON</button>
+        <button class="btn sm secondary" id="grpAlarmOff" ${can("can_alert") ? "" : "disabled"}>Alarm OFF</button>
+      </div>
+    </section>
+    <section class="card">
+      <h3 style="margin:0">Devices</h3>
+      <div class="divider"></div>
+      <div class="device-grid" id="groupPageDevices"></div>
+    </section>
+    <details class="card danger-zone device-drawer">
+      <summary class="device-drawer__summary">
+        <span class="device-drawer__title">Danger zone</span>
+        <span class="device-drawer__hint muted">Delete group \xB7 expand</span>
+      </summary>
+      <div class="device-drawer__body">
+        <p class="muted" style="margin:0 0 10px">Delete group will clear notification_group from all devices in this group.</p>
+        <div class="row" style="justify-content:flex-end">
+          <button class="btn danger btn-tap" id="grpDelete" ${isSharedGroup ? 'disabled title="Shared group cannot be deleted"' : ""}>Delete group</button>
+        </div>
+      </div>
+    </details>
+  `);
+    const devGrid = $("#groupPageDevices", view);
+    const renderGroupDevices = () => {
+      if (!devGrid) return;
+      setChildMarkup(
+        devGrid,
+        rows.length ? rows.map((d) => {
+          const on = isOnline(d);
+          const primary = escapeHtml(d.display_label || d.device_id || "unknown");
+          const subId = d.display_label ? `<div class="device-id-sub mono">${escapeHtml(d.device_id || "")}</div>` : "";
+          return `<a class="device-card" href="#/devices/${encodeURIComponent(d.device_id)}" style="text-decoration:none;color:inherit">
+        <h3><div class="device-primary-name">${primary}</div>${subId}</h3>
+        <div><span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>
+          ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
+          ${d.fw ? `<span class="chip">v${escapeHtml(d.fw)}</span>` : ""}
+          ${d.is_shared ? `<span class="badge accent" title="shared device">sharing by ${escapeHtml(d.shared_by || "?")}</span>` : ""}
+        </div>
+        <div class="meta">Platform: ${escapeHtml(maskPlatform(`${d.chip_target || ""}/${d.board_profile || ""}`))}<br/>Manufacturer: ESA Sibu</div>
+      </a>`;
+        }).join("") : `<p class="muted">No devices in this group.</p>`
+      );
+      const onNow = rows.filter((d) => isOnline(d)).length;
+      const offNow = Math.max(0, rows.length - onNow);
+      const tEl = $("#grpTotal", view);
+      const oEl = $("#grpOnline", view);
+      const fEl = $("#grpOffline", view);
+      if (tEl) tEl.textContent = String(rows.length);
+      if (oEl) oEl.textContent = String(onNow);
+      if (fEl) fEl.textContent = String(offNow);
+    };
+    renderGroupDevices();
+    const clearGroupByDevicePatchCompat = async () => {
+      let changed = 0;
+      for (const id of ids) {
+        await api(`/devices/${encodeURIComponent(id)}/profile`, { method: "PATCH", body: { notification_group: "" } });
+        changed += 1;
+      }
+      return { ok: true, changed };
+    };
+    const withOwnerQuery = (path, ownerO) => {
+      const q = groupApiQueryOwner(ownerO);
+      if (!q) return path;
+      const join = path.includes("?") ? "&" : "?";
+      return `${path}${join}${q}`;
+    };
+    const deleteGroupCardCompat = async (groupKey, ownerO) => runGroupDeleteAction({
+      groupKey,
+      ownerAdmin: ownerO,
+      apiCaps: groupApiCaps,
+      saveApiCaps: saveGroupApiCaps,
+      tryDeletePostRoute: async (gk, oa) => {
+        const p = withOwnerQuery(`/group-cards/${encodeURIComponent(gk)}/delete`, oa);
+        try {
+          return await api(p, { method: "POST" });
+        } catch (e) {
+          if (!isGroupRouteMissingError(e)) throw e;
+        }
+        return await api(withOwnerQuery(`/api/group-cards/${encodeURIComponent(gk)}/delete`, oa), { method: "POST" });
+      },
+      tryDeleteRoute: async (gk, oa) => {
+        const p = withOwnerQuery(`/group-cards/${encodeURIComponent(gk)}`, oa);
+        try {
+          return await api(p, { method: "DELETE" });
+        } catch (e) {
+          if (!isGroupRouteMissingError(e)) throw e;
+        }
+        return await api(withOwnerQuery(`/api/group-cards/${encodeURIComponent(gk)}`, oa), { method: "DELETE" });
+      },
+      clearFallback: clearGroupByDevicePatchCompat
+    });
+    const applyGroupSettingsFallbackCompat = async (_groupKey, _ownerO, payload) => {
+      const durationMs = Number(payload.trigger_duration_ms || DEFAULT_REMOTE_SIREN_MS);
+      const tkey = metaKey;
+      const prev = window.__groupDelayTimers.get(tkey);
+      if (prev) {
+        clearTimeout(prev);
+        window.__groupDelayTimers.delete(tkey);
+      }
+      await api("/alerts", { method: "POST", body: { action: "on", duration_ms: durationMs, device_ids: ids } });
+      return { ok: true, fallback: true, device_count: ids.length };
+    };
+    const tryApplyRouteCompat = async (groupKey, ownerO) => {
+      const p = withOwnerQuery(`/group-cards/${encodeURIComponent(groupKey)}/apply`, ownerO);
+      try {
+        return await api(p, { method: "POST" });
+      } catch (e) {
+        if (!isGroupRouteMissingError(e)) throw e;
+      }
+      return await api(withOwnerQuery(`/api/group-cards/${encodeURIComponent(groupKey)}/apply`, ownerO), { method: "POST" });
+    };
+    const sendAlert = async (action) => {
+      if (!can("can_alert")) {
+        toast("No can_alert capability", "err");
+        return;
+      }
+      if (ids.length === 0) {
+        toast("No devices in this group", "warn");
+        return;
+      }
+      if (!confirm(`${action === "on" ? "Open" : "Close"} alarm for ${ids.length} devices in ${g}?`)) return;
+      if (action === "on") {
+        const payload = groupTriggerPayloadFromSettings(gsMap[metaKey] || gsMap[g] || {});
+        await runGroupApplyOnAction({
+          groupKey: g,
+          ownerAdmin: tenantOwner,
+          payload,
+          apiCaps: groupApiCaps,
+          saveApiCaps: saveGroupApiCaps,
+          tryApplyRoute: tryApplyRouteCompat,
+          applyFallback: applyGroupSettingsFallbackCompat
+        });
+      } else {
+        const prev = window.__groupDelayTimers.get(metaKey);
+        if (prev) {
+          clearTimeout(prev);
+          window.__groupDelayTimers.delete(metaKey);
+        }
+        await api("/alerts", { method: "POST", body: { action: "off", duration_ms: DEFAULT_REMOTE_SIREN_MS, device_ids: ids } });
+      }
+      toast(`${action === "on" ? "Alarm ON" : "Alarm OFF"} \xB7 ${ids.length}`, "ok");
+    };
+    const alarmOnBtn = $("#grpAlarmOn", view);
+    const alarmOffBtn = $("#grpAlarmOff", view);
+    const delGroupBtn = $("#grpDelete", view);
+    if (alarmOnBtn) alarmOnBtn.addEventListener("click", () => sendAlert("on"));
+    if (alarmOffBtn) alarmOffBtn.addEventListener("click", () => sendAlert("off"));
+    if (delGroupBtn) {
+      delGroupBtn.addEventListener("click", async () => {
+        if (isSharedGroup) {
+          toast("Shared group cannot be deleted", "err");
+          return;
+        }
+        if (!confirm(`Delete group card "${g}"?`)) return;
+        try {
+          await deleteGroupCardCompat(g, tenantOwner);
+          if (meta[metaKey]) delete meta[metaKey];
+          else if (meta[g]) delete meta[g];
+          localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(meta));
+          toast("Group deleted", "ok");
+          location.hash = "#/overview";
+        } catch (e) {
+          toast(e.message || e, "err");
+        }
+      });
+    }
+    const refreshGroupLive = async () => {
+      if (!isRouteCurrent(routeSeq)) return;
+      const latest = await apiGetCached("/devices", { timeoutMs: 16e3 }, 2e3);
+      if (!isRouteCurrent(routeSeq)) return;
+      list = latest || { items: [] };
+      byId = new Map((list.items || []).map((d) => [String(d.device_id), d]));
+      syncGroupMetaWithDevices(meta, list.items || []);
+      try {
+        localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(meta));
+      } catch (_) {
+      }
+      rows = rowsByGroup();
+      ids = rows.map((d) => String(d.device_id || "")).filter(Boolean);
+      renderGroupDevices();
+    };
+    scheduleRouteTicker(routeSeq, `group-live-${g}`, refreshGroupLive, 1e4);
+  });
+  registerRoute("login", async (view) => {
+    setCrumb("Sign in");
+    document.body.dataset.auth = "none";
+    const cleanAuthMessage = (raw) => {
+      const s = String(raw || "").trim();
+      if (!s) return "Request failed. Please try again.";
+      const l = s.toLowerCase();
+      if (l.includes("401")) return "Username or password is incorrect.";
+      if (l.includes("invalid credentials")) return "Username or password is incorrect.";
+      if (l.includes("too many login attempts")) return s;
+      if (l.includes("session expired")) return "Session expired. Please sign in again.";
+      if (l.includes("networkerror") || l.includes("failed to fetch")) return "Network error. Please check server/API.";
+      return s.replace(/^error:\s*/i, "");
+    };
+    mountView(view, `
+    <div class="auth-surface" role="main">
+      ${authAsideHtml("login")}
+      <div class="auth-surface__body">
+        <div class="auth-surface__inner">
+          <div class="auth-card auth-card--panel auth-card--auth-main" data-auth-card>
+            <header class="auth-card__head">
+              <h1 class="auth-card__title">Sign in</h1>
+              <p class="auth-card__lead">Use the credentials your administrator provided.</p>
+            </header>
+            <form class="auth-card__body" id="loginForm" autocomplete="on">
+              <label class="field">
+                <span>Username</span>
+                <input name="username" autocomplete="username" required placeholder="e.g. dan" />
+              </label>
+              <label class="field field--spaced">
+                <span>Password</span>
+                <input name="password" type="password" autocomplete="current-password" required placeholder="\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022" />
+              </label>
+              <div class="auth-card__submit">
+                <button class="btn btn-tap btn-block auth-btn-primary" type="submit" id="loginSubmit">Sign in</button>
+              </div>
+              <p class="auth-card__msg auth-card__msg--fixed muted" id="loginMsg" aria-live="polite"></p>
+              <nav class="auth-card__links auth-card__links--grid" aria-label="Other sign-in options">
+                <a class="auth-link" href="#/register">Register admin</a>
+                <a class="auth-link" href="#/account-activate">Activate account</a>
+                <a class="auth-link" href="#/forgot-password">Forgot password</a>
+              </nav>
+            </form>
+          </div>
+          ${authSiteFooterHtml()}
+        </div>
+      </div>
+    </div>`);
+    const form = $("#loginForm", view);
+    const card = view.querySelector("[data-auth-card]");
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const data = new FormData(form);
+      const msg = $("#loginMsg", view);
+      const btn = $("#loginSubmit", view);
+      const label = btn ? btn.textContent : "Sign in";
+      msg.textContent = "";
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = "Signing in\u2026";
+      }
+      try {
+        await login(data.get("username"), data.get("password"));
+        await loadMe();
+        await loadHealth();
+        location.hash = "#/overview";
+      } catch (e) {
+        msg.textContent = cleanAuthMessage(e.message || e);
+        if (card) {
+          card.classList.remove("auth-shake");
+          void card.offsetWidth;
+          card.classList.add("auth-shake");
+          setTimeout(() => card.classList.remove("auth-shake"), 500);
+        }
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = label;
+        }
+      }
+    });
   });
   registerRoute("overview", async (view, _args, routeSeq) => {
     setCrumb("Overview");
@@ -1925,139 +5422,139 @@ ${curFw} \u2192 ${fw}`)) return;
       }
     };
     mountView(view, `
-      <header class="page-head">
-        <h2>Overview</h2>
-        <p class="muted">Fleet snapshot, group cards, and MQTT health for your scope.</p>
-      </header>
-      <section class="stats">
-        <div class="stat"><div class="k">Server</div><div class="v" id="ovServerV">\u2014</div><div class="sub">HTTP + MQTT realtime</div></div>
-        <div class="stat"><div class="k">Devices</div><div class="v" id="ovDevicesV">\u2014</div><div class="sub">total in scope</div></div>
-        <div class="stat"><div class="k">Online</div><div class="v" id="ovOnlineV">\u2014</div><div class="sub">active now</div></div>
-        <div class="stat"><div class="k">Offline</div><div class="v" id="ovOfflineV">\u2014</div><div class="sub">inactive now</div></div>
-        <div class="stat"><div class="k">TX</div><div class="v" id="ovTxV">\u2014</div><div class="sub">aggregate uplink</div></div>
-        <div class="stat"><div class="k">RX</div><div class="v" id="ovRxV">\u2014</div><div class="sub">aggregate downlink</div></div>
-      </section>
-      <section class="card card--groups">
-        <div class="row">
-          <h3 style="margin:0">MQTT risk</h3>
-          <span class="badge ${mqClass}" id="ovMqttRisk">${mqStatus}</span>
+    <header class="page-head">
+      <h2>Overview</h2>
+      <p class="muted">Fleet snapshot, group cards, and MQTT health for your scope.</p>
+    </header>
+    <section class="stats">
+      <div class="stat"><div class="k">Server</div><div class="v" id="ovServerV">\u2014</div><div class="sub">HTTP + MQTT realtime</div></div>
+      <div class="stat"><div class="k">Devices</div><div class="v" id="ovDevicesV">\u2014</div><div class="sub">total in scope</div></div>
+      <div class="stat"><div class="k">Online</div><div class="v" id="ovOnlineV">\u2014</div><div class="sub">active now</div></div>
+      <div class="stat"><div class="k">Offline</div><div class="v" id="ovOfflineV">\u2014</div><div class="sub">inactive now</div></div>
+      <div class="stat"><div class="k">TX</div><div class="v" id="ovTxV">\u2014</div><div class="sub">aggregate uplink</div></div>
+      <div class="stat"><div class="k">RX</div><div class="v" id="ovRxV">\u2014</div><div class="sub">aggregate downlink</div></div>
+    </section>
+    <section class="card card--groups">
+      <div class="row">
+        <h3 style="margin:0">MQTT risk</h3>
+        <span class="badge ${mqClass}" id="ovMqttRisk">${mqStatus}</span>
+      </div>
+      <div class="divider"></div>
+      <div class="muted">queue=<span class="mono" id="ovMqttQueue">0</span> \xB7 dropped=<span class="mono" id="ovMqttDropped">0</span></div>
+    </section>
+    <section class="card">
+      <div class="row">
+        <h2 style="margin:0">Group cards</h2>
+        <button class="btn sm secondary right" id="grpNew">New group</button>
+      </div>
+      ${state.me && state.me.role === "superadmin" ? `
+      <div class="row" style="flex-wrap:wrap;gap:10px;align-items:flex-end;margin:10px 0 4px">
+        <label class="field" style="margin:0;min-width:220px;flex:1">
+          <span>Filter by owner / \u6309\u79DF\u6237\u7B5B\u9009\u7EC4\u5361</span>
+          <input type="search" id="ovOwnerFilter" list="ovOwnerDatalist" placeholder="username substring\u2026" autocomplete="off" />
+          <datalist id="ovOwnerDatalist"></datalist>
+        </label>
+        <button type="button" class="btn sm secondary btn-tap" id="ovOwnerClear">Clear</button>
+      </div>
+      <p class="muted" style="margin:0 0 8px;font-size:12px">One card per tenant group. <span class="mono">__unowned__</span> means no owner.</p>
+      ` : ""}
+      <div id="groupCards" class="device-grid"></div>
+      ${state.me && (state.me.role === "superadmin" || state.me.role === "admin" && can("can_manage_users")) ? `
+      <details class="share-fold" id="grpShareFold">
+        <summary class="share-fold__summary">
+          <span>Global sharing</span>
+          <span class="muted">Device ACL only</span>
+        </summary>
+        <div class="share-global-panel">
+          <div class="share-global-head">
+            <div class="share-global-toolbar">
+              <button class="btn sm secondary btn-tap" type="button" id="grpShareRefresh">Refresh</button>
+              <button class="btn sm btn-tap" type="button" id="grpShareOpen">New grant</button>
+            </div>
+          </div>
+          <p class="muted" style="margin:0 0 6px;font-size:12px">Shared users get per-device access only; group cards and trigger policy stay tenant-local.</p>
+          <div id="shareGrantsTableWrap" class="share-grants-table mini" style="margin-top:10px">
+            <p class="muted" style="margin:0;padding:8px 0">Loading shares\u2026</p>
+          </div>
         </div>
-        <div class="divider"></div>
-        <div class="muted">queue=<span class="mono" id="ovMqttQueue">0</span> \xB7 dropped=<span class="mono" id="ovMqttDropped">0</span></div>
-      </section>
-      <section class="card">
-        <div class="row">
-          <h2 style="margin:0">Group cards</h2>
-          <button class="btn sm secondary right" id="grpNew">New group</button>
+      </details>` : ""}
+    </section>
+    <div id="shareModal" class="grp-modal" style="display:none">
+      <div class="grp-modal-card" style="max-width:760px;width:min(760px,96vw)">
+        <h3 style="margin:0 0 8px" id="shareModalTitle">Share devices / group</h3>
+        <p class="muted" id="shareTargetHint" style="margin:0 0 10px">Select devices, users, and permissions.</p>
+        <p class="muted" id="shareEditNote" style="margin:0 0 8px;display:none"></p>
+        <div class="row" style="gap:10px;align-items:flex-start;flex-wrap:wrap">
+          <div style="flex:1;min-width:280px">
+            <div class="row" style="justify-content:space-between;align-items:center">
+              <strong>Devices</strong>
+              <label class="muted"><input type="checkbox" id="shareSelAllDevices" /> Select all</label>
+            </div>
+            <div id="shareDeviceList" class="grp-pick-list grp-pick-list--devices" style="max-height:280px;overflow:auto"></div>
+          </div>
+          <div style="flex:1;min-width:280px">
+            <div class="row" style="justify-content:space-between;align-items:center">
+              <strong>Users</strong>
+              <label class="muted"><input type="checkbox" id="shareSelAllUsers" /> Select all</label>
+            </div>
+            <div id="shareUserList" class="grp-pick-list" style="max-height:260px;overflow:auto"></div>
+          </div>
         </div>
-        ${state.me && state.me.role === "superadmin" ? `
-        <div class="row" style="flex-wrap:wrap;gap:10px;align-items:flex-end;margin:10px 0 4px">
-          <label class="field" style="margin:0;min-width:220px;flex:1">
-            <span>Filter by owner / \u6309\u79DF\u6237\u7B5B\u9009\u7EC4\u5361</span>
-            <input type="search" id="ovOwnerFilter" list="ovOwnerDatalist" placeholder="username substring\u2026" autocomplete="off" />
-            <datalist id="ovOwnerDatalist"></datalist>
-          </label>
-          <button type="button" class="btn sm secondary btn-tap" id="ovOwnerClear">Clear</button>
+        <div class="row" style="margin-top:10px;gap:14px">
+          <label><input type="checkbox" id="sharePermView" checked /> can_view</label>
+          <label><input type="checkbox" id="sharePermOperate" /> can_operate</label>
         </div>
-        <p class="muted" style="margin:0 0 8px;font-size:12px">One card per tenant group. <span class="mono">__unowned__</span> means no owner.</p>
-        ` : ""}
-        <div id="groupCards" class="device-grid"></div>
-        ${state.me && (state.me.role === "superadmin" || state.me.role === "admin" && can("can_manage_users")) ? `
-        <details class="share-fold" id="grpShareFold">
-          <summary class="share-fold__summary">
-            <span>Global sharing</span>
-            <span class="muted">Device ACL only</span>
-          </summary>
-          <div class="share-global-panel">
-            <div class="share-global-head">
-              <div class="share-global-toolbar">
-                <button class="btn sm secondary btn-tap" type="button" id="grpShareRefresh">Refresh</button>
-                <button class="btn sm btn-tap" type="button" id="grpShareOpen">New grant</button>
-              </div>
-            </div>
-            <p class="muted" style="margin:0 0 6px;font-size:12px">Shared users get per-device access only; group cards and trigger policy stay tenant-local.</p>
-            <div id="shareGrantsTableWrap" class="share-grants-table mini" style="margin-top:10px">
-              <p class="muted" style="margin:0;padding:8px 0">Loading shares\u2026</p>
-            </div>
-          </div>
-        </details>` : ""}
-      </section>
-      <div id="shareModal" class="grp-modal" style="display:none">
-        <div class="grp-modal-card" style="max-width:760px;width:min(760px,96vw)">
-          <h3 style="margin:0 0 8px" id="shareModalTitle">Share devices / group</h3>
-          <p class="muted" id="shareTargetHint" style="margin:0 0 10px">Select devices, users, and permissions.</p>
-          <p class="muted" id="shareEditNote" style="margin:0 0 8px;display:none"></p>
-          <div class="row" style="gap:10px;align-items:flex-start;flex-wrap:wrap">
-            <div style="flex:1;min-width:280px">
-              <div class="row" style="justify-content:space-between;align-items:center">
-                <strong>Devices</strong>
-                <label class="muted"><input type="checkbox" id="shareSelAllDevices" /> Select all</label>
-              </div>
-              <div id="shareDeviceList" class="grp-pick-list grp-pick-list--devices" style="max-height:280px;overflow:auto"></div>
-            </div>
-            <div style="flex:1;min-width:280px">
-              <div class="row" style="justify-content:space-between;align-items:center">
-                <strong>Users</strong>
-                <label class="muted"><input type="checkbox" id="shareSelAllUsers" /> Select all</label>
-              </div>
-              <div id="shareUserList" class="grp-pick-list" style="max-height:260px;overflow:auto"></div>
-            </div>
-          </div>
-          <div class="row" style="margin-top:10px;gap:14px">
-            <label><input type="checkbox" id="sharePermView" checked /> can_view</label>
-            <label><input type="checkbox" id="sharePermOperate" /> can_operate</label>
-          </div>
-          <p class="muted" id="shareBatchStat" style="min-height:1.2em;margin:8px 0 0"></p>
-          <div class="row" style="justify-content:flex-end;gap:8px;margin-top:10px">
-            <button class="btn sm secondary" id="shareModalCancel" type="button">Cancel</button>
-            <button class="btn sm" id="shareModalApply" type="button">Apply sharing</button>
-          </div>
+        <p class="muted" id="shareBatchStat" style="min-height:1.2em;margin:8px 0 0"></p>
+        <div class="row" style="justify-content:flex-end;gap:8px;margin-top:10px">
+          <button class="btn sm secondary" id="shareModalCancel" type="button">Cancel</button>
+          <button class="btn sm" id="shareModalApply" type="button">Apply sharing</button>
         </div>
       </div>
-      <div id="grpSetModal" class="grp-modal" style="display:none">
-        <div class="grp-modal-card">
-          <h3 style="margin:0 0 8px">Group trigger settings</h3>
-          <p class="muted" id="gsKeyLabel" style="margin:0 0 10px"></p>
-          <p class="muted" style="margin:0 0 10px;font-size:12px;line-height:1.45" lang="zh">\u5EF6\u8FDF\u4E3A 0 \u8868\u793A\u7ACB\u5373\u9E23\u54CD\uFF1B\u9E23\u54CD\u65F6\u957F\u4EE5\u5206\u949F\u8BA1\uFF08\u4E0E\u5355\u673A\u8FDC\u7A0B\u8B66\u62A5\u590D\u4F4D\u7B56\u7565\u4E00\u81F4\uFF09\u3002<br/><span lang="en">Delay 0 = immediate siren. Duration is in minutes (same idea as remote siren length).</span></p>
-          <label class="field"><span>Siren duration (minutes)</span><input id="gsDurMin" type="number" min="0.5" max="5" step="0.5" /></label>
-          <label class="field field--spaced"><span>Delay before siren (seconds)</span><input id="gsDelay" type="number" min="0" max="3600" step="1" /></label>
-          <label class="field field--spaced field--toggle">
-            <span class="row field--toggle__row" style="margin:0;align-items:flex-start;gap:10px">
-              <input id="gsReboot" type="checkbox" />
-              <span class="field--toggle__text">Reboot + self-check this group after trigger</span>
-            </span>
-          </label>
-          <div class="row" style="justify-content:flex-end;gap:8px;margin-top:10px">
-            <button class="btn sm secondary" id="gsCancel" type="button">Cancel</button>
-            <button class="btn sm secondary" id="gsApply" type="button">Apply now</button>
-            <button class="btn sm" id="gsSave" type="button">Save</button>
-          </div>
+    </div>
+    <div id="grpSetModal" class="grp-modal" style="display:none">
+      <div class="grp-modal-card">
+        <h3 style="margin:0 0 8px">Group trigger settings</h3>
+        <p class="muted" id="gsKeyLabel" style="margin:0 0 10px"></p>
+        <p class="muted" style="margin:0 0 10px;font-size:12px;line-height:1.45" lang="zh">\u5EF6\u8FDF\u4E3A 0 \u8868\u793A\u7ACB\u5373\u9E23\u54CD\uFF1B\u9E23\u54CD\u65F6\u957F\u4EE5\u5206\u949F\u8BA1\uFF08\u4E0E\u5355\u673A\u8FDC\u7A0B\u8B66\u62A5\u590D\u4F4D\u7B56\u7565\u4E00\u81F4\uFF09\u3002<br/><span lang="en">Delay 0 = immediate siren. Duration is in minutes (same idea as remote siren length).</span></p>
+        <label class="field"><span>Siren duration (minutes)</span><input id="gsDurMin" type="number" min="0.5" max="5" step="0.5" /></label>
+        <label class="field field--spaced"><span>Delay before siren (seconds)</span><input id="gsDelay" type="number" min="0" max="3600" step="1" /></label>
+        <label class="field field--spaced field--toggle">
+          <span class="row field--toggle__row" style="margin:0;align-items:flex-start;gap:10px">
+            <input id="gsReboot" type="checkbox" />
+            <span class="field--toggle__text">Reboot + self-check this group after trigger</span>
+          </span>
+        </label>
+        <div class="row" style="justify-content:flex-end;gap:8px;margin-top:10px">
+          <button class="btn sm secondary" id="gsCancel" type="button">Cancel</button>
+          <button class="btn sm secondary" id="gsApply" type="button">Apply now</button>
+          <button class="btn sm" id="gsSave" type="button">Save</button>
         </div>
       </div>
-      <div id="grpModal" class="grp-modal" style="display:none">
-        <div class="grp-modal-card grp-modal-card--edit">
-          <header class="grp-modal__head">
-            <h3 class="grp-modal__title">\u7F16\u8F91\u7EC4\u5361 / Edit group card</h3>
-            <p class="grp-modal__lede muted">\u586B\u5199\u7EC4\u6807\u8BC6\u4E0E\u5C55\u793A\u4FE1\u606F\uFF0C\u52FE\u9009\u8981\u51FA\u73B0\u5728\u6B64\u5361\u4E0A\u7684\u8BBE\u5907\u3002\u9700\u8981\u8BF4\u660E\u65F6\u8BF7\u5411\u7BA1\u7406\u5458\u7D22\u53D6\u6587\u6863\u3002<br/><span lang="en">Set the group identifier and display fields, then pick devices for this card. Ask your administrator for documentation if needed.</span></p>
-          </header>
-          <div class="grp-modal__fields">
-            <label class="field"><span>Group key</span><input id="gmKey" placeholder="e.g. Warehouse-A" autocomplete="off"/></label>
-            <p class="muted grp-modal__key-hint" style="margin:-2px 0 10px;font-size:11px;line-height:1.45">\u4FDD\u5B58\u65F6\u4F1A\u81EA\u52A8\u6574\u7406\u9996\u5C3E\u7A7A\u683C\u4E0E\u8FDE\u7EED\u7A7A\u683C\uFF08Unicode NFC\uFF09\u3002<strong>\u5927\u5C0F\u5199\u4ECD\u533A\u5206</strong>\uFF1B\u4E0E\u300C\u8BBE\u5907\u8BE6\u60C5 \u2192 Notification group\u300D\u4E0D\u4E00\u81F4\u65F6\u4F1A\u51FA\u73B0\u591A\u5F20\u7EC4\u5361\u3002<br/><span lang="en">Spaces are normalized on save; <strong>case still matters</strong>. Must match each device&rsquo;s Notification group or you will see multiple cards.</span></p>
-            <label class="field"><span>Display name</span><input id="gmName" autocomplete="off"/></label>
-            <label class="field"><span>Owner name</span><input id="gmOwner" autocomplete="name"/></label>
-            <label class="field"><span>Phone</span><input id="gmPhone" inputmode="tel" autocomplete="tel"/></label>
-            <label class="field"><span>Email</span><input id="gmEmail" type="email" autocomplete="email"/></label>
-            <div class="field field--devices">
-              <span>Devices in this group</span>
-              <div id="gmDevices" class="grp-pick-list grp-pick-list--devices" role="group" aria-label="Devices in group"></div>
-            </div>
-          </div>
-          <div class="row grp-modal__actions" style="justify-content:flex-end;gap:8px;margin-top:12px">
-            <button class="btn sm secondary" id="gmCancel" type="button">Cancel</button>
-            <button class="btn sm" id="gmSave" type="button">Save</button>
+    </div>
+    <div id="grpModal" class="grp-modal" style="display:none">
+      <div class="grp-modal-card grp-modal-card--edit">
+        <header class="grp-modal__head">
+          <h3 class="grp-modal__title">\u7F16\u8F91\u7EC4\u5361 / Edit group card</h3>
+          <p class="grp-modal__lede muted">\u586B\u5199\u7EC4\u6807\u8BC6\u4E0E\u5C55\u793A\u4FE1\u606F\uFF0C\u52FE\u9009\u8981\u51FA\u73B0\u5728\u6B64\u5361\u4E0A\u7684\u8BBE\u5907\u3002\u9700\u8981\u8BF4\u660E\u65F6\u8BF7\u5411\u7BA1\u7406\u5458\u7D22\u53D6\u6587\u6863\u3002<br/><span lang="en">Set the group identifier and display fields, then pick devices for this card. Ask your administrator for documentation if needed.</span></p>
+        </header>
+        <div class="grp-modal__fields">
+          <label class="field"><span>Group key</span><input id="gmKey" placeholder="e.g. Warehouse-A" autocomplete="off"/></label>
+          <p class="muted grp-modal__key-hint" style="margin:-2px 0 10px;font-size:11px;line-height:1.45">\u4FDD\u5B58\u65F6\u4F1A\u81EA\u52A8\u6574\u7406\u9996\u5C3E\u7A7A\u683C\u4E0E\u8FDE\u7EED\u7A7A\u683C\uFF08Unicode NFC\uFF09\u3002<strong>\u5927\u5C0F\u5199\u4ECD\u533A\u5206</strong>\uFF1B\u4E0E\u300C\u8BBE\u5907\u8BE6\u60C5 \u2192 Notification group\u300D\u4E0D\u4E00\u81F4\u65F6\u4F1A\u51FA\u73B0\u591A\u5F20\u7EC4\u5361\u3002<br/><span lang="en">Spaces are normalized on save; <strong>case still matters</strong>. Must match each device&rsquo;s Notification group or you will see multiple cards.</span></p>
+          <label class="field"><span>Display name</span><input id="gmName" autocomplete="off"/></label>
+          <label class="field"><span>Owner name</span><input id="gmOwner" autocomplete="name"/></label>
+          <label class="field"><span>Phone</span><input id="gmPhone" inputmode="tel" autocomplete="tel"/></label>
+          <label class="field"><span>Email</span><input id="gmEmail" type="email" autocomplete="email"/></label>
+          <div class="field field--devices">
+            <span>Devices in this group</span>
+            <div id="gmDevices" class="grp-pick-list grp-pick-list--devices" role="group" aria-label="Devices in group"></div>
           </div>
         </div>
-      </div>`);
+        <div class="row grp-modal__actions" style="justify-content:flex-end;gap:8px;margin-top:12px">
+          <button class="btn sm secondary" id="gmCancel" type="button">Cancel</button>
+          <button class="btn sm" id="gmSave" type="button">Save</button>
+        </div>
+      </div>
+    </div>`);
     patchOverviewHeader({
       server: `${httpOk ? "HTTP OK" : "HTTP DOWN"} \xB7 ${mqConnected ? "MQTT UP" : "MQTT DOWN"}`,
       devices: totalDevices,
@@ -2180,19 +5677,19 @@ ${curFw} \u2192 ${fw}`)) return;
       const showOwnerTag = !!(d.owner_admin && state.me && (state.me.role === "superadmin" || d.is_shared));
       const ownerCorner = showOwnerTag ? `<div class="device-card__corner-tr device-card__corner-tr--solo"><span class="card-owner-tag" title="Owning admin / \u79DF\u6237">${escapeHtml(String(d.owner_admin))}</span></div>` : "";
       return `<a class="device-card${showOwnerTag ? " device-card--has-owner-tag" : ""}" href="#/devices/${encodeURIComponent(d.device_id)}" style="text-decoration:none;color:inherit">
-        ${ownerCorner}
-        <h3><div class="device-primary-name">${primary}</div>${subId}</h3>
-        <div><span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>
-          ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
-          ${d.fw ? `<span class="chip">v${escapeHtml(d.fw)}</span>` : ""}
-          ${d.is_shared ? `<span class="badge accent" title="shared device">sharing by ${escapeHtml(d.shared_by || "?")}</span>` : ""}
-        </div>
-        <div class="meta">
-          Platform: ${escapeHtml(maskPlatform(`${d.chip_target || ""}/${d.board_profile || ""}`))}<br/>
-          Manufacturer: ESA Sibu<br/>
-          Updated: ${escapeHtml(fmtRel(d.updated_at))}
-        </div>
-      </a>`;
+      ${ownerCorner}
+      <h3><div class="device-primary-name">${primary}</div>${subId}</h3>
+      <div><span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>
+        ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
+        ${d.fw ? `<span class="chip">v${escapeHtml(d.fw)}</span>` : ""}
+        ${d.is_shared ? `<span class="badge accent" title="shared device">sharing by ${escapeHtml(d.shared_by || "?")}</span>` : ""}
+      </div>
+      <div class="meta">
+        Platform: ${escapeHtml(maskPlatform(`${d.chip_target || ""}/${d.board_profile || ""}`))}<br/>
+        Manufacturer: ESA Sibu<br/>
+        Updated: ${escapeHtml(fmtRel(d.updated_at))}
+      </div>
+    </a>`;
     };
     const buildGroupCardHtml = (slot) => {
       const g = slot.groupKey;
@@ -2218,32 +5715,32 @@ ${curFw} \u2192 ${fw}`)) return;
       const ownerPill = slot.tenantOwner ? `<span class="card-owner-tag" title="Owning admin / \u6240\u5C5E\u79DF\u6237">${escapeHtml(slot.tenantOwner)}</span>` : unassignedSuper ? `<span class="card-owner-tag" title="No owner_admin on devices in this card">Unassigned</span>` : "";
       const cornerHtml = hasCorner ? `<div class="device-card__corner-tr" role="group" aria-label="Tenant">${ownerPill}${shareBtn}</div>` : "";
       return `<article class="device-card js-group-card ${hasCorner ? "js-group-card--has-corner " : ""}${selectedGroup === slot.metaKey ? "is-selected" : ""}" data-meta-key="${escapeHtml(slot.metaKey)}" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" style="cursor:pointer;position:relative">
-        ${cornerHtml}
-        <h3><div class="device-primary-name">${escapeHtml(m.display_name || g)}</div><div class="device-id-sub mono">${escapeHtml(g)}</div></h3>
-        <div class="meta" style="margin-bottom:8px">
-          Trigger: <span class="mono">${escapeHtml(modeLabel)}</span> \xB7
-          Duration: <span class="mono">${escapeHtml(String(Math.round((Number(gs.trigger_duration_ms) || DEFAULT_REMOTE_SIREN_MS) / 6e4 * 10) / 10))} min</span> \xB7
-          Reboot+self-check: <span class="mono">${gs.reboot_self_check ? "yes" : "no"}</span>
+      ${cornerHtml}
+      <h3><div class="device-primary-name">${escapeHtml(m.display_name || g)}</div><div class="device-id-sub mono">${escapeHtml(g)}</div></h3>
+      <div class="meta" style="margin-bottom:8px">
+        Trigger: <span class="mono">${escapeHtml(modeLabel)}</span> \xB7
+        Duration: <span class="mono">${escapeHtml(String(Math.round((Number(gs.trigger_duration_ms) || DEFAULT_REMOTE_SIREN_MS) / 6e4 * 10) / 10))} min</span> \xB7
+        Reboot+self-check: <span class="mono">${gs.reboot_self_check ? "yes" : "no"}</span>
+      </div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;align-items:center">
+        <span class="badge neutral">total ${total}</span>
+        <span class="badge online">online ${on}</span>
+        <span class="badge offline">offline ${off}</span>
+        ${scopeShareHtml}
+      </div>
+      <div class="meta">Owner: ${escapeHtml(m.owner_name || "\u2014")} \xB7 ${escapeHtml(m.phone || "\u2014")} \xB7 ${escapeHtml(m.email || "\u2014")}</div>
+      <div class="group-card-actions">
+        <div class="group-card-actions__alarms">
+          <button class="btn sm danger js-alert-on" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button">Alarm ON</button>
+          <button class="btn sm secondary js-alert-off" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button">Alarm OFF</button>
         </div>
-        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;align-items:center">
-          <span class="badge neutral">total ${total}</span>
-          <span class="badge online">online ${on}</span>
-          <span class="badge offline">offline ${off}</span>
-          ${scopeShareHtml}
+        <div class="group-card-actions__manage">
+          <button class="btn sm secondary js-group-settings" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button" ${isSharedGroup ? 'disabled title="Shared group follows owner settings"' : ""}>Settings</button>
+          <button class="btn sm secondary js-edit-group" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button" ${isSharedGroup ? 'disabled title="Shared group: device membership is read-only"' : ""}>Edit</button>
+          <button class="btn sm danger js-del-group" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button" ${isSharedGroup ? 'disabled title="Shared group cannot be deleted"' : 'title="Delete group"'}>Delete</button>
         </div>
-        <div class="meta">Owner: ${escapeHtml(m.owner_name || "\u2014")} \xB7 ${escapeHtml(m.phone || "\u2014")} \xB7 ${escapeHtml(m.email || "\u2014")}</div>
-        <div class="group-card-actions">
-          <div class="group-card-actions__alarms">
-            <button class="btn sm danger js-alert-on" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button">Alarm ON</button>
-            <button class="btn sm secondary js-alert-off" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button">Alarm OFF</button>
-          </div>
-          <div class="group-card-actions__manage">
-            <button class="btn sm secondary js-group-settings" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button" ${isSharedGroup ? 'disabled title="Shared group follows owner settings"' : ""}>Settings</button>
-            <button class="btn sm secondary js-edit-group" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button" ${isSharedGroup ? 'disabled title="Shared group: device membership is read-only"' : ""}>Edit</button>
-            <button class="btn sm danger js-del-group" data-group="${escapeHtml(g)}" data-owner="${escapeHtml(slot.tenantOwner)}" data-meta-key="${escapeHtml(slot.metaKey)}" type="button" ${isSharedGroup ? 'disabled title="Shared group cannot be deleted"' : 'title="Delete group"'}>Delete</button>
-          </div>
-        </div>
-      </article>`;
+      </div>
+    </article>`;
     };
     const renderGroups = () => {
       const slots = collectGroupSlots();
@@ -2520,15 +6017,15 @@ ${curFw} \u2192 ${fw}`)) return;
           const v = it.can_view ? "\u2713" : "\u2014";
           const o = it.can_operate ? "\u2713" : "\u2014";
           return `<tr data-device-id="${did}" data-grantee="${gu}">
-            <td class="mono">${did}</td>
-            <td class="mono">${gu}</td>
-            <td>${v}</td>
-            <td>${o}</td>
-            <td style="white-space:nowrap">
-              <button type="button" class="btn sm secondary js-share-grant-edit">Edit</button>
-              <button type="button" class="btn sm danger js-share-grant-revoke">Revoke</button>
-            </td>
-          </tr>`;
+          <td class="mono">${did}</td>
+          <td class="mono">${gu}</td>
+          <td>${v}</td>
+          <td>${o}</td>
+          <td style="white-space:nowrap">
+            <button type="button" class="btn sm secondary js-share-grant-edit">Edit</button>
+            <button type="button" class="btn sm danger js-share-grant-revoke">Revoke</button>
+          </td>
+        </tr>`;
         }).join("");
         setChildMarkup(wrap, `<div class="table-wrap"><table class="t"><thead><tr><th>Device</th><th>Grantee</th><th>View</th><th>Operate</th><th>Actions</th></tr></thead><tbody>${body}</tbody></table></div>`);
       } catch (e) {
@@ -3012,3729 +6509,6 @@ ${curFw} \u2192 ${fw}`)) return;
       loadOverviewShareGrants();
     }
   });
-  registerRoute("site", async (view, _args, routeSeq) => {
-    setCrumb("Site \xB7 owners & groups / \u7AD9\u70B9");
-    if (!(state.me && state.me.role === "superadmin")) {
-      mountView(view, `<div class="card"><p class="muted">Superadmin only.</p></div>`);
-      return;
-    }
-    let ownerQ = String(window.__routeQuery && window.__routeQuery.get("owner") || "").trim();
-    let allDevs = [];
-    try {
-      const r = await api("/devices", { timeoutMs: 2e4 });
-      if (!isRouteCurrent(routeSeq)) return;
-      allDevs = Array.isArray(r.items) ? r.items.slice() : [];
-    } catch (e) {
-      if (!isRouteCurrent(routeSeq)) return;
-      mountView(view, `<div class="card"><p class="badge offline">${escapeHtml(e.message || e)}</p></div>`);
-      return;
-    }
-    const applyFilter = (list, q) => {
-      const s = String(q || "").trim().toLowerCase();
-      if (!s) return list;
-      return list.filter((d) => String(d.owner_admin || "").toLowerCase().includes(s));
-    };
-    const filtered = () => applyFilter(allDevs, ownerQ);
-    const ownersU = [...new Set(allDevs.map((d) => String(d.owner_admin || "").trim()).filter(Boolean))].sort();
-    const fd = filtered();
-    const slots = buildGroupSlotsFromDeviceList(fd);
-    const rows = fd.map((d) => {
-      const on = isOnline(d);
-      const did = encodeURIComponent(d.device_id);
-      return `<tr><td class="mono"><a href="#/devices/${did}">${escapeHtml(d.device_id)}</a></td><td class="mono">${escapeHtml(d.owner_admin || "\u2014")}</td><td>${escapeHtml(d.notification_group || "\u2014")}</td><td>${escapeHtml(d.zone || "")}</td><td><span class="badge ${on ? "online" : "offline"}">${on ? "on" : "off"}</span></td></tr>`;
-    }).join("");
-    const grpRows = slots.map((s) => {
-      const owq = s.tenantOwner ? `?owner=${encodeURIComponent(s.tenantOwner)}` : "";
-      return `<tr><td class="mono"><a href="#/group/${encodeURIComponent(s.groupKey)}${owq}">${escapeHtml(s.groupKey)}</a></td><td class="mono">${escapeHtml(s.tenantOwner || "\u2014")}</td><td class="mono muted">${escapeHtml(s.metaKey)}</td></tr>`;
-    }).join("");
-    mountView(view, `
-      <section class="card">
-        <h2 class="ui-section-title" style="margin:0">Site / \u7AD9\u70B9</h2>
-        <p class="muted" style="margin:8px 0 0">Search <strong>owner admin</strong> username (substring). Lists devices and <strong>notification groups</strong> under that filter \u2014 same slot keys as Overview group cards.</p>
-        <div class="inline-form" style="margin-top:12px;flex-wrap:wrap;gap:10px;align-items:flex-end">
-          <label class="field grow"><span>Owner contains</span>
-            <input type="search" id="siteOwnerQ" value="${escapeHtml(ownerQ)}" placeholder="e.g. dan" list="siteOwnerDl" autocomplete="off" />
-            <datalist id="siteOwnerDl">${ownersU.map((o) => `<option value="${escapeHtml(o)}"></option>`).join("")}</datalist>
-          </label>
-          <button type="button" class="btn sm secondary btn-tap" id="siteOwnerClear">Clear</button>
-          <button type="button" class="btn btn-tap" id="siteOwnerApply">Apply</button>
-        </div>
-      </section>
-      <section class="card">
-        <h3 style="margin:0 0 8px">Owners in fleet (${ownersU.length})</h3>
-        <p class="muted" style="margin:0;font-size:12px">Unique <span class="mono">owner_admin</span> from API. Click a chip to filter.</p>
-        <div class="row" style="gap:6px;flex-wrap:wrap;margin-top:10px">
-          ${ownersU.map((o) => `<button type="button" class="chip js-site-owner-chip" data-o="${escapeHtml(o)}" style="cursor:pointer">${escapeHtml(o)}</button>`).join("")}
-        </div>
-      </section>
-      <section class="card">
-        <h3 style="margin:0 0 8px">Devices (${fd.length})</h3>
-        <div class="table-wrap"><table class="t">
-          <thead><tr><th>Device</th><th>Owner</th><th>Notification group</th><th>Zone</th><th>Presence</th></tr></thead>
-          <tbody>${rows || `<tr><td colspan="5" class="muted">No devices match.</td></tr>`}</tbody>
-        </table></div>
-      </section>
-      <section class="card">
-        <h3 style="margin:0 0 8px">Groups (${slots.length})</h3>
-        <div class="table-wrap"><table class="t">
-          <thead><tr><th>Group key</th><th>Tenant (slot)</th><th>Card meta-key</th></tr></thead>
-          <tbody>${grpRows || `<tr><td colspan="3" class="muted">No groups in filter.</td></tr>`}</tbody>
-        </table></div>
-      </section>
-    `);
-    $("#siteOwnerApply", view).addEventListener("click", () => {
-      ownerQ = String($("#siteOwnerQ", view)?.value || "").trim();
-      location.hash = ownerQ ? `#/site?owner=${encodeURIComponent(ownerQ)}` : "#/site";
-    });
-    $("#siteOwnerClear", view).addEventListener("click", () => {
-      location.hash = "#/site";
-    });
-    $("#siteOwnerQ", view).addEventListener("keydown", (ev) => {
-      if (ev.key === "Enter") {
-        ev.preventDefault();
-        $("#siteOwnerApply", view).click();
-      }
-    });
-    $$(".js-site-owner-chip", view).forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const o = btn.getAttribute("data-o") || "";
-        location.hash = o ? `#/site?owner=${encodeURIComponent(o)}` : "#/site";
-      });
-    });
-  });
-  registerRoute("group", async (view, args, routeSeq) => {
-    const g = canonicalGroupKey(decodeURIComponent(args[0] || ""));
-    if (!g) {
-      location.hash = "#/overview";
-      return;
-    }
-    const tenantOwner = String(window.__routeQuery && window.__routeQuery.get("owner") || "").trim();
-    const metaKey = groupCardMetaKey(g, tenantOwner);
-    const groupScope = state.me && state.me.username ? state.me.username : "anon";
-    const GROUP_META_LS_KEY = `croc.group.meta.v2.${groupScope}`;
-    const GROUP_SETTINGS_LS_KEY = `croc.group.settings.v1.${groupScope}`;
-    const GROUP_API_CAPS_LS_KEY = `croc.group.api.caps.v2.${groupScope}`;
-    const loadGroupMeta = () => {
-      try {
-        const raw = localStorage.getItem(GROUP_META_LS_KEY);
-        const obj = raw ? JSON.parse(raw) : {};
-        return obj && typeof obj === "object" ? obj : {};
-      } catch {
-        return {};
-      }
-    };
-    const loadGroupSettings = () => {
-      try {
-        const raw = localStorage.getItem(GROUP_SETTINGS_LS_KEY);
-        const obj = raw ? JSON.parse(raw) : {};
-        return obj && typeof obj === "object" ? obj : {};
-      } catch {
-        return {};
-      }
-    };
-    const loadGroupApiCaps = () => {
-      try {
-        const raw = localStorage.getItem(GROUP_API_CAPS_LS_KEY);
-        const obj = raw ? JSON.parse(raw) : {};
-        return {
-          apply: obj && obj.apply === false ? false : true,
-          delete: obj && obj.delete === false ? false : true
-        };
-      } catch {
-        return { apply: true, delete: true };
-      }
-    };
-    const saveGroupApiCaps = (caps) => localStorage.setItem(GROUP_API_CAPS_LS_KEY, JSON.stringify({
-      apply: !!(caps && caps.apply),
-      delete: !!(caps && caps.delete)
-    }));
-    window.__groupDelayTimers = window.__groupDelayTimers || /* @__PURE__ */ new Map();
-    const meta = loadGroupMeta();
-    const gsMap = loadGroupSettings();
-    const groupApiCaps = loadGroupApiCaps();
-    setCrumb(`Group \xB7 ${(meta[metaKey] || meta[g] || {}).display_name || g}`);
-    mountView(view, `
-      <section class="card">
-        <div class="row" style="align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
-          <h2 style="margin:0">${escapeHtml((meta[metaKey] || meta[g] || {}).display_name || g)}</h2>
-          <a href="#/overview" class="btn ghost right">\u2190 Back</a>
-        </div>
-        <p class="muted" style="margin-top:10px">Loading group\u2026</p>
-      </section>`);
-    if (!isRouteCurrent(routeSeq)) return;
-    const [listRes] = await Promise.allSettled([apiGetCached("/devices", { timeoutMs: 16e3 }, 3e3)]);
-    if (!isRouteCurrent(routeSeq)) return;
-    let list = listRes.status === "fulfilled" && listRes.value ? listRes.value : { items: [] };
-    let byId = new Map((list.items || []).map((d) => [String(d.device_id), d]));
-    syncGroupMetaWithDevices(meta, list.items || []);
-    try {
-      localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(meta));
-    } catch (_) {
-    }
-    const gm = meta[metaKey] || meta[g] || { display_name: g, owner_name: "", phone: "", email: "", device_ids: [] };
-    const rowsByGroup = () => (list.items || []).filter((d) => {
-      if (canonicalGroupKey(d.notification_group) !== g) return false;
-      if (state.me && state.me.role === "superadmin" && tenantOwner) {
-        return String(d.owner_admin || "").trim() === tenantOwner;
-      }
-      return true;
-    });
-    let rows = rowsByGroup();
-    let ids = rows.map((d) => String(d.device_id || "")).filter(Boolean);
-    const isSharedGroup = rows.some((d) => !!d.is_shared);
-    const online = rows.filter((d) => isOnline(d)).length;
-    const offline = Math.max(0, rows.length - online);
-    setCrumb(`Group \xB7 ${gm.display_name || g}`);
-    mountView(view, `
-      <section class="card">
-        <div class="row" style="align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap">
-          <h2 style="margin:0;flex:1;min-width:0">${escapeHtml(gm.display_name || g)}</h2>
-          <div class="row" style="gap:8px;align-items:center;flex-shrink:0;margin-left:auto">
-            ${tenantOwner ? `<span class="card-owner-tag" title="Owning admin / \u6240\u5C5E\u79DF\u6237">${escapeHtml(tenantOwner)}</span>` : ""}
-            <a href="#/overview" class="btn ghost right">\u2190 Back</a>
-          </div>
-        </div>
-        <div class="divider"></div>
-        <div class="row" style="gap:6px;flex-wrap:wrap">
-          <span class="badge neutral">total <span id="grpTotal">${rows.length}</span></span>
-          <span class="badge online">online <span id="grpOnline">${online}</span></span>
-          <span class="badge offline">offline <span id="grpOffline">${offline}</span></span>
-          <span class="chip">${escapeHtml(g)}</span>
-        </div>
-        <p class="muted" style="margin-top:8px">Owner: ${escapeHtml(gm.owner_name || "\u2014")} \xB7 ${escapeHtml(gm.phone || "\u2014")} \xB7 ${escapeHtml(gm.email || "\u2014")}</p>
-        <div class="row" style="margin-top:8px;gap:8px;justify-content:flex-end">
-          <button class="btn sm danger" id="grpAlarmOn" ${can("can_alert") ? "" : "disabled"}>Alarm ON</button>
-          <button class="btn sm secondary" id="grpAlarmOff" ${can("can_alert") ? "" : "disabled"}>Alarm OFF</button>
-        </div>
-      </section>
-      <section class="card">
-        <h3 style="margin:0">Devices</h3>
-        <div class="divider"></div>
-        <div class="device-grid" id="groupPageDevices"></div>
-      </section>
-      <details class="card danger-zone device-drawer">
-        <summary class="device-drawer__summary">
-          <span class="device-drawer__title">Danger zone</span>
-          <span class="device-drawer__hint muted">Delete group \xB7 expand</span>
-        </summary>
-        <div class="device-drawer__body">
-          <p class="muted" style="margin:0 0 10px">Delete group will clear notification_group from all devices in this group.</p>
-          <div class="row" style="justify-content:flex-end">
-            <button class="btn danger btn-tap" id="grpDelete" ${isSharedGroup ? 'disabled title="Shared group cannot be deleted"' : ""}>Delete group</button>
-          </div>
-        </div>
-      </details>
-    `);
-    const devGrid = $("#groupPageDevices", view);
-    const renderGroupDevices = () => {
-      if (!devGrid) return;
-      setChildMarkup(
-        devGrid,
-        rows.length ? rows.map((d) => {
-          const on = isOnline(d);
-          const primary = escapeHtml(d.display_label || d.device_id || "unknown");
-          const subId = d.display_label ? `<div class="device-id-sub mono">${escapeHtml(d.device_id || "")}</div>` : "";
-          return `<a class="device-card" href="#/devices/${encodeURIComponent(d.device_id)}" style="text-decoration:none;color:inherit">
-          <h3><div class="device-primary-name">${primary}</div>${subId}</h3>
-          <div><span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>
-            ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
-            ${d.fw ? `<span class="chip">v${escapeHtml(d.fw)}</span>` : ""}
-            ${d.is_shared ? `<span class="badge accent" title="shared device">sharing by ${escapeHtml(d.shared_by || "?")}</span>` : ""}
-          </div>
-          <div class="meta">Platform: ${escapeHtml(maskPlatform(`${d.chip_target || ""}/${d.board_profile || ""}`))}<br/>Manufacturer: ESA Sibu</div>
-        </a>`;
-        }).join("") : `<p class="muted">No devices in this group.</p>`
-      );
-      const onNow = rows.filter((d) => isOnline(d)).length;
-      const offNow = Math.max(0, rows.length - onNow);
-      const tEl = $("#grpTotal", view);
-      const oEl = $("#grpOnline", view);
-      const fEl = $("#grpOffline", view);
-      if (tEl) tEl.textContent = String(rows.length);
-      if (oEl) oEl.textContent = String(onNow);
-      if (fEl) fEl.textContent = String(offNow);
-    };
-    renderGroupDevices();
-    const clearGroupByDevicePatchCompat = async () => {
-      let changed = 0;
-      for (const id of ids) {
-        await api(`/devices/${encodeURIComponent(id)}/profile`, { method: "PATCH", body: { notification_group: "" } });
-        changed += 1;
-      }
-      return { ok: true, changed };
-    };
-    const withOwnerQuery = (path, ownerO) => {
-      const q = groupApiQueryOwner(ownerO);
-      if (!q) return path;
-      const join = path.includes("?") ? "&" : "?";
-      return `${path}${join}${q}`;
-    };
-    const deleteGroupCardCompat = async (groupKey, ownerO) => runGroupDeleteAction({
-      groupKey,
-      ownerAdmin: ownerO,
-      apiCaps: groupApiCaps,
-      saveApiCaps: saveGroupApiCaps,
-      tryDeletePostRoute: async (gk, oa) => {
-        const p = withOwnerQuery(`/group-cards/${encodeURIComponent(gk)}/delete`, oa);
-        try {
-          return await api(p, { method: "POST" });
-        } catch (e) {
-          if (!isGroupRouteMissingError(e)) throw e;
-        }
-        return await api(withOwnerQuery(`/api/group-cards/${encodeURIComponent(gk)}/delete`, oa), { method: "POST" });
-      },
-      tryDeleteRoute: async (gk, oa) => {
-        const p = withOwnerQuery(`/group-cards/${encodeURIComponent(gk)}`, oa);
-        try {
-          return await api(p, { method: "DELETE" });
-        } catch (e) {
-          if (!isGroupRouteMissingError(e)) throw e;
-        }
-        return await api(withOwnerQuery(`/api/group-cards/${encodeURIComponent(gk)}`, oa), { method: "DELETE" });
-      },
-      clearFallback: clearGroupByDevicePatchCompat
-    });
-    const applyGroupSettingsFallbackCompat = async (_groupKey, _ownerO, payload) => {
-      const durationMs = Number(payload.trigger_duration_ms || DEFAULT_REMOTE_SIREN_MS);
-      const tkey = metaKey;
-      const prev = window.__groupDelayTimers.get(tkey);
-      if (prev) {
-        clearTimeout(prev);
-        window.__groupDelayTimers.delete(tkey);
-      }
-      await api("/alerts", { method: "POST", body: { action: "on", duration_ms: durationMs, device_ids: ids } });
-      return { ok: true, fallback: true, device_count: ids.length };
-    };
-    const tryApplyRouteCompat = async (groupKey, ownerO) => {
-      const p = withOwnerQuery(`/group-cards/${encodeURIComponent(groupKey)}/apply`, ownerO);
-      try {
-        return await api(p, { method: "POST" });
-      } catch (e) {
-        if (!isGroupRouteMissingError(e)) throw e;
-      }
-      return await api(withOwnerQuery(`/api/group-cards/${encodeURIComponent(groupKey)}/apply`, ownerO), { method: "POST" });
-    };
-    const sendAlert = async (action) => {
-      if (!can("can_alert")) {
-        toast("No can_alert capability", "err");
-        return;
-      }
-      if (ids.length === 0) {
-        toast("No devices in this group", "warn");
-        return;
-      }
-      if (!confirm(`${action === "on" ? "Open" : "Close"} alarm for ${ids.length} devices in ${g}?`)) return;
-      if (action === "on") {
-        const payload = groupTriggerPayloadFromSettings(gsMap[metaKey] || gsMap[g] || {});
-        await runGroupApplyOnAction({
-          groupKey: g,
-          ownerAdmin: tenantOwner,
-          payload,
-          apiCaps: groupApiCaps,
-          saveApiCaps: saveGroupApiCaps,
-          tryApplyRoute: tryApplyRouteCompat,
-          applyFallback: applyGroupSettingsFallbackCompat
-        });
-      } else {
-        const prev = window.__groupDelayTimers.get(metaKey);
-        if (prev) {
-          clearTimeout(prev);
-          window.__groupDelayTimers.delete(metaKey);
-        }
-        await api("/alerts", { method: "POST", body: { action: "off", duration_ms: DEFAULT_REMOTE_SIREN_MS, device_ids: ids } });
-      }
-      toast(`${action === "on" ? "Alarm ON" : "Alarm OFF"} \xB7 ${ids.length}`, "ok");
-    };
-    const alarmOnBtn = $("#grpAlarmOn", view);
-    const alarmOffBtn = $("#grpAlarmOff", view);
-    const delGroupBtn = $("#grpDelete", view);
-    if (alarmOnBtn) alarmOnBtn.addEventListener("click", () => sendAlert("on"));
-    if (alarmOffBtn) alarmOffBtn.addEventListener("click", () => sendAlert("off"));
-    if (delGroupBtn) {
-      delGroupBtn.addEventListener("click", async () => {
-        if (isSharedGroup) {
-          toast("Shared group cannot be deleted", "err");
-          return;
-        }
-        if (!confirm(`Delete group card "${g}"?`)) return;
-        try {
-          await deleteGroupCardCompat(g, tenantOwner);
-          if (meta[metaKey]) delete meta[metaKey];
-          else if (meta[g]) delete meta[g];
-          localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(meta));
-          toast("Group deleted", "ok");
-          location.hash = "#/overview";
-        } catch (e) {
-          toast(e.message || e, "err");
-        }
-      });
-    }
-    const refreshGroupLive = async () => {
-      if (!isRouteCurrent(routeSeq)) return;
-      const latest = await apiGetCached("/devices", { timeoutMs: 16e3 }, 2e3);
-      if (!isRouteCurrent(routeSeq)) return;
-      list = latest || { items: [] };
-      byId = new Map((list.items || []).map((d) => [String(d.device_id), d]));
-      syncGroupMetaWithDevices(meta, list.items || []);
-      try {
-        localStorage.setItem(GROUP_META_LS_KEY, JSON.stringify(meta));
-      } catch (_) {
-      }
-      rows = rowsByGroup();
-      ids = rows.map((d) => String(d.device_id || "")).filter(Boolean);
-      renderGroupDevices();
-    };
-    scheduleRouteTicker(routeSeq, `group-live-${g}`, refreshGroupLive, 1e4);
-  });
-  registerRoute("devices", async (view, args, routeSeq) => {
-    const id = decodeURIComponent(args[0] || "");
-    if (!id) {
-      setCrumb("All devices");
-      let allItems = [];
-      const hintById = /* @__PURE__ */ new Map();
-      const selectedIds = /* @__PURE__ */ new Set();
-      const filteredItems = () => {
-        const inp = $("#allDevFilter", view);
-        const q = inp ? String(inp.value || "").trim().toLowerCase() : "";
-        return allItems.filter((d2) => {
-          if (!q) return true;
-          const did = String(d2.device_id || "").toLowerCase();
-          const nm = String(d2.display_label || "").toLowerCase();
-          const grp = String(d2.notification_group || "").toLowerCase();
-          const zn = String(d2.zone || "").toLowerCase();
-          return did.includes(q) || nm.includes(q) || grp.includes(q) || zn.includes(q);
-        });
-      };
-      const bulkBarState = () => {
-        const c = selectedIds.size;
-        const stat = $("#bulkSelStat", view);
-        const grpBtn2 = $("#bulkApplyGroup", view);
-        const zoBtn = $("#bulkApplyZone", view);
-        const zcBtn = $("#bulkClearZone", view);
-        const selVisBtn = $("#bulkSelectVisible", view);
-        const clrBtn = $("#bulkClearSel", view);
-        const totalVisible = filteredItems().length;
-        if (stat) stat.textContent = `${c} selected \xB7 ${totalVisible} visible`;
-        const disable = c === 0;
-        if (grpBtn2) grpBtn2.disabled = disable;
-        if (zoBtn) zoBtn.disabled = disable;
-        if (zcBtn) zcBtn.disabled = disable;
-        if (clrBtn) clrBtn.disabled = disable;
-        if (selVisBtn) selVisBtn.disabled = totalVisible === 0;
-      };
-      const deviceListCard = (d2) => {
-        const on = isOnline(d2);
-        const did = String(d2.device_id || "");
-        const checked = selectedIds.has(did);
-        const hasLabel = !!(d2.display_label && String(d2.display_label).trim());
-        const titleHtml = hasLabel ? `<div class="device-card__title-row"><span class="device-primary-name device-card__title-name">${escapeHtml(String(d2.display_label).trim())}</span><span class="device-card__sn mono" title="${escapeHtml(did)}">${escapeHtml(did)}</span></div>` : `<div class="device-card__title-row device-card__title-row--mono"><span class="device-primary-name mono device-card__sn" title="${escapeHtml(did)}">${escapeHtml(did || "unknown")}</span></div>`;
-        const letter = escapeHtml((d2.display_label || d2.device_id || "?").slice(0, 1).toUpperCase());
-        const spLine = d2.status_preview && d2.status_preview.line ? escapeHtml(String(d2.status_preview.line)) : "\u2014";
-        const showOwnerTag = !!(d2.owner_admin && state.me && (state.me.role === "superadmin" || d2.is_shared));
-        const scopeLead = d2.is_shared && d2.shared_by ? `<span class="device-card__meta-k">Shared</span><span class="device-card__meta-scope">${escapeHtml(String(d2.shared_by))}</span><span class="device-card__meta-sep" aria-hidden="true"> \xB7 </span>` : "";
-        const needFw = !!(d2.firmware_hint && d2.firmware_hint.update_available && firmwareHintStillValid(d2.fw, d2.firmware_hint));
-        const fwBlock = d2.fw ? `<div class="device-card__firmware"><span class="device-fw-inline" role="group" aria-label="Firmware"><span class="chip device-fw-chip" title="Reported firmware">v${escapeHtml(d2.fw)}</span>` + (needFw ? `<span class="device-fw-pill" title="Newer build on server / \u670D\u52A1\u5668\u4E0A\u6709\u8F83\u65B0\u7248\u672C">Update / \u6709\u66F4\u65B0</span><button type="button" class="btn sm secondary fw-hint-cta fw-hint-cta--sm js-fw-hint" data-did="${escapeHtml(did)}" title="View update details / \u67E5\u770B\u66F4\u65B0" aria-label="Firmware update">\u66F4\u65B0</button>` : "") + `</span></div>` : "";
-        const listCorner = `<div class="device-card__corner-tr device-card__corner-tr--list-bulk" role="group" aria-label="Selection">` + (showOwnerTag ? `<span class="card-owner-tag" title="Owning admin / \u79DF\u6237">${escapeHtml(String(d2.owner_admin))}</span>` : "") + `<label class="device-card__pick-wrap muted"><input type="checkbox" class="bulk-dev-pick" data-device-id="${escapeHtml(did)}" ${checked ? "checked" : ""} /><span>Pick</span></label></div>`;
-        return `<div class="device-card device-card--row-thumb${showOwnerTag ? " device-card--row-thumb--wide-pad" : ""}" style="position:relative">` + listCorner + `<a href="#/devices/${encodeURIComponent(d2.device_id)}" style="display:flex;gap:10px;text-decoration:none;color:inherit;flex:1;min-width:0"><div class="device-thumb device-thumb--list" aria-hidden="true">${letter}</div><div class="device-card--row-body"><h3 class="device-card__h3">${titleHtml}</h3><div class="device-card__status"><div class="device-card__pills"><span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>` + (d2.zone ? `<span class="chip device-zone-chip">${escapeHtml(d2.zone)}</span>` : "") + (d2.is_shared ? `<span class="badge accent" title="shared device">shared</span>` : "") + `</div>${fwBlock}</div><div class="device-card__meta-compact meta"><div class="device-card__meta-row"><span class="device-card__meta-k">Live</span><span class="device-card__meta-v">${spLine}</span></div><div class="device-card__meta-row">${scopeLead}<span class="device-card__meta-k">Updated</span><span class="device-card__meta-v">${escapeHtml(fmtRel(d2.updated_at))}</span></div></div></div></a></div>`;
-      };
-      const applyFilter = () => {
-        const items = filteredItems();
-        const grid2 = $("#allDevicesGrid", view);
-        if (!grid2) return;
-        try {
-          grid2.classList.remove("device-grid--skeleton");
-          grid2.removeAttribute("aria-busy");
-        } catch (_) {
-        }
-        if (allItems.length === 0) {
-          setChildMarkup(grid2, `<p class="muted" style="padding:8px 0">No devices in your scope.</p>`);
-          bulkBarState();
-          return;
-        }
-        setChildMarkup(
-          grid2,
-          items.length === 0 ? `<p class="muted" style="padding:8px 0">No matches.</p>` : items.map(deviceListCard).join("")
-        );
-        bulkBarState();
-      };
-      const runBulkProfile = async (payload) => {
-        if (!selectedIds.size) {
-          toast("Select at least one device", "err");
-          return;
-        }
-        const ids = Array.from(selectedIds.values());
-        const r = await api("/devices/bulk/profile", {
-          method: "POST",
-          body: Object.assign({ device_ids: ids }, payload || {})
-        });
-        bustDeviceListCaches();
-        toast(`Bulk done \xB7 ${Number(r.count || ids.length)} devices`, "ok");
-        await loadDevicesAndHints();
-      };
-      const mergeFirmwareHintsObject = (raw) => {
-        const o = raw && typeof raw === "object" ? raw : {};
-        hintById.clear();
-        for (const k of Object.keys(o)) hintById.set(k, o[k]);
-        for (const it of allItems) {
-          const k = String(it.device_id);
-          const h = o[k];
-          it.firmware_hint = h && h.update_available && firmwareHintStillValid(it.fw, h) ? h : null;
-        }
-      };
-      const loadDevicesAndHints = async () => {
-        if (!isRouteCurrent(routeSeq)) return;
-        let r;
-        try {
-          r = await api("/devices", { timeoutMs: 2e4, retries: 2 });
-        } catch (e) {
-          if (isRouteCurrent(routeSeq)) toast(String(e && e.message) || "Failed to load devices", "err");
-          return;
-        }
-        if (!isRouteCurrent(routeSeq)) return;
-        allItems = Array.isArray(r.items) ? r.items : [];
-        for (const did of Array.from(selectedIds)) {
-          if (!allItems.some((x) => String(x.device_id) === did)) selectedIds.delete(did);
-        }
-        for (const it of allItems) {
-          it.firmware_hint = null;
-        }
-        applyFilter();
-        try {
-          const hintRes = await api("/devices/firmware-hints", { timeoutMs: 25e3, retries: 0 });
-          if (!isRouteCurrent(routeSeq)) return;
-          mergeFirmwareHintsObject(hintRes && hintRes.hints || {});
-        } catch (_) {
-        }
-        if (isRouteCurrent(routeSeq)) applyFilter();
-      };
-      mountView(view, `
-        <header class="page-head">
-          <h2>All devices</h2>
-          <p class="muted">Thumbnails and quick status. Multi-select for production bulk updates.</p>
-        </header>
-        <div class="card" style="margin:0 0 12px">
-          <div class="inline-form" style="margin-top:4px">
-            <label class="field" style="max-width:min(100%, 360px)">
-              <span>Filter</span>
-              <input type="search" id="allDevFilter" placeholder="id / name / group / zone" autocomplete="off" />
-            </label>
-          </div>
-          <div class="action-bar" style="margin-top:12px">
-            <span class="chip" id="bulkSelStat">0 selected \xB7 0 visible</span>
-            <button class="btn sm secondary" id="bulkSelectVisible" type="button">Select visible</button>
-            <button class="btn sm secondary" id="bulkClearSel" type="button" disabled>Clear selection</button>
-            <details class="toolbar-collapse" style="min-width:260px;flex:1 1 420px">
-              <summary>Bulk actions</summary>
-              <div class="inline-form" style="margin-top:2px">
-                <label class="field">
-                  <span>Bulk group</span>
-                  <input id="bulkGroupValue" maxlength="80" placeholder="empty = clear group" />
-                </label>
-                <button class="btn sm" id="bulkApplyGroup" type="button" disabled>Apply group</button>
-                <label class="field">
-                  <span>Zone override</span>
-                  <input id="bulkZoneValue" maxlength="31" placeholder="e.g. all / Zone-A" />
-                </label>
-                <div class="row" style="gap:8px;justify-content:flex-end;flex-wrap:wrap">
-                  <button class="btn sm" id="bulkApplyZone" type="button" disabled>Apply zone</button>
-                  <button class="btn sm secondary" id="bulkClearZone" type="button" disabled>Clear zone override</button>
-                </div>
-              </div>
-            </details>
-          </div>
-        </div>
-        <div id="allDevicesGrid" class="device-grid device-grid--skeleton" aria-busy="true">
-          ${[1, 2, 3, 4, 5, 6].map(() => `<div class="device-card device-card--skeleton" role="presentation"><div class="device-card--skeleton__thumb"></div><div class="device-card--skeleton__body"><div class="device-card--skeleton__line device-card--skeleton__line--w80"></div><div class="device-card--skeleton__line device-card--skeleton__line--w40"></div><div class="device-card--skeleton__line device-card--skeleton__line--w90"></div></div></div>`).join("")}
-        </div>
-      `);
-      const f = $("#allDevFilter", view);
-      if (f) f.addEventListener("input", () => {
-        applyFilter();
-      });
-      const grid = $("#allDevicesGrid", view);
-      if (grid) {
-        grid.addEventListener("change", (ev) => {
-          const el = ev.target;
-          if (!(el instanceof HTMLInputElement)) return;
-          if (!el.classList.contains("bulk-dev-pick")) return;
-          const did = String(el.dataset.deviceId || "").trim();
-          if (!did) return;
-          if (el.checked) selectedIds.add(did);
-          else selectedIds.delete(did);
-          bulkBarState();
-        });
-      }
-      const selVis = $("#bulkSelectVisible", view);
-      if (selVis) {
-        selVis.addEventListener("click", () => {
-          for (const d2 of filteredItems()) {
-            const did = String(d2.device_id || "").trim();
-            if (did) selectedIds.add(did);
-          }
-          applyFilter();
-        });
-      }
-      const clrSel = $("#bulkClearSel", view);
-      if (clrSel) {
-        clrSel.addEventListener("click", () => {
-          selectedIds.clear();
-          applyFilter();
-        });
-      }
-      const grpBtn = $("#bulkApplyGroup", view);
-      if (grpBtn) {
-        grpBtn.addEventListener("click", async () => {
-          const rawG = String($("#bulkGroupValue", view)?.value || "").trim();
-          const grpVal = rawG ? canonicalGroupKey(rawG) : "";
-          const promptTxt = grpVal ? `Apply group "${grpVal}" to ${selectedIds.size} selected device(s)?` : `Clear group for ${selectedIds.size} selected device(s)?`;
-          if (!confirm(promptTxt)) return;
-          try {
-            await runBulkProfile({ set_notification_group: true, notification_group: grpVal });
-          } catch (e) {
-            toast(e.message || e, "err");
-          }
-        });
-      }
-      const zoneBtn = $("#bulkApplyZone", view);
-      if (zoneBtn) {
-        zoneBtn.addEventListener("click", async () => {
-          const z = String($("#bulkZoneValue", view)?.value || "").trim();
-          if (!z) {
-            toast("Enter zone value", "err");
-            return;
-          }
-          if (!confirm(`Apply zone override "${z}" to ${selectedIds.size} selected device(s)?`)) return;
-          try {
-            await runBulkProfile({ set_zone_override: true, zone_override: z });
-          } catch (e) {
-            toast(e.message || e, "err");
-          }
-        });
-      }
-      const clrZoneBtn = $("#bulkClearZone", view);
-      if (clrZoneBtn) {
-        clrZoneBtn.addEventListener("click", async () => {
-          if (!confirm(`Clear zone override for ${selectedIds.size} selected device(s)?`)) return;
-          try {
-            await runBulkProfile({ clear_zone_override: true });
-          } catch (e) {
-            toast(e.message || e, "err");
-          }
-        });
-      }
-      view.addEventListener("click", (ev) => {
-        const t = ev.target && ev.target.closest && ev.target.closest(".js-fw-hint");
-        if (!t) return;
-        ev.preventDefault();
-        ev.stopPropagation();
-        const did0 = t.getAttribute("data-did");
-        const h = did0 && hintById.get(did0);
-        const row = did0 ? allItems.find((x) => String(x.device_id) === String(did0)) : null;
-        if (h) {
-          openGlobalFwHintDialog(h, {
-            currentFw: row && row.fw != null ? String(row.fw) : "",
-            deviceId: String(did0 || ""),
-            canOperateThisDevice: void 0
-          });
-        }
-      });
-      requestAnimationFrame(() => {
-        setTimeout(() => {
-          void loadDevicesAndHints();
-        }, 0);
-      });
-      scheduleRouteTicker(routeSeq, "devices-list-live", loadDevicesAndHints, 22e3);
-      return;
-    }
-    const isSuperViewer = !!(state.me && state.me.role === "superadmin");
-    let d = await api(`/devices/${encodeURIComponent(id)}`);
-    const canOperateThisDevice = !!(d.can_operate ?? (state.me && (state.me.role === "superadmin" || state.me.role === "admin")));
-    window.__devicePollLocks = window.__devicePollLocks || /* @__PURE__ */ new Map();
-    const runPollDedup = (key, worker) => {
-      const k = String(key || "");
-      if (!k) return worker();
-      const locks = window.__devicePollLocks;
-      if (locks.has(k)) return locks.get(k);
-      const p = (async () => {
-        try {
-          return await worker();
-        } finally {
-          if (locks.get(k) === p) locks.delete(k);
-        }
-      })();
-      locks.set(k, p);
-      return p;
-    };
-    setCrumb(d.display_label ? `Device \xB7 ${d.display_label}` : `Device \xB7 ${id}`);
-    const bps = (v) => {
-      v = Number(v || 0);
-      if (v < 1024) return v.toFixed(0) + " B/s";
-      if (v < 1024 * 1024) return (v / 1024).toFixed(1) + " KB/s";
-      return (v / 1024 / 1024).toFixed(2) + " MB/s";
-    };
-    const reasonEn = {
-      none: "OK",
-      power_low: "Power low",
-      network_lost: "Network lost",
-      signal_weak: "Weak signal"
-    };
-    const deviceLiveModel = (dev) => {
-      const on = isOnline(dev);
-      const s = dev.last_status_json || {};
-      const reason = s.disconnect_reason || (on ? "none" : "network_lost");
-      const outV = s.vbat == null || s.vbat < 0 ? "\u2014" : `${Number(s.vbat).toFixed(2)} V`;
-      const rssi = s.rssi == null || s.rssi === -127 ? "\u2014" : `${s.rssi} dBm`;
-      const netT = String(s.net_type || dev.net_type || "");
-      const wifiSsidDd = netT === "wifi" ? s.wifi_ssid != null && String(s.wifi_ssid).length > 0 ? escapeHtml(String(s.wifi_ssid)) : `<span class="muted">Not associated</span>` : `<span class="muted">N/A (${escapeHtml(netT || "\u2014")})</span>`;
-      const wifiChDd = netT === "wifi" && s.wifi_channel != null && Number(s.wifi_channel) > 0 ? escapeHtml(String(s.wifi_channel)) : "\u2014";
-      return { on, s, reason, outV, rssi, wifiSsidDd, wifiChDd };
-    };
-    const dm = deviceLiveModel(d);
-    const rawCommandDrawer = state.me && state.me.role === "superadmin" ? `
-      <details class="card device-drawer">
-        <summary class="device-drawer__summary">
-          <span class="device-drawer__title">Raw command</span>
-          <span class="device-drawer__hint muted">Superadmin \xB7 manual MQTT cmd</span>
-        </summary>
-        <div class="device-drawer__body">
-          <label class="field"><span>cmd</span><input id="cmdName" placeholder="get_info / ota" ${can("can_send_command") ? "" : "disabled"} /></label>
-          <label class="field" style="margin-top:8px"><span>params (JSON)</span><textarea id="cmdParams" placeholder='{"key":"value"}' ${can("can_send_command") ? "" : "disabled"}></textarea></label>
-          <div class="row" style="margin-top:8px;justify-content:flex-end">
-            <button class="btn" id="sendCmd" ${can("can_send_command") ? "" : "disabled"}>Send</button>
-          </div>
-        </div>
-      </details>` : "";
-    const canUseSharePanel = !!(state.me && (state.me.role === "superadmin" || state.me.role === "admin" && can("can_manage_users")) && (!d.is_shared || state.me.role === "superadmin"));
-    const sharePanel = canUseSharePanel ? `
-      <details class="card device-drawer" id="sharePanel">
-        <summary class="device-drawer__summary">
-          <span class="device-drawer__title">Sharing</span>
-          <span class="device-drawer__hint muted">Grant / revoke \xB7 expand</span>
-        </summary>
-        <div class="device-drawer__body">
-          <div class="row" style="justify-content:flex-end;margin-bottom:8px">
-            <button class="btn secondary btn-tap sm" type="button" id="shareRefresh">Refresh</button>
-          </div>
-          <p class="muted" style="margin:0 0 10px">Grant or revoke per-account access (admin: your users only).</p>
-          <div class="inline-form" style="margin-top:4px">
-            <label class="field grow"><span>Grantee username</span>
-              <input id="shareUser" placeholder="admin_x or user_x" />
-            </label>
-            <label class="field"><span>View</span>
-              <input id="shareCanView" type="checkbox" checked />
-            </label>
-            <label class="field"><span>Operate</span>
-              <input id="shareCanOperate" type="checkbox" />
-            </label>
-            <div class="row wide" style="justify-content:flex-end">
-              <button class="btn btn-tap" id="shareGrant">Grant / Update</button>
-            </div>
-          </div>
-          <div id="shareList" style="margin-top:12px"></div>
-        </div>
-      </details>
-    ` : "";
-    const renderMsgFeed = (items) => {
-      const msgItems = Array.isArray(items) ? items : [];
-      if (msgItems.length === 0) return `<p class="muted audit-empty">No messages.</p>`;
-      return `<div class="audit-feed">${msgItems.map((m) => {
-        const plRows = messagePayloadRows(m.payload || {});
-        const extra = plRows.length ? `<div class="audit-extra">${plRows.map(
-          (row) => `<div class="audit-extra-row"><span class="audit-k">${escapeHtml(row.k)}</span><span class="audit-v mono">${escapeHtml(row.v)}</span></div>`
-        ).join("")}</div>` : "";
-        return `<article class="audit-item">
-          <div class="audit-item-top">
-            <div class="audit-time">
-              <span class="audit-ts mono">${escapeHtml(fmtTs(m.ts_received))}</span>
-              <span class="muted audit-rel">${escapeHtml(fmtRel(m.ts_received))}</span>
-            </div>
-            <span class="chip">${escapeHtml(m.channel || "\u2014")}</span>
-          </div>
-          ${extra}
-        </article>`;
-      }).join("")}</div>`;
-    };
-    const mqttMsgPanel = isSuperViewer ? `
-      <div class="card">
-        <details id="mqttMsgDetails">
-          <summary style="cursor:pointer;font-weight:600">MQTT debug messages (latest 25)</summary>
-          <p class="muted" style="margin:8px 0 0">Debug-only raw device uplink snapshots. Hidden by default to keep the page clean.</p>
-          <div class="divider"></div>
-          <div class="audit-feed-wrap" id="devMsgsList"><p class="muted">Expand to load\u2026</p></div>
-        </details>
-      </div>` : "";
-    mountView(view, `
-      <nav class="device-page-back-nav" aria-label="Device navigation">
-        <a href="#/devices" class="btn secondary sm btn-tap device-page-back">\u2190 Back</a>
-      </nav>
-      <div class="card device-focus-layout">
-        <div class="device-focus-left">
-          <div class="row" style="align-items:flex-start;flex-wrap:wrap;gap:10px">
-            <div class="device-page-head" style="flex:1;min-width:0">
-              <div class="device-primary-name">${escapeHtml(d.display_label || id)}</div>
-              ${d.display_label ? `<div class="device-id-sub mono">${escapeHtml(id)}</div>` : ""}
-            </div>
-            <span class="badge ${dm.on ? "online" : "offline"}" id="devOnlineBadge">${dm.on ? "online" : "offline"}</span>
-            <span class="chip" id="devReasonChip">${escapeHtml(reasonEn[dm.reason] || dm.reason)}</span>
-            ${d.zone ? `<span class="chip">${escapeHtml(d.zone)}</span>` : ""}
-          </div>
-          <div class="device-hero-card">
-            <div class="device-thumb">${escapeHtml((d.display_label || id || "?").slice(0, 1).toUpperCase())}</div>
-            <div class="device-hero-meta">
-              <div class="device-hero-line device-hero-line--fw">
-                <span class="muted">Firmware</span>
-                <div class="device-hero-fw">
-                  <span class="mono" id="devFwVer">${escapeHtml(d.fw || "\u2014")}</span>
-                  <span class="device-fw-state" id="devFwStatus" aria-live="polite">\u2014</span>
-                  <button type="button" class="btn sm secondary fw-hint-cta" id="devFwHintBtn" style="display:${d.firmware_hint && d.firmware_hint.update_available && firmwareHintStillValid(d.fw, d.firmware_hint) ? "inline-flex" : "none"}" title="New firmware on server / \u670D\u52A1\u5668\u6709\u65B0\u56FA\u4EF6">\u66F4\u65B0</button>
-                </div>
-              </div>
-              <div class="device-hero-line"><span class="muted">Platform</span><span class="mono">${escapeHtml(maskPlatform(`${d.chip_target || ""}/${d.board_profile || ""}`))}</span></div>
-              <div class="device-hero-line"><span class="muted">Network</span><span class="mono" id="devNetRow">${escapeHtml(d.net_type || "\u2014")} \xB7 ${escapeHtml(dm.s.ip || "\u2014")}</span></div>
-              <div class="device-hero-line"><span class="muted">Wi\u2011Fi</span><span id="devWifiSsid">${dm.wifiSsidDd}</span></div>
-              <div class="device-hero-line"><span class="muted">Output V</span><span class="mono" id="devOutV">${escapeHtml(dm.outV)}</span></div>
-              <div class="device-hero-line"><span class="muted">Tx / Rx</span><span class="mono" id="devTxRx">${escapeHtml(bps(dm.s.tx_bps))} / ${escapeHtml(bps(dm.s.rx_bps))}</span></div>
-              <div class="device-hero-line"><span class="muted">RSSI</span><span class="mono" id="devRssi">${escapeHtml(dm.rssi)}</span></div>
-              <div class="device-hero-line"><span class="muted">Wi\u2011Fi CH</span><span class="mono" id="devWifiCh">${dm.wifiChDd}</span></div>
-              <div class="device-hero-line"><span class="muted">Uptime</span><span class="mono" id="devUptime">${escapeHtml(dm.s.uptime_s ? `${Math.floor(dm.s.uptime_s / 3600)}h ${Math.floor(dm.s.uptime_s % 3600 / 60)}m` : "\u2014")}</span></div>
-              <div class="device-hero-line"><span class="muted">Heap</span><span class="mono" id="devHeap">${escapeHtml(dm.s.free_heap ? `${dm.s.free_heap} B (min ${dm.s.min_free_heap || "?"} B)` : "\u2014")}</span></div>
-              <div class="device-hero-line"><span class="muted">Disconnect</span><span class="mono" id="devDisconnect">${escapeHtml(dm.reason)}</span></div>
-              <div class="device-hero-line"><span class="muted">Updated</span><span id="devUpdated">${escapeHtml(fmtTs(d.updated_at))} (${escapeHtml(fmtRel(d.updated_at))})</span></div>
-            </div>
-          </div>
-        </div>
-        <aside class="device-focus-right">
-          <div class="card" style="margin:0">
-            <h3 style="margin:0 0 8px">Ownership</h3>
-            <p class="muted" style="margin:0 0 8px">Current account binding for this device.</p>
-            <div class="device-owner-kv">
-              <div><span class="muted">Account</span><span class="mono">${escapeHtml(d.owner_admin || d.shared_by || "\u2014")}</span></div>
-              <div><span class="muted">Email</span><span class="mono">${escapeHtml(d.owner_email || "\u2014")}</span></div>
-              <div><span class="muted">Shared</span><span class="mono">${d.is_shared ? `yes \xB7 by ${escapeHtml(d.shared_by || "?")}` : "no"}</span></div>
-            </div>
-          </div>
-          <div class="card" style="margin:12px 0 0">
-            <h3 style="margin:0 0 8px;font-size:13px;color:var(--text-muted)">Notifications</h3>
-            ${d.is_shared ? `<p class="muted" style="margin:0 0 8px">Device share is <strong>device-scoped</strong> only. You cannot see or edit the owner&rsquo;s notification group; use your own tenant group cards or single-device actions.</p>` : ""}
-            <div class="row" style="gap:10px;align-items:flex-end;flex-wrap:wrap">
-              <label class="field grow"><span>Display name</span>
-                <input id="dispLabel" value="${escapeHtml(d.display_label || "")}" maxlength="80" />
-              </label>
-              <label class="field grow"><span>Notification group</span>
-                <input id="notifGroup" value="${escapeHtml(d.notification_group || "")}" maxlength="80" placeholder="e.g. Warehouse A" ${d.is_shared ? 'disabled title="Owner tenant only"' : ""} />
-              </label>
-              <button class="btn secondary btn-tap" type="button" id="saveProfile">Save</button>
-            </div>
-          </div>
-        </aside>
-      </div>
-
-      <div class="split device-quick-split">
-        <div class="card">
-          <h3>Quick actions</h3>
-          ${d.is_shared ? `<p class="muted" style="margin:0 0 8px">Shared by <span class="mono">${escapeHtml(d.shared_by || "?")}</span>. Delete/Revoke actions are disabled for shared devices.</p>` : ""}
-          <div class="row">
-            <button class="btn" id="alertOn" ${can("can_alert") ? "" : "disabled"}>Siren ON</button>
-            <button class="btn secondary" id="alertOff" ${can("can_alert") ? "" : "disabled"}>Siren OFF</button>
-            <button class="btn secondary" id="selfTest" ${can("can_send_command") && canOperateThisDevice ? "" : "disabled"}>Self-test</button>
-          </div>
-          <div class="row" style="margin-top:10px">
-            <input id="rebootDelay" placeholder="Delay seconds (e.g. 30)" style="max-width:200px" />
-            <button class="btn secondary" id="doReboot" ${can("can_send_command") && canOperateThisDevice ? "" : "disabled"}>Schedule reboot</button>
-          </div>
-          <div class="row" style="margin-top:14px">
-            <button class="btn secondary" id="unrevoke" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Unrevoke</button>
-          </div>
-        </div>
-      </div>
-      ${sharePanel}
-
-      <details class="card device-drawer" id="wifiCtlCard">
-        <summary class="device-drawer__summary">
-          <span class="device-drawer__title">Wi\u2011Fi (device)</span>
-          <span class="device-drawer__hint muted">Provision \xB7 NVS \xB7 expand</span>
-        </summary>
-        <div class="device-drawer__body">
-          <p class="muted" style="margin:0 0 10px">Credentials are written to device NVS, then the board reboots. Optional <strong>follow\u2011up commands</strong> are stored in NVS and run <strong>in order</strong> after Wi\u2011Fi + MQTT reconnect \u2014 no second dashboard click (safe cmds only: get_info, ping, self_test, set_param).</p>
-          ${can("can_send_command") && canOperateThisDevice ? `
-          <div class="inline-form" style="margin-top:4px">
-            <label class="field grow"><span>New SSID</span><input id="wifiNewSsid" maxlength="32" autocomplete="off" placeholder="2.4 GHz network name" /></label>
-            <label class="field grow"><span>Password</span><input id="wifiNewPass" type="password" maxlength="64" autocomplete="new-password" placeholder="empty if open network" /></label>
-            <div class="field" style="margin-top:10px">
-              <span>After reconnect (stored on device, sequential)</span>
-              <div class="row" style="gap:14px;flex-wrap:wrap;margin-top:6px">
-                <label><input type="checkbox" id="wifiChainGetInfo" checked /> <span class="mono">get_info</span> (status)</label>
-                <label><input type="checkbox" id="wifiChainPing" checked /> <span class="mono">ping</span></label>
-                <label><input type="checkbox" id="wifiChainSelfTest" /> <span class="mono">self_test</span></label>
-              </div>
-            </div>
-            <div class="row wide" style="justify-content:flex-end;flex-wrap:wrap;gap:8px">
-              <button class="btn btn-tap" type="button" id="wifiApplyBtn">Start provision task</button>
-            </div>
-          </div>
-          <div style="margin-top:8px">
-            <progress id="wifiTaskProgress" value="0" max="100" style="width:100%;height:12px"></progress>
-          </div>
-          <p class="muted" id="wifiScanStatus" style="margin-top:8px;min-height:1.3em"></p>` : `<p class="muted">Requires <span class="mono">can_send_command</span> and <strong>operate</strong> access on this device (tenant owner, admin, or shared grant with Operate).</p>`}
-        </div>
-      </details>
-
-      <details class="card danger-zone danger-zone--compact device-drawer">
-        <summary class="device-drawer__summary">
-          <span class="device-drawer__title">Danger zone</span>
-          <span class="device-drawer__hint muted">Unbind &amp; reset</span>
-        </summary>
-        <div class="device-drawer__body danger-zone-body">
-          <p class="muted danger-zone-compact-lead">Removes this device from your tenant and sends <span class="mono">unclaim_reset</span> when online. Re-add from Activate.</p>
-          <div class="danger-zone-single-action">
-            <button class="btn danger sm danger-zone-unbind-btn" type="button" id="deleteReset" ${can("can_send_command") && !d.is_shared ? "" : "disabled"}>Unbind &amp; reset</button>
-          </div>
-        </div>
-      </details>
-
-      ${d.is_shared ? `
-      <details class="card device-drawer" id="triggerPolicyCard">
-        <summary class="device-drawer__summary">
-          <span class="device-drawer__title">Trigger policy</span>
-          <span class="device-drawer__hint muted">Owner tenant only</span>
-        </summary>
-        <div class="device-drawer__body">
-          <p class="muted" style="margin:0">Sibling / group trigger policy is managed by the <strong>owning tenant</strong> only. Device share does not expose group policy.</p>
-        </div>
-      </details>` : `
-      <details class="card device-drawer" id="triggerPolicyCard">
-        <summary class="device-drawer__summary">
-          <span class="device-drawer__title">Trigger policy</span>
-          <span class="device-drawer__hint muted">Server \xB7 group scope \xB7 expand</span>
-        </summary>
-        <div class="device-drawer__body">
-          <p class="muted" style="margin:0 0 10px">Scope: owner account + group <span class="mono">${escapeHtml(d.notification_group || "(default)")}</span>. Siblings = same tenant + same <span class="mono">notification_group</span> (server normalizes spacing/case). Remote #1 = silent; #2 = loud to siblings; panic = local + optional sibling siren.</p>
-          ${can("can_send_command") && canOperateThisDevice ? `
-          <div class="inline-form" style="margin-top:4px;gap:12px;flex-wrap:wrap;align-items:flex-end">
-            <label class="field"><span>Panic local</span><input type="checkbox" id="tpPanicLocal" title="Sound on device that pressed panic" /></label>
-            <label class="field"><span>Panic \u2192 siblings</span><input type="checkbox" id="tpPanicLink" title="MQTT siren to same-group devices" /></label>
-            <label class="field"><span>Remote silent link</span><input type="checkbox" id="tpSilentLink" /></label>
-            <label class="field"><span>Remote loud link</span><input type="checkbox" id="tpLoudLink" /></label>
-            <label class="field"><span>Exclude self</span><input type="checkbox" id="tpExcludeSelf" /></label>
-            <label class="field"><span>Loud (min)</span><input id="tpLoudMin" type="number" min="0.5" max="5" step="0.5" value="3" title="Remote / #2 sibling siren length" /></label>
-            <label class="field"><span>Panic sibling (min)</span><input id="tpPanicMin" type="number" min="0.5" max="10" step="0.5" value="5" title="Panic MQTT sibling siren length" /></label>
-            <div class="row wide" style="justify-content:flex-end;flex-basis:100%">
-              <button class="btn secondary btn-tap" type="button" id="tpRefresh">Refresh</button>
-              <button class="btn btn-tap" type="button" id="tpSave">Save</button>
-            </div>
-          </div>
-          <p class="muted" id="tpStatus" style="margin-top:8px;min-height:1.3em"></p>` : `<p class="muted">Requires <span class="mono">can_send_command</span> and <strong>operate</strong> access on this device.</p>`}
-        </div>
-      </details>`}
-
-      ${rawCommandDrawer}
-
-      ${mqttMsgPanel}`);
-    const patchDeviceLive = (dev) => {
-      const m = deviceLiveModel(dev);
-      const onlineBadge = $("#devOnlineBadge", view);
-      if (onlineBadge) {
-        onlineBadge.textContent = m.on ? "online" : "offline";
-        onlineBadge.className = `badge ${m.on ? "online" : "offline"}`;
-      }
-      const reasonChip = $("#devReasonChip", view);
-      if (reasonChip) reasonChip.textContent = String(reasonEn[m.reason] || m.reason);
-      const setText = (idSel, txt) => {
-        const el = $(idSel, view);
-        if (el) el.textContent = String(txt);
-      };
-      const setHtml = (idSel, txt) => {
-        const el = $(idSel, view);
-        if (el) setChildMarkup(el, String(txt));
-      };
-      setText("#devNetRow", `${dev.net_type || "\u2014"} \xB7 ${m.s.ip || "\u2014"}`);
-      setHtml("#devWifiSsid", m.wifiSsidDd);
-      setHtml("#devWifiCh", m.wifiChDd);
-      setText("#devRssi", m.rssi);
-      setText("#devOutV", m.outV);
-      setText("#devTxRx", `${bps(m.s.tx_bps)} / ${bps(m.s.rx_bps)}`);
-      setText("#devDisconnect", m.reason);
-      setText("#devUptime", m.s.uptime_s ? `${Math.floor(m.s.uptime_s / 3600)}h ${Math.floor(m.s.uptime_s % 3600 / 60)}m` : "\u2014");
-      setText("#devHeap", m.s.free_heap ? `${m.s.free_heap} B (min ${m.s.min_free_heap || "?"} B)` : "\u2014");
-      setText("#devUpdated", `${fmtTs(dev.updated_at)} (${fmtRel(dev.updated_at)})`);
-      syncDevicePageFirmwareHint(view, dev, id);
-    };
-    patchDeviceLive(d);
-    scheduleRouteTicker(routeSeq, `device-live-${id}`, async () => {
-      if (!isRouteCurrent(routeSeq)) return;
-      const latest = await apiGetCached(`/devices/${encodeURIComponent(id)}`, { timeoutMs: 16e3 }, 5e3);
-      if (!isRouteCurrent(routeSeq) || !latest) return;
-      d = latest;
-      patchDeviceLive(latest);
-    }, 12e3);
-    if (isSuperViewer) {
-      const det = $("#mqttMsgDetails", view);
-      const box = $("#devMsgsList", view);
-      let loaded = false;
-      const loadDebugMsgs = async () => {
-        if (loaded || !box) return;
-        loaded = true;
-        setChildMarkup(box, `<p class="muted">Loading\u2026</p>`);
-        try {
-          const msgs = await api(`/devices/${encodeURIComponent(id)}/messages?limit=25`, { timeoutMs: 16e3 });
-          setChildMarkup(box, renderMsgFeed(msgs.items || []));
-        } catch (e) {
-          setChildMarkup(box, `<p class="badge offline">${escapeHtml(e.message || e)}</p>`);
-        }
-      };
-      if (det) {
-        det.addEventListener("toggle", () => {
-          if (det.open) loadDebugMsgs();
-        });
-      }
-    }
-    $("#saveProfile").addEventListener("click", async () => {
-      try {
-        const body = { display_label: ($("#dispLabel").value || "").trim() };
-        if (!d.is_shared) {
-          body.notification_group = canonicalGroupKey($("#notifGroup") && $("#notifGroup").value || "");
-        }
-        await api(`/devices/${encodeURIComponent(id)}/profile`, {
-          method: "PATCH",
-          body
-        });
-        if (!d.is_shared) {
-          reconcileGroupMetaForDevice(id, body.notification_group || "", d.owner_admin);
-        }
-        toast("Saved", "ok");
-      } catch (e) {
-        toast(e.message || e, "err");
-      }
-    });
-    const withDev = (fn) => async () => {
-      try {
-        await fn();
-        toast("Sent", "ok");
-      } catch (e) {
-        toast(e.message || e, "err");
-      }
-    };
-    $("#alertOn").addEventListener("click", withDev(() => api(`/devices/${encodeURIComponent(id)}/alert/on?duration_ms=${DEFAULT_REMOTE_SIREN_MS}`, { method: "POST" })));
-    $("#alertOff").addEventListener("click", withDev(() => api(`/devices/${encodeURIComponent(id)}/alert/off`, { method: "POST" })));
-    $("#selfTest").addEventListener("click", withDev(() => api(`/devices/${encodeURIComponent(id)}/self-test`, { method: "POST" })));
-    $("#doReboot").addEventListener("click", withDev(() => {
-      const v = parseInt($("#rebootDelay").value, 10);
-      if (!Number.isFinite(v) || v < 5) throw new Error("delay must be >= 5 seconds");
-      return api(`/devices/${encodeURIComponent(id)}/schedule-reboot`, { method: "POST", body: { delay_s: v } });
-    }));
-    $("#unrevoke").addEventListener("click", withDev(async () => {
-      await api(`/devices/${encodeURIComponent(id)}/unrevoke`, { method: "POST" });
-      bustDeviceListCaches();
-    }));
-    const deleteResetBtn = $("#deleteReset", view);
-    if (deleteResetBtn) {
-      deleteResetBtn.addEventListener("click", async () => {
-        if (!confirm("Delete this device from current account records? You can re-add and reconfigure later.")) return;
-        const typed = String(prompt(`Type device ID to confirm delete/reset:
-${id}`) || "").trim();
-        if (typed.toUpperCase() !== String(id).toUpperCase()) {
-          toast("Confirmation mismatch", "err");
-          return;
-        }
-        try {
-          const dr = await api(`/devices/${encodeURIComponent(id)}/delete-reset`, {
-            method: "POST",
-            body: { confirm_text: typed }
-          });
-          removeDeviceIdFromAllGroupMeta(id);
-          bustDeviceListCaches();
-          const sentNv = dr && dr.nvs_purge_sent === true;
-          const ackNv = dr && dr.nvs_purge_acked === true;
-          toast(
-            `Device removed from account.${ackNv ? " Device confirmed unclaim_reset (WiFi+claim cleared, rebooting)." : sentNv ? " Command was dispatched but device ack not confirmed before unlink." : " Command dispatch failed/offline."} Re-add from Activate.`,
-            ackNv ? "ok" : "err"
-          );
-          location.hash = "#/devices";
-        } catch (e) {
-          toast(e.message || e, "err");
-        }
-      });
-    }
-    const sendCmdBtn = $("#sendCmd");
-    if (sendCmdBtn) {
-      sendCmdBtn.addEventListener("click", async () => {
-        const name = ($("#cmdName").value || "").trim();
-        if (!name) {
-          toast("Enter cmd", "err");
-          return;
-        }
-        let params = {};
-        const raw = ($("#cmdParams").value || "").trim();
-        if (raw) {
-          try {
-            params = JSON.parse(raw);
-          } catch {
-            toast("Invalid JSON in params", "err");
-            return;
-          }
-        }
-        try {
-          await api(`/devices/${encodeURIComponent(id)}/commands`, { method: "POST", body: { cmd: name, params } });
-          toast("Command sent", "ok");
-        } catch (e) {
-          toast(e.message || e, "err");
-        }
-      });
-    }
-    const wifiApplyBtn = $("#wifiApplyBtn");
-    try {
-      const rawPf = sessionStorage.getItem("croc.deviceWifiPrefill.v1");
-      if (rawPf) {
-        const pf = JSON.parse(rawPf);
-        const match = pf && String(pf.device_id || "").toUpperCase() === String(id).toUpperCase();
-        if (match && pf.ssid) {
-          const wS = $("#wifiNewSsid", view);
-          const wP = $("#wifiNewPass", view);
-          const card = $("#wifiCtlCard", view);
-          if (wS) wS.value = String(pf.ssid);
-          if (wP) wP.value = String(pf.password || "");
-          sessionStorage.removeItem("croc.deviceWifiPrefill.v1");
-          if (card) card.open = true;
-          toast("Prefilled Wi\u2011Fi from Activate page \u2014 start provision below when the device is online.", "ok");
-        }
-      }
-    } catch (_) {
-    }
-    const wifiTaskProgress = $("#wifiTaskProgress");
-    const setWifiProgress = (n) => {
-      if (!wifiTaskProgress) return;
-      const v = Math.max(0, Math.min(100, Number(n || 0)));
-      wifiTaskProgress.value = v;
-    };
-    const pollWifiTask = async (taskId) => runPollDedup(`wifi-task:${id}:${String(taskId || "")}`, async () => {
-      const st = $("#wifiScanStatus");
-      for (let i = 0; i < 120; i++) {
-        await new Promise((r) => setTimeout(r, 1e3));
-        try {
-          const t = await api(`/devices/${encodeURIComponent(id)}/provision/wifi-task/${encodeURIComponent(taskId)}`, { timeoutMs: 16e3 });
-          setWifiProgress(t.progress || 0);
-          if (st) st.textContent = String(t.message || t.status || "");
-          if (t.status === "success") {
-            toast("Provision success", "ok");
-            return;
-          }
-          if (t.status === "failed") {
-            toast(t.message || "Provision failed", "err");
-            return;
-          }
-        } catch (e) {
-          if (st) st.textContent = String(e.message || e);
-        }
-      }
-      if (st) st.textContent = "Timed out waiting task result";
-      toast("Provision task timeout", "err");
-    });
-    if (wifiApplyBtn) {
-      wifiApplyBtn.addEventListener("click", async () => {
-        const ssid = ($("#wifiNewSsid", view).value || "").trim();
-        const password = $("#wifiNewPass", view).value || "";
-        const st = $("#wifiScanStatus", view);
-        if (!ssid) {
-          toast("Enter SSID", "err");
-          return;
-        }
-        if (!confirm("Save Wi\u2011Fi on device and reboot? You may lose contact until it joins the new network.")) return;
-        try {
-          wifiApplyBtn.disabled = true;
-          setWifiProgress(10);
-          if (st) st.textContent = "Creating provision task\u2026";
-          const chain = [];
-          const cGi = $("#wifiChainGetInfo", view);
-          const cPi = $("#wifiChainPing", view);
-          const cSt = $("#wifiChainSelfTest", view);
-          if (cGi && cGi.checked) chain.push({ cmd: "get_info", params: {} });
-          if (cPi && cPi.checked) chain.push({ cmd: "ping", params: {} });
-          if (cSt && cSt.checked) chain.push({ cmd: "self_test", params: {} });
-          const body = { ssid, password };
-          if (chain.length) body.chain = chain;
-          const r = await api(`/devices/${encodeURIComponent(id)}/provision/wifi-task`, {
-            method: "POST",
-            body
-          });
-          setWifiProgress(r.progress || 35);
-          if (st) st.textContent = `Task ${r.task_id} running\u2026`;
-          await pollWifiTask(r.task_id);
-        } catch (e) {
-          toast(e.message || e, "err");
-          if (st) st.textContent = String(e.message || e);
-        } finally {
-          wifiApplyBtn.disabled = false;
-        }
-      });
-    }
-    const tpPanicLocal = $("#tpPanicLocal");
-    const tpPanicLink = $("#tpPanicLink");
-    const tpSilentLink = $("#tpSilentLink");
-    const tpLoudLink = $("#tpLoudLink");
-    const tpExcludeSelf = $("#tpExcludeSelf");
-    const tpLoudMin = $("#tpLoudMin");
-    const tpPanicMin = $("#tpPanicMin");
-    const tpStatus = $("#tpStatus");
-    const loadTriggerPolicy = async () => {
-      if (!tpPanicLocal || !tpPanicLink || !tpSilentLink || !tpLoudLink || !tpExcludeSelf || !tpLoudMin || !tpPanicMin) return;
-      try {
-        if (tpStatus) tpStatus.textContent = "Loading policy\u2026";
-        const r = await api(`/devices/${encodeURIComponent(id)}/trigger-policy`, { timeoutMs: 16e3 });
-        const p = r.policy || {};
-        tpPanicLocal.checked = !!p.panic_local_siren;
-        if (tpPanicLink) tpPanicLink.checked = p.panic_link_enabled !== false;
-        tpSilentLink.checked = !!p.remote_silent_link_enabled;
-        tpLoudLink.checked = !!p.remote_loud_link_enabled;
-        tpExcludeSelf.checked = !!p.fanout_exclude_self;
-        const loudMs = Number(p.remote_loud_duration_ms || DEFAULT_REMOTE_SIREN_MS);
-        const panicMs = Number(p.panic_fanout_duration_ms || DEFAULT_PANIC_FANOUT_MS);
-        tpLoudMin.value = String(Math.round(Math.max(0.5, Math.min(5, loudMs / 6e4)) * 10) / 10);
-        tpPanicMin.value = String(Math.round(Math.max(0.5, Math.min(10, panicMs / 6e4)) * 10) / 10);
-        if (tpStatus) tpStatus.textContent = `Loaded for group ${r.scope_group || "(default)"}`;
-      } catch (e) {
-        if (tpStatus) tpStatus.textContent = String(e.message || e);
-      }
-    };
-    const tpRefresh = $("#tpRefresh");
-    if (tpRefresh) tpRefresh.addEventListener("click", () => loadTriggerPolicy());
-    const tpSave = $("#tpSave");
-    if (tpSave) {
-      tpSave.addEventListener("click", async () => {
-        try {
-          const lm = parseFloat(tpLoudMin && tpLoudMin.value || "3", 10);
-          const pm = parseFloat(tpPanicMin && tpPanicMin.value || "5", 10);
-          if (!Number.isFinite(lm) || lm < 0.5 || lm > 5) throw new Error("Loud duration must be 0.5\u20135 minutes");
-          if (!Number.isFinite(pm) || pm < 0.5 || pm > 10) throw new Error("Panic sibling duration must be 0.5\u201310 minutes");
-          const remote_loud_duration_ms = Math.round(lm * 6e4);
-          const panic_fanout_duration_ms = Math.round(pm * 6e4);
-          if (tpStatus) tpStatus.textContent = "Saving policy\u2026";
-          await api(`/devices/${encodeURIComponent(id)}/trigger-policy`, {
-            method: "PUT",
-            body: {
-              panic_local_siren: !!(tpPanicLocal && tpPanicLocal.checked),
-              panic_link_enabled: !!(tpPanicLink && tpPanicLink.checked),
-              remote_silent_link_enabled: !!(tpSilentLink && tpSilentLink.checked),
-              remote_loud_link_enabled: !!(tpLoudLink && tpLoudLink.checked),
-              fanout_exclude_self: !!(tpExcludeSelf && tpExcludeSelf.checked),
-              remote_loud_duration_ms,
-              panic_fanout_duration_ms
-            }
-          });
-          if (tpStatus) tpStatus.textContent = "Policy saved";
-          toast("Trigger policy saved", "ok");
-        } catch (e) {
-          if (tpStatus) tpStatus.textContent = String(e.message || e);
-          toast(e.message || e, "err");
-        }
-      });
-      loadTriggerPolicy();
-    }
-    const shareListEl = $("#shareList");
-    const renderShares = async () => {
-      if (!shareListEl) return;
-      setChildMarkup(shareListEl, `<p class="muted">Loading shares\u2026</p>`);
-      try {
-        const r = await api(`/admin/devices/${encodeURIComponent(id)}/shares`, { timeoutMs: 16e3 });
-        const items = r.items || [];
-        setChildMarkup(
-          shareListEl,
-          `
-          <div class="table-wrap"><table class="t">
-            <thead><tr><th>User</th><th>Role</th><th>View</th><th>Operate</th><th>Granted by</th><th>Granted at</th><th>Status</th><th></th></tr></thead>
-            <tbody>${items.length === 0 ? `<tr><td colspan="8" class="muted">No shares</td></tr>` : items.map((it) => `
-                  <tr>
-                    <td class="mono">${escapeHtml(it.grantee_username || "")}</td>
-                    <td>${escapeHtml(it.grantee_role || "\u2014")}</td>
-                    <td>${it.can_view ? "yes" : "no"}</td>
-                    <td>${it.can_operate ? "yes" : "no"}</td>
-                    <td class="mono">${escapeHtml(it.granted_by || "")}</td>
-                    <td>${escapeHtml(fmtTs(it.granted_at))}</td>
-                    <td>${it.revoked_at ? `<span class="badge offline">revoked</span>` : `<span class="badge online">active</span>`}</td>
-                    <td>${it.revoked_at ? "" : `<button class="btn ghost shareRevokeBtn" data-user="${escapeHtml(it.grantee_username || "")}">Revoke</button>`}</td>
-                  </tr>
-                `).join("")}</tbody>
-          </table></div>
-        `
-        );
-        $$(".shareRevokeBtn", shareListEl).forEach((btn) => {
-          btn.addEventListener("click", async () => {
-            const u = btn.getAttribute("data-user") || "";
-            if (!u) return;
-            if (!confirm(`Revoke share for ${u}?`)) return;
-            try {
-              await api(`/admin/devices/${encodeURIComponent(id)}/share/${encodeURIComponent(u)}`, { method: "DELETE" });
-              toast("Share revoked", "ok");
-              await renderShares();
-            } catch (e) {
-              toast(e.message || e, "err");
-            }
-          });
-        });
-      } catch (e) {
-        setChildMarkup(shareListEl, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
-      }
-    };
-    const shareGrantBtn = $("#shareGrant");
-    if (shareGrantBtn) {
-      shareGrantBtn.addEventListener("click", async () => {
-        const grantee = ($("#shareUser").value || "").trim();
-        const canView = !!$("#shareCanView").checked;
-        const canOperate = !!$("#shareCanOperate").checked;
-        if (!grantee) {
-          toast("Enter grantee username", "err");
-          return;
-        }
-        if (!canView && !canOperate) {
-          toast("Select view and/or operate", "err");
-          return;
-        }
-        try {
-          await api(`/admin/devices/${encodeURIComponent(id)}/share`, {
-            method: "POST",
-            body: { grantee_username: grantee, can_view: canView, can_operate: canOperate }
-          });
-          toast("Share granted", "ok");
-          await renderShares();
-        } catch (e) {
-          toast(e.message || e, "err");
-        }
-      });
-    }
-    const shareRefreshBtn = $("#shareRefresh");
-    if (shareRefreshBtn) {
-      shareRefreshBtn.addEventListener("click", () => renderShares());
-      renderShares();
-    }
-  });
-  registerRoute("activate", async (view) => {
-    setCrumb("Activate device");
-    if (!hasRole("admin")) {
-      mountView(view, `<div class="card"><p class="muted">Admins only.</p></div>`);
-      return;
-    }
-    const canClaim = can("can_claim_device");
-    mountView(view, `
-      <div class="activate-shell">
-        <section class="card activate-hero">
-          <p class="activate-kicker">Field \xB7 Claim</p>
-          <h2 class="activate-title">Claim device</h2>
-          <p class="muted activate-lead">
-            A serial appears as <strong>claimable</strong> only after the unit is <strong>powered and has contacted the server</strong>. Optionally save a <strong>target Wi\u2011Fi</strong> here (stored in this browser only); after claim we pre-fill the device page Wi\u2011Fi form for MQTT provisioning when online.
-          </p>
-          <ol class="activate-steps">
-            <li><span class="n">1</span>Optional: save target Wi\u2011Fi (recommended)</li>
-            <li><span class="n">2</span>Enter sticker serial or paste full <span class="mono">CROC|\u2026</span></li>
-            <li><span class="n">3</span>Identify \u2192 if claimable, confirm and complete claim</li>
-          </ol>
-          ${canClaim ? "" : `<p class="badge revoked" style="margin-top:12px">Your account lacks <span class="mono">can_claim_device</span>; ask an administrator.</p>`}
-        </section>
-
-        <section class="card activate-main">
-          <div class="activate-wifi-row">
-            <button type="button" class="btn secondary btn-tap" style="width:100%" id="activateWifiOpenBtn">\u2460 Target Wi\u2011Fi (SSID / password)</button>
-            <p class="muted activate-wifi-status" id="activateWifiStatus"></p>
-          </div>
-          <div class="inline-form activate-serial-block">
-            <label class="field wide"><span>\u2461 Serial or full QR line (CROC|\u2026)</span>
-              <input id="idn_input" class="activate-serial-input" placeholder="SN-\u2026 or paste full CROC|\u2026 line" autocomplete="off"/>
-            </label>
-            <div class="row wide activate-actions">
-              <button class="btn btn-tap activate-id-btn" id="idn_go" ${canClaim ? "" : "disabled"}>\u2462 Identify</button>
-            </div>
-          </div>
-          <div id="idnResult" class="activate-result"></div>
-        </section>
-
-        <dialog id="activateWifiDialog" class="activate-wifi-dlg">
-          <form class="activate-wifi-dlg__inner" onsubmit="return false">
-            <h3 class="activate-wifi-dlg__title">Target Wi\u2011Fi</h3>
-            <p class="muted activate-wifi-dlg__lead">
-              If the device has <strong>never been online</strong>, the server cannot push Wi\u2011Fi to it directly. SSID/password here are saved only in <strong>this browser</strong>; after claim, paste them into the device page for MQTT delivery. Leave password empty on open networks.
-            </p>
-            <label class="field wide"><span>SSID</span>
-              <input type="text" id="activateDlgSsid" maxlength="32" autocomplete="off" placeholder="2.4 GHz network name" />
-            </label>
-            <label class="field wide"><span>Password</span>
-              <input type="password" id="activateDlgPass" maxlength="64" autocomplete="new-password" placeholder="Empty if open network" />
-            </label>
-            <label class="field" style="margin-bottom:0"><span></span>
-              <span><input type="checkbox" id="activateDlgShowPass" /> Show password</span>
-            </label>
-            <div class="activate-wifi-dlg__actions">
-              <button type="button" class="btn ghost" id="activateWifiDlgClose">Close</button>
-              <button type="button" class="btn" id="activateWifiDlgSave">Save to this browser</button>
-              <button type="button" class="btn secondary" id="activateWifiDlgClear">Clear draft</button>
-            </div>
-          </form>
-        </dialog>
-
-        <section class="card activate-pending-card">
-          <div class="row between" style="flex-wrap:wrap;gap:8px;align-items:center">
-            <h3 style="margin:0">Recently reported (pending claim)</h3>
-            <span class="muted" style="font-size:13px">MQTT <span class="mono">bootstrap.register</span></span>
-            <button class="btn secondary btn-tap" id="reload">Refresh</button>
-          </div>
-          <div class="divider"></div>
-          <div id="pendList"></div>
-        </section>
-      </div>`);
-    const ACTIVATE_WIFI_STORE = "croc.activateWifiDraft.v1";
-    const DEVICE_WIFI_PREFILL_KEY = "croc.deviceWifiPrefill.v1";
-    const readWifiDraft = () => {
-      try {
-        const raw = sessionStorage.getItem(ACTIVATE_WIFI_STORE);
-        const o = raw ? JSON.parse(raw) : null;
-        if (o && typeof o.ssid === "string" && o.ssid.trim()) {
-          return { ssid: o.ssid.trim(), password: typeof o.password === "string" ? o.password : "" };
-        }
-      } catch (_) {
-      }
-      return null;
-    };
-    const refreshWifiBanner = () => {
-      const el = $("#activateWifiStatus", view);
-      const d = readWifiDraft();
-      if (!el) return;
-      el.textContent = d ? `Saved target Wi\u2011Fi \u201C${d.ssid}\u201D. After claim we open the device page with Wi\u2011Fi (device) prefilled (requires device online to push).` : "Optionally save the Wi\u2011Fi you plan to use (this browser only), or skip and fill it later on the device page.";
-    };
-    const dlgWifi = $("#activateWifiDialog", view);
-    const openActivateWifiDialog = () => {
-      const d = readWifiDraft();
-      const s = $("#activateDlgSsid", view);
-      const p = $("#activateDlgPass", view);
-      if (s) s.value = d ? d.ssid : "";
-      if (p) p.value = d ? d.password : "";
-      if (dlgWifi && typeof dlgWifi.showModal === "function") dlgWifi.showModal();
-    };
-    const closeActivateWifiDialog = () => {
-      if (dlgWifi && typeof dlgWifi.close === "function") dlgWifi.close();
-    };
-    const wifiOpenBtn = $("#activateWifiOpenBtn", view);
-    if (wifiOpenBtn) wifiOpenBtn.addEventListener("click", openActivateWifiDialog);
-    const wifiSaveBtn = $("#activateWifiDlgSave", view);
-    if (wifiSaveBtn) {
-      wifiSaveBtn.addEventListener("click", () => {
-        const ssid = ($("#activateDlgSsid", view).value || "").trim();
-        const password = $("#activateDlgPass", view).value || "";
-        if (!ssid) {
-          toast("Enter Wi\u2011Fi name (SSID)", "err");
-          return;
-        }
-        sessionStorage.setItem(ACTIVATE_WIFI_STORE, JSON.stringify({ ssid, password }));
-        refreshWifiBanner();
-        closeActivateWifiDialog();
-        toast("Saved (this browser only)", "ok");
-      });
-    }
-    const wifiClrDlg = $("#activateWifiDlgClear", view);
-    if (wifiClrDlg) {
-      wifiClrDlg.addEventListener("click", () => {
-        sessionStorage.removeItem(ACTIVATE_WIFI_STORE);
-        refreshWifiBanner();
-        closeActivateWifiDialog();
-        toast("Wi\u2011Fi draft cleared", "ok");
-      });
-    }
-    const wifiClsDlg = $("#activateWifiDlgClose", view);
-    if (wifiClsDlg) wifiClsDlg.addEventListener("click", closeActivateWifiDialog);
-    const showPassEl = $("#activateDlgShowPass", view);
-    if (showPassEl) {
-      showPassEl.addEventListener("change", () => {
-        const p = $("#activateDlgPass", view);
-        if (p) p.type = showPassEl.checked ? "text" : "password";
-      });
-    }
-    refreshWifiBanner();
-    const resultBox = $("#idnResult");
-    const drawBadge = (kind, label) => `<span class="badge ${kind === "ok" ? "online" : kind === "err" ? "offline" : ""}">${escapeHtml(label)}</span>`;
-    const showClaimForm = (serial, mac, qr) => {
-      const draft = readWifiDraft();
-      const draftNote = draft ? `<p class="muted" style="margin:0 0 12px">Saved target Wi\u2011Fi <span class="mono">${escapeHtml(draft.ssid)}</span> \u2014 after claim we jump to the device page with Wi\u2011Fi (device) prefilled.</p>` : "";
-      appendChildMarkup(
-        resultBox,
-        `
-        <div class="card" style="margin-top:10px">
-          <h4 style="margin-top:0">Confirm claim</h4>
-          ${draftNote}
-          <div class="inline-form">
-            <label class="field"><span>device_id (usually serial)</span><input id="c_id" value="${escapeHtml(serial)}"/></label>
-            <label class="field"><span>mac_nocolon</span><input id="c_mac" value="${escapeHtml(mac)}"/></label>
-            <label class="field"><span>zone</span><input id="c_zone" value="all"/></label>
-            <label class="field wide"><span>qr_code (optional)</span><input id="c_qr" value="${escapeHtml(qr || "")}"/></label>
-            <div class="row wide" style="justify-content:flex-end">
-              <button class="btn btn-tap" id="c_submit">Confirm claim</button>
-            </div>
-          </div>
-        </div>`
-      );
-      $("#c_submit").addEventListener("click", async () => {
-        const body = {
-          mac_nocolon: ($("#c_mac").value || "").trim().toUpperCase(),
-          device_id: ($("#c_id").value || "").trim().toUpperCase(),
-          zone: ($("#c_zone").value || "all").trim()
-        };
-        const q = ($("#c_qr").value || "").trim();
-        if (q) body.qr_code = q;
-        const preWifi = readWifiDraft();
-        try {
-          await api("/provision/claim", { method: "POST", body });
-          const did = String(body.device_id || "").toUpperCase();
-          if (preWifi && preWifi.ssid) {
-            sessionStorage.setItem(
-              DEVICE_WIFI_PREFILL_KEY,
-              JSON.stringify({ device_id: did, ssid: preWifi.ssid, password: preWifi.password || "" })
-            );
-          }
-          sessionStorage.removeItem(ACTIVATE_WIFI_STORE);
-          refreshWifiBanner();
-          toast("Claim completed", "ok");
-          location.hash = `#/devices/${encodeURIComponent(did)}`;
-        } catch (e) {
-          toast(e.message || e, "err");
-        }
-      });
-    };
-    $("#idn_go").addEventListener("click", async () => {
-      setChildMarkup(resultBox, `<p class="muted">Identifying\u2026</p>`);
-      const raw = ($("#idn_input").value || "").trim();
-      if (!raw) {
-        setChildMarkup(resultBox, `<p class="muted">Enter serial or QR payload</p>`);
-        return;
-      }
-      const body = raw.startsWith("CROC|") ? { qr_code: raw } : { serial: raw.toUpperCase() };
-      try {
-        const r = await api("/provision/identify", { method: "POST", body });
-        const kv = (k, v) => `<dt>${escapeHtml(k)}</dt><dd class="mono">${escapeHtml(v)}</dd>`;
-        switch (r.status) {
-          case "ready":
-            setChildMarkup(
-              resultBox,
-              `${drawBadge("ok", "Ready to claim")}
-              <dl class="kv">${kv("Serial", r.serial)}${kv("MAC", r.mac_nocolon)}${kv("Firmware", r.fw || "\u2014")}${kv("Last seen", r.last_seen_at ? fmtTs(r.last_seen_at) : "\u2014")}</dl>
-              <p>${escapeHtml(r.message)}</p>`
-            );
-            showClaimForm(r.serial, r.mac_nocolon, raw.startsWith("CROC|") ? raw : "");
-            break;
-          case "already_registered":
-            const canSeeOwner = !!(state.me && state.me.role === "superadmin");
-            const ownerKv = canSeeOwner ? kv("Owner admin", r.owner_admin || "\u2014") : "";
-            const byYou = !!r.by_you;
-            setChildMarkup(
-              resultBox,
-              `${drawBadge("err", byYou ? "Already yours" : "Already registered")}
-              <dl class="kv">${kv("Serial", r.serial)}${kv("device_id", r.device_id)}${ownerKv}${kv("Claimed at", r.claimed_at ? fmtTs(r.claimed_at) : "\u2014")}</dl>
-              <p class="muted">${escapeHtml(r.message)}</p>
-              ${byYou ? `<a class="btn secondary" href="#/devices/${encodeURIComponent(r.device_id)}">Open device</a>` : ""}`
-            );
-            break;
-          case "offline": {
-            const dw = readWifiDraft();
-            const draftNote = dw ? `<p class="muted" style="margin-top:10px">Saved Wi\u2011Fi on this machine: <strong>${escapeHtml(dw.ssid)}</strong>. After the unit is online and claimed, push credentials from the device page.</p>` : "";
-            setChildMarkup(
-              resultBox,
-              `${drawBadge("", "Waiting for device")}
-              <dl class="kv">${kv("Serial", r.serial)}${r.mac_hint ? kv("Factory MAC", r.mac_hint) : ""}</dl>
-              <p>${escapeHtml(r.message)}</p>
-              ${draftNote}
-              <div class="activate-offline-actions">
-                <button type="button" class="btn secondary btn-tap" id="activateOfflineWifiBtn">Edit target Wi\u2011Fi</button>
-                <button type="button" class="btn btn-tap" id="idn_retry_offline">Powered & online \u2014 retry identify</button>
-              </div>`
-            );
-            break;
-          }
-          case "blocked":
-            setChildMarkup(resultBox, `${drawBadge("err", "Factory blocked")}<p>${escapeHtml(r.message)}</p>`);
-            break;
-          case "unknown_serial":
-            setChildMarkup(resultBox, `${drawBadge("err", "Unknown serial")}<p>${escapeHtml(r.message)}</p>`);
-            break;
-          default:
-            setChildMarkup(resultBox, `<p class="muted">Unknown status: ${escapeHtml(r.status)}</p>`);
-        }
-      } catch (e) {
-        setChildMarkup(resultBox, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
-      }
-    });
-    view.addEventListener("click", (ev) => {
-      if (ev.target.closest("#activateOfflineWifiBtn")) {
-        openActivateWifiDialog();
-        return;
-      }
-      if (ev.target.closest("#idn_retry_offline")) {
-        const go = $("#idn_go", view);
-        if (go) go.click();
-      }
-    });
-    $("#reload").addEventListener("click", () => renderRoute());
-    try {
-      const rq = window.__routeQuery || new URLSearchParams("");
-      const pre = (rq.get("q") || rq.get("serial") || "").trim();
-      if (pre) {
-        const el = $("#idn_input");
-        if (el) el.value = pre;
-      }
-    } catch (_) {
-    }
-    let pendingErr = "";
-    const data = await apiOr("/provision/pending", (e) => {
-      pendingErr = String(e && e.message || e || "load failed");
-      return { items: [] };
-    }, { timeoutMs: 16e3 });
-    const items = data.items || [];
-    const pendListEl = view.querySelector("#pendList");
-    if (!pendListEl) return;
-    setChildMarkup(
-      pendListEl,
-      `
-      <div class="table-wrap"><table class="t">
-        <thead><tr><th>MAC</th><th>Serial / proposed ID</th><th>QR</th><th>Firmware</th><th>Last seen</th></tr></thead>
-        <tbody>${items.length === 0 ? `<tr><td colspan="5" class="muted">${pendingErr ? "Load failed (retry with Refresh)." : "None"}</td></tr>` : items.map((p) => `<tr>
-            <td class="mono">${escapeHtml(p.mac_nocolon || p.mac || "")}</td>
-            <td class="mono">${escapeHtml(p.proposed_device_id || "\u2014")}</td>
-            <td class="mono">${escapeHtml(p.qr_code || "\u2014")}</td>
-            <td>${escapeHtml(p.fw || "\u2014")}</td>
-            <td>${escapeHtml(fmtTs(p.last_seen_at))}</td>
-          </tr>`).join("")}</tbody>
-      </table></div>`
-    );
-  });
-  registerRoute("events", async (view, _args) => {
-    const navTok = state.routeSeq;
-    setCrumb("Events");
-    const me = state.me || { username: "", role: "" };
-    const isSuper = me.role === "superadmin";
-    const scopeLabel = isSuper ? "System-wide" : me.role === "admin" ? "Your tenant" : "Your account";
-    mountView(view, `
-      <div class="ui-shell card audit-page" style="margin:0">
-        <div class="row between" style="flex-wrap:wrap;gap:10px">
-          <div>
-            <h2 class="ui-section-title" style="margin:0">Event center</h2>
-            <p class="muted" style="margin:4px 0 0">Visibility: ${scopeLabel}.</p>
-          </div>
-          <div class="row" style="gap:8px;align-items:center">
-            <span id="evLive" class="badge offline" title="Live stream">Offline</span>
-            <button class="btn sm secondary" id="evPause">Pause</button>
-            <button class="btn sm secondary" id="evClear">Clear</button>
-          </div>
-        </div>
-        <div class="divider"></div>
-        <div class="inline-form" style="margin-bottom:10px">
-          <label class="field"><span>Min level</span>
-            <select id="evLevel">
-              <option value="">All</option>
-              <option value="debug">debug+</option>
-              <option value="info" selected>info+</option>
-              <option value="warn">warn+</option>
-              <option value="error">error+</option>
-              <option value="critical">critical</option>
-            </select>
-          </label>
-          <label class="field"><span>Category</span>
-            <select id="evCategory">
-              <option value="">All</option>
-              <option value="alarm">alarm</option>
-              <option value="ota">ota</option>
-              <option value="presence">presence</option>
-              <option value="provision">provision</option>
-              <option value="device">device</option>
-              <option value="auth">auth</option>
-              <option value="audit">audit</option>
-              <option value="system">system</option>
-            </select>
-          </label>
-          <label class="field"><span>Device ID</span><input id="evDevice" placeholder="SN-\u2026 or id" /></label>
-          <label class="field wide"><span>Search</span><input id="evQ" placeholder="summary / actor / event_type" /></label>
-          <div class="row wide action-bar" style="justify-content:flex-end;gap:8px;flex-wrap:wrap">
-            <button class="btn sm" id="evApply">Apply & reload</button>
-            <details class="toolbar-collapse" style="min-width:160px">
-              <summary>More tools</summary>
-              <div class="table-actions">
-                <button class="btn sm secondary" id="evStats">By device (7d)</button>
-                <button class="btn sm secondary" id="evCsv">Export CSV</button>
-                <button class="btn sm secondary" id="evReload">Last 200</button>
-              </div>
-            </details>
-          </div>
-        </div>
-      </div>
-      <div id="evStatsBox" class="card" style="margin-top:12px;display:none">
-        <h3 style="margin:0 0 8px">Events per device (7 days)</h3>
-        <div id="evStatsInner" class="muted">\u2014</div>
-      </div>
-      <div class="ui-shell card audit-page" style="margin-top:12px">
-        <div id="evList" class="audit-feed-wrap muted">Connecting\u2026</div>
-      </div>`);
-    let paused = false;
-    let buffer = [];
-    const BUFFER_MAX = 180;
-    const RENDER_LIMIT = 150;
-    let evRenderTimer = 0;
-    let evReconnectBackoffMs = 800;
-    function badgeClass(lvl) {
-      return {
-        debug: "neutral",
-        info: "accent",
-        warn: "partial",
-        error: "failed",
-        critical: "revoked"
-      }[lvl] || "neutral";
-    }
-    function catClass(cat) {
-      return {
-        alarm: "failed",
-        ota: "accent",
-        presence: "partial",
-        provision: "accent",
-        device: "neutral",
-        auth: "partial",
-        audit: "neutral",
-        system: "neutral"
-      }[cat] || "neutral";
-    }
-    function rowHtml(e) {
-      const primary = e.summary && String(e.summary).trim() || (e.event_type || "\u2014");
-      const tsShort = fmtTs(e.ts_malaysia || e.ts);
-      const typeDiffers = e.event_type && String(e.event_type) !== String(primary);
-      const extras = eventDetailDedupedRows(
-        e.detail && typeof e.detail === "object" && !Array.isArray(e.detail) ? e.detail : {},
-        e
-      );
-      const devLink = e.device_id ? `<a class="mono audit-target" href="#/devices/${encodeURIComponent(e.device_id)}">${escapeHtml(e.device_id)}</a>` : "";
-      const targetStr = e.target && e.target !== e.device_id ? String(e.target) : "";
-      const typeTag = typeDiffers ? ` \xB7 <span class="mono" style="font-size:12px;opacity:0.88">${escapeHtml(e.event_type)}</span>` : "";
-      const extraBlock = extras.length ? `<div class="audit-extra">${extras.map(
-        (row) => `<div class="audit-extra-row"><span class="audit-k">${escapeHtml(row.k)}</span><span class="audit-v mono">${escapeHtml(row.v)}</span></div>`
-      ).join("")}</div>` : "";
-      return `<details class="audit-item audit-item--foldable" data-level="${escapeHtml(e.level || "")}">
-        <summary class="audit-item__fold-sum">
-        <div class="audit-item-top">
-          <div class="audit-time">
-            <span class="audit-ts mono">${escapeHtml(tsShort)}</span>
-            <span class="muted audit-rel">${escapeHtml(fmtRel(e.ts))}</span>
-          </div>
-          <span class="badge ${badgeClass(e.level)}">${escapeHtml(e.level || "")}</span>
-          <span class="badge ${catClass(e.category)}">${escapeHtml(e.category || "")}</span>
-        </div>
-        <div class="audit-item-line audit-item__fold-primary" style="font-weight:600;margin-top:8px">${escapeHtml(primary)}${typeTag}</div>
-        </summary>
-        <div class="audit-item__fold-body">
-        <div class="audit-item-line" style="font-size:12.5px;flex-wrap:wrap">
-          <span class="audit-actor">${e.actor ? escapeHtml(e.actor) : "\u2014"}</span>
-          ${targetStr ? ` <span class="audit-arrow">\u2192</span> <span class="mono audit-target">${escapeHtml(targetStr)}</span>` : ""}
-          ${devLink ? ` \xB7 ${devLink}` : ""}
-          ${e.owner_admin ? ` <span class="chip" title="owner_admin">@${escapeHtml(e.owner_admin)}</span>` : ""}
-        </div>
-        ${extraBlock}
-        </div>
-      </details>`;
-    }
-    function flushEvRender() {
-      evRenderTimer = 0;
-      const listEl = document.getElementById("evList");
-      if (!listEl) return;
-      if (buffer.length === 0) {
-        setHtmlIfChanged(listEl, `<p class="muted audit-empty">No events.</p>`);
-        return;
-      }
-      const visible = buffer.slice(0, RENDER_LIMIT);
-      setHtmlIfChanged(listEl, `<div class="audit-feed">${visible.map(rowHtml).join("")}</div>`);
-    }
-    function scheduleEvRender() {
-      if (evRenderTimer) return;
-      evRenderTimer = setTimeout(flushEvRender, 120);
-    }
-    function pushEvent(ev) {
-      if (paused) return;
-      let row = ev;
-      try {
-        if (ev && ev.detail != null && typeof ev.detail === "object") {
-          const sj = JSON.stringify(ev.detail);
-          if (sj.length > 12e3) {
-            row = Object.assign({}, ev, {
-              detail: { _truncated: true, _approx_bytes: sj.length }
-            });
-          }
-        }
-      } catch (_) {
-      }
-      buffer.unshift(row);
-      if (buffer.length > BUFFER_MAX) buffer.length = BUFFER_MAX;
-      scheduleEvRender();
-    }
-    function currentFilters() {
-      const p = new URLSearchParams();
-      const lvl = $("#evLevel").value.trim();
-      if (lvl) p.set("min_level", lvl);
-      const cat = $("#evCategory").value.trim();
-      if (cat) p.set("category", cat);
-      const dev = $("#evDevice").value.trim();
-      if (dev) p.set("device_id", dev);
-      const q = $("#evQ").value.trim();
-      if (q) p.set("q", q);
-      return p;
-    }
-    async function loadHistory() {
-      try {
-        if (!isRouteCurrent(navTok)) return;
-        const p = currentFilters();
-        p.set("limit", "200");
-        const r = await api("/events?" + p.toString(), { timeoutMs: 16e3 });
-        if (!isRouteCurrent(navTok)) return;
-        buffer = (r.items || []).slice();
-        if (buffer.length > BUFFER_MAX) buffer = buffer.slice(0, BUFFER_MAX);
-        if (evRenderTimer) {
-          clearTimeout(evRenderTimer);
-          evRenderTimer = 0;
-        }
-        flushEvRender();
-      } catch (e) {
-        if (!isRouteCurrent(navTok)) return;
-        const listEl = document.getElementById("evList");
-        if (listEl) mountView(listEl, hx`<p class="badge offline">${e.message || e}</p>`);
-        toast(e.message || e, "err");
-      }
-    }
-    function closeStream() {
-      if (window.__evReconnectTimer) {
-        try {
-          clearTimeout(window.__evReconnectTimer);
-        } catch (_) {
-        }
-        window.__evReconnectTimer = 0;
-      }
-      if (window.__evSSE) {
-        try {
-          window.__evSSE.close();
-        } catch (_) {
-        }
-        window.__evSSE = null;
-      }
-      if (window.__evFetchAbort) {
-        try {
-          window.__evFetchAbort.abort();
-        } catch (_) {
-        }
-        window.__evFetchAbort = null;
-      }
-      const live = $("#evLive");
-      if (live) {
-        live.textContent = "Offline";
-        live.className = "badge offline";
-      }
-    }
-    function openStream() {
-      if (!isRouteCurrent(navTok)) return;
-      closeStream();
-      const p = currentFilters();
-      const slack = Math.max(0, BUFFER_MAX - buffer.length);
-      p.set("backlog", String(Math.min(100, slack)));
-      const qs = p.toString();
-      const tok = getToken();
-      const ac = new AbortController();
-      window.__evFetchAbort = ac;
-      const shim = {
-        readyState: EventSource.CONNECTING,
-        close() {
-          try {
-            ac.abort();
-          } catch (_) {
-          }
-          window.__evFetchAbort = null;
-          this.readyState = EventSource.CLOSED;
-        }
-      };
-      window.__evSSE = shim;
-      const scheduleReconnect = () => {
-        if (!isRouteCurrent(navTok) || paused || window.__evReconnectTimer) return;
-        const wait = evReconnectBackoffMs + Math.floor(Math.random() * 480);
-        window.__evReconnectTimer = setTimeout(() => {
-          window.__evReconnectTimer = 0;
-          if (!isRouteCurrent(navTok) || paused) return;
-          openStream();
-        }, wait);
-        evReconnectBackoffMs = Math.min(8e3, Math.floor(evReconnectBackoffMs * 1.5));
-      };
-      const run = async () => {
-        const url = apiBase() + "/events/stream" + (qs ? "?" + qs : "");
-        const hdrs = {
-          Accept: "text/event-stream",
-          "Cache-Control": "no-store"
-        };
-        if (tok) hdrs.Authorization = "Bearer " + tok;
-        try {
-          const r = await fetch(url, {
-            method: "GET",
-            credentials: "include",
-            headers: hdrs,
-            signal: ac.signal
-          });
-          if (!isRouteCurrent(navTok)) return;
-          if (!r.ok) {
-            const errText = await r.text().catch(() => "");
-            throw new Error(errText || String(r.status));
-          }
-          if (!r.body || typeof r.body.getReader !== "function") {
-            throw new Error("Event stream unsupported in this browser");
-          }
-          evReconnectBackoffMs = 800;
-          shim.readyState = EventSource.OPEN;
-          const liveOn = $("#evLive");
-          if (liveOn) {
-            liveOn.textContent = "Live";
-            liveOn.className = "badge online";
-            liveOn.title = "Live stream connected";
-          }
-          await pumpSseBody(r.body.getReader(), ac.signal, (kind, payload) => {
-            if (kind === "ping") return;
-            if (!isRouteCurrent(navTok)) return;
-            try {
-              const ev = JSON.parse(payload);
-              if (ev.event_type === "stream.hello") return;
-              pushEvent(ev);
-            } catch (_) {
-            }
-          });
-          if (ac.signal.aborted || !isRouteCurrent(navTok)) return;
-          shim.readyState = EventSource.CLOSED;
-          if (!paused && isRouteCurrent(navTok)) {
-            evReconnectBackoffMs = 800;
-            const live = $("#evLive");
-            if (live) {
-              live.textContent = "Reconnecting\u2026";
-              live.className = "badge offline";
-            }
-            scheduleReconnect();
-          }
-        } catch (e) {
-          if (e && e.name === "AbortError") return;
-          if (!isRouteCurrent(navTok)) return;
-          shim.readyState = EventSource.CLOSED;
-          const live = $("#evLive");
-          if (live && isRouteCurrent(navTok)) {
-            live.textContent = "Reconnecting\u2026";
-            live.className = "badge offline";
-          }
-          if (!paused && isRouteCurrent(navTok)) scheduleReconnect();
-        }
-      };
-      void run();
-    }
-    $("#evPause").addEventListener("click", () => {
-      paused = !paused;
-      $("#evPause").textContent = paused ? "Resume" : "Pause";
-    });
-    $("#evClear").addEventListener("click", () => {
-      buffer = [];
-      if (evRenderTimer) {
-        clearTimeout(evRenderTimer);
-        evRenderTimer = 0;
-      }
-      flushEvRender();
-    });
-    $("#evApply").addEventListener("click", () => {
-      loadHistory().then(openStream);
-    });
-    $("#evReload").addEventListener("click", loadHistory);
-    $("#evStats").addEventListener("click", async () => {
-      try {
-        if (!isRouteCurrent(navTok)) return;
-        const r = await api("/events/stats/by-device?hours=168&limit=200", { timeoutMs: 16e3 });
-        const items = r.items || [];
-        const evStatsBoxEl = $("#evStatsBox", view);
-        const evStatsInnerEl = $("#evStatsInner", view);
-        if (!evStatsBoxEl || !evStatsInnerEl || !isRouteCurrent(navTok)) return;
-        evStatsBoxEl.style.display = "block";
-        if (items.length === 0) {
-          setChildMarkup(evStatsInnerEl, "<p class='muted'>No rows with device_id.</p>");
-          return;
-        }
-        setChildMarkup(
-          evStatsInnerEl,
-          `<div class="table-wrap"><table class="t"><thead><tr><th>Device</th><th>Count</th></tr></thead><tbody>${items.map((x) => `<tr><td class="mono">${escapeHtml(x.device_id)}</td><td>${x.count}</td></tr>`).join("")}</tbody></table></div>`
-        );
-      } catch (e) {
-        toast(e.message || e, "err");
-      }
-    });
-    $("#evCsv").addEventListener("click", async () => {
-      try {
-        const p = currentFilters();
-        p.set("limit", "8000");
-        const url = apiBase() + "/events/export.csv?" + p.toString();
-        const _ex = {};
-        const _t = getToken();
-        if (_t) _ex.Authorization = "Bearer " + _t;
-        const r = await fetch(url, { credentials: "include", headers: _ex });
-        if (!r.ok) {
-          const t = await r.text();
-          throw new Error(t || r.statusText);
-        }
-        const blob = await r.blob();
-        const a = document.createElement("a");
-        a.href = URL.createObjectURL(blob);
-        a.download = "croc_sentinel_events.csv";
-        a.click();
-        URL.revokeObjectURL(a.href);
-        toast("CSV downloaded", "ok");
-      } catch (e) {
-        toast(e.message || e, "err");
-      }
-    });
-    await loadHistory();
-    openStream();
-    window.__eventsStreamResume = () => {
-      if (paused) return;
-      if (!isRouteCurrent(navTok)) return;
-      openStream();
-    };
-  });
-  registerRoute("telegram", async (view) => {
-    setCrumb("Telegram");
-    if (!hasRole("user")) {
-      mountView(view, `<div class="card"><p class="muted">Sign in required.</p></div>`);
-      return;
-    }
-    mountView(view, `
-      <div class="ui-shell telegram-shell">
-      <div class="card">
-        <div class="ui-section-head">
-          <div>
-            <h2 class="ui-section-title">Telegram connect</h2>
-            <p class="ui-section-sub">No password in Telegram. Generate link, open chat, send <span class="mono">/start</span>, done.</p>
-          </div>
-          <div class="ui-section-actions">
-            <button class="btn" id="tgGenLink">Generate connect link</button>
-            <button class="btn secondary" id="tgReloadMine">Refresh bindings</button>
-          </div>
-        </div>
-        <div id="tgLinkBox" style="margin-top:10px"></div>
-      </div>
-      <div class="card">
-        <div class="ui-section-head">
-          <div>
-            <h3 class="ui-section-title">My chat bindings</h3>
-            <p class="ui-section-sub">Enable, disable, or unbind your own Telegram chats.</p>
-          </div>
-        </div>
-        <div id="tgMineList"></div>
-      </div>
-      <div class="card">
-        <div class="ui-section-head">
-          <div>
-            <h3 class="ui-section-title">Manual bind (fallback)</h3>
-            <p class="ui-section-sub">If deep link cannot open Telegram, use <span class="mono">/start</span> to get chat_id, then bind manually.</p>
-          </div>
-        </div>
-        <div class="inline-form">
-          <label class="field"><span>chat_id</span><input id="tgManualChatId" placeholder="e.g. 2082431201 or -100xxxx" /></label>
-          <label class="field"><span>Enabled</span><input id="tgManualEnabled" type="checkbox" checked /></label>
-          <div class="row wide" style="justify-content:flex-end"><button class="btn" id="tgManualBind">Bind manually</button></div>
-        </div>
-      </div>
-      </div>
-    `);
-    const mineEl = $("#tgMineList", view);
-    const linkEl = $("#tgLinkBox", view);
-    const loadMine = async () => {
-      if (!mineEl) return;
-      setChildMarkup(mineEl, `<p class="muted">Loading\u2026</p>`);
-      try {
-        const d = await api("/admin/telegram/bindings", { timeoutMs: 16e3 });
-        const items = d.items || [];
-        setChildMarkup(
-          mineEl,
-          items.length === 0 ? `<p class="muted">No bindings yet.</p>` : `<div class="table-wrap"><table class="t">
-              <thead><tr><th>chat_id</th><th>enabled</th><th>updated</th><th></th><th></th></tr></thead>
-              <tbody>${items.map((it) => `
-                <tr>
-                  <td class="mono">${escapeHtml(it.chat_id || "")}</td>
-                  <td>${it.enabled ? `<span class="badge online">on</span>` : `<span class="badge offline">off</span>`}</td>
-                  <td>${escapeHtml(fmtTs(it.updated_at || it.created_at))}</td>
-                  <td><button class="btn sm secondary js-tg-toggle" data-chat="${escapeHtml(String(it.chat_id || ""))}" data-en="${it.enabled ? "1" : "0"}">${it.enabled ? "Disable" : "Enable"}</button></td>
-                  <td><button class="btn sm danger js-tg-unbind" data-chat="${escapeHtml(String(it.chat_id || ""))}">Unbind</button></td>
-                </tr>`).join("")}</tbody>
-            </table></div>`
-        );
-      } catch (e) {
-        setChildMarkup(mineEl, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
-      }
-    };
-    $("#tgGenLink", view).addEventListener("click", async () => {
-      if (!linkEl) return;
-      try {
-        const r = await api("/telegram/link-token", { method: "POST", body: { enabled_on_bind: true } });
-        const deep = r.deep_link || "";
-        const openChat = r.open_chat_url || "";
-        const payload = r.start_payload || "";
-        setChildMarkup(
-          linkEl,
-          deep ? `<div class="ui-status-strip">
-               <div class="ui-status-item"><div class="k">Step 1</div><div class="v"><a class="btn" href="${escapeHtml(openChat || deep)}" target="_blank" rel="noopener">Open bot chat</a></div></div>
-               <div class="ui-status-item"><div class="k">Step 2</div><div class="v"><a class="btn secondary" href="${escapeHtml(deep)}" target="_blank" rel="noopener">Run one-click bind</a></div></div>
-             </div>
-             <p class="muted mono" style="margin-top:8px">${escapeHtml(deep)}</p>` : `<p class="muted">Set <span class="mono">TELEGRAM_BOT_USERNAME</span> on server, then retry.<br/>Fallback: send <span class="mono">/start ${escapeHtml(payload)}</span> in your bot chat.</p>`
-        );
-      } catch (e) {
-        setChildMarkup(linkEl, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
-      }
-    });
-    $("#tgManualBind", view).addEventListener("click", async () => {
-      const chatId = ($("#tgManualChatId", view).value || "").trim();
-      const enabled = !!$("#tgManualEnabled", view).checked;
-      if (!chatId) {
-        toast("Enter chat_id", "err");
-        return;
-      }
-      try {
-        await api("/admin/telegram/bind-self", { method: "POST", body: { chat_id: chatId, enabled } });
-        toast("Bound", "ok");
-        loadMine();
-      } catch (e) {
-        toast(e.message || e, "err");
-      }
-    });
-    $("#tgReloadMine", view).addEventListener("click", loadMine);
-    mineEl.addEventListener("click", async (ev) => {
-      const tgl = ev.target.closest(".js-tg-toggle");
-      if (tgl) {
-        const chat = tgl.dataset.chat || "";
-        const enabled = !(tgl.dataset.en === "1");
-        try {
-          await api(`/admin/telegram/bindings/${encodeURIComponent(chat)}/enabled?enabled=${enabled ? "true" : "false"}`, { method: "PATCH" });
-          toast(enabled ? "Enabled" : "Disabled", "ok");
-          loadMine();
-        } catch (e) {
-          toast(e.message || e, "err");
-        }
-        return;
-      }
-      const del = ev.target.closest(".js-tg-unbind");
-      if (del) {
-        const chat = del.dataset.chat || "";
-        if (!chat) return;
-        if (!confirm(`Unbind chat ${chat}?`)) return;
-        try {
-          await api(`/admin/telegram/bindings/${encodeURIComponent(chat)}`, { method: "DELETE" });
-          toast("Unbound", "ok");
-          loadMine();
-        } catch (e) {
-          toast(e.message || e, "err");
-        }
-      }
-    });
-    loadMine();
-  });
-  registerRoute("audit", async (view, _args, routeSeq) => {
-    setCrumb("Audit");
-    if (!hasRole("admin")) {
-      mountView(view, `<div class="card"><p class="muted">Admins only.</p></div>`);
-      return;
-    }
-    mountView(view, `
-      <div class="ui-shell card audit-page">
-        <div class="ui-section-head">
-          <div>
-            <h2 class="ui-section-title">Audit</h2>
-            <p class="ui-section-sub">Who did what, when \u2014 extra fields only when they add information beyond actor / target.</p>
-          </div>
-          <div class="ui-section-actions audit-filters">
-            <label class="field compact"><span>Actor</span><input id="f_actor" type="search" autocomplete="off" placeholder="username" /></label>
-            <label class="field compact"><span>Action</span><input id="f_action" type="search" autocomplete="off" placeholder="prefix e.g. provision" /></label>
-            <label class="field compact"><span>Target</span><input id="f_target" type="search" autocomplete="off" placeholder="device or user" /></label>
-            <button class="btn secondary btn-tap" id="f_reload" type="button">Apply</button>
-          </div>
-        </div>
-        <div class="ui-status-strip" id="auditStrip">
-          <span class="ui-status-item"><strong id="auditCount">\u2014</strong> entries</span>
-          <span class="ui-status-item muted">Newest first \xB7 max 200</span>
-        </div>
-        <div class="divider"></div>
-        <div id="auditList" class="audit-feed-wrap"><p class="muted">Loading\u2026</p></div>
-      </div>`);
-    const reload = async () => {
-      const qs = new URLSearchParams();
-      const elA = $("#f_actor", view);
-      const elAc = $("#f_action", view);
-      const elT = $("#f_target", view);
-      const a = (elA && elA.value ? String(elA.value) : "").trim();
-      const ac = (elAc && elAc.value ? String(elAc.value) : "").trim();
-      const t = (elT && elT.value ? String(elT.value) : "").trim();
-      if (a) qs.set("actor", a);
-      if (ac) qs.set("action", ac);
-      if (t) qs.set("target", t);
-      qs.set("limit", "200");
-      let d;
-      try {
-        d = await api("/audit?" + qs.toString(), { timeoutMs: 24e3 });
-      } catch (e) {
-        toast(e.message || e, "err");
-        return;
-      }
-      if (!isRouteCurrent(routeSeq)) return;
-      const items = d.items || [];
-      const auditListEl = $("#auditList", view);
-      const countEl = $("#auditCount", view);
-      if (!auditListEl) return;
-      if (countEl) setTextIfChanged(countEl, String(items.length));
-      if (items.length === 0) {
-        setHtmlIfChanged(auditListEl, `<p class="muted audit-empty">No matching entries.</p>`);
-        return;
-      }
-      setHtmlIfChanged(auditListEl, `<div class="audit-feed">${items.map((e) => {
-        const actor = e.actor || "";
-        const tgt = e.target || "";
-        const action = e.action || "";
-        const extras = auditDetailDedupedRows(e.detail || {}, actor, tgt);
-        const extrasHtml = extras.length ? `<div class="audit-extra">${extras.map(
-          (row) => `<div class="audit-extra-row"><span class="audit-k">${escapeHtml(row.k)}</span><span class="audit-v mono">${escapeHtml(row.v)}</span></div>`
-        ).join("")}</div>` : "";
-        const tgtHtml = tgt ? `<span class="audit-target mono" title="target">${escapeHtml(tgt)}</span>` : `<span class="muted">\u2014</span>`;
-        return `
-          <article class="audit-item">
-            <div class="audit-item-top">
-              <div class="audit-time">
-                <span class="audit-ts">${escapeHtml(fmtTs(e.created_at))}</span>
-                <span class="muted audit-rel">${escapeHtml(fmtRel(e.created_at))}</span>
-              </div>
-              <span class="audit-action-chip ${auditChipClass(action)}" title="${escapeHtml(action)}">${escapeHtml(action)}</span>
-            </div>
-            <div class="audit-item-line">
-              <span class="audit-actor">${escapeHtml(actor)}</span>
-              <span class="audit-arrow" aria-hidden="true">\u2192</span>
-              ${tgtHtml}
-            </div>
-            ${extrasHtml}
-          </article>`;
-      }).join("")}</div>`);
-    };
-    const onFilterKey = (ev) => {
-      if (ev.key === "Enter") reload();
-    };
-    $("#f_reload", view).addEventListener("click", reload);
-    const fa = $("#f_actor", view);
-    const fac = $("#f_action", view);
-    const ft = $("#f_target", view);
-    if (fa) fa.addEventListener("keydown", onFilterKey);
-    if (fac) fac.addEventListener("keydown", onFilterKey);
-    if (ft) ft.addEventListener("keydown", onFilterKey);
-    reload();
-    scheduleRouteTicker(routeSeq, "audit-live-reload", reload, 12e3);
-  });
-  registerRoute("admin", async (view) => {
-    setCrumb("Admin");
-    if (!hasRole("admin")) {
-      mountView(view, `<div class="card"><p class="muted">Admins only.</p></div>`);
-      return;
-    }
-    const isSuper = state.me.role === "superadmin";
-    let admins = [];
-    if (isSuper) {
-      try {
-        admins = (await api("/auth/admins", { timeoutMs: 16e3 })).items || [];
-      } catch {
-        admins = [];
-      }
-    }
-    mountView(view, `
-      <div class="card">
-        <h2>Users</h2>
-        <p class="muted">${isSuper ? "Superadmin: create admin/user, assign manager_admin and policies." : "Admin: manage users under you and toggle their capabilities."}</p>
-        <p class="muted" style="margin-top:8px">Registration and reset codes are sent via your configured mail channel on server <span class="mono">.env</span>. Telegram alerts need <span class="mono">TELEGRAM_BOT_TOKEN</span> and <span class="mono">TELEGRAM_CHAT_IDS</span>; restart the API after changing those. Status: top bar pills (from <span class="mono">/health</span>).</p>
-        <div class="row right-end" style="justify-content:flex-end;flex-wrap:wrap;gap:10px">
-          <button class="btn btn-tap" id="showCreate" type="button">New user</button>
-          <button class="btn secondary btn-tap" id="reloadUsers" type="button">Refresh</button>
-        </div>
-        <div class="divider"></div>
-        <div id="userTable"></div>
-      </div>
-
-      ${isSuper ? `<div class="card">
-        <h3>Global sharing</h3>
-        <p class="muted">Search all share grants, create/update a grant, or revoke directly.</p>
-        <div class="inline-form">
-          <label class="field"><span>Device ID</span><input id="gs_device" placeholder="SN-..." /></label>
-          <label class="field"><span>Grantee</span><input id="gs_user" placeholder="admin_x / user_x" /></label>
-          <label class="field"><span>View</span><input id="gs_view" type="checkbox" checked /></label>
-          <label class="field"><span>Operate</span><input id="gs_operate" type="checkbox" /></label>
-          <div class="row wide" style="justify-content:flex-end;gap:8px;flex-wrap:wrap">
-            <button class="btn btn-tap" id="gs_grant" type="button">Grant / Update</button>
-            <button class="btn secondary btn-tap" id="gs_query" type="button">Query</button>
-            <label class="field" style="margin:0"><span>Include revoked</span><input id="gs_inc_rev" type="checkbox" /></label>
-          </div>
-        </div>
-        <div id="gsList" style="margin-top:10px"></div>
-      </div>` : ""}
-
-      <div class="card" id="createPanel" style="display:none">
-        <h3>New user</h3>
-        <div class="inline-form">
-          <label class="field"><span>Username</span><input id="u_name" autocomplete="off" /></label>
-          <label class="field"><span>Password (min 8)</span><input id="u_pass" type="password" autocomplete="new-password" /></label>
-          <label class="field"><span>Role</span><select id="u_role">
-            ${isSuper ? `<option value="user">user</option><option value="admin">admin</option>` : `<option value="user">user</option>`}
-          </select></label>
-          <label class="field" id="u_mgr_wrap" ${isSuper ? "" : 'style="display:none"'}>
-            <span>Manager admin</span>
-            <select id="u_mgr">${admins.map((a) => `<option value="${escapeHtml(a)}">${escapeHtml(a)}</option>`).join("")}</select>
-          </label>
-          <label class="field"><span>Email (required)</span><input id="u_email" type="email" autocomplete="off"/></label>
-          <label class="field"><span>Tenant (optional)</span><input id="u_tenant" /></label>
-          <div class="row wide" style="justify-content:flex-end;flex-wrap:wrap;gap:10px">
-            <button class="btn ghost btn-tap" id="u_cancel" type="button">Cancel</button>
-            <button class="btn btn-tap" id="u_submit" type="button">Create & send activation email</button>
-          </div>
-          <p class="muted" style="margin:8px 0 0">
-            New users start as <span class="mono">pending</span>. They must finish
-            <a href="#/account-activate">Activate account</a> with the email code before sign-in.
-          </p>
-        </div>
-      </div>
-
-      ${isSuper ? `<div class="card">
-        <h3>Pending admin signups</h3>
-        <p class="muted">Public registration + email verified; awaiting your approval.</p>
-        <div id="pendAdmins"></div>
-      </div>` : ""}
-
-      <div class="card">
-        <h3>Alert email recipients</h3>
-        <p class="muted">Inbox list for alarm emails when mail channel is configured on the server.</p>
-        <div id="smtpStatus" class="row" style="gap:6px"></div>
-        <div class="divider"></div>
-        <div class="inline-form">
-          <label class="field wide"><span>Email</span><input id="r_email" type="email" autocomplete="off" placeholder="you@company.com"/></label>
-          <label class="field"><span>Label</span><input id="r_label" autocomplete="off" placeholder="on-call"/></label>
-          <div class="row wide" style="justify-content:flex-end">
-            <button class="btn" id="r_add">Add</button>
-            <button class="btn ghost" id="r_test">Send test mail</button>
-          </div>
-        </div>
-        <div id="recipientList" style="margin-top:10px"></div>
-      </div>
-
-      <div class="card">
-        <h3>Telegram</h3>
-        <p class="muted">Forwards <span class="mono">emit_event</span> from server env (<span class="mono">TELEGRAM_BOT_TOKEN</span>, <span class="mono">TELEGRAM_CHAT_IDS</span>). Test does not use the queue.</p>
-        <div id="tgStatus" class="row" style="gap:6px;flex-wrap:wrap"></div>
-        <div class="row" style="margin-top:10px">
-          <button class="btn secondary" id="tgTest" type="button">Send test to all chats</button>
-        </div>
-        <div class="divider"></div>
-        <h4 style="margin:0 0 8px">Command chat binding</h4>
-        <p class="muted" style="margin:0 0 8px">User sends <span class="mono">/start</span> to bot, copies <span class="mono">chat_id</span>, then binds here. No password in Telegram.</p>
-        <div class="inline-form">
-          <label class="field"><span>chat_id</span><input id="tgBindChatId" placeholder="e.g. 2082431201 or -100xxxx" /></label>
-          <label class="field"><span>Enabled</span><input id="tgBindEnabled" type="checkbox" checked /></label>
-          <div class="row wide" style="justify-content:flex-end">
-            <button class="btn" id="tgBindSelf" type="button">Bind this chat</button>
-            <button class="btn secondary" id="tgReloadBindings" type="button">Refresh bindings</button>
-          </div>
-        </div>
-        <div id="tgBindings" style="margin-top:10px"></div>
-      </div>
-
-      ${isSuper ? `<div class="card">
-        <h3>Database backup / restore</h3>
-        <p class="muted">Uses <span class="mono">/admin/backup/export</span> and <span class="mono">/admin/backup/import</span>: full SQLite encrypted to <span class="mono">.enc</span>. Import writes <span class="mono">*.restored</span> \u2014 follow ops runbook to swap files.</p>
-        <label class="field" style="max-width:420px">
-          <span>Encryption key <span class="muted">X-Backup-Encryption-Key</span></span>
-          <input id="bk_key" type="password" autocomplete="off" />
-        </label>
-        <div class="row" style="margin-top:10px">
-          <button class="btn" id="bk_export">Export .enc</button>
-          <input type="file" id="bk_file" accept=".enc,application/octet-stream" />
-          <button class="btn secondary" id="bk_import">Upload & decrypt</button>
-        </div>
-      </div>` : ""}`);
-    const $v = (sel) => $(sel, view);
-    const loadUsers = async () => {
-      try {
-        const d = await api("/auth/users", { timeoutMs: 16e3 });
-        const users = d.items || [];
-        const userTableEl = $v("#userTable");
-        if (!userTableEl) return;
-        setChildMarkup(
-          userTableEl,
-          users.length === 0 ? `<p class="muted">No users.</p>` : `<div class="table-wrap"><table class="t">
-              <thead><tr><th>User</th><th>Role</th><th>manager</th><th>tenant</th><th>Created</th><th></th></tr></thead>
-              <tbody>${users.map((u) => {
-            const isUser = u.role === "user";
-            const isAdminRow = u.role === "admin";
-            const self = u.username === (state.me && state.me.username);
-            const closeTenantBtn = isSuper && isAdminRow && !self ? `<button type="button" class="btn sm danger js-close-admin" data-u="${escapeHtml(u.username)}">Close tenant</button>` : "";
-            return `<tr>
-                  <td><strong>${escapeHtml(u.username)}</strong></td>
-                  <td><span class="chip">${escapeHtml(u.role)}</span></td>
-                  <td class="mono">${escapeHtml(u.manager_admin || "\u2014")}</td>
-                  <td class="mono">${escapeHtml(u.tenant || "\u2014")}</td>
-                  <td>${escapeHtml(fmtTs(u.created_at))}</td>
-                  <td>
-                    <div class="table-actions">
-                      <details class="toolbar-collapse">
-                        <summary>Actions</summary>
-                        <div class="table-actions">
-                          ${isUser ? `<button type="button" class="btn sm secondary js-pol" data-u="${escapeHtml(u.username)}">Policy</button>` : ""}
-                          ${closeTenantBtn}
-                          ${self ? "" : isAdminRow ? "" : `<button type="button" class="btn sm danger js-del" data-u="${escapeHtml(u.username)}">Delete</button>`}
-                        </div>
-                      </details>
-                    </div>
-                  </td>
-                </tr><tr class="sub" style="display:none" data-pol-row="${escapeHtml(u.username)}"><td colspan="6"></td></tr>`;
-          }).join("")}</tbody></table></div>`
-        );
-      } catch (e) {
-        const userTableEl = $v("#userTable");
-        if (userTableEl) setChildMarkup(userTableEl, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
-      }
-    };
-    const loadGlobalShares = async () => {
-      if (!isSuper) return;
-      const listEl = $v("#gsList");
-      if (!listEl) return;
-      const qs = new URLSearchParams();
-      const device = ($v("#gs_device").value || "").trim();
-      const user = ($v("#gs_user").value || "").trim();
-      if (device) qs.set("device_id", device);
-      if (user) qs.set("grantee_username", user);
-      if ($v("#gs_inc_rev") && $v("#gs_inc_rev").checked) qs.set("include_revoked", "true");
-      qs.set("limit", "500");
-      setChildMarkup(listEl, `<p class="muted">Loading shares\u2026</p>`);
-      try {
-        const d = await api("/admin/shares?" + qs.toString(), { timeoutMs: 16e3 });
-        const items = d.items || [];
-        setChildMarkup(
-          listEl,
-          items.length === 0 ? `<p class="muted">No matching shares.</p>` : `<div class="table-wrap"><table class="t">
-              <thead><tr><th>Device</th><th>Owner</th><th>Grantee</th><th>Role</th><th>View</th><th>Operate</th><th>Granted by</th><th>Status</th><th></th></tr></thead>
-              <tbody>${items.map((it) => `
-                <tr>
-                  <td class="mono">${escapeHtml(it.device_id || "")}</td>
-                  <td class="mono">${escapeHtml(it.owner_admin || "\u2014")}</td>
-                  <td class="mono">${escapeHtml(it.grantee_username || "")}</td>
-                  <td>${escapeHtml(it.grantee_role || "\u2014")}</td>
-                  <td>${it.can_view ? "yes" : "no"}</td>
-                  <td>${it.can_operate ? "yes" : "no"}</td>
-                  <td class="mono">${escapeHtml(it.granted_by || "")}</td>
-                  <td>${it.revoked_at ? `<span class="badge offline">revoked</span>` : `<span class="badge online">active</span>`}</td>
-                  <td><div class="table-actions">${it.revoked_at ? "" : `<button class="btn sm danger js-gs-revoke" data-device="${escapeHtml(it.device_id || "")}" data-user="${escapeHtml(it.grantee_username || "")}">Revoke</button>`}</div></td>
-                </tr>`).join("")}</tbody></table></div>`
-        );
-      } catch (e) {
-        setChildMarkup(listEl, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
-      }
-    };
-    $v("#reloadUsers").addEventListener("click", loadUsers);
-    $v("#showCreate").addEventListener("click", () => {
-      $v("#createPanel").style.display = "";
-      $v("#createPanel").scrollIntoView({ behavior: "smooth", block: "start" });
-    });
-    $v("#u_cancel").addEventListener("click", () => {
-      $v("#createPanel").style.display = "none";
-    });
-    $v("#u_submit").addEventListener("click", async () => {
-      const body = {
-        username: $v("#u_name").value.trim(),
-        password: $v("#u_pass").value,
-        role: $v("#u_role").value
-      };
-      if (!body.username || !body.password) {
-        toast("Username and password required", "err");
-        return;
-      }
-      const email = $v("#u_email").value.trim();
-      if (!email) {
-        toast("Email required for activation", "err");
-        return;
-      }
-      body.email = email;
-      const tenant = $v("#u_tenant").value.trim();
-      if (tenant) body.tenant = tenant;
-      if (isSuper && body.role === "user") body.manager_admin = $v("#u_mgr").value;
-      try {
-        const resp = await api("/auth/users", { method: "POST", body });
-        toast(`Created: ${resp.message || "activation email sent"}`, "ok");
-        $v("#createPanel").style.display = "none";
-        $v("#u_name").value = "";
-        $v("#u_pass").value = "";
-        $v("#u_tenant").value = "";
-        $v("#u_email").value = "";
-        loadUsers();
-      } catch (e) {
-        toast(e.message || e, "err");
-      }
-    });
-    if (isSuper) {
-      $v("#gs_query").addEventListener("click", loadGlobalShares);
-      $v("#gs_grant").addEventListener("click", async () => {
-        const device = ($v("#gs_device").value || "").trim();
-        const user = ($v("#gs_user").value || "").trim();
-        const canView = !!$v("#gs_view").checked;
-        const canOperate = !!$v("#gs_operate").checked;
-        if (!device || !user) {
-          toast("Device ID and grantee required", "err");
-          return;
-        }
-        if (!canView && !canOperate) {
-          toast("Select view and/or operate", "err");
-          return;
-        }
-        try {
-          await api(`/admin/devices/${encodeURIComponent(device)}/share`, {
-            method: "POST",
-            body: { grantee_username: user, can_view: canView, can_operate: canOperate }
-          });
-          toast("Share updated", "ok");
-          loadGlobalShares();
-        } catch (e) {
-          toast(e.message || e, "err");
-        }
-      });
-      $v("#gsList").addEventListener("click", async (ev) => {
-        const btn = ev.target.closest(".js-gs-revoke");
-        if (!btn) return;
-        const device = btn.dataset.device || "";
-        const user = btn.dataset.user || "";
-        if (!device || !user) return;
-        if (!confirm(`Revoke ${user} from ${device}?`)) return;
-        try {
-          await api(`/admin/devices/${encodeURIComponent(device)}/share/${encodeURIComponent(user)}`, { method: "DELETE" });
-          toast("Share revoked", "ok");
-          loadGlobalShares();
-        } catch (e) {
-          toast(e.message || e, "err");
-        }
-      });
-      loadGlobalShares();
-    }
-    const openPolicy = async (username, trRow) => {
-      const cell = trRow.querySelector("td");
-      setChildMarkup(cell, `<span class="muted">Loading\u2026</span>`);
-      trRow.style.display = "";
-      try {
-        const p = await api(`/auth/users/${encodeURIComponent(username)}/policy`, { timeoutMs: 16e3 });
-        setChildMarkup(cell, renderPolicyPanel(username, p));
-        cell.querySelector(".js-save").addEventListener("click", async () => {
-          const body = {};
-          cell.querySelectorAll("input[type=checkbox][data-k]").forEach((i) => body[i.dataset.k] = !!i.checked);
-          try {
-            const r = await api(`/auth/users/${encodeURIComponent(username)}/policy`, { method: "PUT", body });
-            toast(`Policy updated for ${username}`, "ok");
-            setChildMarkup(cell, renderPolicyPanel(username, r.policy || r));
-            cell.querySelector(".js-save").addEventListener("click", () => openPolicy(username, trRow));
-          } catch (e) {
-            toast(e.message || e, "err");
-          }
-        });
-      } catch (e) {
-        setChildMarkup(cell, `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`);
-      }
-    };
-    $v("#userTable").addEventListener("click", async (ev) => {
-      const t = ev.target.closest("button");
-      if (!t) return;
-      const u = t.dataset.u;
-      if (t.classList.contains("js-del")) {
-        if (!confirm(`Delete user ${u}?`)) return;
-        try {
-          await api(`/auth/users/${encodeURIComponent(u)}`, { method: "DELETE" });
-          toast("Deleted", "ok");
-          loadUsers();
-        } catch (e) {
-          toast(e.message || e, "err");
-        }
-      }
-      if (t.classList.contains("js-pol")) {
-        const row = view.querySelector(`tr[data-pol-row="${CSS.escape(u)}"]`);
-        if (!row) return;
-        if (row.style.display === "") {
-          row.style.display = "none";
-          return;
-        }
-        openPolicy(u, row);
-      }
-      if (t.classList.contains("js-close-admin")) {
-        if (!isSuper) return;
-        if (!u) return;
-        if (!confirm(
-          `Close admin tenant "${u}"?
-
-\xB7 Devices: factory-unclaim all, OR transfer to another admin in the next prompt.
-\xB7 All subordinate users under this admin will be deleted.
-\xB7 That username and email are released for new signups.`
-        )) return;
-        const transfer = window.prompt(
-          "Optional: target admin username to receive ALL this admin\u2019s devices (leave empty to unclaim every device):"
-        );
-        if (transfer === null) return;
-        const transferTo = String(transfer).trim() || null;
-        const confirmText = window.prompt("Type exactly: CLOSE TENANT");
-        if (confirmText === null) return;
-        if (String(confirmText).trim() !== "CLOSE TENANT") {
-          toast("Confirmation must be exactly: CLOSE TENANT", "err");
-          return;
-        }
-        try {
-          const r = await api(`/auth/admins/${encodeURIComponent(u)}/close`, {
-            method: "POST",
-            body: { confirm_text: "CLOSE TENANT", transfer_devices_to: transferTo }
-          });
-          toast(
-            `Tenant closed \u2014 unclaimed ${Number(r.devices_unclaimed || 0)}, transferred ${Number(r.devices_transferred || 0)}, removed ${Number(r.subordinate_users_deleted || 0)} user(s).`,
-            "ok"
-          );
-          loadUsers();
-        } catch (e) {
-          toast(e.message || e, "err");
-        }
-      }
-    });
-    if (isSuper) {
-      $v("#bk_export").addEventListener("click", async () => {
-        const key = ($v("#bk_key").value || "").trim();
-        if (!key) {
-          toast("Enter backup encryption key", "err");
-          return;
-        }
-        const btn = $v("#bk_export");
-        const orig = btn ? btn.textContent : "";
-        if (btn) {
-          btn.disabled = true;
-          btn.textContent = "Exporting\u2026";
-        }
-        try {
-          const _h = { "X-Backup-Encryption-Key": key };
-          const _tb = getToken();
-          if (_tb) _h.Authorization = "Bearer " + _tb;
-          const r = await fetchWithDeadline(apiBase() + "/admin/backup/export", {
-            method: "GET",
-            credentials: "include",
-            headers: _h
-          }, 3e5);
-          if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
-          const blob = new Blob([await r.arrayBuffer()], { type: "application/octet-stream" });
-          const a = document.createElement("a");
-          a.href = URL.createObjectURL(blob);
-          a.download = "sentinel-backup.enc";
-          a.click();
-          URL.revokeObjectURL(a.href);
-          toast("Downloaded", "ok");
-        } catch (e) {
-          toast(e.message || e, "err");
-        } finally {
-          if (btn) {
-            btn.disabled = false;
-            btn.textContent = orig || "Export";
-          }
-        }
-      });
-      $v("#bk_import").addEventListener("click", async () => {
-        const key = ($v("#bk_key").value || "").trim();
-        const f = $v("#bk_file").files[0];
-        if (!key || !f) {
-          toast("Pick a file and enter the encryption key", "err");
-          return;
-        }
-        const fd = new FormData();
-        fd.append("file", f, f.name || "sentinel-backup.enc");
-        const btn = $v("#bk_import");
-        const orig = btn ? btn.textContent : "";
-        if (btn) {
-          btn.disabled = true;
-          btn.textContent = "Importing\u2026";
-        }
-        try {
-          const _hi = { "X-Backup-Encryption-Key": key };
-          const _ti = getToken();
-          if (_ti) _hi.Authorization = "Bearer " + _ti;
-          else {
-            let _ctok = getCsrfToken();
-            if (!_ctok) _ctok = await refreshCsrfToken();
-            if (_ctok) _hi[CSRF_HEADER_NAME] = _ctok;
-          }
-          const r = await fetchWithDeadline(apiBase() + "/admin/backup/import", {
-            method: "POST",
-            credentials: "include",
-            headers: _hi,
-            body: fd
-          }, 3e5);
-          const j = await r.json().catch(() => ({}));
-          if (!r.ok) throw new Error(`${r.status} ${j.detail || ""}`);
-          toast("Written: " + (j.written_path || "done"), "ok");
-        } catch (e) {
-          toast(e.message || e, "err");
-        } finally {
-          if (btn) {
-            btn.disabled = false;
-            btn.textContent = orig || "Import";
-          }
-        }
-      });
-    }
-    const loadSmtpStatus = async () => {
-      try {
-        const s = await api("/admin/smtp/status", { timeoutMs: 16e3 });
-        const smtpEl = $v("#smtpStatus");
-        if (!smtpEl) return;
-        const okBadge = s.enabled ? `<span class="badge online">Mail on</span>` : `<span class="badge offline">Mail off</span>`;
-        const last = s.last_error ? `<span class="chip" title="last error">${escapeHtml(s.last_error)}</span>` : "";
-        setChildMarkup(
-          smtpEl,
-          `${okBadge}
-          <span class="chip">host: ${escapeHtml(s.host || "\u2014")}:${escapeHtml(String(s.port || "\u2014"))}</span>
-          <span class="chip">mode: ${escapeHtml(s.mode || "\u2014")}</span>
-          <span class="chip">from: ${escapeHtml(s.sender || "\u2014")}</span>
-          <span class="chip">sent: ${s.sent_count || 0}</span>
-          <span class="chip">failed: ${s.failed_count || 0}</span>
-          <span class="chip">queue: ${s.queue_size ?? 0}/${s.queue_max ?? ""}</span>${last}`
-        );
-      } catch (e) {
-        const smtpEl = $v("#smtpStatus");
-        if (!smtpEl) return;
-        setChildMarkup(smtpEl, `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`);
-      }
-    };
-    const loadRecipients = async () => {
-      try {
-        const d = await api("/admin/alert-recipients", { timeoutMs: 16e3 });
-        const items = d.items || [];
-        const listEl = $v("#recipientList");
-        if (!listEl) return;
-        setChildMarkup(
-          listEl,
-          items.length === 0 ? `<p class="muted">No recipients yet.</p>` : `<div class="table-wrap"><table class="t">
-              <thead><tr><th>Email</th><th>Label</th><th>Enabled</th><th>Tenant</th><th></th></tr></thead>
-              <tbody>${items.map((r) => `
-                <tr>
-                  <td class="mono">${escapeHtml(r.email)}</td>
-                  <td>${escapeHtml(r.label || "\u2014")}</td>
-                  <td>${r.enabled ? `<span class="badge online">On</span>` : `<span class="badge offline">Off</span>`}</td>
-                  <td class="mono">${escapeHtml(r.owner_admin || "")}</td>
-                  <td><div class="table-actions">
-                    <button class="btn sm secondary js-rtoggle" data-id="${r.id}" data-en="${r.enabled ? 1 : 0}">${r.enabled ? "Disable" : "Enable"}</button>
-                    <button class="btn sm danger js-rdel" data-id="${r.id}">Delete</button>
-                  </div></td>
-                </tr>`).join("")}</tbody></table></div>`
-        );
-      } catch (e) {
-        const listEl = $v("#recipientList");
-        if (!listEl) return;
-        setChildMarkup(listEl, `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`);
-      }
-    };
-    $v("#r_add").addEventListener("click", async () => {
-      const email = ($v("#r_email").value || "").trim();
-      const label = ($v("#r_label").value || "").trim();
-      if (!email) {
-        toast("Enter email", "err");
-        return;
-      }
-      try {
-        await api("/admin/alert-recipients", { method: "POST", body: { email, label } });
-        $v("#r_email").value = "";
-        $v("#r_label").value = "";
-        toast("Added", "ok");
-        loadRecipients();
-      } catch (e) {
-        toast(e.message || e, "err");
-      }
-    });
-    $v("#r_test").addEventListener("click", async () => {
-      const email = ($v("#r_email").value || "").trim();
-      if (!email) {
-        toast("Enter recipient email first", "err");
-        return;
-      }
-      try {
-        await api("/admin/smtp/test", { method: "POST", body: { to: email } });
-        toast("Mail test sent", "ok");
-        loadSmtpStatus();
-      } catch (e) {
-        toast(e.message || e, "err");
-      }
-    });
-    const loadTgStatus = async () => {
-      try {
-        const t = await api("/admin/telegram/status", { timeoutMs: 16e3 });
-        const tgEl = $v("#tgStatus");
-        if (!tgEl) return;
-        const badge = t.enabled ? `<span class="badge online">enabled</span>` : `<span class="badge offline">disabled</span>`;
-        const wk = t.worker_running ? "yes" : "no";
-        const th = t.token_hint ? `<span class="chip mono" title="Token prefix/suffix only">${escapeHtml(t.token_hint)}</span>` : "";
-        const modErr = t.status_module_error ? `<p class="badge revoked" style="margin-top:8px">Telegram module failed \u2014 see <span class="mono">last_error</span> and API logs.</p>` : "";
-        const le = (t.last_error || "").trim() ? `<p class="muted" style="margin-top:8px;word-break:break-word"><strong>Last error:</strong> ${escapeHtml(t.last_error)}</p>` : "";
-        setChildMarkup(
-          tgEl,
-          `${badge}
-          ${th}
-          <span class="chip">worker: ${wk}</span>
-          <span class="chip">chats: ${t.chats ?? 0}</span>
-          <span class="chip">min_level: ${escapeHtml(t.min_level || "")}</span>
-          <span class="chip">queue: ${t.queue_size ?? 0}</span>${modErr}${le}`
-        );
-      } catch (e) {
-        const tgEl = $v("#tgStatus");
-        if (!tgEl) return;
-        setChildMarkup(tgEl, `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`);
-      }
-    };
-    const loadTgBindings = async () => {
-      const el = $v("#tgBindings");
-      if (!el) return;
-      setChildMarkup(el, `<p class="muted">Loading bindings\u2026</p>`);
-      try {
-        const d = await api("/admin/telegram/bindings", { timeoutMs: 16e3 });
-        const items = d.items || [];
-        setChildMarkup(
-          el,
-          items.length === 0 ? `<p class="muted">No bindings yet.</p>` : `<div class="table-wrap"><table class="t">
-              <thead><tr><th>chat_id</th><th>username</th><th>enabled</th><th>updated</th><th></th></tr></thead>
-              <tbody>${items.map((it) => `
-                <tr>
-                  <td class="mono">${escapeHtml(it.chat_id || "")}</td>
-                  <td>${escapeHtml(it.username || "")}</td>
-                  <td>${it.enabled ? `<span class="badge online">on</span>` : `<span class="badge offline">off</span>`}</td>
-                  <td>${escapeHtml(fmtTs(it.updated_at || it.created_at))}</td>
-                  <td><div class="table-actions"><button class="btn sm danger js-tg-unbind" data-chat="${escapeHtml(String(it.chat_id || ""))}">Unbind</button></div></td>
-                </tr>`).join("")}</tbody></table></div>`
-        );
-      } catch (e) {
-        setChildMarkup(el, `<span class="badge revoked">${escapeHtml(e.message || e)}</span>`);
-      }
-    };
-    $v("#tgTest").addEventListener("click", async () => {
-      try {
-        const r = await api("/admin/telegram/test", { method: "POST", body: { text: "Croc Sentinel UI test" } });
-        toast(r.detail || "ok", "ok");
-        loadTgStatus();
-      } catch (e) {
-        toast(e.message || e, "err");
-      }
-    });
-    $v("#tgBindSelf").addEventListener("click", async () => {
-      const chat_id = ($v("#tgBindChatId").value || "").trim();
-      const enabled = !!$v("#tgBindEnabled").checked;
-      if (!chat_id) {
-        toast("Enter chat_id", "err");
-        return;
-      }
-      try {
-        await api("/admin/telegram/bind-self", { method: "POST", body: { chat_id, enabled } });
-        toast("Chat bound", "ok");
-        loadTgBindings();
-      } catch (e) {
-        toast(e.message || e, "err");
-      }
-    });
-    $v("#tgReloadBindings").addEventListener("click", loadTgBindings);
-    $v("#tgBindings").addEventListener("click", async (ev) => {
-      const btn = ev.target.closest(".js-tg-unbind");
-      if (!btn) return;
-      const chat = btn.dataset.chat || "";
-      if (!chat) return;
-      if (!confirm(`Unbind chat ${chat}?`)) return;
-      try {
-        await api(`/admin/telegram/bindings/${encodeURIComponent(chat)}`, { method: "DELETE" });
-        toast("Unbound", "ok");
-        loadTgBindings();
-      } catch (e) {
-        toast(e.message || e, "err");
-      }
-    });
-    $v("#recipientList").addEventListener("click", async (ev) => {
-      const b = ev.target.closest("button");
-      if (!b) return;
-      const id = b.dataset.id;
-      if (b.classList.contains("js-rdel")) {
-        if (!confirm("Remove this recipient?")) return;
-        try {
-          await api(`/admin/alert-recipients/${id}`, { method: "DELETE" });
-          toast("Removed", "ok");
-          loadRecipients();
-        } catch (e) {
-          toast(e.message || e, "err");
-        }
-      }
-      if (b.classList.contains("js-rtoggle")) {
-        const en = b.dataset.en === "1" ? 0 : 1;
-        try {
-          await api(`/admin/alert-recipients/${id}`, { method: "PATCH", body: { enabled: !!en } });
-          loadRecipients();
-        } catch (e) {
-          toast(e.message || e, "err");
-        }
-      }
-    });
-    loadSmtpStatus();
-    loadRecipients();
-    loadTgStatus();
-    loadTgBindings();
-    const loadPendAdmins = async () => {
-      if (!isSuper) return;
-      try {
-        const d = await api("/auth/signup/pending", { timeoutMs: 16e3 });
-        const items = d.items || [];
-        const pendEl = $v("#pendAdmins");
-        if (!pendEl) return;
-        setChildMarkup(
-          pendEl,
-          items.length === 0 ? `<p class="muted">No pending signups.</p>` : `<div class="table-wrap"><table class="t">
-              <thead><tr><th>Username</th><th>Email</th><th>Submitted</th><th>Email OK</th><th></th></tr></thead>
-              <tbody>${items.map((u) => `<tr>
-                <td><strong>${escapeHtml(u.username)}</strong></td>
-                <td class="mono">${escapeHtml(u.email || "\u2014")}</td>
-                <td>${escapeHtml(fmtTs(u.created_at))}</td>
-                <td>${u.email_verified_at ? "\u2713" : "\u2014"}</td>
-                <td>
-                  <button class="btn sm js-ok" data-u="${escapeHtml(u.username)}">Approve</button>
-                  <button class="btn sm danger js-reject" data-u="${escapeHtml(u.username)}">Reject</button>
-                </td>
-              </tr>`).join("")}</tbody></table></div>`
-        );
-      } catch (e) {
-        const pendEl = $v("#pendAdmins");
-        if (!pendEl) return;
-        setChildMarkup(pendEl, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
-      }
-    };
-    if (isSuper) {
-      $v("#pendAdmins").addEventListener("click", async (ev) => {
-        const b = ev.target.closest("button");
-        if (!b) return;
-        const u = b.dataset.u;
-        if (b.classList.contains("js-ok")) {
-          try {
-            await api(`/auth/signup/approve/${encodeURIComponent(u)}`, { method: "POST" });
-            toast("Approved", "ok");
-            loadPendAdmins();
-            loadUsers();
-          } catch (e) {
-            toast(e.message || e, "err");
-          }
-        } else if (b.classList.contains("js-reject")) {
-          if (!confirm(`Reject and delete signup for ${u}?`)) return;
-          try {
-            await api(`/auth/signup/reject/${encodeURIComponent(u)}`, { method: "POST" });
-            toast("Rejected", "ok");
-            loadPendAdmins();
-          } catch (e) {
-            toast(e.message || e, "err");
-          }
-        }
-      });
-      loadPendAdmins();
-    }
-    loadUsers();
-  });
-  async function renderSignalsPage(view, _args, routeSeq) {
-    setCrumb("Signals");
-    mountView(view, `
-      <div class="card">
-        <div class="row" style="flex-wrap:wrap;align-items:flex-end;gap:12px">
-          <div style="flex:1;min-width:200px">
-            <h2 style="margin:0">Signal log</h2>
-            <p class="muted" style="margin:6px 0 0">Device alarms and dashboard/API siren events. Group comes from device notification settings.</p>
-          </div>
-          <label class="field" style="max-width:140px;margin:0"><span>Hours</span><input id="sig_hours" type="number" value="168" min="1" max="720"/></label>
-          <button class="btn secondary btn-tap" id="sig_reload">Refresh</button>
-        </div>
-        <div class="divider"></div>
-        <div class="stats" id="sigSummary"></div>
-        <div class="divider"></div>
-        <div id="sigList"><p class="muted">Loading\u2026</p></div>
-      </div>`);
-    const reload = async () => {
-      const hours = parseInt($("#sig_hours").value, 10) || 168;
-      const qs = new URLSearchParams({ limit: "200", since_hours: String(hours) });
-      try {
-        if (!isRouteCurrent(routeSeq)) return;
-        const [d, sumR] = await Promise.all([
-          api("/activity/signals?" + qs.toString(), { timeoutMs: 24e3 }),
-          api("/alarms/summary", { timeoutMs: 16e3 }).catch(() => ({ last_24h: 0, last_7d: 0, top_sources_7d: [] }))
-        ]);
-        if (!isRouteCurrent(routeSeq)) return;
-        const sigSummaryEl = $("#sigSummary", view);
-        const sigListEl = $("#sigList", view);
-        if (!sigSummaryEl || !sigListEl) return;
-        setHtmlIfChanged(sigSummaryEl, [
-          ["Alarms 24h", sumR.last_24h || 0, "device-side alarm rows"],
-          ["Alarms 7d", sumR.last_7d || 0, "same scope"],
-          ["Top source 7d", (sumR.top_sources_7d || []).slice(0, 1).map((x) => `${x.source_id} \xD7 ${x.c}`).join("") || "\u2014", "by count"]
-        ].map(([k, v, s]) => `<div class="stat"><div class="k">${escapeHtml(k)}</div><div class="v">${escapeHtml(v)}</div><div class="sub">${escapeHtml(s)}</div></div>`).join(""));
-        const items = d.items || [];
-        const whoLbl = (w) => ({
-          remote_button: "GPIO / local button",
-          network: "MQTT / network",
-          api: "API / automation"
-        })[w] || w;
-        setHtmlIfChanged(sigListEl, items.length === 0 ? `<p class="muted audit-empty">No rows in this window.</p>` : `<div class="audit-feed">${items.map((a) => {
-          const dev = a.device_id === "*" ? "(bulk)" : a.device_id;
-          const link = a.device_id && a.device_id !== "*" ? `<a class="mono audit-target" href="#/devices/${encodeURIComponent(a.device_id)}">${escapeHtml(dev)}</a>` : escapeHtml(dev);
-          const em = a.email_sent ? "queued" : a.email_detail || "\u2014";
-          const fo = a.kind && a.kind.startsWith("bulk") ? String(a.fanout_count || 0) : String(a.fanout_count ?? "\u2014");
-          const whoS = a.kind === "device_alarm" ? whoLbl(a.who) : a.who || "\u2014";
-          const tShort = fmtTs(a.ts);
-          return `<article class="audit-item">
-              <div class="audit-item-top">
-                <div class="audit-time">
-                  <span class="audit-ts mono">${escapeHtml(tShort)}</span>
-                  <span class="muted audit-rel">${escapeHtml(fmtRel(a.ts))}</span>
-                </div>
-                <span class="chip">${escapeHtml(a.what || a.kind || "")}</span>
-                <span class="chip">${escapeHtml(a.zone || "all")}</span>
-              </div>
-              <div class="audit-item-line" style="flex-wrap:wrap;align-items:center;gap:6px">
-                <span class="mono">${link}</span>
-                <span class="chip">${escapeHtml(a.display_label || "\u2014")}</span>
-                <span class="chip">${escapeHtml(a.notification_group || "\u2014")}</span>
-              </div>
-              <div class="audit-item-line muted" style="font-size:12.5px">Who: ${escapeHtml(String(whoS))} \xB7 Fan-out: ${escapeHtml(fo)} \xB7 Email: ${escapeHtml(em)}</div>
-            </article>`;
-        }).join("")}</div>`);
-      } catch (e) {
-        if (!isRouteCurrent(routeSeq)) return;
-        toast(e.message || e, "err");
-      }
-    };
-    $("#sig_reload").addEventListener("click", reload);
-    reload();
-    scheduleRouteTicker(routeSeq, "signals-live-reload", reload, 1e4);
-  }
-  registerRoute("signals", renderSignalsPage);
-  registerRoute("ota", async (view, _args, routeSeq) => {
-    await __renderOtaFirmwareRoute(view, routeSeq);
-  });
-  async function __renderOtaFirmwareRoute(view, routeSeq) {
-    setCrumb("OTA (ops)");
-    const me = state.me || { username: "", role: "user" };
-    const isSuper = me.role === "superadmin";
-    if (!isSuper) {
-      mountView(view, `
-        <div class="card">
-          <h2 class="ui-section-title" style="margin:0">OTA & firmware</h2>
-          <p class="muted" style="margin:8px 0 0">\u79DF\u6237\u4FA7 <strong>\u4E0D</strong>\u518D\u4F7F\u7528 Admin OTA \u63A7\u5236\u53F0\u3002\u8BF7\u5728 <a href="#/devices">\u5168\u90E8\u8BBE\u5907</a> \u4E0E\u8BBE\u5907\u8BE6\u60C5\u67E5\u770B\u7248\u672C\u65C1\u7684 <strong>\u2191 + \u7EA2\u70B9</strong>\uFF08\u6709\u53EF\u7528\u65B0\u56FA\u4EF6\u65F6\uFF09\u3002OTA \u4E0A\u4F20\u4E0E campaign \u4EC5 <strong>superadmin</strong> \u5728\u4FA7\u680F\u300COTA (ops)\u300D\u64CD\u4F5C\u3002</p>
-          <p class="muted" style="margin:8px 0 0">There is <strong>no</strong> admin OTA console in this product. Use <a href="#/devices">All devices</a> and device detail for the <strong>\u2191 + red dot</strong> when an upgrade is available. Staging and campaigns are <strong>superadmin</strong> only (sidebar <strong>OTA (ops)</strong>).</p>
-        </div>`);
-      return;
-    }
-    const helpCard = `
-      <div class="card ota-help-card">
-        <h2 class="ui-section-title" style="margin:0">OTA & firmware \xB7 \u4F7F\u7528\u8BF4\u660E</h2>
-        <div class="ota-help__cols">
-          <div>
-            <h3 class="ota-help__h">\u4E2D\u6587</h3>
-            <ul class="muted ota-help__ul">
-              <li><strong>\u5168\u5458\uFF08\u542B admin\uFF09</strong>\uFF1A\u53EA\u770B <a href="#/devices">\u5168\u90E8\u8BBE\u5907</a> / \u8BBE\u5907\u8BE6\u60C5\u4E0A\u7684 <strong>\u2191 + \u7EA2\u70B9</strong> \u4E0E\u8BF4\u660E\u5F39\u7A97\uFF1B\u4E0D\u5728\u6B64\u9875\u5BF9 campaign \u505A Accept\u3002</li>
-              <li><strong>\u68C0\u6D4B</strong>\uFF1A\u670D\u52A1\u5668\u6BD4\u8F83 <code>OTA_FIRMWARE_DIR</code> \u4E2D\u7684 <code>.bin</code> \u4E0E\u8BBE\u5907 <code>fw</code>\uFF1B\u9700 <code>OTA_PUBLIC_BASE_URL</code> \u624D\u80FD\u5728\u5F39\u7A97\u4E2D\u7ED9\u51FA\u4E0B\u8F7D URL\u3002</li>
-              <li><strong>\u6587\u4EF6</strong>\uFF1A\u63A8\u8350 <code>croc-\u7248\u672C\u53F7-8\u4F4Dhex.bin</code>\uFF1B\u540C\u540D <code>.txt</code> / <code>.md</code> \u4E3A release notes\u3002</li>
-              <li><strong>Superadmin</strong>\uFF1A\u5728\u672C\u9875\u4E0B\u65B9\u4E0A\u4F20 / \u4ECE\u5DF2\u5B58\u6587\u4EF6\u5EFA campaign\uFF08\u82E5\u4ECD\u4F7F\u7528\u540E\u7AEF campaign \u6D41\uFF0C\u7531 API \u6216\u5176\u5B83\u6D41\u7A0B\u8BA9\u5404\u79DF\u6237\u8BBE\u5907\u62C9\u53D6\uFF1B\u63A7\u5236\u53F0\u4E0D\u518D\u7ED9 admin \u63D0\u4F9B OTA \u5165\u53E3\uFF09\u3002</li>
-            </ul>
-          </div>
-          <div>
-            <h3 class="ota-help__h">English</h3>
-            <ul class="muted ota-help__ul">
-              <li><strong>Everyone (including admin)</strong>: use <a href="#/devices">All devices</a> / device detail <strong>\u2191 + red dot</strong> + notes dialog only \u2014 <strong>no</strong> tenant OTA Accept UI here.</li>
-              <li><strong>Detection</strong>: server compares <code>.bin</code> in <code>OTA_FIRMWARE_DIR</code> vs device <code>fw</code>; set <code>OTA_PUBLIC_BASE_URL</code> for URLs in the dialog.</li>
-              <li><strong>Files</strong>: prefer <code>croc-SEMVER-random8.bin</code>; sidecar <code>.txt</code>/<code>.md</code> for notes.</li>
-              <li><strong>Superadmin</strong>: upload / create-from-stored below. Campaign APIs may still exist server-side; this dashboard does not expose an admin OTA workflow.</li>
-            </ul>
-          </div>
-        </div>
-        <p class="muted" style="margin:12px 0 0">Fleet: <a href="#/devices">All devices</a></p>
-      </div>`;
-    const superCard = `
-      <div class="card">
-        <h2 class="ui-section-title">Superadmin \xB7 Upload & campaign</h2>
-        <p class="muted" style="margin:0 0 8px">Upload stages a <code>.bin</code> under <code>OTA_FIRMWARE_DIR</code> (upload password <code>OTA_UPLOAD_PASSWORD</code>). The API keeps at most <strong id="otaMaxBinsLbl">10</strong> <code>.bin</code> files and deletes the <strong>oldest by file mtime</strong> (and sidecars) when over limit \u2014 same rule as <code>POST /ota/firmware/upload</code>. The list below is <strong>fetched from this server</strong> (<code>GET /ota/firmwares</code>); click <strong>Refresh list</strong> after upload or if you copied files in by hand.</p>
-        <div class="inline-form">
-          <label class="field wide"><span>Upload password *</span><input type="password" id="otaStUploadPwd" autocomplete="off" placeholder="Server OTA_UPLOAD_PASSWORD" /></label>
-          <label class="field"><span>Firmware file (.bin)</span><input type="file" id="otaStFile" accept=".bin,application/octet-stream" /></label>
-          <label class="field"><span>Version label *</span><input id="otaStFw" placeholder="6.6.8" maxlength="40" /></label>
-          <div class="row wide" style="justify-content:flex-end">
-            <button type="button" class="btn btn-tap" id="otaStBtn">Upload & verify</button>
-          </div>
-        </div>
-        <p class="muted" id="otaRetentionInfo" style="margin-top:8px;min-height:1.2em"></p>
-        <p class="muted" id="otaStResult" style="margin-top:4px;min-height:1.2em"></p>
-        <div class="divider"></div>
-        <h3 style="margin:0 0 6px">Publish from server-staged firmware / \u4F7F\u7528\u670D\u52A1\u5668\u4E0A\u7684\u56FA\u4EF6</h3>
-        <p class="muted" style="margin:0 0 8px;font-size:12.5px">The dropdown is populated by <strong>pulling the current directory listing from the API</strong> (not from your PC). Pick a <code>.bin</code> already on the server, then create a campaign. <strong>Version</strong> is resolved on the server (<code>.version</code> sidecar or filename) \u2014 not hand-typed; it should match that build&rsquo;s <code>FW_VERSION</code>.</p>
-        <div class="row wide" style="align-items:flex-end;flex-wrap:wrap;gap:10px;margin-bottom:6px">
-          <label class="field wide" style="flex:1;min-width:220px;margin:0"><span>Firmware on server *</span><select id="otaFromSel"><option value="">Loading\u2026</option></select></label>
-          <button type="button" class="btn secondary btn-tap sm" id="otaFwListRefresh">Refresh list</button>
-        </div>
-        <label class="field wide"><span>Version (from server, read-only)</span><input type="text" id="otaFromResolvedVer" class="mono" readonly tabindex="-1" value="\u2014" style="background:var(--bg-muted);cursor:default" aria-live="polite" /></label>
-        <label class="field wide"><span>Notes</span><input id="otaFromNotes" maxlength="500" /></label>
-        <label class="checkbox"><input type="checkbox" id="otaFromAllAd" checked /><span>Target all admins</span></label>
-        <label class="field wide"><span>Or comma-separated admin usernames</span><input id="otaFromAdmTxt" placeholder="admin-a, admin-b (when not targeting all)" /></label>
-        <div class="row wide" style="justify-content:flex-end;margin-top:10px">
-          <button type="button" class="btn btn-tap" id="otaFromBtn">Create campaign</button>
-        </div>
-      </div>`;
-    mountView(view, helpCard + superCard);
-    const otaSyncFromStoredVersion = () => {
-      const sel = $("#otaFromSel", view);
-      const ro = $("#otaFromResolvedVer", view);
-      if (!ro) return;
-      if (!sel || !sel.value) {
-        ro.value = "\u2014";
-        return;
-      }
-      const i = Number(sel.selectedIndex);
-      const opt = sel.options[i];
-      const raw = opt && opt.getAttribute("data-fw-version");
-      const v = raw && String(raw).trim() || "";
-      ro.value = v || "\u2014";
-    };
-    const refreshFirmwareSelect = async () => {
-      if (!isSuper) return;
-      const sel = $("#otaFromSel", view);
-      if (!sel) return;
-      try {
-        const r = await api("/ota/firmwares", { timeoutMs: 2e4 });
-        if (!isRouteCurrent(routeSeq)) return;
-        const items = r.items || [];
-        const ret = r.retention;
-        const mx = $("#otaMaxBinsLbl", view);
-        if (mx && ret && ret.max_bins != null) mx.textContent = String(ret.max_bins);
-        const inf = $("#otaRetentionInfo", view);
-        if (inf) {
-          inf.textContent = ret ? `Server directory: ${ret.stored_count || 0} / max ${ret.max_bins} .bin files (oldest mtime removed when over limit). Upload password: ${ret.upload_password_configured ? "configured" : "not set on server"}.` : "";
-        }
-        const fmtM = (ts) => {
-          const t = Number(ts);
-          if (!Number.isFinite(t) || t <= 0) return "";
-          try {
-            const d = new Date(t * 1e3);
-            return d.toLocaleString(void 0, { dateStyle: "short", timeStyle: "short" });
-          } catch {
-            return "";
-          }
-        };
-        sel.innerHTML = items.length ? items.map((it) => {
-          const vRaw = it.fw_version && String(it.fw_version).trim() || "";
-          const dv = vRaw ? escapeHtml(vRaw) : "";
-          const fv = vRaw ? ` \xB7 v${escapeHtml(vRaw)}` : "";
-          const mt = fmtM(it.mtime);
-          const mtS = mt ? ` \xB7 ${escapeHtml(mt)}` : "";
-          return `<option value="${escapeHtml(it.name)}" data-fw-version="${dv}">${escapeHtml(it.name)}${fv} (${Math.round(Number(it.size || 0) / 1024)} KB${mtS})</option>`;
-        }).join("") : '<option value="">(no .bin in folder)</option>';
-        otaSyncFromStoredVersion();
-        sel.onchange = otaSyncFromStoredVersion;
-      } catch (e) {
-        const inf = $("#otaRetentionInfo", view);
-        if (inf) inf.textContent = "";
-        sel.innerHTML = `<option value="">${escapeHtml(e.message || "list failed")}</option>`;
-        otaSyncFromStoredVersion();
-        sel.onchange = otaSyncFromStoredVersion;
-      }
-    };
-    await refreshFirmwareSelect();
-    const otaFwListRefresh = $("#otaFwListRefresh", view);
-    if (otaFwListRefresh) {
-      otaFwListRefresh.addEventListener("click", async () => {
-        otaFwListRefresh.disabled = true;
-        try {
-          await refreshFirmwareSelect();
-          toast("Firmware list refreshed from server", "ok");
-        } catch (_) {
-        } finally {
-          otaFwListRefresh.disabled = false;
-        }
-      });
-    }
-    const stBtn = $("#otaStBtn", view);
-    if (stBtn) {
-      stBtn.addEventListener("click", async () => {
-        const inp = $("#otaStFile", view);
-        const f = inp && inp.files && inp.files[0];
-        const fw = String($("#otaStFw", view)?.value || "").trim();
-        const upw = String($("#otaStUploadPwd", view)?.value || "");
-        if (!f || !fw) {
-          toast("Choose file and version label", "err");
-          return;
-        }
-        if (!upw) {
-          toast("Enter the upload password (set OTA_UPLOAD_PASSWORD on the server).", "err");
-          return;
-        }
-        if (!confirm("Upload firmware to server (HEAD check against public /fw/ URL)?")) return;
-        try {
-          const fd = new FormData();
-          fd.append("file", f);
-          fd.append("fw_version", fw);
-          fd.append("upload_password", upw);
-          const r = await api("/ota/firmware/upload", { method: "POST", body: fd, timeoutMs: 18e4 });
-          if (!isRouteCurrent(routeSeq)) return;
-          const resEl = $("#otaStResult", view);
-          if (resEl) resEl.textContent = `Stored ${r.stored_as || ""} \xB7 head_ok=${r.head_ok} \xB7 ${r.verify || ""}`;
-          toast("Upload finished", r.head_ok ? "ok" : "err");
-          if (inp) inp.value = "";
-          refreshFirmwareSelect();
-        } catch (e) {
-          toast(e.message || e, "err");
-        }
-      });
-    }
-    const fromBtn = $("#otaFromBtn", view);
-    if (fromBtn) {
-      fromBtn.addEventListener("click", async () => {
-        const fn = String($("#otaFromSel", view)?.value || "").trim();
-        const notes = String($("#otaFromNotes", view)?.value || "").trim();
-        const allCh = $("#otaFromAllAd", view);
-        const rawAdm = String($("#otaFromAdmTxt", view)?.value || "").trim();
-        const target_admins = allCh && allCh.checked ? ["*"] : rawAdm ? rawAdm.split(/[\s,;]+/).filter(Boolean) : ["*"];
-        if (!fn) {
-          toast("Select a firmware package from the list", "err");
-          return;
-        }
-        if (!confirm("Create OTA campaign from this stored file? The campaign version will be taken from the server (staged .version / filename), not the UI.")) return;
-        try {
-          const out = await api("/ota/campaigns/from-stored", {
-            method: "POST",
-            body: { filename: fn, notes: notes || void 0, target_admins }
-          });
-          toast(
-            out && out.fw_version ? `Campaign created \xB7 v${out.fw_version}` : "Campaign created",
-            "ok"
-          );
-          try {
-            bustDeviceListCaches();
-          } catch (_) {
-          }
-        } catch (e) {
-          toast(e.message || e, "err");
-        }
-      });
-    }
-  }
-  function renderPolicyPanel(username, p) {
-    const row = (k, label, locked) => `
-      <label class="checkbox"><input type="checkbox" data-k="${k}" ${p[k] ? "checked" : ""} ${locked ? "disabled" : ""}/><span>${escapeHtml(label)}</span></label>`;
-    return `
-      <div class="stack">
-        <p class="muted" style="margin:0">Capabilities for <strong>${escapeHtml(username)}</strong> (user role).</p>
-        <div class="row">
-          ${row("can_alert", "Alarms (device + bulk + cancel)")}
-          ${row("can_send_command", "Send device commands")}
-          ${row("can_claim_device", "Claim / provision devices")}
-          ${row("can_manage_users", "Manage users (N/A for user role)", true)}
-          ${row("can_backup_restore", "Backup / restore (N/A for user role)", true)}
-        </div>
-        <div class="row" style="justify-content:flex-end">
-          <button class="btn js-save" type="button">Save</button>
-        </div>
-      </div>`;
-  }
-  async function boot() {
-    initTheme();
-    $("#menuBtn").addEventListener("click", () => toggleNav());
-    $("#sidebarBackdrop").addEventListener("click", () => toggleNav(false));
-    const railT = document.getElementById("sidebarRailToggle");
-    if (railT) railT.addEventListener("click", () => toggleSidebarRail());
-    window.addEventListener("resize", syncNavForViewport);
-    window.addEventListener("orientationchange", syncNavForViewport);
-    $("#themeBtn").addEventListener("click", () => {
-      setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
-    });
-    $("#logoutBtn").addEventListener("click", async () => {
-      try {
-        await fetchWithDeadline(apiBase() + "/auth/logout", { method: "POST" }, 12e3);
-      } catch (_) {
-      }
-      setToken("");
-      state.me = null;
-      clearHealthPollTimer();
-      location.hash = "#/login";
-      renderAuthState();
-    });
-    $("#refreshBtn").addEventListener("click", () => renderRoute());
-    document.addEventListener("click", (ev) => {
-      const b = ev.target.closest(".btn-tap");
-      if (!b || b.disabled) return;
-      try {
-        if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
-        if (typeof navigator !== "undefined" && navigator.vibrate) navigator.vibrate(10);
-      } catch (_) {
-      }
-    }, true);
-    await loadMe();
-    syncNavForViewport();
-    try {
-      applySidebarRail();
-    } catch (_) {
-    }
-    if (!location.hash) location.hash = state.me ? "#/overview" : "#/login";
-    else renderRoute();
-    await loadHealth().catch(() => {
-    });
-    window.addEventListener("online", () => {
-      loadHealth().catch(() => {
-      });
-      tickHealthIfVisible();
-      if (typeof window.__eventsStreamResume === "function") {
-        try {
-          if (!window.__evSSE || window.__evSSE.readyState === EventSource.CLOSED) {
-            window.__eventsStreamResume();
-          } else {
-            syncEventsLiveBadge();
-          }
-        } catch (_) {
-        }
-      }
-    });
-    document.addEventListener("visibilitychange", () => {
-      document.documentElement.classList.toggle("tab-hidden", document.visibilityState === "hidden");
-      if (document.visibilityState === "hidden") {
-        const live = document.getElementById("evLive");
-        if (live && window.__evSSE && window.__evSSE.readyState === EventSource.OPEN) {
-          live.textContent = "Background";
-          live.className = "badge neutral";
-          live.title = "Stream stays connected in background";
-        }
-        return;
-      }
-      tickHealthIfVisible();
-      syncEventsLiveBadge();
-      if (typeof window.__eventsStreamResume === "function") {
-        try {
-          if (!window.__evSSE || window.__evSSE.readyState === EventSource.CLOSED) {
-            window.__eventsStreamResume();
-          }
-        } catch (_) {
-        }
-      }
-    });
-    document.documentElement.classList.toggle("tab-hidden", document.visibilityState === "hidden");
-  }
-  document.addEventListener("DOMContentLoaded", boot);
-  registerRoute("account-activate", async (view) => {
-    setCrumb("Activate account");
-    document.body.dataset.auth = "none";
-    mountView(view, `
-    <div class="auth-surface" role="main">
-      ${authAsideHtml("activate")}
-      <div class="auth-surface__body">
-        <div class="auth-surface__inner">
-      <div class="auth-card auth-card--panel auth-card--wide" data-auth-card>
-        <header class="auth-card__head">
-          <h1 class="auth-card__title">Activate account</h1>
-          <p class="auth-card__lead">Use the code from your invitation email</p>
-        </header>
-        <div class="auth-card__body">
-          <p class="auth-card__note muted">An administrator created your user. Enter your <strong>username</strong> and the <strong>email code</strong> below.</p>
-          <label class="field"><span>Username</span><input id="a_user" autocomplete="username" placeholder="Your username"/></label>
-          <label class="field field--spaced"><span>Email code</span><input id="a_email_code" inputmode="numeric" maxlength="12" autocomplete="one-time-code" placeholder="From email"/></label>
-          <div class="auth-card__submit">
-            <button class="btn btn-tap btn-block" type="button" id="a_submit">Activate</button>
-            <button class="btn secondary btn-tap btn-block" type="button" id="a_resend">Resend code</button>
-            <a class="auth-link auth-link--center" href="#/login">Back to sign in</a>
-          </div>
-          <p class="auth-card__msg muted" id="a_msg" aria-live="polite"></p>
-        </div>
-      </div>
-      ${authSiteFooterHtml()}
-        </div>
-      </div>
-    </div>`);
-    const msg = $("#a_msg");
-    $("#a_submit").addEventListener("click", async () => {
-      const body = {
-        username: $("#a_user").value.trim(),
-        email_code: $("#a_email_code").value.trim()
-      };
-      msg.textContent = "";
-      try {
-        const r = await fetch(apiBase() + "/auth/activate", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body)
-        });
-        const j = await r.json().catch(() => ({}));
-        if (!r.ok) throw new Error(j.detail || `${r.status}`);
-        setChildMarkup(msg, `<span class="badge online">Activated</span> Redirecting to sign in\u2026`);
-        scheduleRouteRedirect(1500, "#/login");
-      } catch (e) {
-        msg.textContent = String(e.message || e);
-      }
-    });
-    $("#a_resend").addEventListener("click", async () => {
-      msg.textContent = "";
-      const username = $("#a_user").value.trim();
-      if (!username) {
-        msg.textContent = "Enter username first";
-        return;
-      }
-      try {
-        const r = await fetch(apiBase() + "/auth/code/resend", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ username, channel: "email", purpose: "activate" })
-        });
-        const j = await r.json().catch(() => ({}));
-        if (!r.ok) throw new Error(j.detail || `${r.status}`);
-        msg.textContent = "Resend requested \u2014 check inbox and spam.";
-      } catch (e) {
-        msg.textContent = String(e.message || e);
-      }
-    });
-  });
-  registerRoute("alerts", async (view) => {
-    setCrumb("Siren");
-    const enabled = can("can_alert");
-    mountView(view, `
-    <div class="card">
-      <h2>Bulk siren</h2>
-      <p class="muted">MQTT <span class="mono">siren_on</span> / <span class="mono">siren_off</span>. Requires <span class="mono">can_alert</span>.</p>
-      ${enabled ? "" : `<p class="badge revoked">No can_alert \u2014 ask admin (Policies).</p>`}
-      <p id="alertsLoadMsg" class="muted" aria-live="polite">Loading device list\u2026</p>
-      <div class="inline-form inline-form--bulk-siren" style="margin-top:12px">
-        <label class="field"><span>Action</span>
-          <select id="action"><option value="on">ON</option><option value="off">OFF</option></select>
-        </label>
-        <label class="field"><span>Duration (ms)</span>
-          <input id="dur" type="number" value="${DEFAULT_REMOTE_SIREN_MS}" min="500" max="300000" step="1000" />
-        </label>
-        <label class="field wide"><span>Targets (empty = all visible)</span>
-          <select id="targets" multiple size="6" disabled></select>
-        </label>
-        <div class="row wide" style="justify-content:flex-end">
-          <button class="btn danger" id="fire" disabled>Run</button>
-        </div>
-      </div>
-    </div>`);
-    const sel = $("#targets");
-    const fireBtn = $("#fire");
-    const loadMsg = $("#alertsLoadMsg");
-    let list;
-    try {
-      list = await apiGetCached("/devices", { timeoutMs: 16e3 }, 4e3);
-      if (loadMsg) loadMsg.remove();
-    } catch (e) {
-      const detail = String(e && e.message || e || "load failed");
-      if (loadMsg) {
-        loadMsg.className = "badge offline";
-        loadMsg.textContent = `Device list fallback: ${detail}`;
-      }
-      list = { items: [] };
-    }
-    const devices = list.items || [];
-    setChildMarkup(sel, devices.map((d) => {
-      const lab = d.display_label ? `${escapeHtml(d.display_label)}` : escapeHtml(d.device_id);
-      const serial = d.display_label ? ` \xB7 ${escapeHtml(d.device_id)}` : "";
-      const grp = d.notification_group ? `[${escapeHtml(d.notification_group)}] ` : "";
-      const z = d.zone ? ` \xB7 ${escapeHtml(d.zone)}` : "";
-      return `<option value="${escapeHtml(d.device_id)}">${grp}${lab}${serial}${z}</option>`;
-    }).join(""));
-    sel.disabled = false;
-    if (enabled) fireBtn.disabled = false;
-    fireBtn.addEventListener("click", async () => {
-      const action = $("#action").value;
-      const dur = parseInt($("#dur").value, 10) || DEFAULT_REMOTE_SIREN_MS;
-      const ids = Array.from(sel.selectedOptions).map((o) => o.value);
-      if (action === "on" && !confirm(`Siren ON for ${ids.length === 0 ? "ALL visible devices" : ids.length + " device(s)"}?`)) return;
-      try {
-        const r = await api("/alerts", { method: "POST", body: { action, duration_ms: dur, device_ids: ids } });
-        toast(`${action === "on" ? "ON" : "OFF"} \u2192 ${r.sent_count} device(s)`, "ok");
-      } catch (e) {
-        toast(e.message || e, "err");
-      }
-    });
-  });
-  registerRoute("forgot-password", async (view) => {
-    setCrumb("Forgot password");
-    document.body.dataset.auth = "none";
-    let enabled = true;
-    try {
-      const r = await fetch(apiBase() + "/auth/forgot/email/enabled");
-      const j = await r.json();
-      enabled = !!j.enabled;
-    } catch {
-      enabled = false;
-    }
-    mountView(view, `
-    <div class="auth-surface" role="main">
-      ${authAsideHtml("recovery")}
-      <div class="auth-surface__body">
-        <div class="auth-surface__inner auth-surface__inner--wide">
-      <div class="auth-card auth-card--panel auth-card--wide auth-card--prose" data-auth-card>
-        <header class="auth-card__head">
-          <h1 class="auth-card__title">Account recovery</h1>
-          <p class="auth-card__lead">Reset via email verification code</p>
-        </header>
-        <div class="auth-card__body">
-        <p class="muted auth-card__prose">
-          Enter your username and the same email used at registration.
-          The server sends a SHA-style verification code to that email.
-          Enter the code to set a new password (saved permanently on server).
-        </p>
-        ${enabled ? "" : `<p class="badge revoked" style="margin:10px 0">Email sender is not configured on server.</p>`}
-        <div id="fpStep1">
-          <label class="field"><span>Username</span><input id="fp_user" autocomplete="username" /></label>
-          <label class="field field--spaced"><span>Registered email</span><input id="fp_email" autocomplete="email" /></label>
-          <div class="auth-card__submit">
-            <button class="btn btn-tap btn-block" type="button" id="fp_go" ${enabled ? "" : "disabled"}>Send SHA code</button>
-            <a class="auth-link auth-link--center" href="#/login">Back to sign in</a>
-          </div>
-          <p class="auth-card__msg muted" id="fp_msg1" aria-live="polite"></p>
-        </div>
-        <div id="fpStep2" style="display:none">
-          <label class="field"><span>SHA code (from email)</span>
-            <input id="fp_sha_code" class="mono" maxlength="32" autocomplete="one-time-code" />
-          </label>
-          <label class="field field--spaced"><span>New password (\u22658)</span><input id="fp_p1" type="password" autocomplete="new-password" /></label>
-          <label class="field field--spaced"><span>Confirm password</span><input id="fp_p2" type="password" autocomplete="new-password" /></label>
-          <div class="auth-card__submit">
-            <button class="btn btn-tap btn-block" type="button" id="fp_done">Update password</button>
-            <button class="btn secondary btn-tap btn-block" type="button" id="fp_resend">Resend SHA code</button>
-            <button class="btn secondary btn-tap btn-block" type="button" id="fp_back">Back</button>
-          </div>
-          <p class="auth-card__msg muted" id="fp_msg2" aria-live="polite"></p>
-        </div>
-        </div>
-      </div>
-      ${authSiteFooterHtml()}
-        </div>
-      </div>
-    </div>`);
-    const m1 = $("#fp_msg1"), m2 = $("#fp_msg2");
-    let fpCooldown = 0;
-    let fpCooldownTimer = 0;
-    const fpGoBtn = $("#fp_go");
-    const fpResendBtn = $("#fp_resend");
-    const applyFpCooldownUi = () => {
-      const left = Math.max(0, Number(fpCooldown || 0));
-      if (fpGoBtn) {
-        fpGoBtn.disabled = !enabled || left > 0;
-        fpGoBtn.textContent = left > 0 ? `Resend in ${left}s` : "Send SHA code";
-      }
-      if (fpResendBtn) {
-        fpResendBtn.disabled = left > 0;
-        fpResendBtn.textContent = left > 0 ? `Resend in ${left}s` : "Resend SHA code";
-      }
-    };
-    const startFpCooldown = (seconds) => {
-      fpCooldown = Math.max(0, Number(seconds || 0));
-      applyFpCooldownUi();
-      if (fpCooldownTimer) clearInterval(fpCooldownTimer);
-      if (window.__fpCooldownTimer) {
-        try {
-          clearInterval(window.__fpCooldownTimer);
-        } catch (_) {
-        }
-        window.__fpCooldownTimer = 0;
-      }
-      if (fpCooldown <= 0) return;
-      fpCooldownTimer = setInterval(() => {
-        fpCooldown = Math.max(0, fpCooldown - 1);
-        applyFpCooldownUi();
-        if (fpCooldown <= 0) {
-          clearInterval(fpCooldownTimer);
-          fpCooldownTimer = 0;
-          window.__fpCooldownTimer = 0;
-        }
-      }, 1e3);
-      window.__fpCooldownTimer = fpCooldownTimer;
-    };
-    const parseCooldownFromMessage = (msg) => {
-      const m = String(msg || "").match(/wait\s+(\d+)s/i);
-      return m ? Math.max(1, Number(m[1])) : 0;
-    };
-    const doForgotSend = async () => {
-      m1.textContent = "";
-      const username = $("#fp_user").value.trim();
-      const email = ($("#fp_email").value || "").trim().toLowerCase();
-      if (!username || !email) {
-        m1.textContent = "Enter username and email";
-        return false;
-      }
-      if (fpCooldown > 0) {
-        m1.textContent = `Please wait ${fpCooldown}s before resending.`;
-        return false;
-      }
-      const check = await fetch(apiBase() + "/auth/forgot/email/check", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username, email })
-      });
-      const cj = await check.json().catch(() => ({}));
-      if (!check.ok) {
-        const det = cj.detail;
-        const msg = Array.isArray(det) ? det.map((x) => x.msg || JSON.stringify(x)).join("; ") : det || check.statusText;
-        throw new Error(msg);
-      }
-      if (!cj.matched) {
-        m1.textContent = "Username and registered email do not match.";
-        return false;
-      }
-      const preWait = Number(cj.resend_after_seconds || 0);
-      if (preWait > 0) {
-        startFpCooldown(preWait);
-        m1.textContent = `Please wait ${preWait}s before sending again.`;
-        return false;
-      }
-      const r = await fetch(apiBase() + "/auth/forgot/email/start", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username, email })
-      });
-      const d = await r.json().catch(() => ({}));
-      if (!r.ok) {
-        const det = d.detail;
-        const msg = Array.isArray(det) ? det.map((x) => x.msg || JSON.stringify(x)).join("; ") : det || r.statusText;
-        const wait = parseCooldownFromMessage(msg);
-        if (wait > 0) startFpCooldown(wait);
-        throw new Error(msg);
-      }
-      const cd = Number(d.resend_after_seconds || 60);
-      startFpCooldown(cd);
-      m1.textContent = `Code sent. TTL ${(Number(d.ttl_seconds || 0) / 60).toFixed(0)} min.`;
-      return true;
-    };
-    applyFpCooldownUi();
-    $("#fp_go").addEventListener("click", async () => {
-      try {
-        const ok = await doForgotSend();
-        if (!ok) return;
-        $("#fpStep1").style.display = "none";
-        $("#fpStep2").style.display = "block";
-      } catch (e) {
-        m1.textContent = String(e.message || e);
-      }
-    });
-    if (fpResendBtn) {
-      fpResendBtn.addEventListener("click", async () => {
-        try {
-          const ok = await doForgotSend();
-          if (ok) m2.textContent = `Code resent. Wait ${fpCooldown}s before next resend.`;
-        } catch (e) {
-          m2.textContent = String(e.message || e);
-        }
-      });
-    }
-    $("#fp_back").addEventListener("click", () => {
-      $("#fpStep2").style.display = "none";
-      $("#fpStep1").style.display = "block";
-      m2.textContent = "";
-    });
-    $("#fp_done").addEventListener("click", async () => {
-      m2.textContent = "";
-      const username = $("#fp_user").value.trim();
-      const email = ($("#fp_email").value || "").trim().toLowerCase();
-      const sha_code = ($("#fp_sha_code").value || "").trim().toUpperCase();
-      const password = $("#fp_p1").value;
-      const password_confirm = $("#fp_p2").value;
-      if (!email || !sha_code || !password) {
-        m2.textContent = "Enter email, SHA code, and password";
-        return;
-      }
-      if (password !== password_confirm) {
-        m2.textContent = "Passwords do not match";
-        return;
-      }
-      try {
-        const r = await fetch(apiBase() + "/auth/forgot/email/complete", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ username, email, sha_code, password, password_confirm })
-        });
-        const d = await r.json().catch(() => ({}));
-        if (!r.ok) {
-          const det = d.detail;
-          const msg = Array.isArray(det) ? det.map((x) => x.msg || JSON.stringify(x)).join("; ") : det || r.statusText;
-          throw new Error(msg);
-        }
-        setChildMarkup(m2, `<span class="badge online">Password updated</span> Redirecting to sign in\u2026`);
-        toast("Password updated", "ok");
-        scheduleRouteRedirect(1500, "#/login");
-      } catch (e) {
-        m2.textContent = String(e.message || e);
-      }
-    });
-  });
-  registerRoute("login", async (view) => {
-    setCrumb("Sign in");
-    document.body.dataset.auth = "none";
-    const cleanAuthMessage = (raw) => {
-      const s = String(raw || "").trim();
-      if (!s) return "Request failed. Please try again.";
-      const l = s.toLowerCase();
-      if (l.includes("401")) return "Username or password is incorrect.";
-      if (l.includes("invalid credentials")) return "Username or password is incorrect.";
-      if (l.includes("too many login attempts")) return s;
-      if (l.includes("session expired")) return "Session expired. Please sign in again.";
-      if (l.includes("networkerror") || l.includes("failed to fetch")) return "Network error. Please check server/API.";
-      return s.replace(/^error:\s*/i, "");
-    };
-    mountView(view, `
-    <div class="auth-surface" role="main">
-      ${authAsideHtml("login")}
-      <div class="auth-surface__body">
-        <div class="auth-surface__inner">
-          <div class="auth-card auth-card--panel auth-card--auth-main" data-auth-card>
-            <header class="auth-card__head">
-              <h1 class="auth-card__title">Sign in</h1>
-              <p class="auth-card__lead">Use the credentials your administrator provided.</p>
-            </header>
-            <form class="auth-card__body" id="loginForm" autocomplete="on">
-              <label class="field">
-                <span>Username</span>
-                <input name="username" autocomplete="username" required placeholder="e.g. dan" />
-              </label>
-              <label class="field field--spaced">
-                <span>Password</span>
-                <input name="password" type="password" autocomplete="current-password" required placeholder="\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022" />
-              </label>
-              <div class="auth-card__submit">
-                <button class="btn btn-tap btn-block auth-btn-primary" type="submit" id="loginSubmit">Sign in</button>
-              </div>
-              <p class="auth-card__msg auth-card__msg--fixed muted" id="loginMsg" aria-live="polite"></p>
-              <nav class="auth-card__links auth-card__links--grid" aria-label="Other sign-in options">
-                <a class="auth-link" href="#/register">Register admin</a>
-                <a class="auth-link" href="#/account-activate">Activate account</a>
-                <a class="auth-link" href="#/forgot-password">Forgot password</a>
-              </nav>
-            </form>
-          </div>
-          ${authSiteFooterHtml()}
-        </div>
-      </div>
-    </div>`);
-    const form = $("#loginForm", view);
-    const card = view.querySelector("[data-auth-card]");
-    form.addEventListener("submit", async (ev) => {
-      ev.preventDefault();
-      const data = new FormData(form);
-      const msg = $("#loginMsg", view);
-      const btn = $("#loginSubmit", view);
-      const label = btn ? btn.textContent : "Sign in";
-      msg.textContent = "";
-      if (btn) {
-        btn.disabled = true;
-        btn.textContent = "Signing in\u2026";
-      }
-      try {
-        await login(data.get("username"), data.get("password"));
-        await loadMe();
-        await loadHealth();
-        location.hash = "#/overview";
-      } catch (e) {
-        msg.textContent = cleanAuthMessage(e.message || e);
-        if (card) {
-          card.classList.remove("auth-shake");
-          void card.offsetWidth;
-          card.classList.add("auth-shake");
-          setTimeout(() => card.classList.remove("auth-shake"), 500);
-        }
-      } finally {
-        if (btn) {
-          btn.disabled = false;
-          btn.textContent = label;
-        }
-      }
-    });
-  });
   registerRoute("register", async (view) => {
     setCrumb("Register admin");
     document.body.dataset.auth = "none";
@@ -6865,5 +6639,231 @@ ${id}`) || "").trim();
         m2.textContent = cleanSignupMessage(e.message || e);
       }
     });
+  });
+  registerRoute("site", async (view, _args, routeSeq) => {
+    setCrumb("Site \xB7 owners & groups / \u7AD9\u70B9");
+    if (!(state.me && state.me.role === "superadmin")) {
+      mountView(view, `<div class="card"><p class="muted">Superadmin only.</p></div>`);
+      return;
+    }
+    let ownerQ = String(window.__routeQuery && window.__routeQuery.get("owner") || "").trim();
+    let allDevs = [];
+    try {
+      const r = await api("/devices", { timeoutMs: 2e4 });
+      if (!isRouteCurrent(routeSeq)) return;
+      allDevs = Array.isArray(r.items) ? r.items.slice() : [];
+    } catch (e) {
+      if (!isRouteCurrent(routeSeq)) return;
+      mountView(view, `<div class="card"><p class="badge offline">${escapeHtml(e.message || e)}</p></div>`);
+      return;
+    }
+    const applyFilter = (list, q) => {
+      const s = String(q || "").trim().toLowerCase();
+      if (!s) return list;
+      return list.filter((d) => String(d.owner_admin || "").toLowerCase().includes(s));
+    };
+    const filtered = () => applyFilter(allDevs, ownerQ);
+    const ownersU = [...new Set(allDevs.map((d) => String(d.owner_admin || "").trim()).filter(Boolean))].sort();
+    const fd = filtered();
+    const slots = buildGroupSlotsFromDeviceList(fd);
+    const rows = fd.map((d) => {
+      const on = isOnline(d);
+      const did = encodeURIComponent(d.device_id);
+      return `<tr><td class="mono"><a href="#/devices/${did}">${escapeHtml(d.device_id)}</a></td><td class="mono">${escapeHtml(d.owner_admin || "\u2014")}</td><td>${escapeHtml(d.notification_group || "\u2014")}</td><td>${escapeHtml(d.zone || "")}</td><td><span class="badge ${on ? "online" : "offline"}">${on ? "on" : "off"}</span></td></tr>`;
+    }).join("");
+    const grpRows = slots.map((s) => {
+      const owq = s.tenantOwner ? `?owner=${encodeURIComponent(s.tenantOwner)}` : "";
+      return `<tr><td class="mono"><a href="#/group/${encodeURIComponent(s.groupKey)}${owq}">${escapeHtml(s.groupKey)}</a></td><td class="mono">${escapeHtml(s.tenantOwner || "\u2014")}</td><td class="mono muted">${escapeHtml(s.metaKey)}</td></tr>`;
+    }).join("");
+    mountView(view, `
+    <section class="card">
+      <h2 class="ui-section-title" style="margin:0">Site / \u7AD9\u70B9</h2>
+      <p class="muted" style="margin:8px 0 0">Search <strong>owner admin</strong> username (substring). Lists devices and <strong>notification groups</strong> under that filter \u2014 same slot keys as Overview group cards.</p>
+      <div class="inline-form" style="margin-top:12px;flex-wrap:wrap;gap:10px;align-items:flex-end">
+        <label class="field grow"><span>Owner contains</span>
+          <input type="search" id="siteOwnerQ" value="${escapeHtml(ownerQ)}" placeholder="e.g. dan" list="siteOwnerDl" autocomplete="off" />
+          <datalist id="siteOwnerDl">${ownersU.map((o) => `<option value="${escapeHtml(o)}"></option>`).join("")}</datalist>
+        </label>
+        <button type="button" class="btn sm secondary btn-tap" id="siteOwnerClear">Clear</button>
+        <button type="button" class="btn btn-tap" id="siteOwnerApply">Apply</button>
+      </div>
+    </section>
+    <section class="card">
+      <h3 style="margin:0 0 8px">Owners in fleet (${ownersU.length})</h3>
+      <p class="muted" style="margin:0;font-size:12px">Unique <span class="mono">owner_admin</span> from API. Click a chip to filter.</p>
+      <div class="row" style="gap:6px;flex-wrap:wrap;margin-top:10px">
+        ${ownersU.map((o) => `<button type="button" class="chip js-site-owner-chip" data-o="${escapeHtml(o)}" style="cursor:pointer">${escapeHtml(o)}</button>`).join("")}
+      </div>
+    </section>
+    <section class="card">
+      <h3 style="margin:0 0 8px">Devices (${fd.length})</h3>
+      <div class="table-wrap"><table class="t">
+        <thead><tr><th>Device</th><th>Owner</th><th>Notification group</th><th>Zone</th><th>Presence</th></tr></thead>
+        <tbody>${rows || `<tr><td colspan="5" class="muted">No devices match.</td></tr>`}</tbody>
+      </table></div>
+    </section>
+    <section class="card">
+      <h3 style="margin:0 0 8px">Groups (${slots.length})</h3>
+      <div class="table-wrap"><table class="t">
+        <thead><tr><th>Group key</th><th>Tenant (slot)</th><th>Card meta-key</th></tr></thead>
+        <tbody>${grpRows || `<tr><td colspan="3" class="muted">No groups in filter.</td></tr>`}</tbody>
+      </table></div>
+    </section>
+  `);
+    $("#siteOwnerApply", view).addEventListener("click", () => {
+      ownerQ = String($("#siteOwnerQ", view)?.value || "").trim();
+      location.hash = ownerQ ? `#/site?owner=${encodeURIComponent(ownerQ)}` : "#/site";
+    });
+    $("#siteOwnerClear", view).addEventListener("click", () => {
+      location.hash = "#/site";
+    });
+    $("#siteOwnerQ", view).addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        $("#siteOwnerApply", view).click();
+      }
+    });
+    $$(".js-site-owner-chip", view).forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const o = btn.getAttribute("data-o") || "";
+        location.hash = o ? `#/site?owner=${encodeURIComponent(o)}` : "#/site";
+      });
+    });
+  });
+  registerRoute("telegram", async (view) => {
+    setCrumb("Telegram");
+    if (!hasRole("user")) {
+      mountView(view, `<div class="card"><p class="muted">Sign in required.</p></div>`);
+      return;
+    }
+    mountView(view, `
+    <div class="ui-shell telegram-shell">
+    <div class="card">
+      <div class="ui-section-head">
+        <div>
+          <h2 class="ui-section-title">Telegram connect</h2>
+          <p class="ui-section-sub">No password in Telegram. Generate link, open chat, send <span class="mono">/start</span>, done.</p>
+        </div>
+        <div class="ui-section-actions">
+          <button class="btn" id="tgGenLink">Generate connect link</button>
+          <button class="btn secondary" id="tgReloadMine">Refresh bindings</button>
+        </div>
+      </div>
+      <div id="tgLinkBox" style="margin-top:10px"></div>
+    </div>
+    <div class="card">
+      <div class="ui-section-head">
+        <div>
+          <h3 class="ui-section-title">My chat bindings</h3>
+          <p class="ui-section-sub">Enable, disable, or unbind your own Telegram chats.</p>
+        </div>
+      </div>
+      <div id="tgMineList"></div>
+    </div>
+    <div class="card">
+      <div class="ui-section-head">
+        <div>
+          <h3 class="ui-section-title">Manual bind (fallback)</h3>
+          <p class="ui-section-sub">If deep link cannot open Telegram, use <span class="mono">/start</span> to get chat_id, then bind manually.</p>
+        </div>
+      </div>
+      <div class="inline-form">
+        <label class="field"><span>chat_id</span><input id="tgManualChatId" placeholder="e.g. 2082431201 or -100xxxx" /></label>
+        <label class="field"><span>Enabled</span><input id="tgManualEnabled" type="checkbox" checked /></label>
+        <div class="row wide" style="justify-content:flex-end"><button class="btn" id="tgManualBind">Bind manually</button></div>
+      </div>
+    </div>
+    </div>
+  `);
+    const mineEl = $("#tgMineList", view);
+    const linkEl = $("#tgLinkBox", view);
+    const loadMine = async () => {
+      if (!mineEl) return;
+      setChildMarkup(mineEl, `<p class="muted">Loading\u2026</p>`);
+      try {
+        const d = await api("/admin/telegram/bindings", { timeoutMs: 16e3 });
+        const items = d.items || [];
+        setChildMarkup(
+          mineEl,
+          items.length === 0 ? `<p class="muted">No bindings yet.</p>` : `<div class="table-wrap"><table class="t">
+            <thead><tr><th>chat_id</th><th>enabled</th><th>updated</th><th></th><th></th></tr></thead>
+            <tbody>${items.map((it) => `
+              <tr>
+                <td class="mono">${escapeHtml(it.chat_id || "")}</td>
+                <td>${it.enabled ? `<span class="badge online">on</span>` : `<span class="badge offline">off</span>`}</td>
+                <td>${escapeHtml(fmtTs(it.updated_at || it.created_at))}</td>
+                <td><button class="btn sm secondary js-tg-toggle" data-chat="${escapeHtml(String(it.chat_id || ""))}" data-en="${it.enabled ? "1" : "0"}">${it.enabled ? "Disable" : "Enable"}</button></td>
+                <td><button class="btn sm danger js-tg-unbind" data-chat="${escapeHtml(String(it.chat_id || ""))}">Unbind</button></td>
+              </tr>`).join("")}</tbody>
+          </table></div>`
+        );
+      } catch (e) {
+        setChildMarkup(mineEl, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
+      }
+    };
+    $("#tgGenLink", view).addEventListener("click", async () => {
+      if (!linkEl) return;
+      try {
+        const r = await api("/telegram/link-token", { method: "POST", body: { enabled_on_bind: true } });
+        const deep = r.deep_link || "";
+        const openChat = r.open_chat_url || "";
+        const payload = r.start_payload || "";
+        setChildMarkup(
+          linkEl,
+          deep ? `<div class="ui-status-strip">
+             <div class="ui-status-item"><div class="k">Step 1</div><div class="v"><a class="btn" href="${escapeHtml(openChat || deep)}" target="_blank" rel="noopener">Open bot chat</a></div></div>
+             <div class="ui-status-item"><div class="k">Step 2</div><div class="v"><a class="btn secondary" href="${escapeHtml(deep)}" target="_blank" rel="noopener">Run one-click bind</a></div></div>
+           </div>
+           <p class="muted mono" style="margin-top:8px">${escapeHtml(deep)}</p>` : `<p class="muted">Set <span class="mono">TELEGRAM_BOT_USERNAME</span> on server, then retry.<br/>Fallback: send <span class="mono">/start ${escapeHtml(payload)}</span> in your bot chat.</p>`
+        );
+      } catch (e) {
+        setChildMarkup(linkEl, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
+      }
+    });
+    $("#tgManualBind", view).addEventListener("click", async () => {
+      const chatId = ($("#tgManualChatId", view).value || "").trim();
+      const enabled = !!$("#tgManualEnabled", view).checked;
+      if (!chatId) {
+        toast("Enter chat_id", "err");
+        return;
+      }
+      try {
+        await api("/admin/telegram/bind-self", { method: "POST", body: { chat_id: chatId, enabled } });
+        toast("Bound", "ok");
+        loadMine();
+      } catch (e) {
+        toast(e.message || e, "err");
+      }
+    });
+    $("#tgReloadMine", view).addEventListener("click", loadMine);
+    mineEl.addEventListener("click", async (ev) => {
+      const tgl = ev.target.closest(".js-tg-toggle");
+      if (tgl) {
+        const chat = tgl.dataset.chat || "";
+        const enabled = !(tgl.dataset.en === "1");
+        try {
+          await api(`/admin/telegram/bindings/${encodeURIComponent(chat)}/enabled?enabled=${enabled ? "true" : "false"}`, { method: "PATCH" });
+          toast(enabled ? "Enabled" : "Disabled", "ok");
+          loadMine();
+        } catch (e) {
+          toast(e.message || e, "err");
+        }
+        return;
+      }
+      const del = ev.target.closest(".js-tg-unbind");
+      if (del) {
+        const chat = del.dataset.chat || "";
+        if (!chat) return;
+        if (!confirm(`Unbind chat ${chat}?`)) return;
+        try {
+          await api(`/admin/telegram/bindings/${encodeURIComponent(chat)}`, { method: "DELETE" });
+          toast("Unbound", "ok");
+          loadMine();
+        } catch (e) {
+          toast(e.message || e, "err");
+        }
+      }
+    });
+    loadMine();
   });
 })();
