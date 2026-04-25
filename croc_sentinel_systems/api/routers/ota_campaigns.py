@@ -65,7 +65,7 @@ from config import (
 )
 from db import db_lock, db_read_lock, get_conn
 from helpers import utc_now_iso
-from routers.ota import (
+from routers.ota_storage import (
     _ota_bin_path_for_stored_name,
     _ota_store_uploaded_bin,
     _require_ota_upload_password,

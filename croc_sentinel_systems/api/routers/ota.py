@@ -1,25 +1,40 @@
-"""OTA firmware staging + diagnostics + direct broadcast (Phase-13, trimmed in Phase-65).
+"""OTA firmware staging + diagnostics + direct broadcast (Phase-13,
+trimmed in Phase-65 / Phase-79).
 
-Originally this module covered the entire OTA surface (14 routes,
-867 lines). Phase 65 split out the 8 *campaign-lifecycle* routes
-into ``routers/ota_campaigns.py`` so this file now hosts only the
-"firmware bytes on disk" half:
+Surface evolution:
+  Phase 13 — original module: 14 routes (~870 lines) covering the
+              full OTA surface.
+  Phase 65 — extracted the 8 *campaign-lifecycle* routes into
+              ``routers/ota_campaigns.py``.
+  Phase 77 — split campaign accept/decline/rollback into
+              ``routers/ota_campaigns_lifecycle.py``.
+  Phase 79 — extracted the 6 firmware-bytes helpers into
+              ``routers/ota_storage.py`` so this file is now
+              routes-only.
 
-  GET    /ota/service-check                       — diagnostics (no secrets)
-  GET    /ota/firmware-reachability               — HEAD-probe staged file
-  GET    /ota/firmwares                           — superadmin: inventory
-  GET    /ota/firmware-verify                     — re-hash a stored .bin
-  POST   /ota/broadcast                           — direct fan-out (no campaign row)
-  POST   /ota/firmware/upload                     — stage .bin only, no campaign
+Routes (still here)
+-------------------
+  GET    /ota/service-check          — diagnostics (no secrets).
+  GET    /ota/firmware-reachability  — HEAD-probe a staged file.
+  GET    /ota/firmwares              — superadmin: full inventory.
+  GET    /ota/firmware-verify        — re-hash a stored .bin.
+  POST   /ota/broadcast              — direct fan-out, no campaign row.
+  POST   /ota/firmware/upload        — stage a .bin without creating a
+                                       campaign row.
 
-Helpers (re-exported for ota_campaigns.py)
-------------------------------------------
-``_ota_store_uploaded_bin``, ``_ota_bin_path_for_stored_name``,
-``_require_ota_upload_password`` and ``_sha256_for`` are all
-re-exported via ``__all__`` so ``routers/ota_campaigns.py`` can
-import them — those four helpers are needed by both halves
-(``/ota/firmware/upload`` in this file, ``/ota/campaigns/from-upload``
-+ ``/ota/campaigns/from-stored`` over there).
+Helpers (re-exported from ``routers/ota_storage`` for backward compat)
+----------------------------------------------------------------------
+``_sha256_for``, ``_sha256_sidecar_only``, ``_safe_ota_stored_filename``,
+``_ota_bin_path_for_stored_name``, ``_require_ota_upload_password``,
+and ``_ota_store_uploaded_bin`` all live in ``routers/ota_storage.py``
+now. We re-export them via ``__all__`` so any historical caller
+that did ``from routers.ota import _sha256_for`` keeps working
+(test rigs in particular).
+
+``routers/ota_campaigns.py`` was switched to import directly from
+``routers/ota_storage`` in Phase 79 — single source of truth — so
+the ``import app as _app`` capture window in this file no longer
+matters for those four helpers.
 
 Stays in ``app.py`` (late-bound here)
 -------------------------------------
@@ -27,24 +42,19 @@ Stays in ``app.py`` (late-bound here)
 ``_effective_ota_verify_base``, ``_get_ota_firmware_catalog``,
 ``_version_str_for_ota_bin_file``, ``resolve_target_devices``,
 ``publish_command``, ``get_cmd_key_for_device``,
-``require_capability``, ``require_principal``,
-``_ota_enforce_max_stored_bins`` (defined later in app.py — see the
-call-time wrapper below).
+``require_capability``, ``require_principal``.
 
 We deliberately reference function objects directly in
 ``Depends(require_principal)`` — never wrap in a lambda. See
-routers/factory.py for the long write-up of the trap.
+``routers/factory.py`` for the long write-up of the trap.
 """
 
 from __future__ import annotations
 
 import hashlib
-import hmac
 import logging
 import os
-import re
-import secrets
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
@@ -53,7 +63,6 @@ import app as _app
 from audit import audit_event
 from config import (
     CMD_PROTO,
-    MAX_OTA_UPLOAD_BYTES,
     OTA_FIRMWARE_DIR,
     OTA_MAX_FIRMWARE_BINS,
     OTA_PUBLIC_BASE_URL,
@@ -61,6 +70,14 @@ from config import (
     OTA_UPLOAD_PASSWORD,
     OTA_VERIFY_BASE_URL,
     TOPIC_ROOT,
+)
+from routers.ota_storage import (
+    _ota_bin_path_for_stored_name,  # noqa: F401  re-export for ota_campaigns / tests
+    _ota_store_uploaded_bin,
+    _require_ota_upload_password,
+    _safe_ota_stored_filename,  # noqa: F401  re-export
+    _sha256_for,  # noqa: F401  re-export
+    _sha256_sidecar_only,
 )
 from security import Principal, assert_min_role
 
@@ -76,15 +93,6 @@ _version_str_for_ota_bin_file = _app._version_str_for_ota_bin_file
 _get_ota_firmware_catalog = _app._get_ota_firmware_catalog
 
 
-# `_ota_enforce_max_stored_bins` is *defined later* in app.py (after the
-# ``include_router`` line for this module, since the retention helpers
-# stay in app.py for non-OTA callers). Use a call-time lookup instead of
-# a module-load-time attribute capture, otherwise we'd hit AttributeError
-# during `import app`.
-def _ota_enforce_max_stored_bins() -> None:
-    _app._ota_enforce_max_stored_bins()
-
-
 logger = logging.getLogger("croc-api.routers.ota")
 router = APIRouter(tags=["ota"])
 
@@ -95,107 +103,6 @@ class OtaBroadcastRequest(BaseModel):
     url: str = Field(min_length=8, max_length=400)
     fw: str = Field(default="", max_length=40)
     device_ids: list[str] = Field(default_factory=list)
-
-
-# ─────────────────────────────────────── helpers (firmware bytes) ────
-
-def _sha256_sidecar_only(path: str) -> Optional[str]:
-    """Fast path for listings: use .sha256 sidecar only (no full-file read)."""
-    sidecar = path + ".sha256"
-    if not os.path.isfile(sidecar):
-        return None
-    try:
-        with open(sidecar, "r", encoding="utf-8", errors="ignore") as f:
-            line = f.readline().strip()
-        if line:
-            return line.split()[0]
-    except Exception:
-        return None
-    return None
-
-
-def _sha256_for(path: str) -> Optional[str]:
-    hit = _sha256_sidecar_only(path)
-    if hit:
-        return hit
-    try:
-        h = hashlib.sha256()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(65536), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    except Exception:
-        return None
-
-
-def _safe_ota_stored_filename(fw_version: str, original_filename: str) -> str:
-    base = os.path.basename(original_filename or "")
-    if not base.lower().endswith(".bin"):
-        raise HTTPException(status_code=400, detail="upload must be a .bin file")
-    safe_fw = re.sub(r"[^a-zA-Z0-9._-]", "_", (fw_version or "").strip())[:28]
-    if not safe_fw:
-        safe_fw = "fw"
-    tail = secrets.token_hex(4)
-    return f"croc-{safe_fw}-{tail}.bin"
-
-
-def _ota_bin_path_for_stored_name(fname: str) -> str:
-    """Resolve a firmware basename under OTA_FIRMWARE_DIR (no path traversal)."""
-    base_dir = os.path.realpath(OTA_FIRMWARE_DIR)
-    name = os.path.basename((fname or "").strip())
-    if not name.lower().endswith(".bin"):
-        raise HTTPException(status_code=400, detail="filename must be a .bin file")
-    path = os.path.realpath(os.path.join(OTA_FIRMWARE_DIR, name))
-    if not path.startswith(base_dir + os.sep):
-        raise HTTPException(status_code=400, detail="invalid firmware filename")
-    if not os.path.isfile(path):
-        raise HTTPException(status_code=404, detail="firmware file not found on server")
-    return path
-
-
-def _require_ota_upload_password(provided: str | None) -> None:
-    """Server-side shared secret for staging .bin (separate from JWT). Constant-time compare."""
-    if not OTA_UPLOAD_PASSWORD:
-        raise HTTPException(
-            status_code=503,
-            detail="OTA_UPLOAD_PASSWORD is not set on the server; firmware uploads are disabled. Set it in the API environment.",
-        )
-    a = OTA_UPLOAD_PASSWORD
-    b = (provided or "")
-    if len(a) != len(b) or not hmac.compare_digest(a, b):
-        raise HTTPException(status_code=403, detail="Invalid upload password")
-
-
-async def _ota_store_uploaded_bin(file: UploadFile, fw_version: str) -> tuple[str, str, int]:
-    """Save multipart upload to OTA_FIRMWARE_DIR. Returns (fname_on_disk, sha256_hex, byte_size)."""
-    os.makedirs(OTA_FIRMWARE_DIR, mode=0o755, exist_ok=True)
-    fname = _safe_ota_stored_filename(fw_version, file.filename or "")
-    dest = os.path.join(OTA_FIRMWARE_DIR, fname)
-    body = await file.read()
-    if len(body) > MAX_OTA_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail=f"file exceeds {MAX_OTA_UPLOAD_BYTES} bytes")
-    if len(body) < 1024:
-        raise HTTPException(status_code=400, detail="file too small to be a firmware image")
-    sha_hex = hashlib.sha256(body).hexdigest()
-    try:
-        with open(dest, "wb") as out:
-            out.write(body)
-        with open(dest + ".sha256", "w", encoding="utf-8") as sf:
-            sf.write(f"{sha_hex}  {fname}\n")
-        ver = (fw_version or "").strip()
-        if ver:
-            with open(dest + ".version", "w", encoding="utf-8") as vf:
-                vf.write(ver + "\n")
-        else:
-            try:
-                if os.path.isfile(dest + ".version"):
-                    os.remove(dest + ".version")
-            except OSError:
-                pass
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"failed to save firmware: {exc}") from exc
-    _ota_enforce_max_stored_bins()
-    return fname, sha_hex, len(body)
 
 
 # ───────────────────────────────────────────────── routes: diagnostics ────
