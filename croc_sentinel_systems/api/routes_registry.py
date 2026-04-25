@@ -187,10 +187,19 @@ def register_routers(app: FastAPI) -> None:
 
     app.include_router(_notif_admin_router)
 
-    # Phase-12: 6 Telegram link/bind/webhook routes + telegram-only helpers.
+    # Phase-12 / 67: Telegram surface split into two halves —
+    #   * routers.telegram          — link-token + bind/unbind/list/toggle CRUD
+    #                                 (5 routes + shared _telegram_bind_chat)
+    #   * routers.telegram_webhook  — POST /integrations/telegram/webhook
+    #                                 + 9 command-grammar helpers
+    # telegram must ship first because telegram_webhook imports
+    # ``_telegram_bind_chat`` from it at module-load time (the
+    # /start bind_<token> deep-link flow shares that helper).
     from routers.telegram import router as _telegram_router
+    from routers.telegram_webhook import router as _telegram_webhook_router
 
     app.include_router(_telegram_router)
+    app.include_router(_telegram_webhook_router)
 
     # Phase-13 / 65: OTA surface split into two halves —
     #   * routers.ota                — diagnostics + listing + broadcast +
