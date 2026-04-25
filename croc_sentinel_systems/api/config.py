@@ -201,13 +201,18 @@ TELEGRAM_BOT_USERNAME: str = os.getenv("TELEGRAM_BOT_USERNAME", "").strip().lstr
 TELEGRAM_LINK_TOKEN_TTL_SECONDS: int = int(os.getenv("TELEGRAM_LINK_TOKEN_TTL_SECONDS", "900"))
 
 # --- Presence probe (last-resort liveness check) ---------------------------
+# OFFLINE_THRESHOLD_SECONDS (90s) marks a device offline in the dashboard
+# device list and the dashboard_read summary. Late-bound via
+# ``_app.OFFLINE_THRESHOLD_SECONDS`` from device_presence.py / tenant_admin.py
+# / routers/dashboard_read.py so any tweak via env reload is picked up live.
+OFFLINE_THRESHOLD_SECONDS: int = int(os.getenv("OFFLINE_THRESHOLD_SECONDS", "90"))
 # Devices in HYBRID mode should publish a keepalive every ~60s (see firmware
-# HEARTBEAT_IDLE_KEEPALIVE_MS). OFFLINE_THRESHOLD_SECONDS (90s) marks a device
-# offline in the UI. If the device is still silent after IDLE_SECONDS the
-# server publishes a single `ping` so we can distinguish "TCP quietly dropped"
-# from "device genuinely dead". Keep this >> OFFLINE_THRESHOLD_SECONDS so we
-# don't probe-spam devices that are merely momentarily late with a keepalive.
-# Default 600s (10 min) = 10 missed keepalives, which is clearly abnormal.
+# HEARTBEAT_IDLE_KEEPALIVE_MS). If the device is still silent after IDLE_SECONDS
+# the server publishes a single ``ping`` so we can distinguish "TCP quietly
+# dropped" from "device genuinely dead". Keep this >> OFFLINE_THRESHOLD_SECONDS
+# so we don't probe-spam devices that are merely momentarily late with a
+# keepalive. Default 600s (10 min) = 10 missed keepalives, which is clearly
+# abnormal.
 PRESENCE_PROBE_IDLE_SECONDS: int = int(os.getenv("PRESENCE_PROBE_IDLE_SECONDS", "600"))
 # How often the background worker scans for stale devices. Keep moderate so
 # we don't hammer the DB; 120s is comfortably < IDLE_SECONDS/4.
@@ -377,6 +382,7 @@ __all__ = [
     "OTA_UPLOAD_PASSWORD",
     "OTA_URL_VERIFY_TIMEOUT_SECONDS",
     "OTA_VERIFY_BASE_URL",
+    "OFFLINE_THRESHOLD_SECONDS",
     "OTP_RESEND_COOLDOWN_SECONDS",
     "OTP_TTL_SECONDS",
     "PASSWORD_RECOVERY_BLOB_MAGIC",

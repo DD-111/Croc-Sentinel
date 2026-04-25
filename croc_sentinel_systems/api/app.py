@@ -674,13 +674,11 @@ async def _slow_request_log_middleware(request: Request, call_next):
     return await _slow_request_log_impl(request, call_next)
 
 
-# Phase-33 modularization: the six tiny SPA-mount redirect routes
-# (/, /ui[/], /dashboard[/], /ui/{path:path}) now live in
-# routers/ui_mounts.py. Pure redirect-to-mount shape — no auth,
-# no DB, no shared state.
-from routers.ui_mounts import router as _ui_mounts_router  # noqa: E402
-
-app.include_router(_ui_mounts_router)
+# Phase-33 / 17 / 22 / 15 / 20 / 21 / 25 / 24 / 23 / 26 / 32 / 28 / 14 /
+# 27 / 16 / 31 / 29 / 9 / 19 / 18 / 30 / 10 / 11 / 12 / 13 / 8 / 7
+# router-include wiring centralised in routes_registry.register_routers().
+# Called below the helper re-exports so every routers.* module's
+# module-level `_app.<helper>` capture binds to the correct callable.
 
 
 # Client-context helpers (Phase-50 modularization). The 6 helpers
@@ -736,95 +734,6 @@ from auth_helpers import (  # noqa: E402,F401  (re-exports for legacy callers)
 
 
 
-# =====================================================================
-#  Auth signup + password recovery (offline RSA blob + email-OTP path)
-# =====================================================================
-
-# Phase-17 modularization: 14 routes + 7 schemas + 6 password-recovery
-# helpers now live in routers/auth_recovery.py. The scheduler loop in
-# this file calls _prune_password_reset_tokens via the re-export below.
-from routers.auth_recovery import (  # noqa: E402,F401
-    router as _auth_recovery_router,
-    _prune_password_reset_tokens,
-)
-
-app.include_router(_auth_recovery_router)
-
-
-# =====================================================================
-#  Auth core  (login / csrf / logout)
-# =====================================================================
-
-# Phase-22 modularization: 3 routes + LoginRequest now live in routers/auth_core.py.
-from routers.auth_core import router as _auth_core_router  # noqa: E402
-
-app.include_router(_auth_core_router)
-
-# =====================================================================
-#  Device-side HTTP fallback (boot-sync, OTA report, command pull/ack)
-# =====================================================================
-
-# Phase-15 modularization: the four /device/* endpoints called by the
-# ESP32 firmware (NOT the dashboard) — they authenticate via
-# device_id+mac_nocolon+cmd_key, not JWT — plus their four request
-# schemas (DeviceBootSyncRequest, DeviceOtaReportRequest,
-# DeviceCommandsPendingRequest, DeviceCommandAckRequest) and the
-# three device-only auth helpers (_norm_mac_nocolon12,
-# _provision_row_for_device_mac, _auth_device_http) now live in
-# routers/device_http.py.
-from routers.device_http import router as _device_http_router  # noqa: E402
-
-app.include_router(_device_http_router)
-
-
-# =====================================================================
-#  Self-service account routes  (/auth/me/*)
-# =====================================================================
-
-# Phase-20 modularization: 10 routes + _auth_me_delete_impl +
-# 6 schemas + _validate_avatar_url now live in routers/auth_self.py.
-from routers.auth_self import router as _auth_self_router  # noqa: E402
-
-app.include_router(_auth_self_router)
-
-
-# =====================================================================
-#  Admin/user CRUD  (/auth/admins, /auth/users)
-# =====================================================================
-
-# Phase-21 modularization: 7 routes + 3 schemas now live in routers/auth_users.py.
-from routers.auth_users import router as _auth_users_router  # noqa: E402
-
-app.include_router(_auth_users_router)
-
-
-# =====================================================================
-#  Admin DB backup (encrypted export / import)
-# =====================================================================
-
-# Phase-25 modularization: 2 routes now live in routers/admin_backup.py.
-from routers.admin_backup import router as _admin_backup_router  # noqa: E402
-
-app.include_router(_admin_backup_router)
-
-# =====================================================================
-#  Provisioning challenge (sign nonce → verify)
-# =====================================================================
-
-# Phase-24 modularization: 2 routes + 2 schemas now live in routers/provision_challenge.py.
-from routers.provision_challenge import router as _provision_challenge_router  # noqa: E402
-
-app.include_router(_provision_challenge_router)
-
-# =====================================================================
-#  Device revoke / unrevoke
-# =====================================================================
-
-# Phase-23 modularization: 3 routes + DeviceRevokeRequest now live in routers/device_revoke.py.
-from routers.device_revoke import router as _device_revoke_router  # noqa: E402
-
-app.include_router(_device_revoke_router)
-
 # Tenant lifecycle + device-cleanup helpers (Phase-47 modularization).
 # The five helpers below — _delete_user_auxiliary_cur,
 # _apply_device_factory_unclaim_cur, _close_admin_tenant_cur,
@@ -846,29 +755,10 @@ from tenant_admin import (
 )
 
 
-# Phase-26 modularization: the impl helper + 2 routes (delete-reset,
-# factory-unregister) and the DeviceDeleteRequest schema now live in
-# routers/device_delete.py. The router is wired in here so it sits at
-# roughly the same point in the route table as the original @app
-# decorators did, and so _try_mqtt_unclaim_reset (defined just above)
-# is already bound by the time the router module is imported.
-from routers.device_delete import router as _device_delete_router  # noqa: E402
-
-app.include_router(_device_delete_router)
-
-
-# Phase-32 modularization: /health (+ its three private helpers
-# _health_notify_summary_public, _health_db_probe,
-# _health_subscriber_summary) plus /admin/presence-probes and
-# /diag/db-ping now live in routers/diagnostics.py. The router reads
-# mqtt_* / api_ready_event / api_bootstrap_error off `app` at call time
-# so the live worker-thread state stays the source of truth.
-from routers.diagnostics import router as _diagnostics_router  # noqa: E402
-
-app.include_router(_diagnostics_router)
-
-
-OFFLINE_THRESHOLD_SECONDS = int(os.getenv("OFFLINE_THRESHOLD_SECONDS", "90"))
+# OFFLINE_THRESHOLD_SECONDS moved to config.py (Phase 62) — re-imported via
+# `from config import *` at the top of this file so legacy late-binders
+# (`_app.OFFLINE_THRESHOLD_SECONDS` in device_presence / tenant_admin /
+# routers/dashboard_read) keep resolving identically.
 
 
 # Phase-44 modularization: 9 pure presence/parsing helpers (epoch
@@ -915,81 +805,6 @@ from ota_catalog import (  # noqa: E402,F401  (re-exports for legacy callers)
     _version_str_for_ota_bin_file,
     _version_str_from_ota_bin_name,
 )
-
-
-# (dashboard_overview moved to routers/dashboard_read.py — see the
-# `app.include_router(_dashboard_read_router)` block alongside
-# get_device_messages further below.)
-
-
-# Phase-28 modularization: the four read-only device endpoints
-# (GET /devices, /devices/firmware-hints, /devices/{id},
-# /devices/{id}/siblings-preview) now live in routers/device_read.py.
-# Most helpers are early-bound; _cmd_queue_pending_counts is wrapped
-# call-time because it is defined later in app.py.
-from routers.device_read import router as _device_read_router  # noqa: E402
-
-app.include_router(_device_read_router)
-
-
-# (DeviceDisplayLabelBody, DeviceProfileBody, DeviceBulkProfileBody schemas
-# moved to routers/device_profile.py — see the corresponding
-# `from routers.device_profile import ...` re-export below.)
-
-# (GroupCardSettingsBody moved to routers/group_cards.py — see the
-# corresponding `from routers.group_cards import ...` block below.)
-
-# (DeviceShareRequest moved to routers/device_shares.py — see the
-# corresponding `from routers.device_shares import ...` block below.)
-
-# =====================================================================
-#  Group cards (siren fan-out by notification_group)
-# =====================================================================
-
-# Phase-14 modularization: the eleven group-card routes (six canonical
-# plus five /api/* mirrors), the GroupCardSettingsBody schema, and the
-# four group-card helpers (_delete_group_card_impl, _group_owner_scope,
-# _group_settings_defaults, _group_devices_with_owner) now live in
-# routers/group_cards.py. That module late-binds the cross-feature
-# helpers (_principal_tenant_owns_device, _lookup_owner_admin,
-# _log_signal_trigger, _device_access_flags, publish_command, …) from
-# `app` so we don't duplicate them here.
-from routers.group_cards import router as _group_cards_router  # noqa: E402
-
-app.include_router(_group_cards_router)
-
-# Phase-27 modularization: the three device-profile mutation routes
-# (PATCH /devices/{id}/profile, PATCH /devices/{id}/display-label,
-# POST /devices/bulk/profile), the shared `_apply_device_profile_update`
-# helper, and the three Pydantic schemas now live in
-# routers/device_profile.py. Late-binds emit_event,
-# _principal_tenant_owns_device, _lookup_owner_admin,
-# _extract_zone_from_device_state_row, assert_device_owner,
-# require_principal from `app`.
-from routers.device_profile import router as _device_profile_router  # noqa: E402
-
-app.include_router(_device_profile_router)
-
-
-# =====================================================================
-#  Device sharing / ACL admin
-# =====================================================================
-
-# Phase-16 modularization: the four /admin/(devices/{id}/)?share(s)?/*
-# routes plus the DeviceShareRequest schema now live in
-# routers/device_shares.py. Late-binds assert_device_owner +
-# require_capability + require_principal from `app`.
-from routers.device_shares import router as _device_shares_router  # noqa: E402
-
-app.include_router(_device_shares_router)
-
-# Phase-31 modularization: GET /dashboard/overview and
-# GET /devices/{device_id}/messages now live in routers/dashboard_read.py
-# (mqtt_connected is read off `app` at call time so the live MQTT-state
-# global stays the source of truth).
-from routers.dashboard_read import router as _dashboard_read_router  # noqa: E402
-
-app.include_router(_dashboard_read_router)
 
 
 # Per-device credentials + bootstrap publish (Phase-51 modularization).
@@ -1083,116 +898,6 @@ from scheduler import (  # noqa: E402,F401
 )
 
 
-# Phase-29 modularization: the three provision-lifecycle routes
-# (/provision/pending, /provision/claim, /provision/identify) plus
-# their two schemas (ClaimDeviceRequest, IdentifyRequest) and the
-# FACTORY_SERIAL_RE regex now live in routers/provision_lifecycle.py.
-# Late-binds get_manager_admin, generate_device_credentials,
-# publish_bootstrap_claim, require_capability, require_principal from
-# `app`.
-from routers.provision_lifecycle import router as _provision_lifecycle_router  # noqa: E402
-
-app.include_router(_provision_lifecycle_router)
-
-
-# Phase-9 modularization: /audit, /logs/messages, /logs/file moved to
-# routers/audit_logs.py. The router is imported and wired in here so it
-# sits at the same point in the route table as the original @app
-# decorators did.
-from routers.audit_logs import router as _audit_logs_router  # noqa: E402
-
-app.include_router(_audit_logs_router)
-
-
-# (send_device_command moved to routers/device_commands.py — see the
-# `app.include_router(_device_commands_router)` block at the bottom of
-# this section.)
-
-
-# =====================================================================
-#  Trigger policy + Wi-Fi provisioning task
-# =====================================================================
-
-# Phase-19 modularization: 4 routes + _load_device_row_for_task +
-# 4 schemas now live in routers/device_provision.py.
-from routers.device_provision import router as _device_provision_router  # noqa: E402
-
-app.include_router(_device_provision_router)
-
-# =====================================================================
-#  Device control: alert on/off + self-test + schedule-reboot
-# =====================================================================
-
-# Phase-18 modularization: 5 single-device control routes + the
-# ScheduleRebootRequest schema now live in routers/device_control.py.
-from routers.device_control import router as _device_control_router  # noqa: E402
-
-app.include_router(_device_control_router)
-
-# (bulk_alert + send_broadcast_command moved to routers/device_commands.py
-# alongside send_device_command — single phase-30 router covers all three
-# command-publishing endpoints.)
-from routers.device_commands import router as _device_commands_router  # noqa: E402
-
-app.include_router(_device_commands_router)
-
-# (3 more device control routes moved with phase-18 — see include above.)
-
-
-# =====================================================================
-#  Alarms (server-side fan-out history)
-# =====================================================================
-# Phase-10 modularization: the three alarms / activity-feed routes
-# (/alarms, /alarms/summary, /activity/signals) plus the ACL helper
-# `_alarm_scope_for` now live in routers/alarms.py.
-from routers.alarms import router as _alarms_router  # noqa: E402
-
-app.include_router(_alarms_router)
-
-
-# =====================================================================
-#  Email recipients (per-tenant) & SMTP/Telegram/FCM admin status & test
-# =====================================================================
-# Phase-11 modularization: ten admin notification-channel routes plus
-# their request schemas now live in routers/notifications_admin.py.
-# (Drive-by: removed dead `_admin_scope_for` helper that was defined
-# here but never called anywhere.)
-from routers.notifications_admin import router as _notif_admin_router  # noqa: E402
-
-app.include_router(_notif_admin_router)
-
-
-# Phase-12 modularization: the six Telegram link/bind/webhook routes
-# plus all telegram-only helpers (chat reply, bind, capability gating,
-# target parsing, recent-devices/recent-logs replies, command publish,
-# text command parser) and the two request schemas now live in
-# routers/telegram.py. The status/test/webhook-info routes were
-# already moved out in Phase 11 (see routers/notifications_admin.py).
-from routers.telegram import router as _telegram_router  # noqa: E402
-
-app.include_router(_telegram_router)
-
-
-# =====================================================================
-#  OTA — firmware listing & tenant-scoped broadcast
-# =====================================================================
-
-# Phase-13 modularization: every /ota/* route, the three Pydantic request
-# schemas (OtaBroadcastRequest, OtaCampaignCreateRequest,
-# OtaCampaignFromStoredRequest), and eight OTA-only helpers
-# (_sha256_sidecar_only, _sha256_for, _list_all_admin_usernames,
-# _insert_ota_campaign, _safe_ota_stored_filename,
-# _ota_bin_path_for_stored_name, _require_ota_upload_password,
-# _ota_store_uploaded_bin) now live in routers/ota.py. The retention
-# helpers (_ota_delete_artifacts_for_stored_basename, _ota_in_use_basenames,
-# _ota_enforce_max_stored_bins) stay in this file because non-OTA code
-# paths still call them; routers/ota.py late-binds via _app.
-from routers.ota import router as _ota_router  # noqa: E402
-
-app.include_router(_ota_router)
-
-
-
 # Phase-40: disk-retention helpers (`_ota_delete_artifacts_for_stored_basename`,
 # `_ota_in_use_basenames`, `_ota_enforce_max_stored_bins`) live in
 # ota_files.py — see the re-export block above for the URL utilities.
@@ -1213,50 +918,16 @@ from ota_files import (  # noqa: E402,F401  (re-exports for legacy callers)
 # `app.include_router(_diagnostics_router)` block above.)
 
 
-# =====================================================================
-#  Event center — historical query + live SSE stream
-#
-#  Phase-8 modularization: the six event-center routes (paginated /events,
-#  CSV export, by-device stats, taxonomy, SSE stream, WS mirror) plus the
-#  tenant-scope SQL helpers (_event_scope_sql, _events_filter_sql_args)
-#  and the SSE auth helper now live in routers/events.py. The router is
-#  imported and wired in here so it sits at the same point in the route
-#  table as the original @app decorators did.
-#
-#  Tenant isolation rules (kept here for readers grepping app.py):
-#    * superadmin  → every event in the system
-#    * admin       → events where owner_admin = self OR actor/target = self
-#    * user        → events in their manager_admin's tenant that mention them
-#                    or are warn+
-# =====================================================================
-from routers.events import router as _events_router  # noqa: E402
+# All router-include wiring has been centralised in
+# routes_registry.register_routers() (Phase 62). It lives in its own
+# module so app.py reads as a clean bootstrap shell:
+#   1. helper / config / db / security imports
+#   2. module state (mqtt_*, api_ready_event, _bootstrap_thread)
+#   3. helper-module re-exports (auth_helpers / authz / csrf / lifespan / ...)
+#   4. FastAPI(...) + middleware decorators
+#   5. routes_registry.register_routers(app) <-- THIS LINE
+# Order is preserved exactly as it used to appear inline; FastAPI route
+# precedence depends on registration order.
+from routes_registry import register_routers  # noqa: E402
 
-app.include_router(_events_router)
-
-
-# (diag_db_ping moved to routers/diagnostics.py — see the
-# `app.include_router(_diagnostics_router)` block above.)
-
-
-# =====================================================================
-#  Factory device registry & /provision/identify (the "unguessable" story)
-# =====================================================================
-
-# (FACTORY_SERIAL_RE moved to routers/provision_lifecycle.py — re-exported
-# above via the `from routers.provision_lifecycle import FACTORY_SERIAL_RE`
-# block.)
-
-
-# Phase-7 modularization: the four /factory/* routes (register / ping /
-# list / block) plus their request models and the X-Factory-Token auth
-# helper now live in routers/factory.py. The router is imported and
-# wired in here so it sits at the same point in the route table as the
-# original @app decorators did.
-from routers.factory import router as _factory_router  # noqa: E402
-
-app.include_router(_factory_router)
-
-
-# (IdentifyRequest schema + /provision/identify route moved to
-# routers/provision_lifecycle.py — re-exported above via the
-# `from routers.provision_lifecycle import IdentifyRequest` block.)
+register_routers(app)
