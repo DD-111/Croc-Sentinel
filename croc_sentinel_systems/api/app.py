@@ -1,79 +1,43 @@
-import collections
-import csv
-import io
-import json
+"""FastAPI application bootstrap (Phase-62 final shell).
+
+After 62 modularization phases this file is the *thin shell* that
+brings the API up:
+
+* tiny stdlib + FastAPI imports,
+* live-mutable module state (``mqtt_*``, ``api_ready_event``,
+  ``_bootstrap_thread``) that helper modules read/write through
+  ``import app as _app``,
+* re-exports from helper modules (``auth_helpers``, ``authz``,
+  ``csrf``, ``lifespan``, ``middleware``, ``event_bus``,
+  ``mqtt_pipeline``, ``superadmin_cache``, ``redis_bridge``,
+  ``scheduler``, ``cmd_queue``, ``cmd_publish``, ``cmd_keys``,
+  ``device_presence``, ``device_state``, ``ota_catalog``,
+  ``ota_files``, ``alarm_db``, ``alarm_fanout``,
+  ``auto_reconcile``, ``trigger_policy``, ``presence_probes``,
+  ``client_context``, ``device_security``, ``audit``,
+  ``tenant_admin``, ``fcm_dispatch``) so legacy ``_app.<name>``
+  late-binders keep resolving,
+* the FastAPI instance + its 4 middleware decorators (kept here
+  to preserve registration order),
+* a single ``register_routers(app)`` call that wires every
+  ``routers/*`` module via ``routes_registry.py``.
+
+All actual business logic now lives in dedicated modules.
+``app.py`` is intentionally noisy with comments — they're the map
+that lets a new reader find which module owns which behaviour.
+"""
+
 import logging
 import os
 import queue as _stdqueue
-import secrets
-import sqlite3
 import threading
 import time
-import urllib.error
-import urllib.request
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
-from contextlib import asynccontextmanager
-import asyncio
-import base64
-import hashlib
-import hmac
-import re
-import ssl
-import uuid
-from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from fastapi import Cookie, Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
+from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.gzip import GZipMiddleware
-from pydantic import BaseModel, Field
 import paho.mqtt.client as mqtt
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding, rsa
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
-from security import (
-    JWT_EXPIRE_S,
-    Principal,
-    assert_min_role,
-    assert_zone_for_device,
-    decode_jwt,
-    decrypt_blob,
-    encrypt_blob,
-    hash_password,
-    issue_jwt,
-    verify_password,
-    zones_from_json,
-)
-from notifier import notifier, render_alarm_email, render_remote_siren_email
-from email_templates import (
-    render_otp_email,
-    render_password_changed_email,
-    render_smtp_test_email,
-    render_welcome_email,
-)
-from tz_display import iso_timestamp_to_malaysia, malaysia_now_iso
-from db import (
-    CACHE_TTL_SECONDS,
-    DB_PATH,
-    SQLITE_BUSY_TIMEOUT_MS,
-    SQLITE_CONNECT_TIMEOUT_S,
-    _DbLockContext,
-    _SqliteRWLock,
-    _db_rw,
-    api_cache,
-    cache_get,
-    cache_invalidate,
-    cache_lock,
-    cache_put,
-    db_lock,
-    db_read_lock,
-    db_write_lock,
-    ensure_column,
-    get_conn,
-    init_db_pragmas,
-)
 
 # Env-derived configuration (Phase-2 modularization). ``from config import *``
 # re-binds every previously module-level constant under its original name so
@@ -81,30 +45,6 @@ from db import (
 # config.py defines ``__all__`` to gate exposure, and listing 100+ names here
 # would just be noise that drifts from config.py.
 from config import *  # noqa: E402,F401,F403  (re-export for app.py call sites)
-
-# Stable re-export surface for any third party that already does
-# ``from app import ...`` — these names round-trip through db.py / config.py
-# but their identity is unchanged.
-__all_db_reexports__ = (
-    "CACHE_TTL_SECONDS",
-    "DB_PATH",
-    "SQLITE_BUSY_TIMEOUT_MS",
-    "SQLITE_CONNECT_TIMEOUT_S",
-    "_DbLockContext",
-    "_SqliteRWLock",
-    "_db_rw",
-    "api_cache",
-    "cache_get",
-    "cache_invalidate",
-    "cache_lock",
-    "cache_put",
-    "db_lock",
-    "db_read_lock",
-    "db_write_lock",
-    "ensure_column",
-    "get_conn",
-    "init_db_pragmas",
-)
 
 
 # Pure leaf helpers (Phase-4 modularization). ``utc_now_iso``,
@@ -488,10 +428,18 @@ from presence_probes import (  # noqa: E402,F401  (re-exports for legacy callers
 # `_app._verify_ota_url`, `_app._ota_enforce_max_stored_bins`) keep
 # resolving, and so the in-module call site (`_blocking_api_bootstrap_inner`
 # at startup, the `/ota/upload` retention pass) keeps using the bare names.
+#
+# (Phase 63: consolidated with the disk-retention trio
+# `_ota_delete_artifacts_for_stored_basename` /
+# `_ota_in_use_basenames` / `_ota_enforce_max_stored_bins` —
+# previously imported again at the bottom of this file.)
 from ota_files import (  # noqa: E402,F401  (re-exports for legacy callers)
     _append_ota_token_to_url,
     _effective_ota_verify_base,
     _http_probe_ota,
+    _ota_delete_artifacts_for_stored_basename,
+    _ota_enforce_max_stored_bins,
+    _ota_in_use_basenames,
     _public_firmware_url,
     _service_check_url_for_firmware,
     _verify_firmware_file_on_service,
@@ -555,45 +503,20 @@ from mqtt_pipeline import (  # noqa: E402,F401
 )
 
 
-# Phase-60 modularization: require_principal moved to auth_helpers.py
-# alongside the rest of the auth dependency stack (login lockout, OTP,
-# verification). Re-exported below from `from auth_helpers import ...`
-# so all 28 routers that late-bind `require_principal = _app.require_principal`
-# keep resolving to the same callable.
+# Phase-60: require_principal moved to auth_helpers.py — re-exported in the
+# big `from auth_helpers import ...` block further down.
+#
+# Pydantic schemas (CommandRequest / BroadcastCommandRequest /
+# BulkAlertRequest / ClaimDeviceRequest / ScheduleRebootRequest /
+# 4 device-provision + _WIFI_DEFERRED_CMDS / DeviceChallengeRequest +
+# DeviceChallengeVerifyRequest / DeviceRevokeRequest /
+# DeviceDeleteRequest / LoginRequest / 6 self-service +
+# _validate_avatar_url / 3 user-CRUD schemas) all moved to their
+# respective routers/* modules across phases 8-32. They are *not*
+# re-exported on `app` because nothing outside the routers ever
+# imported them; see the corresponding routers/<name>.py for the
+# definitions.
 
-
-# (CommandRequest, BroadcastCommandRequest, BulkAlertRequest moved to
-# routers/device_commands.py — see the corresponding
-# `from routers.device_commands import ...` re-export below.)
-
-# (ClaimDeviceRequest schema moved to routers/provision_lifecycle.py — see
-# the corresponding `from routers.provision_lifecycle import ClaimDeviceRequest`
-# re-export below.)
-
-# (ScheduleRebootRequest moved to routers/device_control.py — see the
-# corresponding `from routers.device_control import ...` block below.)
-
-# (4 schemas + _WIFI_DEFERRED_CMDS moved to routers/device_provision.py — see
-# the corresponding `from routers.device_provision import ...` block below.)
-
-# (DeviceChallengeRequest + DeviceChallengeVerifyRequest moved to
-# routers/provision_challenge.py — see the corresponding `from
-# routers.provision_challenge import ...` re-export below.)
-
-# (DeviceRevokeRequest schema moved to routers/device_revoke.py — see the
-# corresponding `from routers.device_revoke import DeviceRevokeRequest` re-export below.)
-
-# (DeviceDeleteRequest schema moved to routers/device_delete.py — see the
-# corresponding `from routers.device_delete import DeviceDeleteRequest` re-export below.)
-
-# (LoginRequest schema moved to routers/auth_core.py — see the corresponding
-# `from routers.auth_core import LoginRequest` re-export below.)
-
-# (6 self-service schemas + _validate_avatar_url moved to routers/auth_self.py — see
-# the corresponding `from routers.auth_self import ...` block below.)
-
-# (3 user-CRUD schemas moved to routers/auth_users.py — see the corresponding
-# `from routers.auth_users import ...` block below.)
 
 # Phase-59 modularization: validate_production_env,
 # _blocking_api_bootstrap_inner, _shutdown_api and _app_lifespan all
@@ -825,6 +748,7 @@ from cmd_keys import (
     get_cmd_key_for_device,
     get_cmd_keys_for_devices,
     publish_bootstrap_claim,
+    resolve_target_devices,
 )
 
 
@@ -880,11 +804,6 @@ from cmd_publish import (
 )
 
 
-# resolve_target_devices moved to cmd_keys.py (Phase 51) — see the
-# `from cmd_keys import ...` block above for the rest of that group.
-from cmd_keys import resolve_target_devices  # noqa: E402,F401  (re-export)
-
-
 # Phase-54 modularization: scheduler_loop, scheduler_stop, scheduler_thread,
 # start_scheduler, stop_scheduler all moved to scheduler.py. Re-exported
 # below so the lifespan hooks can call them and any legacy import still
@@ -896,26 +815,6 @@ from scheduler import (  # noqa: E402,F401
     start_scheduler,
     stop_scheduler,
 )
-
-
-# Phase-40: disk-retention helpers (`_ota_delete_artifacts_for_stored_basename`,
-# `_ota_in_use_basenames`, `_ota_enforce_max_stored_bins`) live in
-# ota_files.py — see the re-export block above for the URL utilities.
-# These three are also re-exported from ota_files because the bootstrap
-# pass and routers/ota.py both call `_ota_enforce_max_stored_bins`.
-from ota_files import (  # noqa: E402,F401  (re-exports for legacy callers)
-    _ota_delete_artifacts_for_stored_basename,
-    _ota_enforce_max_stored_bins,
-    _ota_in_use_basenames,
-)
-
-
-# =====================================================================
-#  Presence probes (admin-facing read-only view of the 12h ping log)
-# =====================================================================
-
-# (list_presence_probes moved to routers/diagnostics.py — see the
-# `app.include_router(_diagnostics_router)` block above.)
 
 
 # All router-include wiring has been centralised in
