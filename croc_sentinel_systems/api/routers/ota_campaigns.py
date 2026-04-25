@@ -1,18 +1,25 @@
-"""OTA campaign lifecycle routes (Phase-65 split from ``routers/ota.py``).
+"""OTA campaign creation + read views (Phase-65 split from
+``routers/ota.py``, trimmed Phase 77).
 
-Owns the 2-stage OTA campaign flow: superadmin creates a campaign,
-admins accept/decline it, the rollout worker dispatches per device.
+Owns the **build + browse** half of the 2-stage OTA campaign flow:
 
-Routes (all behind ``Depends(require_principal)``)
----------------------------------------------------
-  POST /ota/campaigns                             [superadmin]  — explicit URL
-  POST /ota/campaigns/from-stored                 [superadmin]  — staged .bin
-  POST /ota/campaigns/from-upload                 [superadmin]  — upload + create
-  GET  /ota/campaigns                             [admin+]      — list
-  GET  /ota/campaigns/{campaign_id}               [admin+]      — detail
-  POST /ota/campaigns/{campaign_id}/accept        [admin+]      — start rollout
-  POST /ota/campaigns/{campaign_id}/decline       [admin+]      — record refusal
-  POST /ota/campaigns/{campaign_id}/rollback      [admin+]      — manual rollback
+  * Superadmin creates a campaign (3 routes — explicit URL,
+    staged .bin, upload+create combo).
+  * Admins list / read campaigns to see what's pending acceptance.
+
+The **state-machine** half (accept / decline / rollback) lives in
+``routers/ota_campaigns_lifecycle.py`` (Phase 77 split). That
+module is responsible for re-verifying the URL on accept, fanning
+out the actual rollout via ``_start_ota_rollout_for_admin``, and
+the manual ``_rollback_admin_devices`` path.
+
+Routes hosted here (all behind ``Depends(require_principal)``)
+---------------------------------------------------------------
+  POST /ota/campaigns                  [superadmin]  — explicit URL
+  POST /ota/campaigns/from-stored      [superadmin]  — staged .bin
+  POST /ota/campaigns/from-upload      [superadmin]  — upload + create
+  GET  /ota/campaigns                  [admin+]      — list
+  GET  /ota/campaigns/{campaign_id}    [admin+]      — detail
 
 What stays in ``routers/ota.py``
 --------------------------------
@@ -27,12 +34,15 @@ the two campaign routes that touch the firmware bytes — still work.
 
 Late binding
 ------------
-Late-bound off ``app`` at module-load time (identical to the original
-file): ``require_principal``, ``require_capability``,
-``_ota_campaign_targets_for_admin``, ``_rollback_admin_devices``,
-``_start_ota_rollout_for_admin``, ``_version_str_for_ota_bin_file``,
-``_invalidate_ota_firmware_catalog_cache``, ``_public_firmware_url``,
-``_verify_firmware_file_on_service``, ``_verify_ota_url``.
+Captured off ``app`` at module-load time:
+  ``require_principal``, ``_public_firmware_url``,
+  ``_verify_firmware_file_on_service``, ``_verify_ota_url``,
+  ``_version_str_for_ota_bin_file``,
+  ``_invalidate_ota_firmware_catalog_cache``.
+
+(Lifecycle-only late-binds — ``_ota_campaign_targets_for_admin``,
+``_rollback_admin_devices``, ``_start_ota_rollout_for_admin`` —
+moved with the routes to ``routers/ota_campaigns_lifecycle.py``.)
 """
 
 from __future__ import annotations
@@ -67,9 +77,6 @@ require_principal = _app.require_principal
 _public_firmware_url = _app._public_firmware_url
 _verify_firmware_file_on_service = _app._verify_firmware_file_on_service
 _verify_ota_url = _app._verify_ota_url
-_ota_campaign_targets_for_admin = _app._ota_campaign_targets_for_admin
-_rollback_admin_devices = _app._rollback_admin_devices
-_start_ota_rollout_for_admin = _app._start_ota_rollout_for_admin
 _version_str_for_ota_bin_file = _app._version_str_for_ota_bin_file
 _invalidate_ota_firmware_catalog_cache = _app._invalidate_ota_firmware_catalog_cache
 
@@ -335,159 +342,6 @@ def get_ota_campaign(campaign_id: str, principal: Principal = Depends(require_pr
         camp["device_runs"] = [dict(x) for x in cur.fetchall()]
         conn.close()
     return camp
-
-
-# ─────────────────────────────────────────── campaigns: state machine ────
-
-@router.post("/ota/campaigns/{campaign_id}/accept")
-def accept_ota_campaign(campaign_id: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    """Admin accepts the campaign → server verifies URL then fans OTA cmd out
-    to every device the admin owns."""
-    assert_min_role(principal, "admin")
-    admin_username = principal.username
-
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM ota_campaigns WHERE id = ?", (campaign_id,))
-        row = cur.fetchone()
-        if not row:
-            conn.close()
-            raise HTTPException(status_code=404, detail="campaign not found")
-        camp = dict(row)
-        targets = json.loads(str(camp.get("target_admins_json") or "[]"))
-        if "*" not in targets and admin_username not in targets:
-            conn.close()
-            raise HTTPException(status_code=403, detail="not your campaign")
-
-        cur.execute(
-            "SELECT action FROM ota_decisions WHERE campaign_id = ? AND admin_username = ?",
-            (campaign_id, admin_username),
-        )
-        prev = cur.fetchone()
-        if prev and str(prev["action"]) in ("accepted",):
-            conn.close()
-            raise HTTPException(status_code=409, detail="already accepted")
-        conn.close()
-
-    ok, detail = _verify_ota_url(str(camp["url"]))
-    if not ok:
-        audit_event(admin_username, "ota.campaign.url_verify_fail", campaign_id, {"detail": detail})
-        raise HTTPException(status_code=400, detail=f"url verify failed: {detail}")
-
-    targets_rows = _ota_campaign_targets_for_admin(admin_username, str(camp["fw_version"]), str(camp["url"]))
-    if not targets_rows:
-        # Still mark decision as accepted so superadmin can see the admin reacted.
-        now_iso = utc_now_iso()
-        with db_lock:
-            conn = get_conn()
-            cur = conn.cursor()
-            cur.execute(
-                """
-                INSERT INTO ota_decisions (campaign_id, admin_username, action, decided_at, detail)
-                VALUES (?, ?, 'accepted', ?, 'no devices')
-                ON CONFLICT(campaign_id, admin_username) DO UPDATE SET
-                  action='accepted', decided_at=excluded.decided_at, detail=excluded.detail
-                """,
-                (campaign_id, admin_username, now_iso),
-            )
-            conn.commit()
-            conn.close()
-        return {"ok": True, "dispatched": 0, "note": "no devices owned by this admin"}
-
-    now_iso = utc_now_iso()
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        for t in targets_rows:
-            cur.execute(
-                """
-                INSERT INTO ota_device_runs
-                    (campaign_id, admin_username, device_id, prev_fw, prev_url, target_fw, target_url, state, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-                ON CONFLICT(campaign_id, device_id) DO UPDATE SET
-                    admin_username = excluded.admin_username,
-                    prev_fw        = excluded.prev_fw,
-                    prev_url       = excluded.prev_url,
-                    target_fw      = excluded.target_fw,
-                    target_url     = excluded.target_url,
-                    state          = CASE WHEN ota_device_runs.state IN ('success','failed','rolled_back') THEN ota_device_runs.state ELSE 'pending' END,
-                    updated_at     = excluded.updated_at
-                """,
-                (campaign_id, admin_username, t["device_id"], t["prev_fw"], t["prev_url"], str(camp["fw_version"]), str(camp["url"]), now_iso, now_iso),
-            )
-        cur.execute(
-            """
-            INSERT INTO ota_decisions (campaign_id, admin_username, action, decided_at, detail)
-            VALUES (?, ?, 'accepted', ?, ?)
-            ON CONFLICT(campaign_id, admin_username) DO UPDATE SET
-              action='accepted', decided_at=excluded.decided_at, detail=excluded.detail
-            """,
-            (campaign_id, admin_username, now_iso, detail),
-        )
-        cur.execute("UPDATE ota_campaigns SET state='running', updated_at=? WHERE id=?", (now_iso, campaign_id))
-        conn.commit()
-        conn.close()
-
-    dispatched, failures = _start_ota_rollout_for_admin(campaign_id, admin_username)
-    audit_event(admin_username, "ota.campaign.accept", campaign_id, {
-        "dispatched": dispatched,
-        "failures": failures[:5],
-        "target_count": len(targets_rows),
-        "verify": detail,
-    })
-    return {"ok": True, "dispatched": dispatched, "target_count": len(targets_rows), "verify": detail, "failures": failures[:5]}
-
-
-@router.post("/ota/campaigns/{campaign_id}/decline")
-def decline_ota_campaign(campaign_id: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_min_role(principal, "admin")
-    admin_username = principal.username
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT target_admins_json FROM ota_campaigns WHERE id = ?", (campaign_id,))
-        row = cur.fetchone()
-        if not row:
-            conn.close()
-            raise HTTPException(status_code=404, detail="campaign not found")
-        targets = json.loads(str(row["target_admins_json"] or "[]"))
-        if "*" not in targets and admin_username not in targets:
-            conn.close()
-            raise HTTPException(status_code=403, detail="not your campaign")
-        cur.execute(
-            """
-            INSERT INTO ota_decisions (campaign_id, admin_username, action, decided_at, detail)
-            VALUES (?, ?, 'declined', ?, '')
-            ON CONFLICT(campaign_id, admin_username) DO UPDATE SET
-              action='declined', decided_at=excluded.decided_at
-            """,
-            (campaign_id, admin_username, utc_now_iso()),
-        )
-        conn.commit()
-        conn.close()
-    audit_event(admin_username, "ota.campaign.decline", campaign_id, {})
-    return {"ok": True}
-
-
-@router.post("/ota/campaigns/{campaign_id}/rollback")
-def rollback_ota_campaign(campaign_id: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    """Explicit rollback trigger (in addition to automatic rollback on failure)."""
-    assert_min_role(principal, "admin")
-    admin_username = principal.username
-    if principal.role == "superadmin":
-        with db_lock:
-            conn = get_conn()
-            cur = conn.cursor()
-            cur.execute("SELECT DISTINCT admin_username FROM ota_device_runs WHERE campaign_id = ?", (campaign_id,))
-            admins = [str(r["admin_username"]) for r in cur.fetchall()]
-            conn.close()
-        rolled_total = 0
-        for a in admins:
-            rolled_total += _rollback_admin_devices(campaign_id, a, reason=f"manual rollback by superadmin {principal.username}")
-        return {"ok": True, "rolled_back": rolled_total, "admins": admins}
-    rolled = _rollback_admin_devices(campaign_id, admin_username, reason=f"manual rollback by admin {admin_username}")
-    return {"ok": True, "rolled_back": rolled}
 
 
 __all__ = (

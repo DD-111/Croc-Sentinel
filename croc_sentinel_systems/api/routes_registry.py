@@ -235,19 +235,27 @@ def register_routers(app: FastAPI) -> None:
     app.include_router(_telegram_router)
     app.include_router(_telegram_webhook_router)
 
-    # Phase-13 / 65: OTA surface split into two halves —
-    #   * routers.ota                — diagnostics + listing + broadcast +
-    #                                  firmware upload (no campaign row)
-    #   * routers.ota_campaigns      — full 2-stage campaign lifecycle
+    # Phase-13 / 65 / 77: OTA surface split into three halves —
+    #   * routers.ota                          — diagnostics + listing +
+    #                                            broadcast + firmware upload
+    #                                            (no campaign row)
+    #   * routers.ota_campaigns                — campaign create + read views
+    #   * routers.ota_campaigns_lifecycle      — accept / decline / rollback
     # ``ota`` ships first because ``ota_campaigns`` imports the
     # firmware-bytes helpers (``_ota_store_uploaded_bin``,
     # ``_ota_bin_path_for_stored_name``, ``_require_ota_upload_password``,
     # ``_sha256_for``) from it at module-load time.
+    # ``ota_campaigns_lifecycle`` has no module-load-time dep on the
+    # other two (it pulls helpers from ``_app`` directly), so its
+    # ordering relative to ``ota_campaigns`` is a wash; we register it
+    # last so the lifecycle reads as a story (create/list → accept/etc).
     from routers.ota import router as _ota_router
     from routers.ota_campaigns import router as _ota_campaigns_router
+    from routers.ota_campaigns_lifecycle import router as _ota_campaigns_lifecycle_router
 
     app.include_router(_ota_router)
     app.include_router(_ota_campaigns_router)
+    app.include_router(_ota_campaigns_lifecycle_router)
 
     # Phase-8 / 68: event center split into two halves —
     #   * routers.events         — paginated /events, CSV, by-device, taxonomy
