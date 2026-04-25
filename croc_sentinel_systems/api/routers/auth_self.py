@@ -1,27 +1,41 @@
-"""Self-service account routes (Phase-20 modularization).
+"""Self-service identity / account routes (Phase-20, trimmed Phase-83).
 
-Ten endpoints scoped to "the signed-in user" — i.e. ``/auth/me/*`` —
-plus the small bag of schemas + helpers that go with them.
+Surface evolution:
+  Phase 20 — original module: 10 routes (~432 lines). Owned every
+              ``/auth/me/*`` endpoint, including FCM tokens and
+              notification prefs.
+  Phase 83 — extracted FCM tokens + notification prefs (5 routes,
+              3 schemas) into ``routers/auth_self_devices.py``,
+              leaving identity/account here.
 
-Routes
-------
-  GET    /auth/me                       (profile snapshot)
-  POST   /auth/me/fcm-token             (register/refresh push token)
-  DELETE /auth/me/fcm-token             (delete one push token, body)
-  POST   /auth/me/fcm-token/delete      (POST mirror for proxies that strip DELETE bodies)
-  GET    /auth/me/notification-prefs    (alarm push style)
-  PATCH  /auth/me/notification-prefs    (alarm push style)
-  PATCH  /auth/me/profile               (avatar URL)
-  PATCH  /auth/me/password              (self password change)
-  DELETE /auth/me                       (self-service delete)
-  POST   /auth/me/delete                (POST mirror for proxies that strip DELETE bodies)
+Routes (still here)
+-------------------
+  GET    /auth/me              — profile snapshot.
+  PATCH  /auth/me/profile      — avatar URL.
+  PATCH  /auth/me/password     — self password change (with
+                                 password-changed email notification).
+  DELETE /auth/me              — self-service deletion.
+  POST   /auth/me/delete       — POST mirror for proxies that strip
+                                 DELETE bodies.
 
-Schemas / helpers moved with the routes
----------------------------------------
-  SelfPasswordChangeRequest, SelfDeleteRequest,
-  FcmTokenRegisterRequest, FcmTokenDeleteRequest,
-  NotificationPrefsPatchRequest, MeProfilePatchRequest,
-  _validate_avatar_url, _auth_me_delete_impl
+Schemas owned here
+------------------
+  SelfPasswordChangeRequest, SelfDeleteRequest, MeProfilePatchRequest
+
+The mobile/preference schemas (``FcmTokenRegisterRequest``,
+``FcmTokenDeleteRequest``, ``NotificationPrefsPatchRequest``) live in
+``routers/auth_self_devices.py``. Both routers share the
+``"auth-self"`` OpenAPI tag so the docs group them together.
+
+Helpers owned here
+------------------
+  _validate_avatar_url       — https-only URL gate for avatar PATCH.
+  _auth_me_delete_impl       — shared body for DELETE/POST delete.
+                               Calls ``_close_admin_tenant_cur`` for
+                               admin tenants (cascades to all owned
+                               devices + subordinate users) or
+                               ``_delete_user_auxiliary_cur`` for
+                               regular users (purges sidecar rows).
 
 Late-binding strategy
 ---------------------
@@ -48,7 +62,6 @@ import app as _app
 from audit import audit_event
 from db import cache_invalidate, db_lock, get_conn
 from email_templates import render_password_changed_email
-from helpers import utc_now_iso
 from notifier import notifier
 from security import Principal, assert_min_role, hash_password, verify_password
 from tz_display import malaysia_now_iso
@@ -87,19 +100,11 @@ class SelfDeleteRequest(BaseModel):
     acknowledge_admin_tenant_closure: bool = Field(default=False)
 
 
-class FcmTokenRegisterRequest(BaseModel):
-    token: str = Field(min_length=32, max_length=512)
-    platform: str = Field(default="", max_length=32)
-
-
-class FcmTokenDeleteRequest(BaseModel):
-    token: str = Field(min_length=32, max_length=512)
-
-
-class NotificationPrefsPatchRequest(BaseModel):
-    """Mobile alarm presentation: fullscreen (high-urgency) vs heads_up (standard notification)."""
-
-    alarm_push_style: str = Field(pattern="^(fullscreen|heads_up)$")
+# Phase-83 split: ``FcmTokenRegisterRequest``, ``FcmTokenDeleteRequest``,
+# and ``NotificationPrefsPatchRequest`` moved to
+# ``routers/auth_self_devices.py`` along with their 5 routes
+# (FCM token register/delete/delete-POST + notification-prefs GET/PATCH).
+# Both routers share the ``auth-self`` tag.
 
 
 class MeProfilePatchRequest(BaseModel):
@@ -200,100 +205,10 @@ def auth_me(principal: Principal = Depends(require_principal)) -> dict[str, Any]
     }
 
 
-@router.post("/auth/me/fcm-token")
-def auth_me_fcm_token_register(
-    body: FcmTokenRegisterRequest,
-    principal: Principal = Depends(require_principal),
-) -> dict[str, Any]:
-    """Register or refresh one FCM device token for the signed-in user."""
-    assert_min_role(principal, "user")
-    tok = body.token.strip()
-    plat = (body.platform or "").strip().lower()[:32]
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO user_fcm_tokens (username, token, platform, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(username, token) DO UPDATE SET
-              platform = excluded.platform,
-              updated_at = excluded.updated_at
-            """,
-            (principal.username, tok, plat, utc_now_iso()),
-        )
-        conn.commit()
-        conn.close()
-    audit_event(principal.username, "auth.fcm_token.upsert", principal.username, {"platform": plat})
-    return {"ok": True}
-
-
-@router.delete("/auth/me/fcm-token")
-def auth_me_fcm_token_delete(
-    body: FcmTokenDeleteRequest,
-    principal: Principal = Depends(require_principal),
-) -> dict[str, Any]:
-    assert_min_role(principal, "user")
-    tok = body.token.strip()
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM user_fcm_tokens WHERE username = ? AND token = ?", (principal.username, tok))
-        n = cur.rowcount
-        conn.commit()
-        conn.close()
-    audit_event(principal.username, "auth.fcm_token.delete", principal.username, {"removed": int(n or 0)})
-    return {"ok": True, "removed": int(n or 0)}
-
-
-@router.post("/auth/me/fcm-token/delete")
-def auth_me_fcm_token_delete_post(
-    body: FcmTokenDeleteRequest,
-    principal: Principal = Depends(require_principal),
-) -> dict[str, Any]:
-    """Same as DELETE /auth/me/fcm-token when reverse proxies drop DELETE bodies."""
-    return auth_me_fcm_token_delete(body, principal)
-
-
-@router.get("/auth/me/notification-prefs")
-def auth_me_notification_prefs_get(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_min_role(principal, "user")
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT IFNULL(alarm_push_style,'fullscreen') AS s FROM dashboard_users WHERE username = ?",
-            (principal.username,),
-        )
-        row = cur.fetchone()
-        conn.close()
-    if not row:
-        raise HTTPException(status_code=404, detail="user not found")
-    return {"alarm_push_style": str(row["s"] or "fullscreen")}
-
-
-@router.patch("/auth/me/notification-prefs")
-def auth_me_notification_prefs_patch(
-    body: NotificationPrefsPatchRequest,
-    principal: Principal = Depends(require_principal),
-) -> dict[str, Any]:
-    assert_min_role(principal, "user")
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE dashboard_users SET alarm_push_style = ? WHERE username = ?",
-            (body.alarm_push_style, principal.username),
-        )
-        conn.commit()
-        conn.close()
-    audit_event(
-        principal.username,
-        "auth.notification_prefs.patch",
-        principal.username,
-        {"alarm_push_style": body.alarm_push_style},
-    )
-    return {"ok": True, "alarm_push_style": body.alarm_push_style}
+# Phase-83 split: the 3 FCM-token routes (POST register, DELETE, POST
+# delete-mirror) and the 2 notification-prefs routes (GET, PATCH) live
+# in routers/auth_self_devices.py. Both routers share the auth-self tag
+# so the OpenAPI doc groups them together for end users.
 
 
 @router.patch("/auth/me/profile")

@@ -105,10 +105,26 @@ def register_routers(app: FastAPI) -> None:
 
     app.include_router(_device_http_router)
 
-    # Phase-20: self-service /auth/me/* (10 routes + 6 schemas + helpers).
+    # Phase-20 / 83: self-service /auth/me/* split into two modules —
+    #   * routers.auth_self          — identity/account (5 routes:
+    #                                   GET /me, PATCH profile,
+    #                                   PATCH password, DELETE /me,
+    #                                   POST /me/delete) + 3 schemas
+    #                                   + ``_validate_avatar_url`` /
+    #                                   ``_auth_me_delete_impl``.
+    #   * routers.auth_self_devices  — mobile preferences (5 routes:
+    #                                   POST/DELETE/POST-mirror FCM
+    #                                   tokens + GET/PATCH
+    #                                   notification-prefs) + 3 schemas.
+    # Both share the ``"auth-self"`` tag so the OpenAPI doc still
+    # groups them together for end users. Order is irrelevant (no
+    # cross-module imports); register identity first so the OpenAPI
+    # route list reads identity → preferences.
     from routers.auth_self import router as _auth_self_router
+    from routers.auth_self_devices import router as _auth_self_devices_router
 
     app.include_router(_auth_self_router)
+    app.include_router(_auth_self_devices_router)
 
     # Phase-21 / 69 / 80: admin+user surface split into three modules —
     #   * routers.auth_admins       — superadmin-only admin tenant
