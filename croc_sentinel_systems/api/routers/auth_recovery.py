@@ -1,43 +1,46 @@
-"""Auth password-recovery routes (Phase-17, trimmed in Phase-64).
+"""Auth password-recovery routes (Phase-17, trimmed Phase-64 + Phase-72).
 
 Originally this module covered both signup and password recovery.
-Phase 64 split the signup half into ``routers/auth_signup.py`` so
-each file stays under ~500 lines and reflects a single concern. The
-remaining contents — the offline-RSA recovery blob path, the
-email-OTP path, and their shared helpers — are kept here.
+Phase 64 split the signup half into ``routers/auth_signup.py``.
+Phase 72 split the email-OTP password recovery flow into
+``routers/auth_recovery_email.py`` so this file now hosts only
+the offline-RSA-blob recovery flow plus the helpers shared
+between the two flows.
 
 Routes (all unauthenticated)
 ----------------------------
   GET   /auth/forgot/enabled
-  GET   /auth/forgot/email/enabled
-  POST  /auth/forgot/email/check
-  POST  /auth/forgot/email/start
-  POST  /auth/forgot/email/complete
   POST  /auth/forgot/start
   POST  /auth/forgot/complete
 
-Helpers and schemas
--------------------
-- 4 Pydantic schemas (ForgotStartRequest / ForgotEmailStartRequest /
-  ForgotEmailCompleteRequest / ForgotCompleteRequest)
-- ``_password_recovery_load_public`` + 3 RSA helpers
-  (``_password_recovery_blob_byte_len``,
-  ``_encrypt_password_recovery_payload``,
-  ``_fake_password_recovery_hex``)
-- ``_check_forgot_ip_rate``, ``_prune_password_reset_tokens``
+Schemas
+-------
+  ForgotStartRequest, ForgotCompleteRequest
 
-The ``_prune_password_reset_tokens`` helper is re-exported back into
-``app.py`` (``routes_registry.register_routers`` binds it onto
-``_app._prune_password_reset_tokens``) so the scheduler thread can
-call it without depending on this module's full import surface.
+Helpers owned here
+------------------
+- 4 RSA-blob helpers
+  (``_password_recovery_load_public``,
+   ``_password_recovery_blob_byte_len``,
+   ``_encrypt_password_recovery_payload``,
+   ``_fake_password_recovery_hex``)
+- ``_check_forgot_ip_rate``      — re-exported and reused by
+  ``routers.auth_recovery_email`` so both flows count toward the
+  same per-IP rate-limit budget.
+- ``_prune_password_reset_tokens`` — re-exported back into
+  ``app.py`` (``routes_registry.register_routers`` binds it onto
+  ``_app._prune_password_reset_tokens``) so the scheduler thread
+  can call it without depending on this module's full import surface.
 
 Late binding
 ------------
-Validation/rate-limit helpers (``_looks_like_email``,
-``_consume_verification``, ``_clear_login_failures`` etc.) live in
-``auth_helpers.py`` / ``app.py`` and are late-bound here via
-``import app as _app``. ``emit_event`` / ``get_manager_admin`` /
-``_client_ip`` are likewise resolved at call time off ``app``.
+``emit_event`` / ``get_manager_admin`` / ``_client_ip`` /
+``_clear_login_failures`` / ``_clear_login_ip_state`` are
+late-bound at call time off ``app``. Validation/rate-limit helpers
+that the email flow needed (``_looks_like_email``, ``_issue_verification``,
+``_consume_verification``, ``_verification_resend_wait_seconds``,
+``_generate_sha_code``) were moved to the email module — this
+module no longer imports those.
 """
 
 from __future__ import annotations
@@ -65,8 +68,6 @@ from config import (
     FORGOT_PASSWORD_IP_MAX,
     FORGOT_PASSWORD_IP_WINDOW_SECONDS,
     FORGOT_PASSWORD_TOKEN_TTL_SECONDS,
-    OTP_RESEND_COOLDOWN_SECONDS,
-    OTP_TTL_SECONDS,
     PASSWORD_RECOVERY_BLOB_MAGIC,
     PASSWORD_RECOVERY_BLOB_VERSION,
     PASSWORD_RECOVERY_PLAINTEXT_PAD,
@@ -75,7 +76,6 @@ from config import (
 )
 from db import db_lock, get_conn
 from helpers import utc_now_iso
-from notifier import notifier
 from security import hash_password
 
 
@@ -90,33 +90,6 @@ def _get_manager_admin(username: str) -> str:
 
 def _client_ip(request: Request) -> str:
     return _app._client_ip(request)
-
-
-def _looks_like_email(value: str) -> bool:
-    return _app._looks_like_email(value)
-
-
-def _consume_verification(username: str, channel: str, purpose: str, code: str) -> bool:
-    return _app._consume_verification(username, channel, purpose, code)
-
-
-def _verification_resend_wait_seconds(username: str, channel: str, purpose: str) -> int:
-    return _app._verification_resend_wait_seconds(username, channel, purpose)
-
-
-def _generate_sha_code() -> str:
-    return _app._generate_sha_code()
-
-
-def _issue_verification(
-    username: str,
-    channel: str,
-    target: str,
-    purpose: str = "activate",
-    *,
-    explicit_code: Optional[str] = None,
-) -> int:
-    return _app._issue_verification(username, channel, target, purpose, explicit_code=explicit_code)
 
 
 def _clear_login_failures(username: str) -> None:
@@ -137,19 +110,6 @@ router = APIRouter(tags=["auth-recovery"])
 
 class ForgotStartRequest(BaseModel):
     username: str = Field(min_length=1, max_length=64)
-
-
-class ForgotEmailStartRequest(BaseModel):
-    username: str = Field(min_length=1, max_length=64)
-    email: str = Field(min_length=3, max_length=254)
-
-
-class ForgotEmailCompleteRequest(BaseModel):
-    username: str = Field(min_length=1, max_length=64)
-    email: str = Field(min_length=3, max_length=254)
-    sha_code: str = Field(min_length=6, max_length=32)
-    password: str = Field(min_length=8, max_length=128)
-    password_confirm: str = Field(min_length=8, max_length=128)
 
 
 class ForgotCompleteRequest(BaseModel):
@@ -274,145 +234,12 @@ def _prune_password_reset_tokens() -> None:
 
 
 # ===========================================================================
-# Forgot-password (email-OTP path) and offline RSA blob path
+# Forgot-password (offline RSA blob path)
 # ===========================================================================
 
 @router.get("/auth/forgot/enabled")
 def auth_forgot_enabled() -> dict[str, Any]:
     return {"enabled": bool(_password_recovery_load_public())}
-
-
-@router.get("/auth/forgot/email/enabled")
-def auth_forgot_email_enabled() -> dict[str, Any]:
-    return {"enabled": bool(notifier.enabled())}
-
-
-@router.post("/auth/forgot/email/check")
-def auth_forgot_email_check(body: ForgotEmailStartRequest, request: Request) -> dict[str, Any]:
-    ip = _client_ip(request)
-    _check_forgot_ip_rate(ip)
-    username = body.username.strip()
-    email = body.email.strip().lower()
-    if not _looks_like_email(email):
-        raise HTTPException(status_code=400, detail="email format invalid")
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT status, email FROM dashboard_users WHERE username = ?",
-            (username,),
-        )
-        row = cur.fetchone()
-        conn.close()
-    if not row:
-        return {"ok": True, "matched": False, "can_send": False, "resend_after_seconds": 0}
-    if str(row["status"] or "active") == "disabled":
-        return {"ok": True, "matched": False, "can_send": False, "resend_after_seconds": 0}
-    reg_email = str(row["email"] or "").strip().lower()
-    matched = bool(reg_email) and reg_email == email
-    if not matched:
-        return {"ok": True, "matched": False, "can_send": False, "resend_after_seconds": 0}
-    wait = _verification_resend_wait_seconds(username, "email", "reset")
-    return {"ok": True, "matched": True, "can_send": wait <= 0, "resend_after_seconds": wait}
-
-
-@router.post("/auth/forgot/email/start")
-def auth_forgot_email_start(body: ForgotEmailStartRequest, request: Request) -> dict[str, Any]:
-    ip = _client_ip(request)
-    _check_forgot_ip_rate(ip)
-    username = body.username.strip()
-    email = body.email.strip().lower()
-    if not _looks_like_email(email):
-        raise HTTPException(status_code=400, detail="email format invalid")
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT username, role, status, email FROM dashboard_users WHERE username = ?",
-            (username,),
-        )
-        row = cur.fetchone()
-        conn.close()
-    if not row:
-        return {"ok": True, "ttl_seconds": OTP_TTL_SECONDS, "resend_after_seconds": OTP_RESEND_COOLDOWN_SECONDS}
-    if str(row["status"] or "active") == "disabled":
-        return {"ok": True, "ttl_seconds": OTP_TTL_SECONDS, "resend_after_seconds": OTP_RESEND_COOLDOWN_SECONDS}
-    reg_email = str(row["email"] or "").strip().lower()
-    if not reg_email or reg_email != email:
-        return {"ok": True, "ttl_seconds": OTP_TTL_SECONDS, "resend_after_seconds": OTP_RESEND_COOLDOWN_SECONDS}
-    if not notifier.enabled():
-        raise HTTPException(status_code=503, detail="email sender is not configured")
-    sha_code = _generate_sha_code()
-    try:
-        ttl = _issue_verification(username, "email", email, "reset", explicit_code=sha_code)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.warning("password reset email send failed for %s: %s", username, exc)
-        raise HTTPException(
-            status_code=502,
-            detail=f"failed to send recovery email: {exc}",
-        ) from exc
-    _emit_event(
-        level="info",
-        category="auth",
-        event_type="auth.password_reset.email_code.started",
-        summary=f"password reset sha code sent for {username}",
-        actor=f"ip:{ip}",
-        target=username,
-        owner_admin=username if str(row["role"] or "") == "admin" else _get_manager_admin(username),
-        detail={"email": email},
-    )
-    return {"ok": True, "ttl_seconds": ttl, "resend_after_seconds": OTP_RESEND_COOLDOWN_SECONDS}
-
-
-@router.post("/auth/forgot/email/complete")
-def auth_forgot_email_complete(body: ForgotEmailCompleteRequest, request: Request) -> dict[str, Any]:
-    if body.password != body.password_confirm:
-        raise HTTPException(status_code=400, detail="passwords do not match")
-    username = body.username.strip()
-    email = body.email.strip().lower()
-    if not _looks_like_email(email):
-        raise HTTPException(status_code=400, detail="email format invalid")
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT status, role, email FROM dashboard_users WHERE username = ?", (username,))
-        urow = cur.fetchone()
-        conn.close()
-    if not urow:
-        raise HTTPException(status_code=404, detail="user not found")
-    if str(urow["status"] or "active") == "disabled":
-        raise HTTPException(status_code=403, detail="account disabled")
-    if str(urow["email"] or "").strip().lower() != email:
-        raise HTTPException(status_code=400, detail="email does not match registered email")
-    ok = _consume_verification(username, "email", "reset", body.sha_code.strip())
-    if not ok:
-        raise HTTPException(status_code=400, detail="invalid or expired sha code")
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE dashboard_users SET password_hash = ? WHERE username = ?",
-            (hash_password(body.password), username),
-        )
-        conn.commit()
-        conn.close()
-    _clear_login_failures(username)
-    ip = _client_ip(request)
-    _clear_login_ip_state(ip)
-    audit_event(username, "auth.password_reset.email_code.ok", "", {"ip": ip, "email": email})
-    _emit_event(
-        level="warn",
-        category="auth",
-        event_type="auth.password_reset.email_code.completed",
-        summary=f"password reset via email code for {username}",
-        actor=username,
-        target=username,
-        owner_admin=username if str(urow["role"] or "") == "admin" else _get_manager_admin(username),
-        detail={"ip": ip, "email": email},
-    )
-    return {"ok": True}
 
 
 @router.post("/auth/forgot/start")
@@ -585,8 +412,6 @@ def auth_forgot_complete(body: ForgotCompleteRequest, request: Request) -> dict[
 __all__ = (
     "router",
     "ForgotStartRequest",
-    "ForgotEmailStartRequest",
-    "ForgotEmailCompleteRequest",
     "ForgotCompleteRequest",
     "_password_recovery_load_public",
     "_password_recovery_blob_byte_len",

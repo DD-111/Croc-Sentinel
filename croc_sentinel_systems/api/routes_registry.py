@@ -57,11 +57,18 @@ def register_routers(app: FastAPI) -> None:
 
     app.include_router(_ui_mounts_router)
 
-    # Phase-64: split into two halves —
-    #   * routers.auth_signup (7 signup/activate/approval routes + 3 schemas)
-    #   * routers.auth_recovery (7 forgot-password routes + 4 schemas + 6 helpers)
-    # Both are unauthenticated-by-default; signup goes first to keep the
-    # original /auth/signup/* registration order from Phase-17.
+    # Phase-64 / 72: auth signup + recovery split into three halves —
+    #   * routers.auth_signup          — 7 signup/activate/approval routes
+    #                                    (3 schemas)
+    #   * routers.auth_recovery        — offline RSA-blob password reset flow
+    #                                    (3 routes, 2 schemas, 6 helpers)
+    #   * routers.auth_recovery_email  — email-OTP password reset flow
+    #                                    (4 routes, 2 schemas)
+    # All are unauthenticated-by-default. Signup goes first to keep the
+    # historical /auth/signup/* registration order from Phase-17.
+    # auth_recovery must be imported before auth_recovery_email because
+    # the email module imports ``_check_forgot_ip_rate`` from it at
+    # module-load time (the rate-limit budget is shared across both flows).
     from routers.auth_signup import router as _auth_signup_router
 
     app.include_router(_auth_signup_router)
@@ -69,11 +76,13 @@ def register_routers(app: FastAPI) -> None:
     # Re-export _prune_password_reset_tokens onto app so scheduler.py late-binds.
     from routers.auth_recovery import _prune_password_reset_tokens
     from routers.auth_recovery import router as _auth_recovery_router
+    from routers.auth_recovery_email import router as _auth_recovery_email_router
 
     import app as _app
 
     _app._prune_password_reset_tokens = _prune_password_reset_tokens
     app.include_router(_auth_recovery_router)
+    app.include_router(_auth_recovery_email_router)
 
     # Phase-22: login / csrf / logout.
     from routers.auth_core import router as _auth_core_router
