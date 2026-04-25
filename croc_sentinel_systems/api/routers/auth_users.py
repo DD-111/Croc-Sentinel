@@ -1,34 +1,45 @@
-"""Admin-managed user CRUD routes (Phase-21, trimmed in Phase-69).
+"""Admin-managed user CRUD routes (Phase-21, trimmed in Phase-69 / 80).
 
-The Phase-21 module covered both admin tenant management
-(superadmin-only) and admin-managed user CRUD in a single 479-line
-file. Phase 69 split the two superadmin endpoints
-(``GET /auth/admins`` and ``POST /auth/admins/{username}/close``)
-into ``routers/auth_admins.py`` so this file now hosts only the
-five admin-facing user CRUD routes.
+Surface evolution:
+  Phase 21 — original module: 7 routes (~479 lines). Covered both
+              admin-tenant CRUD (superadmin) and per-tenant user CRUD.
+  Phase 69 — extracted ``GET /auth/admins`` and
+              ``POST /auth/admins/{username}/close`` into
+              ``routers/auth_admins.py`` (admin-tenant management).
+  Phase 80 — extracted policy GET/PUT into
+              ``routers/auth_user_policy.py`` (capability-flag
+              management) so this file is now identity-lifecycle
+              only.
 
-Routes
-------
-  GET    /auth/users                           — list users in tenant
-  POST   /auth/users                           — create user (sends OTP)
-  DELETE /auth/users/{username}                — remove user
-  GET    /auth/users/{username}/policy         — fetch effective policy
-  PUT    /auth/users/{username}/policy         — update policy fields
+Routes (still here)
+-------------------
+  GET    /auth/users                — list users in tenant.
+  POST   /auth/users                — create user (sends activation
+                                      OTPs to email + optional SMS).
+  DELETE /auth/users/{username}     — remove user (incl. auxiliary
+                                      rows: device_shares,
+                                      role_policies, etc.).
 
 Schemas owned here
 ------------------
-  UserCreateRequest, UserPolicyUpdateRequest
+  UserCreateRequest
+
+The policy schema (``UserPolicyUpdateRequest``) lives next door in
+``routers/auth_user_policy.py``. Both routers share the
+``"auth-users"`` OpenAPI tag so they group together in the docs.
 
 Late-binding strategy
 ---------------------
-Cross-feature helpers come from app.py:
+Cross-feature helpers come from ``app.py``:
 
   early-bound (defined before this module's import):
     require_principal, require_capability,
     _looks_like_email, _normalize_phone, _issue_verification
 
   call-time wrapper (defined later in app.py):
-    _delete_user_auxiliary_cur
+    _delete_user_auxiliary_cur — needed by the DELETE route's
+    fan-out cleanup. Wrapped with a thin ``def`` so the lookup
+    happens at call time, after app.py has finished defining it.
 
 Cross-router note
 -----------------
@@ -91,18 +102,9 @@ class UserCreateRequest(BaseModel):
     phone: Optional[str] = Field(default=None, min_length=4, max_length=32)
 
 
-class UserPolicyUpdateRequest(BaseModel):
-    can_alert: Optional[bool] = None
-    can_send_command: Optional[bool] = None
-    can_claim_device: Optional[bool] = None
-    can_manage_users: Optional[bool] = None
-    can_backup_restore: Optional[bool] = None
-    tg_view_logs: Optional[bool] = None
-    tg_view_devices: Optional[bool] = None
-    tg_siren_on: Optional[bool] = None
-    tg_siren_off: Optional[bool] = None
-    tg_test_single: Optional[bool] = None
-    tg_test_bulk: Optional[bool] = None
+# Phase-80 split: ``UserPolicyUpdateRequest`` and the policy GET/PUT
+# routes moved to ``routers/auth_user_policy.py``. Both routers share
+# the ``"auth-users"`` tag so they group together in the OpenAPI docs.
 
 
 # ---- Routes ----------------------------------------------------------------
@@ -301,140 +303,7 @@ def auth_delete_user(username: str, principal: Principal = Depends(require_princ
     return {"ok": True}
 
 
-@router.get("/auth/users/{username}/policy")
-def auth_get_user_policy(username: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_min_role(principal, "admin")
-    if principal.role == "admin":
-        require_capability(principal, "can_manage_users")
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT username, role, manager_admin FROM dashboard_users WHERE username = ?", (username,))
-        u = cur.fetchone()
-        if not u:
-            conn.close()
-            raise HTTPException(status_code=404, detail="user not found")
-        if principal.role == "admin" and (str(u["role"]) != "user" or str(u["manager_admin"] or "") != principal.username):
-            conn.close()
-            raise HTTPException(status_code=403, detail="not your managed user")
-        cur.execute(
-            """
-            SELECT can_alert, can_send_command, can_claim_device, can_manage_users, can_backup_restore,
-                   tg_view_logs, tg_view_devices, tg_siren_on, tg_siren_off, tg_test_single, tg_test_bulk,
-                   updated_at
-            FROM role_policies WHERE username = ?
-            """,
-            (username,),
-        )
-        p = cur.fetchone()
-        conn.close()
-    if not p:
-        out = default_policy_for_role(str(u["role"]))
-        out["updated_at"] = ""
-        return out
-    return dict(p)
-
-
-@router.put("/auth/users/{username}/policy")
-def auth_set_user_policy(
-    username: str,
-    req: UserPolicyUpdateRequest,
-    principal: Principal = Depends(require_principal),
-) -> dict[str, Any]:
-    assert_min_role(principal, "admin")
-    if principal.role == "admin":
-        require_capability(principal, "can_manage_users")
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT username, role, manager_admin FROM dashboard_users WHERE username = ?", (username,))
-        u = cur.fetchone()
-        if not u:
-            conn.close()
-            raise HTTPException(status_code=404, detail="user not found")
-        if str(u["role"]) != "user":
-            conn.close()
-            raise HTTPException(status_code=400, detail="policy endpoint is for user role")
-        if principal.role == "admin" and str(u["manager_admin"] or "") != principal.username:
-            conn.close()
-            raise HTTPException(status_code=403, detail="not your managed user")
-        base = default_policy_for_role("user")
-        cur.execute(
-            """
-            SELECT can_alert, can_send_command, can_claim_device, can_manage_users, can_backup_restore,
-                   tg_view_logs, tg_view_devices, tg_siren_on, tg_siren_off, tg_test_single, tg_test_bulk
-            FROM role_policies WHERE username = ?
-            """,
-            (username,),
-        )
-        curp = cur.fetchone()
-        if curp:
-            for k in base.keys():
-                base[k] = int(curp[k])
-        updates = {
-            "can_alert": req.can_alert,
-            "can_send_command": req.can_send_command,
-            "can_claim_device": req.can_claim_device,
-            "can_manage_users": req.can_manage_users,
-            "can_backup_restore": req.can_backup_restore,
-            "tg_view_logs": req.tg_view_logs,
-            "tg_view_devices": req.tg_view_devices,
-            "tg_siren_on": req.tg_siren_on,
-            "tg_siren_off": req.tg_siren_off,
-            "tg_test_single": req.tg_test_single,
-            "tg_test_bulk": req.tg_test_bulk,
-        }
-        for k, v in updates.items():
-            if v is not None:
-                base[k] = 1 if v else 0
-        # guardrail: regular users never get backup/manage_users
-        base["can_backup_restore"] = 0
-        base["can_manage_users"] = 0
-        cur.execute(
-            """
-            INSERT INTO role_policies (
-                username, can_alert, can_send_command, can_claim_device, can_manage_users, can_backup_restore,
-                tg_view_logs, tg_view_devices, tg_siren_on, tg_siren_off, tg_test_single, tg_test_bulk, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(username) DO UPDATE SET
-                can_alert=excluded.can_alert,
-                can_send_command=excluded.can_send_command,
-                can_claim_device=excluded.can_claim_device,
-                can_manage_users=excluded.can_manage_users,
-                can_backup_restore=excluded.can_backup_restore,
-                tg_view_logs=excluded.tg_view_logs,
-                tg_view_devices=excluded.tg_view_devices,
-                tg_siren_on=excluded.tg_siren_on,
-                tg_siren_off=excluded.tg_siren_off,
-                tg_test_single=excluded.tg_test_single,
-                tg_test_bulk=excluded.tg_test_bulk,
-                updated_at=excluded.updated_at
-            """,
-            (
-                username,
-                base["can_alert"],
-                base["can_send_command"],
-                base["can_claim_device"],
-                base["can_manage_users"],
-                base["can_backup_restore"],
-                base["tg_view_logs"],
-                base["tg_view_devices"],
-                base["tg_siren_on"],
-                base["tg_siren_off"],
-                base["tg_test_single"],
-                base["tg_test_bulk"],
-                utc_now_iso(),
-            ),
-        )
-        conn.commit()
-        conn.close()
-    audit_event(principal.username, "user.policy.update", username, base)
-    return {"ok": True, "username": username, "policy": base}
-
-
 __all__ = (
     "router",
     "UserCreateRequest",
-    "UserPolicyUpdateRequest",
 )

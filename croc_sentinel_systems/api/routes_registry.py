@@ -99,18 +99,27 @@ def register_routers(app: FastAPI) -> None:
 
     app.include_router(_auth_self_router)
 
-    # Phase-21 / 69: admin+user CRUD split into two halves —
-    #   * routers.auth_admins  — superadmin-only admin tenant management
-    #                            (GET /auth/admins, POST /auth/admins/{u}/close)
-    #   * routers.auth_users   — admin-managed user CRUD + per-user policy
-    #                            (5 routes under /auth/users)
+    # Phase-21 / 69 / 80: admin+user surface split into three modules —
+    #   * routers.auth_admins       — superadmin-only admin tenant
+    #                                 management (GET /auth/admins,
+    #                                 POST /auth/admins/{u}/close).
+    #   * routers.auth_users        — admin-managed user identity CRUD
+    #                                 (3 routes under /auth/users:
+    #                                 list / create / delete).
+    #   * routers.auth_user_policy  — admin-managed user policy
+    #                                 (Phase-80: GET + PUT
+    #                                 /auth/users/{u}/policy).
     # Order is irrelevant (no cross-module imports). Register admins
-    # first so /auth/admins/* paths group naturally in the route list.
+    # first so /auth/admins/* paths group naturally; users next; policy
+    # last so the OpenAPI route list reads identity-then-capabilities.
+    # All three share the ``"auth-users"`` / ``"auth-admins"`` tag groups.
     from routers.auth_admins import router as _auth_admins_router
     from routers.auth_users import router as _auth_users_router
+    from routers.auth_user_policy import router as _auth_user_policy_router
 
     app.include_router(_auth_admins_router)
     app.include_router(_auth_users_router)
+    app.include_router(_auth_user_policy_router)
 
     # Phase-25: admin DB backup (encrypted export / import).
     from routers.admin_backup import router as _admin_backup_router
