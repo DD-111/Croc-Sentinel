@@ -1922,194 +1922,25 @@ from routers.device_revoke import router as _device_revoke_router  # noqa: E402
 
 app.include_router(_device_revoke_router)
 
-def _delete_user_auxiliary_cur(cur: Any, username: str) -> None:
-    """Remove dashboard user row and attached rows (not device ownership)."""
-    cur.execute("DELETE FROM role_policies WHERE username = ?", (username,))
-    cur.execute("DELETE FROM verifications WHERE username = ?", (username,))
-    cur.execute("DELETE FROM device_acl WHERE grantee_username = ?", (username,))
-    cur.execute("DELETE FROM telegram_chat_bindings WHERE username = ?", (username,))
-    cur.execute("DELETE FROM telegram_link_tokens WHERE username = ?", (username,))
-    cur.execute("DELETE FROM user_fcm_tokens WHERE username = ?", (username,))
-    cur.execute("DELETE FROM password_reset_tokens WHERE username = ?", (username,))
-    cur.execute("DELETE FROM dashboard_users WHERE username = ?", (username,))
-    # If the deleted user was a superadmin, the cached chat list is stale;
-    # same for the username->role cache.
-    _invalidate_superadmin_telegram_chats_cache()
-
-
-def _apply_device_factory_unclaim_cur(cur: Any, device_id: str) -> None:
-    """Same data effect as factory-unregister: unclaim in DB + factory_devices status (caller holds lock)."""
-    cur.execute("SELECT mac_nocolon FROM provisioned_credentials WHERE device_id = ?", (device_id,))
-    p = cur.fetchone()
-    mac_nocolon = str(p["mac_nocolon"]) if p and p["mac_nocolon"] else ""
-    cur.execute("DELETE FROM provisioned_credentials WHERE device_id = ?", (device_id,))
-    cur.execute("DELETE FROM device_ownership WHERE device_id = ?", (device_id,))
-    cur.execute("DELETE FROM device_acl WHERE device_id = ?", (device_id,))
-    cur.execute("DELETE FROM revoked_devices WHERE device_id = ?", (device_id,))
-    cur.execute("DELETE FROM device_state WHERE device_id = ?", (device_id,))
-    cur.execute("DELETE FROM scheduled_commands WHERE device_id = ?", (device_id,))
-    if mac_nocolon:
-        cur.execute(
-            "UPDATE factory_devices SET status='unclaimed', updated_at=? WHERE mac_nocolon = ?",
-            (utc_now_iso(), mac_nocolon),
-        )
-    else:
-        cur.execute(
-            "UPDATE factory_devices SET status='unclaimed', updated_at=? WHERE serial = ?",
-            (utc_now_iso(), device_id),
-        )
-
-
-def _close_admin_tenant_cur(
-    cur: Any,
-    admin_username: str,
-    transfer_devices_to: Optional[str],
-    actor_username: str,
-) -> dict[str, Any]:
-    """
-    admin_username: role must be 'admin'. Transfers or unclaims all owned devices, deletes
-    subordinate users, then deletes the admin row. Does not commit.
-    """
-    cur.execute("SELECT role FROM dashboard_users WHERE username = ?", (admin_username,))
-    row = cur.fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="user not found")
-    role = str(row["role"] or "")
-    if role == "superadmin":
-        raise HTTPException(status_code=400, detail="cannot close a superadmin account with this action")
-    if role != "admin":
-        raise HTTPException(status_code=400, detail="target is not an admin tenant")
-    summary: dict[str, Any] = {
-        "admin": admin_username,
-        "devices_unclaimed": 0,
-        "devices_transferred": 0,
-        "subordinate_users_deleted": 0,
-    }
-    transfer_to = (transfer_devices_to or "").strip() or None
-    if transfer_to:
-        cur.execute("SELECT role FROM dashboard_users WHERE username = ?", (transfer_to,))
-        trow = cur.fetchone()
-        if not trow or str(trow["role"] or "") not in ("admin", "superadmin"):
-            raise HTTPException(status_code=400, detail="transfer_devices_to must be an existing admin or superadmin")
-        if secrets.compare_digest(transfer_to, admin_username):
-            raise HTTPException(status_code=400, detail="cannot transfer to the same admin")
-        cur.execute("SELECT device_id FROM device_ownership WHERE owner_admin = ?", (admin_username,))
-        transfer_ids = [str(r["device_id"]) for r in cur.fetchall() if r and r["device_id"]]
-        cur.execute(
-            """
-            UPDATE device_ownership
-            SET owner_admin = ?, assigned_by = ?, assigned_at = ?
-            WHERE owner_admin = ?
-            """,
-            (transfer_to, actor_username, utc_now_iso(), admin_username),
-        )
-        summary["devices_transferred"] = int(cur.rowcount or 0)
-        if transfer_ids:
-            ph = ",".join("?" * len(transfer_ids))
-            cur.execute(
-                f"UPDATE device_state SET display_label = '', notification_group = '' WHERE device_id IN ({ph})",
-                transfer_ids,
-            )
-    else:
-        cur.execute("SELECT device_id FROM device_ownership WHERE owner_admin = ?", (admin_username,))
-        for r in cur.fetchall():
-            did = str(r["device_id"] or "")
-            if not did:
-                continue
-            _apply_device_factory_unclaim_cur(cur, did)
-            summary["devices_unclaimed"] += 1
-    cur.execute(
-        "SELECT username FROM dashboard_users WHERE manager_admin = ? AND role = 'user'",
-        (admin_username,),
-    )
-    for r in cur.fetchall():
-        su = str(r["username"] or "")
-        if su:
-            _delete_user_auxiliary_cur(cur, su)
-            summary["subordinate_users_deleted"] += 1
-    _delete_user_auxiliary_cur(cur, admin_username)
-    return summary
-
-
-def _wait_cmd_ack(device_id: str, cmd: str, timeout_s: float = 2.5, cmd_id: Optional[str] = None) -> bool:
-    deadline = time.time() + max(0.2, float(timeout_s))
-    cid = (cmd_id or "").strip()
-    while time.time() < deadline:
-        with db_lock:
-            conn = get_conn()
-            cur = conn.cursor()
-            cur.execute("SELECT IFNULL(last_ack_json,'') AS last_ack_json FROM device_state WHERE device_id = ?", (device_id,))
-            row = cur.fetchone()
-            conn.close()
-        try:
-            ack = json.loads(str((row["last_ack_json"] if row else "") or ""))
-        except Exception:
-            ack = {}
-        if str(ack.get("cmd") or "") != cmd or not bool(ack.get("ok")):
-            time.sleep(0.12)
-            continue
-        if cid and str(ack.get("cmd_id") or "") != cid:
-            time.sleep(0.12)
-            continue
-        return True
-    return False
-
-
-def _try_mqtt_unclaim_reset(device_id: str) -> tuple[bool, bool]:
-    """Best-effort dispatch + short ack wait for unclaim_reset before DB unlink.
-
-    Returns (sent, acked). Fails fast (no blocking) when the broker is down or
-    the device is offline — the HTTP request must not hang for a dead device.
-    """
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT 1 AS ok,
-                   IFNULL((SELECT updated_at FROM device_state WHERE device_id = pc.device_id),'') AS updated_at
-            FROM provisioned_credentials pc
-            WHERE pc.device_id = ?
-            """,
-            (device_id,),
-        )
-        row = cur.fetchone()
-        conn.close()
-    if not row:
-        return False, False
-    last_seen = str(row["updated_at"] or "")
-    # If the device hasn't been seen recently, skip the ACK wait entirely.
-    # The command is still published (broker queues for QoS 1), but the HTTP caller
-    # won't block waiting for an ACK that's never coming.
-    online_hint = False
-    try:
-        last_ts = _parse_iso(last_seen)
-        if last_ts > 0:
-            online_hint = (time.time() - last_ts) < max(60, int(OFFLINE_THRESHOLD_SECONDS))
-    except Exception:
-        online_hint = False
-    try:
-        # No dedupe: a prior attempt may have deleted server-side creds while
-        # the device never got MQTT; retries must publish a fresh frame. Firmware
-        # treats unclaim_reset idempotently.
-        cmd_id = publish_command(
-            f"{TOPIC_ROOT}/{device_id}/cmd",
-            "unclaim_reset",
-            {},
-            device_id,
-            CMD_PROTO,
-            get_cmd_key_for_device(device_id),
-        )
-    except HTTPException as exc:
-        # 503 = broker disconnected → no MQTT, don't wait.
-        logger.warning("unclaim_reset MQTT not delivered for %s: %s", device_id, getattr(exc, "detail", exc))
-        return False, False
-    except Exception as exc:
-        logger.warning("unclaim_reset MQTT error for %s: %s", device_id, exc)
-        return False, False
-    if not online_hint:
-        return True, False
-    return True, _wait_cmd_ack(device_id, "unclaim_reset", timeout_s=2.2, cmd_id=cmd_id)
+# Tenant lifecycle + device-cleanup helpers (Phase-47 modularization).
+# The five helpers below — _delete_user_auxiliary_cur,
+# _apply_device_factory_unclaim_cur, _close_admin_tenant_cur,
+# _wait_cmd_ack and _try_mqtt_unclaim_reset — now live in
+# tenant_admin.py and are re-exported here so the existing call
+# sites (the @app.* delete-user / close-admin handlers and the
+# routers/auth_users.py + routers/auth_self.py + routers/device_delete.py
+# late-binders) keep finding them on `app`. tenant_admin.py late-binds
+# _invalidate_superadmin_telegram_chats_cache, publish_command,
+# get_cmd_key_for_device, _parse_iso and OFFLINE_THRESHOLD_SECONDS
+# off `app` at call time, so it can be imported safely even before
+# those names are bound.
+from tenant_admin import (
+    _apply_device_factory_unclaim_cur,
+    _close_admin_tenant_cur,
+    _delete_user_auxiliary_cur,
+    _try_mqtt_unclaim_reset,
+    _wait_cmd_ack,
+)
 
 
 # Phase-26 modularization: the impl helper + 2 routes (delete-reset,
