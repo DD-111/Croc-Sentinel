@@ -171,19 +171,102 @@ def test_reserved_prefixes_cover_known_mounts(app_tree: ast.Module) -> None:
 
 _PRINCIPAL_FIELDS = frozenset({"role", "sub", "username", "zones"})
 
+# Functions that always return a Principal (dataclass, NOT a dict). Any local
+# variable bound to a call of one of these is treated as Principal-typed for
+# dict-access linting. Keep this list in sync with security.py / app.py.
+_PRINCIPAL_RETURNING_CALLS = frozenset(
+    {
+        "decode_jwt",
+        "principal_for_username",
+        "principal_from_legacy_bearer",
+        "_telegram_bound_principal",
+        "require_principal",
+    }
+)
 
-def test_no_dict_access_on_principal_role_fields(app_source: str) -> None:
+
+def _receiver_name(node: ast.AST) -> str:
+    """Best-effort readable name for an attribute-access chain."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return f"{_receiver_name(node.value)}.{node.attr}"
+    return ""
+
+
+def _annotation_mentions_principal(ann: ast.AST | None) -> bool:
+    """Return True if the annotation references the `Principal` name anywhere."""
+    if ann is None:
+        return False
+    for sub in ast.walk(ann):
+        if isinstance(sub, ast.Name) and sub.id == "Principal":
+            return True
+    return False
+
+
+def _principal_var_names(tree: ast.Module) -> set[str]:
+    """All identifiers that are *certainly* a Principal at runtime.
+
+    Sources:
+      • Names containing "principal" (case-insensitive) — covers the common
+        convention in app.py.
+      • Function parameters annotated `principal: Principal` /
+        `Optional[Principal]`.
+      • LHS of assignments whose RHS is a call to a known Principal-returning
+        function (decode_jwt, principal_for_username, …).
+
+    We only collect *names*, not full attribute chains — conservatively
+    matching anywhere in the module is good enough for a regression guard.
     """
-    Catch regressions of the factory-auth bug:
+    out: set[str] = set()
+    for node in ast.walk(tree):
+        # Function-parameter annotations.
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for arg in (
+                *node.args.args,
+                *node.args.posonlyargs,
+                *node.args.kwonlyargs,
+            ):
+                if _annotation_mentions_principal(arg.annotation):
+                    out.add(arg.arg)
+        # Assigning the result of decode_jwt(...) etc.
+        targets: list[ast.AST] = []
+        rhs: ast.AST | None = None
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+            rhs = node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets = [node.target]
+            rhs = node.value
+        if rhs is None:
+            continue
+        if not isinstance(rhs, ast.Call):
+            continue
+        fname = ""
+        if isinstance(rhs.func, ast.Name):
+            fname = rhs.func.id
+        elif isinstance(rhs.func, ast.Attribute):
+            fname = rhs.func.attr
+        if fname not in _PRINCIPAL_RETURNING_CALLS:
+            continue
+        for tgt in targets:
+            if isinstance(tgt, ast.Name):
+                out.add(tgt.id)
+    # Convention-based fallback (anything called *principal*).
+    for sub in ast.walk(tree):
+        if isinstance(sub, ast.Name) and "principal" in sub.id.lower():
+            out.add(sub.id)
+    return out
 
-        principal = decode_jwt(token)
-        principal.get("role")   # raises AttributeError → silently dies
-        principal["role"]       # same
 
-    Only the role-ish field names are flagged; unrelated `.get("foo")` calls
-    on dicts are ignored.
+def _scan_principal_dict_access(source: str, filename: str) -> list[str]:
+    """Return offending lines from one Python source string.
+
+    A line offends when something we believe is a Principal is accessed via
+    `obj.get("role")` / `obj["role"]` for any of _PRINCIPAL_FIELDS.
     """
-    tree = ast.parse(app_source, filename=str(APP_PY))
+    tree = ast.parse(source, filename=filename)
+    suspects = _principal_var_names(tree)
     offenders: list[str] = []
 
     class Visitor(ast.NodeVisitor):
@@ -197,9 +280,11 @@ def test_no_dict_access_on_principal_role_fields(app_source: str) -> None:
                 and node.args[0].value in _PRINCIPAL_FIELDS
             ):
                 receiver = _receiver_name(node.func.value)
-                if receiver and "principal" in receiver.lower():
+                head = receiver.split(".", 1)[0] if receiver else ""
+                if head and head in suspects:
                     offenders.append(
-                        f"L{node.lineno}: {receiver}.get({node.args[0].value!r})"
+                        f"{filename}:L{node.lineno}: "
+                        f"{receiver}.get({node.args[0].value!r})"
                     )
             self.generic_visit(node)
 
@@ -211,24 +296,57 @@ def test_no_dict_access_on_principal_role_fields(app_source: str) -> None:
                 and sl.value in _PRINCIPAL_FIELDS
             ):
                 receiver = _receiver_name(node.value)
-                if receiver and "principal" in receiver.lower():
+                head = receiver.split(".", 1)[0] if receiver else ""
+                if head and head in suspects:
                     offenders.append(
-                        f"L{node.lineno}: {receiver}[{sl.value!r}]"
+                        f"{filename}:L{node.lineno}: "
+                        f"{receiver}[{sl.value!r}]"
                     )
             self.generic_visit(node)
 
-    def _receiver_name(node: ast.AST) -> str:
-        """Best-effort readable name for the expression the access is on."""
-        if isinstance(node, ast.Name):
-            return node.id
-        if isinstance(node, ast.Attribute):
-            return f"{_receiver_name(node.value)}.{node.attr}"
-        return ""
-
     Visitor().visit(tree)
+    return offenders
+
+
+def test_no_dict_access_on_principal_role_fields(app_source: str) -> None:
+    """
+    Catch regressions of the factory-auth bug across every Python file in the
+    API package, not just app.py:
+
+        principal = decode_jwt(token)
+        principal.get("role")   # raises AttributeError → silently dies
+        principal["role"]       # same
+
+    Names treated as Principal:
+      • Anything containing "principal" (case-insensitive).
+      • Parameters typed `Principal` / `Optional[Principal]`.
+      • Variables bound to the return of decode_jwt / principal_for_username /
+        principal_from_legacy_bearer / _telegram_bound_principal /
+        require_principal.
+
+    We scan every .py file under croc_sentinel_systems/api/ except this test
+    module itself (which contains the bug pattern as documentation).
+    """
+    api_dir = APP_PY.parent
+    tests_dir = Path(__file__).resolve().parent
+    offenders: list[str] = []
+    for path in sorted(api_dir.rglob("*.py")):
+        # Skip ourselves (we *intentionally* show the bad pattern in a
+        # comment / string for documentation).
+        if path.resolve() == Path(__file__).resolve():
+            continue
+        # Skip test sources — they purposely exercise misuse.
+        if path.is_relative_to(tests_dir):
+            continue
+        try:
+            src = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        rel = path.relative_to(api_dir)
+        offenders.extend(_scan_principal_dict_access(src, str(rel)))
     assert not offenders, (
         "Dict-style access on a Principal-like object found. Use attribute "
-        "access (getattr(principal, 'role', '')) instead — dict access "
-        "silently raised AttributeError inside except-pass blocks once:\n  "
-        + "\n  ".join(offenders)
+        "access (e.g. principal.role, getattr(principal, 'role', '')) "
+        "instead — dict access silently raised AttributeError inside "
+        "except-pass blocks once:\n  " + "\n  ".join(offenders)
     )
