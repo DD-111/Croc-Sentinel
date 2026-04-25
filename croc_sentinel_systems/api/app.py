@@ -1071,153 +1071,23 @@ from auto_reconcile import (  # noqa: E402,F401  (re-exports for legacy callers)
 )
 
 
-def _lookup_owner_admin(device_id: str) -> Optional[str]:
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT owner_admin FROM device_ownership WHERE device_id = ?", (device_id,))
-        row = cur.fetchone()
-        conn.close()
-    if row and row["owner_admin"]:
-        return str(row["owner_admin"])
-    return None
-
-
-def _tenant_siblings(
-    owner_admin: Optional[str],
-    source_id: str,
-    *,
-    source_zone: str = "",
-    source_group: str = "",
-    include_source: bool = False,
-) -> tuple[list[tuple[str, str]], int]:
-    """Devices that receive group fan-out commands ("siblings") for this source_id.
-
-    Selection: same ``owner_admin``, not revoked, optional matching ``source_zone``
-    (unless zone is ``all``/``*``), and **normalized match** on ``notification_group``
-    (NFC, collapse whitespace, case-fold) so minor string drift does not break linkage.
-
-    Non-siblings (other tenants, empty group, revoked) are never targeted.
-
-    ``include_source``: when False (default), the originating ``source_id`` is omitted.
-
-    If the source group's normalized key is empty, there are **no** siblings.
-
-    Returns ``(targets, eligible_total)``: ``targets`` is capped at
-    ``ALARM_FANOUT_MAX_TARGETS``, sorted by ``device_id`` for stable ordering;
-    ``eligible_total`` is how many devices matched before the cap.
-    """
-    zone_filter = source_zone.strip()
-    norm_source = _sibling_group_norm(source_group)
-    if not norm_source:
-        return [], 0
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        if owner_admin:
-            sql = """
-                SELECT d.device_id, d.zone, IFNULL(d.notification_group,'') AS notification_group
-                FROM device_state d
-                JOIN device_ownership o ON o.device_id = d.device_id
-                LEFT JOIN revoked_devices r ON r.device_id = d.device_id
-                WHERE o.owner_admin = ? AND r.device_id IS NULL
-                  AND TRIM(IFNULL(d.notification_group,'')) != ''
-            """
-            args: list[Any] = [owner_admin]
-            if zone_filter and zone_filter.lower() not in ("all", "*"):
-                sql += " AND IFNULL(d.zone,'') = ?"
-                args.append(zone_filter)
-            cur.execute(sql, args)
-        else:
-            sql = """
-                SELECT d.device_id, d.zone, IFNULL(d.notification_group,'') AS notification_group
-                FROM device_state d
-                LEFT JOIN device_ownership o ON o.device_id = d.device_id
-                LEFT JOIN revoked_devices r ON r.device_id = d.device_id
-                WHERE o.device_id IS NULL AND r.device_id IS NULL
-                  AND TRIM(IFNULL(d.notification_group,'')) != ''
-            """
-            args: list[Any] = []
-            if zone_filter and zone_filter.lower() not in ("all", "*"):
-                sql += " AND IFNULL(d.zone,'') = ?"
-                args.append(zone_filter)
-            cur.execute(sql, args)
-        rows = cur.fetchall()
-        conn.close()
-    candidates: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    for r in rows:
-        if _sibling_group_norm(str(r["notification_group"] or "")) != norm_source:
-            continue
-        did = str(r["device_id"])
-        if did == source_id and not include_source:
-            continue
-        if did in seen:
-            continue
-        seen.add(did)
-        candidates.append((did, str(r["zone"] or "")))
-    candidates.sort(key=lambda t: t[0])
-    eligible_total = len(candidates)
-    out = candidates[:ALARM_FANOUT_MAX_TARGETS]
-    return out, eligible_total
-
-
-def _recipients_for_admin(owner_admin: Optional[str]) -> list[str]:
-    if not owner_admin:
-        return []
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT email FROM admin_alert_recipients WHERE owner_admin = ? AND enabled = 1",
-            (owner_admin,),
-        )
-        rows = cur.fetchall()
-        conn.close()
-    return [str(r["email"]) for r in rows if r["email"]]
-
-
-def _insert_alarm(source_id: str, owner_admin: Optional[str], zone: str,
-                  triggered_by: str, payload: dict[str, Any]) -> int:
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO alarms
-                (source_id, owner_admin, zone, triggered_by, ts_device, nonce, sig,
-                 fanout_count, email_sent, email_detail, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, NULL, ?)
-            """,
-            (
-                source_id,
-                owner_admin,
-                zone,
-                triggered_by,
-                int(payload.get("ts") or 0) or None,
-                str(payload.get("nonce") or "") or None,
-                str(payload.get("sig") or "") or None,
-                utc_now_iso(),
-            ),
-        )
-        alarm_id = int(cur.lastrowid)
-        conn.commit()
-        conn.close()
-    return alarm_id
-
-
-def _update_alarm(alarm_id: int, fanout_count: int, email_sent: bool, email_detail: str) -> None:
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            UPDATE alarms SET fanout_count = ?, email_sent = ?, email_detail = ? WHERE id = ?
-            """,
-            (fanout_count, 1 if email_sent else 0, email_detail[:400], alarm_id),
-        )
-        conn.commit()
-        conn.close()
+# Phase-41 modularization: 5 alarm-DB helpers (owner-admin lookup,
+# tenant-sibling resolver, recipient roster, alarm row writers) live in
+# alarm_db.py — pure SQLite + helpers + config. Re-exported here so the
+# in-module call sites (``_fan_out_alarm`` for all 5, ``_remote_siren_notify_email``
+# for ``_recipients_for_admin``, ``_dispatch_mqtt_payload`` for
+# ``_lookup_owner_admin``) keep using the bare names, and so the routers
+# that late-bind via ``_app._lookup_owner_admin`` /
+# ``_app._tenant_siblings`` / ``_app._recipients_for_admin``
+# (device_control, device_commands, device_http, device_profile,
+# device_read, group_cards) keep resolving to the same callables.
+from alarm_db import (  # noqa: E402,F401  (re-exports for legacy callers)
+    _insert_alarm,
+    _lookup_owner_admin,
+    _recipients_for_admin,
+    _tenant_siblings,
+    _update_alarm,
+)
 
 
 def _log_signal_trigger(
