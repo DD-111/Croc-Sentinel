@@ -1,5 +1,23 @@
-"""
-Optional Telegram fan-out for emit_event (non-blocking queue).
+"""Optional Telegram fan-out for ``emit_event`` (non-blocking queue).
+
+This module owns the **transport** half of Telegram delivery:
+
+  * The ``_TelegramQueue`` singleton (thread-safe queue, worker
+    thread, lazy SSL context, env reload).
+  * HTTP send via ``urllib.request`` (Bot API ``sendMessage``).
+  * Public facade used by ``app.py`` and the dashboard
+    diagnostic endpoints (``start_telegram_worker``, ``stop_…``,
+    ``maybe_notify_telegram``, ``telegram_status``,
+    ``send_telegram_text_now``, ``send_telegram_chat_text``,
+    ``telegram_get_webhook_info``).
+
+The **formatting** half — event → multi-line message body,
+duplicate suppression, env-channel level/category gating, and
+target-list resolution — lives in ``telegram_notify_format.py``
+(Phase 75 split). ``maybe_enqueue`` here is a thin wrapper that
+calls :func:`telegram_notify_format.format_event_for_chat`,
+applies the time-windowed dedupe map, and pushes the resulting
+``(text, targets)`` tuple onto the worker queue.
 
 Env:
   TELEGRAM_BOT_TOKEN   — BotFather token; if empty, disabled.
@@ -12,7 +30,6 @@ import json
 import logging
 import os
 import queue
-import re
 import ssl
 import threading
 import time
@@ -20,27 +37,14 @@ import urllib.error
 import urllib.request
 from typing import Any, Optional
 
+from telegram_notify_format import (
+    _LEVEL_RANK,
+    _parse_chat_ids,
+    _strip_bom,
+    format_event_for_chat,
+)
+
 logger = logging.getLogger("croc-telegram")
-
-_LEVEL_RANK = {"debug": 0, "info": 1, "warn": 2, "error": 3, "critical": 4}
-
-
-def _strip_bom(s: str) -> str:
-    s = (s or "").strip()
-    if s.startswith("\ufeff"):
-        s = s[1:].strip()
-    return s.strip().strip('"').strip("'")
-
-
-def _parse_chat_ids(raw: str) -> list[str]:
-    raw = _strip_bom(raw.replace("\u3001", ",").replace("\uff1b", ";"))
-    out: list[str] = []
-    for part in re.split(r"[\s,;]+", raw):
-        p = part.strip().strip('"').strip("'")
-        if not p:
-            continue
-        out.append(p)
-    return out
 
 
 class _TelegramQueue:
@@ -100,153 +104,57 @@ class _TelegramQueue:
             self._worker.join(timeout=2.0)
             self._worker = None
 
-    def maybe_enqueue(self, ev: dict[str, Any], extra_chat_ids: Optional[list[str]] = None) -> None:
+    def maybe_enqueue(
+        self,
+        ev: dict[str, Any],
+        extra_chat_ids: Optional[list[str]] = None,
+    ) -> None:
+        """Filter, format and enqueue an event for the Telegram worker.
+
+        Channel model:
+          * ``env_chats``  — operator-configured ``TELEGRAM_CHAT_IDS``
+            (signal-clean; level + category filters apply).
+          * ``extras``     — per-event chat_ids (e.g. superadmin
+            firehose bindings); bypass env filters.
+
+        Both channels obey the true-duplicate filter
+        (alarm.trigger twins + audit.alarm.fanout echoes — see
+        :func:`telegram_notify_format.is_duplicate_event`).
+
+        This method is intentionally thin: every formatting / filter
+        decision is delegated to ``telegram_notify_format``. We keep
+        the dedupe-window map here because that's stateful (per-
+        instance, time-windowed) and best lives next to the queue.
+        """
         self.reload_from_env()
-        # Two channels:
-        #   env_chats  — operator-configured TELEGRAM_CHAT_IDS (signal-clean)
-        #   extras     — per-event routes (e.g. superadmin bindings, full firehose)
-        # We enqueue if EITHER channel has eligible targets. Env-side filters
-        # (min_level + noise categories) DO NOT apply to the extras channel —
-        # "superadmin 全量订阅" means superadmin wants every non-duplicate event.
-        extras_clean = [str(c).strip() for c in (extra_chat_ids or []) if str(c).strip()]
-        env_chats = list(self._chats)
         if not self._token:
             return
-        if not (env_chats or extras_clean):
+        env_chats = list(self._chats)
+        plan = format_event_for_chat(
+            ev,
+            env_chats=env_chats,
+            extras=extra_chat_ids or [],
+            min_rank=self._min_rank,
+        )
+        if plan is None:
             return
-        lvl = str(ev.get("level") or "info").lower()
-        cat = str(ev.get("category") or "")
-        et = str(ev.get("event_type") or "")
-        actor = str(ev.get("actor") or "-")
-        target = str(ev.get("target") or "-")
-        device_id = str(ev.get("device_id") or "-")
-        summary = str(ev.get("summary") or et or "").strip()
-        # True duplicate filters — apply to EVERYONE including superadmin extras.
-        # The normalized alarm/* event or the canonical record follows these.
-        if cat == "device" and "alarm.trigger" in et:
-            return
-        if et.startswith("audit.alarm.fanout"):
-            return
-        # Env-channel filters (superadmin extras ignore these).
-        env_below_min = _LEVEL_RANK.get(lvl, 1) < self._min_rank
-        env_noise = lvl in ("debug", "info") and cat not in ("alarm", "auth", "ota")
-        env_eligible = bool(env_chats) and not env_below_min and not env_noise
-        extras_eligible = bool(extras_clean)
-        if not (env_eligible or extras_eligible):
-            return
-        detail_map: dict[str, Any] = {}
-        try:
-            d = ev.get("detail") or {}
-            if isinstance(d, dict) and d:
-                keep = {}
-                for k in ("reason", "error", "result", "state", "duration_ms", "fanout_count"):
-                    if k in d and d.get(k) not in (None, ""):
-                        keep[k] = d.get(k)
-                if "login_user" in d and d.get("login_user") not in (None, ""):
-                    keep["login_user"] = d.get("login_user")
-                # Keep rich client context for auth/alarm visibility parity.
-                for k in ("ip", "platform", "device_type", "mac_hint", "geo"):
-                    if k in d and d.get(k) not in (None, ""):
-                        keep[k] = d.get(k)
-                if "owner_admin" in d and d.get("owner_admin") not in (None, ""):
-                    keep["owner_admin"] = d.get("owner_admin")
-                if "device_ids" in d and isinstance(d.get("device_ids"), list):
-                    keep["device_ids"] = d.get("device_ids")
-                if "owner_admins" in d and isinstance(d.get("owner_admins"), list):
-                    keep["owner_admins"] = d.get("owner_admins")
-                # Trigger source is always important for alarm actions.
-                for k in ("trigger_kind", "client_kind"):
-                    if k in d and d.get(k) not in (None, ""):
-                        keep[k] = d.get(k)
-                detail_map = keep
-        except Exception:
-            pass
-        trigger = str(detail_map.get("trigger_kind") or detail_map.get("client_kind") or "")
-        if trigger == "remote_button":
-            trigger = "push_button"
-        elif trigger == "api":
-            trigger = "web/app"
-        dev_name = ""
-        if "·" in summary:
-            dev_name = summary.split("·", 1)[0].strip()
-            if dev_name.startswith("[") and "]" in dev_name:
-                dev_name = dev_name.split("]", 1)[1].strip() or dev_name
-        if cat == "auth" and ("login" in et):
-            who = str(detail_map.get("login_user") or target or actor or "-")
-            lines = [
-                f"[{lvl.upper()}] auth/login",
-                f"user: {who}",
-                f"actor: {actor}",
-                f"target: {target}",
-            ]
-        elif cat == "alarm":
-            if device_id in ("", "-", "none", "None"):
-                dids = detail_map.get("device_ids") if isinstance(detail_map.get("device_ids"), list) else []
-                if dids:
-                    device_id = str(dids[0])
-            lines = [
-                f"[{lvl.upper()}] alarm",
-                f"event: {et}",
-                f"device: {device_id}",
-                f"actor: {actor}",
-                f"target: {target}",
-            ]
-        else:
-            lines = [
-                f"[{lvl.upper()}] {cat}/{et}",
-                f"device: {device_id}",
-                f"actor: {actor}",
-                f"target: {target}",
-            ]
-        if summary:
-            lines.insert(1, summary)
-        if dev_name:
-            lines.insert(3, f"device_name: {dev_name}")
-        if trigger:
-            lines.append(f"trigger: {trigger}")
-        if "owner_admin" in detail_map and detail_map.get("owner_admin") not in (None, ""):
-            lines.append(f"owner_admin: {detail_map.get('owner_admin')}")
-        if "device_ids" in detail_map and isinstance(detail_map.get("device_ids"), list):
-            dids = [str(x) for x in detail_map.get("device_ids") if str(x).strip()]
-            if dids:
-                lines.append(f"device_ids: {','.join(dids[:12])}")
-        if "owner_admins" in detail_map and isinstance(detail_map.get("owner_admins"), list):
-            ows = [str(x) for x in detail_map.get("owner_admins") if str(x).strip()]
-            if ows:
-                lines.append(f"owner_admins: {','.join(ows[:12])}")
-        for k in ("ip", "geo", "platform", "device_type", "mac_hint", "reason", "error", "result", "state", "duration_ms", "fanout_count"):
-            if k in detail_map and detail_map.get(k) not in (None, ""):
-                lines.append(f"{k}: {detail_map.get(k)}")
-        line = "\n".join(lines)
-        fp = f"{lvl}|{cat}|{et}|{device_id}|{summary}"
+        text, fingerprint, final_targets = plan
         now = time.time()
-        prev = float(self._recent_fingerprint_ts.get(fp, 0.0))
+        prev = float(self._recent_fingerprint_ts.get(fingerprint, 0.0))
         if prev and (now - prev) < self._dedupe_window_s:
             return
-        self._recent_fingerprint_ts[fp] = now
-        # Periodic map cleanup to avoid unbounded growth.
+        self._recent_fingerprint_ts[fingerprint] = now
+        # Periodic map cleanup to avoid unbounded growth under steady load.
         if len(self._recent_fingerprint_ts) > 1200:
             cutoff = now - (self._dedupe_window_s * 4.0)
-            self._recent_fingerprint_ts = {k: ts for k, ts in self._recent_fingerprint_ts.items() if ts >= cutoff}
-        # Materialize the target list at enqueue time so queue items are
-        # self-contained — the worker doesn't need to re-run the filter logic.
-        final_targets: list[str] = []
-        seen: set[str] = set()
-        if env_eligible:
-            for c in env_chats:
-                cs = str(c).strip()
-                if cs and cs not in seen:
-                    seen.add(cs); final_targets.append(cs)
-        if extras_eligible:
-            for c in extras_clean:
-                if c and c not in seen:
-                    seen.add(c); final_targets.append(c)
-        if not final_targets:
-            return
-        item = (line, final_targets)
+            self._recent_fingerprint_ts = {
+                k: ts for k, ts in self._recent_fingerprint_ts.items() if ts >= cutoff
+            }
+        item = (text, final_targets)
         try:
             self._q.put_nowait(item)
         except queue.Full:
+            # Drop the oldest item to make room — alerts are time-sensitive.
             try:
                 self._q.get_nowait()
             except queue.Empty:
