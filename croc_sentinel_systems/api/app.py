@@ -3608,46 +3608,15 @@ from routers.auth_users import router as _auth_users_router  # noqa: E402
 
 app.include_router(_auth_users_router)
 
-@app.get("/admin/backup/export")
-def admin_backup_export(
-    principal: Principal = Depends(require_principal),
-    x_backup_key: str = Header(..., alias="X-Backup-Encryption-Key"),
-) -> Response:
-    assert_min_role(principal, "superadmin")
-    if not os.path.isfile(DB_PATH):
-        raise HTTPException(status_code=404, detail="database file not found")
-    with open(DB_PATH, "rb") as f:
-        raw = f.read()
-    if len(raw) < 16 or raw[:15] != b"SQLite format 3":
-        raise HTTPException(status_code=500, detail="database file invalid")
-    enc = encrypt_blob(raw, x_backup_key)
-    return Response(
-        content=enc,
-        media_type="application/octet-stream",
-        headers={"Content-Disposition": 'attachment; filename="sentinel-backup.enc"'},
-    )
 
+# =====================================================================
+#  Admin DB backup (encrypted export / import)
+# =====================================================================
 
-@app.post("/admin/backup/import")
-async def admin_backup_import(
-    principal: Principal = Depends(require_principal),
-    x_backup_key: str = Header(..., alias="X-Backup-Encryption-Key"),
-    file: UploadFile = File(...),
-) -> dict[str, Any]:
-    assert_min_role(principal, "superadmin")
-    body = await file.read()
-    plain = decrypt_blob(body, x_backup_key)
-    if len(plain) < 16 or plain[:15] != b"SQLite format 3":
-        raise HTTPException(status_code=400, detail="decrypted payload is not sqlite")
-    out_path = DB_PATH + ".restored"
-    with open(out_path, "wb") as f:
-        f.write(plain)
-    return {
-        "ok": True,
-        "written_path": out_path,
-        "hint": "Stop the API container, replace the live DB file with this path, then start again (see docs).",
-    }
+# Phase-25 modularization: 2 routes now live in routers/admin_backup.py.
+from routers.admin_backup import router as _admin_backup_router  # noqa: E402
 
+app.include_router(_admin_backup_router)
 
 # =====================================================================
 #  Provisioning challenge (sign nonce → verify)
