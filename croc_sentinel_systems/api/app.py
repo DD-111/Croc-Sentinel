@@ -2753,8 +2753,8 @@ class BulkAlertRequest(BaseModel):
 # (DeviceRevokeRequest schema moved to routers/device_revoke.py — see the
 # corresponding `from routers.device_revoke import DeviceRevokeRequest` re-export below.)
 
-class DeviceDeleteRequest(BaseModel):
-    confirm_text: str = Field(min_length=3, max_length=128)
+# (DeviceDeleteRequest schema moved to routers/device_delete.py — see the
+# corresponding `from routers.device_delete import DeviceDeleteRequest` re-export below.)
 
 # (LoginRequest schema moved to routers/auth_core.py — see the corresponding
 # `from routers.auth_core import LoginRequest` re-export below.)
@@ -3831,107 +3831,17 @@ def _try_mqtt_unclaim_reset(device_id: str) -> tuple[bool, bool]:
     return True, _wait_cmd_ack(device_id, "unclaim_reset", timeout_s=2.2, cmd_id=cmd_id)
 
 
-def _device_delete_reset_impl(
-    device_id: str,
-    principal: Principal,
-    req: DeviceDeleteRequest,
-    *,
-    super_unclaim: bool,
-) -> dict[str, Any]:
-    if str(req.confirm_text or "").strip().upper() != str(device_id or "").strip().upper():
-        raise HTTPException(status_code=400, detail="confirm_text must exactly match device_id")
-    require_capability(principal, "can_send_command")
-    if super_unclaim:
-        # Factory rollback: admin+ only (not subordinate "user" accounts).
-        assert_min_role(principal, "admin")
-        if not principal.is_superadmin():
-            assert_device_owner(principal, device_id)
-    else:
-        assert_min_role(principal, "user")
-        assert_device_owner(principal, device_id)
-    nvs_purge_sent, nvs_purge_acked = _try_mqtt_unclaim_reset(device_id)
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT mac_nocolon FROM provisioned_credentials WHERE device_id = ?", (device_id,))
-        p = cur.fetchone()
-        mac_nocolon = str(p["mac_nocolon"]) if p and p["mac_nocolon"] else ""
-        cur.execute("DELETE FROM provisioned_credentials WHERE device_id = ?", (device_id,))
-        del_cred = int(cur.rowcount or 0)
-        cur.execute("DELETE FROM device_ownership WHERE device_id = ?", (device_id,))
-        del_owner = int(cur.rowcount or 0)
-        cur.execute("DELETE FROM device_acl WHERE device_id = ?", (device_id,))
-        del_acl = int(cur.rowcount or 0)
-        cur.execute("DELETE FROM revoked_devices WHERE device_id = ?", (device_id,))
-        del_revoked = int(cur.rowcount or 0)
-        cur.execute("DELETE FROM device_state WHERE device_id = ?", (device_id,))
-        del_state = int(cur.rowcount or 0)
-        cur.execute("DELETE FROM scheduled_commands WHERE device_id = ?", (device_id,))
-        del_sched = int(cur.rowcount or 0)
-        # Keep factory registry aligned whenever this serial/MAC is known (same as
-        # "factory-unregister" — also applies to normal tenant unbind so ops lists
-        # and identify flows stay consistent after unlink).
-        if mac_nocolon:
-            cur.execute(
-                "UPDATE factory_devices SET status='unclaimed', updated_at=? WHERE mac_nocolon = ?",
-                (utc_now_iso(), mac_nocolon),
-            )
-        else:
-            cur.execute(
-                "UPDATE factory_devices SET status='unclaimed', updated_at=? WHERE serial = ?",
-                (utc_now_iso(), device_id),
-            )
-        conn.commit()
-        conn.close()
-    cache_invalidate("devices")
-    cache_invalidate("overview")
-    action = "device.factory_unclaim" if super_unclaim else "device.delete_reset"
-    audit_event(
-        principal.username,
-        action,
-        device_id,
-        {
-            "mac_nocolon": mac_nocolon or "",
-            "nvs_purge_mqtt": nvs_purge_sent,
-            "nvs_purge_ack": nvs_purge_acked,
-            "deleted_credentials": del_cred,
-            "deleted_owner": del_owner,
-            "deleted_acl": del_acl,
-            "deleted_revoked": del_revoked,
-            "deleted_state": del_state,
-            "deleted_scheduled": del_sched,
-            "factory_unclaimed": super_unclaim,
-        },
-    )
-    return {
-        "ok": True,
-        "device_id": device_id,
-        "mode": "factory_unclaim" if super_unclaim else "delete_reset",
-        "factory_unclaimed": super_unclaim,
-        "nvs_purge_sent": nvs_purge_sent,
-        "nvs_purge_acked": nvs_purge_acked,
-        "nvs_purge_note": "sent=true means command reached broker; acked=true means device confirmed unclaim_reset before DB unlink.",
-    }
+# Phase-26 modularization: the impl helper + 2 routes (delete-reset,
+# factory-unregister) and the DeviceDeleteRequest schema now live in
+# routers/device_delete.py. The router is wired in here so it sits at
+# roughly the same point in the route table as the original @app
+# decorators did, and so _try_mqtt_unclaim_reset (defined just above)
+# is already bound by the time the router module is imported.
+from routers.device_delete import DeviceDeleteRequest  # noqa: E402,F401  (re-export for legacy callers)
+from routers.device_delete import _device_delete_reset_impl  # noqa: E402,F401  (re-export for legacy callers)
+from routers.device_delete import router as _device_delete_router  # noqa: E402
 
-
-@app.post("/devices/{device_id}/delete-reset")
-def device_delete_reset(
-    device_id: str,
-    req: DeviceDeleteRequest,
-    principal: Principal = Depends(require_principal),
-) -> dict[str, Any]:
-    """Tenant user (operate) / admin / superadmin: unlink device + best-effort unclaim_reset."""
-    return _device_delete_reset_impl(device_id, principal, req, super_unclaim=False)
-
-
-@app.post("/devices/{device_id}/factory-unregister")
-def device_factory_unregister(
-    device_id: str,
-    req: DeviceDeleteRequest,
-    principal: Principal = Depends(require_principal),
-) -> dict[str, Any]:
-    """Rollback to unregistered while keeping factory serial: superadmin (any device) or owning admin."""
-    return _device_delete_reset_impl(device_id, principal, req, super_unclaim=True)
+app.include_router(_device_delete_router)
 
 
 def _health_notify_summary_public() -> tuple[dict[str, Any], dict[str, Any]]:
