@@ -9,7 +9,6 @@ import secrets
 import sqlite3
 import threading
 import time
-import unicodedata
 import urllib.error
 import urllib.request
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -108,9 +107,16 @@ __all_db_reexports__ = (
 )
 
 
-def utc_now_iso() -> str:
-    """UTC ISO string for SQLite storage and lexicographic ordering (canonical `ts`)."""
-    return datetime.now(timezone.utc).isoformat()
+# Pure leaf helpers (Phase-4 modularization). ``utc_now_iso``,
+# ``_sibling_group_norm``, ``default_policy_for_role`` now live in
+# ``helpers.py`` — re-imported here so existing call sites keep working
+# and ``from app import utc_now_iso`` (used by tests / migrations) is
+# still legal.
+from helpers import (  # noqa: E402,F401  (re-export for legacy callers)
+    _sibling_group_norm,
+    default_policy_for_role,
+    utc_now_iso,
+)
 
 
 def _normalize_delete_confirm(raw: str) -> str:
@@ -955,50 +961,6 @@ def principal_for_username(username: str) -> Principal:
     return Principal(username=str(row["username"]), role=role, zones=zones)
 
 
-def default_policy_for_role(role: str) -> dict[str, int]:
-    if role == "superadmin":
-        return {
-            "can_alert": 1,
-            "can_send_command": 1,
-            "can_claim_device": 1,
-            "can_manage_users": 1,
-            "can_backup_restore": 1,
-            "tg_view_logs": 1,
-            "tg_view_devices": 1,
-            "tg_siren_on": 1,
-            "tg_siren_off": 1,
-            "tg_test_single": 1,
-            "tg_test_bulk": 1,
-        }
-    if role == "admin":
-        return {
-            "can_alert": 1,
-            "can_send_command": 1,
-            "can_claim_device": 1,
-            "can_manage_users": 1,
-            "can_backup_restore": 0,
-            "tg_view_logs": 1,
-            "tg_view_devices": 1,
-            "tg_siren_on": 1,
-            "tg_siren_off": 1,
-            "tg_test_single": 1,
-            "tg_test_bulk": 1,
-        }
-    return {
-        "can_alert": 0,
-        "can_send_command": 0,
-        "can_claim_device": 0,
-        "can_manage_users": 0,
-        "can_backup_restore": 0,
-        "tg_view_logs": 0,
-        "tg_view_devices": 0,
-        "tg_siren_on": 0,
-        "tg_siren_off": 0,
-        "tg_test_single": 0,
-        "tg_test_bulk": 0,
-    }
-
-
 def get_effective_policy(principal: Principal) -> dict[str, int]:
     base = default_policy_for_role(principal.role)
     with db_lock:
@@ -1391,22 +1353,6 @@ def on_disconnect(_client: mqtt.Client, _userdata: Any, _disconnect_flags: Any, 
     mqtt_last_disconnect_at = utc_now_iso()
     mqtt_last_disconnect_reason = str(_reason_code or "")
     logger.warning("MQTT disconnected reason=%s", mqtt_last_disconnect_reason)
-
-
-def _sibling_group_norm(raw: str) -> str:
-    """Normalize notification_group for sibling matching (case-fold + NFC + whitespace)."""
-    s = str(raw or "").strip()
-    if not s:
-        return ""
-    try:
-        s = unicodedata.normalize("NFC", s)
-    except Exception:
-        pass
-    s = " ".join(s.split())
-    try:
-        return s.casefold()
-    except Exception:
-        return s.lower()
 
 
 def _alarm_event_is_duplicate(device_id: str, payload: dict[str, Any]) -> bool:

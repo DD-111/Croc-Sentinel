@@ -14,13 +14,12 @@ What is *not* here:
   * Pragmas (WAL, mmap_size, synchronous=NORMAL) → ``db.init_db_pragmas``.
   * Routes that consume the schema → ``app.py``.
 
-Why the lazy import inside ``init_db``? A tiny number of seed-time helpers
-(``utc_now_iso``, ``default_policy_for_role``, ``_sibling_group_norm``) live
-in ``app.py`` because they're shared by routes too. Importing them at module
-top would create a cycle (``app`` imports ``schema`` to call ``init_db``).
-``init_db`` only runs from the bootstrap thread *after* ``app.py`` has fully
-loaded, so deferring those imports inside the function body is safe and
-keeps schema.py free of ``app`` import statements at module scope.
+Phase-4 follow-up: the seed-time helpers (``utc_now_iso``,
+``default_policy_for_role``, ``_sibling_group_norm``) used to live in
+``app.py`` and were lazy-imported inside ``init_db`` to dodge an
+``app → schema → app`` cycle. They now live in ``helpers.py`` (a true
+leaf module), so this file imports them at module top — no in-function
+imports needed and the dependency graph stays acyclic at load time.
 """
 from __future__ import annotations
 
@@ -41,6 +40,11 @@ from db import (
     get_conn,
     init_db_pragmas,
 )
+from helpers import (
+    _sibling_group_norm,
+    default_policy_for_role,
+    utc_now_iso,
+)
 from security import hash_password
 
 logger = logging.getLogger("croc-api.schema")
@@ -53,10 +57,6 @@ def init_db() -> None:
     ``IF NOT EXISTS`` or row-existence guards. Safe to call on every
     startup; cost on a fully-migrated DB is < 50 ms.
     """
-    # Lazy-imported here to avoid an ``app → schema → app`` cycle. ``init_db``
-    # is invoked from the bootstrap thread after ``app.py`` has fully loaded.
-    from app import _sibling_group_norm, default_policy_for_role, utc_now_iso
-
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
