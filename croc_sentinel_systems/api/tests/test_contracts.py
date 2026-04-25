@@ -124,6 +124,28 @@ def _route_paths(tree: ast.Module) -> set[str]:
     return paths
 
 
+def _all_route_paths() -> set[str]:
+    """Union of routes declared anywhere in the api package.
+
+    Phase-7 onward, we extracted dozens of routes from ``app.py`` into
+    ``routers/<topic>.py`` modules that all use ``@router.<verb>(...)``.
+    Every CSRF-prefix / route check needs to look at the whole picture
+    or we'll get false-positive "orphan" reports for any route that
+    moved out of app.py.
+    """
+    out: set[str] = set()
+    out |= _route_paths(ast.parse(APP_PY.read_text(encoding="utf-8")))
+    routers_dir = API_DIR / "routers"
+    if routers_dir.is_dir():
+        for path in sorted(routers_dir.glob("*.py")):
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, SyntaxError):
+                continue
+            out |= _route_paths(tree)
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Tests
 # --------------------------------------------------------------------------- #
@@ -147,7 +169,7 @@ def test_csrf_exempt_prefixes_match_real_routes(app_tree: ast.Module) -> None:
     )
     assert exempt, "_CSRF_EXEMPT_PREFIXES must not be empty"
 
-    routes = _route_paths(app_tree)
+    routes = _all_route_paths()
     orphan: list[str] = []
     for entry in exempt:
         if entry in _CSRF_STATIC_EXEMPT:
