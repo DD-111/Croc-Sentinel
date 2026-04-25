@@ -756,7 +756,6 @@ app.include_router(_auth_recovery_router)
 # =====================================================================
 
 # Phase-22 modularization: 3 routes + LoginRequest now live in routers/auth_core.py.
-from routers.auth_core import LoginRequest  # noqa: E402,F401  (re-export for legacy callers)
 from routers.auth_core import router as _auth_core_router  # noqa: E402
 
 app.include_router(_auth_core_router)
@@ -784,15 +783,6 @@ app.include_router(_device_http_router)
 
 # Phase-20 modularization: 10 routes + _auth_me_delete_impl +
 # 6 schemas + _validate_avatar_url now live in routers/auth_self.py.
-from routers.auth_self import (  # noqa: E402,F401  (re-export for legacy callers)
-    FcmTokenDeleteRequest,
-    FcmTokenRegisterRequest,
-    MeProfilePatchRequest,
-    NotificationPrefsPatchRequest,
-    SelfDeleteRequest,
-    SelfPasswordChangeRequest,
-    _validate_avatar_url,
-)
 from routers.auth_self import router as _auth_self_router  # noqa: E402
 
 app.include_router(_auth_self_router)
@@ -803,11 +793,6 @@ app.include_router(_auth_self_router)
 # =====================================================================
 
 # Phase-21 modularization: 7 routes + 3 schemas now live in routers/auth_users.py.
-from routers.auth_users import (  # noqa: E402,F401  (re-export for legacy callers)
-    AdminTenantCloseRequest,
-    UserCreateRequest,
-    UserPolicyUpdateRequest,
-)
 from routers.auth_users import router as _auth_users_router  # noqa: E402
 
 app.include_router(_auth_users_router)
@@ -827,10 +812,6 @@ app.include_router(_admin_backup_router)
 # =====================================================================
 
 # Phase-24 modularization: 2 routes + 2 schemas now live in routers/provision_challenge.py.
-from routers.provision_challenge import (  # noqa: E402,F401  (re-export for legacy callers)
-    DeviceChallengeRequest,
-    DeviceChallengeVerifyRequest,
-)
 from routers.provision_challenge import router as _provision_challenge_router  # noqa: E402
 
 app.include_router(_provision_challenge_router)
@@ -840,7 +821,6 @@ app.include_router(_provision_challenge_router)
 # =====================================================================
 
 # Phase-23 modularization: 3 routes + DeviceRevokeRequest now live in routers/device_revoke.py.
-from routers.device_revoke import DeviceRevokeRequest  # noqa: E402,F401  (re-export for legacy callers)
 from routers.device_revoke import router as _device_revoke_router  # noqa: E402
 
 app.include_router(_device_revoke_router)
@@ -872,8 +852,6 @@ from tenant_admin import (
 # roughly the same point in the route table as the original @app
 # decorators did, and so _try_mqtt_unclaim_reset (defined just above)
 # is already bound by the time the router module is imported.
-from routers.device_delete import DeviceDeleteRequest  # noqa: E402,F401  (re-export for legacy callers)
-from routers.device_delete import _device_delete_reset_impl  # noqa: E402,F401  (re-export for legacy callers)
 from routers.device_delete import router as _device_delete_router  # noqa: E402
 
 app.include_router(_device_delete_router)
@@ -988,12 +966,6 @@ app.include_router(_group_cards_router)
 # _principal_tenant_owns_device, _lookup_owner_admin,
 # _extract_zone_from_device_state_row, assert_device_owner,
 # require_principal from `app`.
-from routers.device_profile import (  # noqa: E402,F401  (re-exports for legacy callers)
-    DeviceBulkProfileBody,
-    DeviceDisplayLabelBody,
-    DeviceProfileBody,
-    _apply_device_profile_update,
-)
 from routers.device_profile import router as _device_profile_router  # noqa: E402
 
 app.include_router(_device_profile_router)
@@ -1118,11 +1090,6 @@ from scheduler import (  # noqa: E402,F401
 # Late-binds get_manager_admin, generate_device_credentials,
 # publish_bootstrap_claim, require_capability, require_principal from
 # `app`.
-from routers.provision_lifecycle import (  # noqa: E402,F401  (re-exports for legacy callers)
-    ClaimDeviceRequest,
-    FACTORY_SERIAL_RE,
-    IdentifyRequest,
-)
 from routers.provision_lifecycle import router as _provision_lifecycle_router  # noqa: E402
 
 app.include_router(_provision_lifecycle_router)
@@ -1165,11 +1132,6 @@ app.include_router(_device_control_router)
 # (bulk_alert + send_broadcast_command moved to routers/device_commands.py
 # alongside send_device_command — single phase-30 router covers all three
 # command-publishing endpoints.)
-from routers.device_commands import (  # noqa: E402
-    BroadcastCommandRequest,
-    BulkAlertRequest,
-    CommandRequest,
-)
 from routers.device_commands import router as _device_commands_router  # noqa: E402
 
 app.include_router(_device_commands_router)
