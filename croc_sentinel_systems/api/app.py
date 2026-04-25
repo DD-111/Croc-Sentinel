@@ -1835,93 +1835,25 @@ from routers.dashboard_read import router as _dashboard_read_router  # noqa: E40
 app.include_router(_dashboard_read_router)
 
 
-def generate_device_credentials(device_id: str) -> tuple[str, str, str]:
-    if (not ENFORCE_PER_DEVICE_CREDS) and PROVISION_USE_SHARED_MQTT_CREDS and MQTT_USERNAME:
-        mqtt_username = MQTT_USERNAME
-        mqtt_password = MQTT_PASSWORD
-    else:
-        suffix = device_id.replace("-", "").lower()[:12]
-        mqtt_username = f"dev_{suffix}"
-        mqtt_password = secrets.token_urlsafe(24)
-    cmd_key = secrets.token_hex(8).upper()
-    return mqtt_username, mqtt_password, cmd_key
-
-
-def get_cmd_key_for_device(device_id: str) -> str:
-    """Resolve signing key for MQTT /cmd. Match credentials case-insensitively — claim may
-    have stored mixed-case device_id while the console route uses uppercase (or vice versa);
-    falling back to CMD_AUTH_KEY then breaks every Danger-zone /commands publish."""
-    raw = str(device_id or "").strip()
-    if not raw:
-        return str(CMD_AUTH_KEY or "").strip().upper()
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT cmd_key FROM provisioned_credentials WHERE UPPER(device_id) = UPPER(?) LIMIT 1",
-            (raw,),
-        )
-        row = cur.fetchone()
-        conn.close()
-    if row and row["cmd_key"]:
-        return str(row["cmd_key"]).strip().upper()
-    return str(CMD_AUTH_KEY or "").strip().upper()
-
-
-def get_cmd_keys_for_devices(device_ids: list[str]) -> dict[str, str]:
-    """Batch-resolve MQTT /cmd signing keys. Keys are ``UPPER(device_id)`` → cmd_key."""
-    ids = sorted({str(x or "").strip().upper() for x in device_ids if str(x or "").strip()})
-    if not ids:
-        return {}
-    out: dict[str, str] = {}
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        ph = ",".join(["?"] * len(ids))
-        cur.execute(
-            f"SELECT UPPER(device_id) AS u, cmd_key FROM provisioned_credentials WHERE UPPER(device_id) IN ({ph})",
-            tuple(ids),
-        )
-        for r in cur.fetchall():
-            ck = str(r["cmd_key"] or "").strip().upper()
-            if ck:
-                out[str(r["u"])] = ck
-        conn.close()
-    return out
-
-
-def publish_bootstrap_claim(
-    mac_nocolon: str,
-    claim_nonce: str,
-    device_id: str,
-    zone: str,
-    qr_code: str,
-    mqtt_username: str,
-    mqtt_password: str,
-    cmd_key: str,
-) -> None:
-    global mqtt_client
-    if mqtt_client is None:
-        raise HTTPException(status_code=500, detail="mqtt client not ready")
-
-    topic = f"{TOPIC_ROOT}/bootstrap/assign/{mac_nocolon}"
-    payload = {
-        "type": "bootstrap.assign",
-        "bind_key": BOOTSTRAP_BIND_KEY,
-        "mac_nocolon": mac_nocolon,
-        "claim_nonce": claim_nonce,
-        "device_id": device_id,
-        "zone": zone,
-        "qr_code": qr_code,
-        "mqtt_username": mqtt_username,
-        "mqtt_password": mqtt_password,
-        "cmd_key": cmd_key,
-        "ts": int(time.time()),
-    }
-    info = mqtt_client.publish(topic, json.dumps(payload, ensure_ascii=True), qos=1)
-    info.wait_for_publish(timeout=3.0)
-    if not info.is_published():
-        raise HTTPException(status_code=502, detail="bootstrap publish failed")
+# Per-device credentials + bootstrap publish (Phase-51 modularization).
+# generate_device_credentials, get_cmd_key_for_device,
+# get_cmd_keys_for_devices and publish_bootstrap_claim now live in
+# cmd_keys.py; resolve_target_devices is re-exported from there
+# below alongside scheduler_loop. Re-exported here so:
+#   - `app.publish_bootstrap_claim is cmd_keys.publish_bootstrap_claim`
+#     etc. (identity preserved for every router/_app shim);
+#   - the in-module call sites in scheduler_loop / @app.* claim
+#     handlers / fan-out workers keep finding these names on `app`.
+# cmd_keys.py reads `app.mqtt_client` and `app.zone_sql_suffix` at
+# call time so MQTT reconnects + the (still-in-app.py) zone helper
+# stay live; everything else is direct imports from config / authz /
+# security / db.
+from cmd_keys import (
+    generate_device_credentials,
+    get_cmd_key_for_device,
+    get_cmd_keys_for_devices,
+    publish_bootstrap_claim,
+)
 
 
 # Phase-36 modularization: cmd_queue ledger lives in cmd_queue.py.
@@ -1976,59 +1908,9 @@ from cmd_publish import (
 )
 
 
-def resolve_target_devices(device_ids: list[str], principal: Optional[Principal] = None) -> list[str]:
-    unique = sorted(set([d for d in device_ids if d]))
-    zs, za = zone_sql_suffix(principal) if principal else ("", [])
-    osf, osa = ("", [])
-    if principal and not principal.is_superadmin():
-        if principal.role == "admin":
-            osf = " AND o.owner_admin = ? "
-            osa = [principal.username]
-        else:
-            manager = get_manager_admin(principal.username)
-            if not manager:
-                osf = " AND 1=0 "
-                osa = []
-            else:
-                osf = " AND o.owner_admin = ? "
-                osa = [manager]
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        if unique:
-            placeholders = ",".join(["?"] * len(unique))
-            cur.execute(
-                f"""
-                SELECT d.device_id, d.zone
-                FROM device_state d
-                LEFT JOIN revoked_devices r ON d.device_id = r.device_id
-                LEFT JOIN device_ownership o ON d.device_id = o.device_id
-                WHERE d.device_id IN ({placeholders}){zs} {osf} AND r.device_id IS NULL
-                """,
-                tuple(unique) + tuple(za) + tuple(osa),
-            )
-        else:
-            cur.execute(
-                f"""
-                SELECT d.device_id, d.zone
-                FROM device_state d
-                LEFT JOIN revoked_devices r ON d.device_id = r.device_id
-                LEFT JOIN device_ownership o ON d.device_id = o.device_id
-                WHERE 1=1 {zs} {osf} AND r.device_id IS NULL
-                """,
-                tuple(za) + tuple(osa),
-            )
-        rows = cur.fetchall()
-        conn.close()
-    out: list[str] = []
-    for r in rows:
-        did = str(r["device_id"])
-        z = str(r["zone"]) if r["zone"] is not None else ""
-        if principal is None or principal.is_superadmin() or principal.has_all_zones() or principal.zone_ok(z):
-            out.append(did)
-    if len(out) > MAX_BULK_TARGETS:
-        raise HTTPException(status_code=413, detail=f"target set too large (> {MAX_BULK_TARGETS})")
-    return out
+# resolve_target_devices moved to cmd_keys.py (Phase 51) — see the
+# `from cmd_keys import ...` block above for the rest of that group.
+from cmd_keys import resolve_target_devices  # noqa: E402,F401  (re-export)
 
 
 def scheduler_loop() -> None:
