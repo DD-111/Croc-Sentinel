@@ -237,10 +237,32 @@ def register_routers(app: FastAPI) -> None:
 
     app.include_router(_audit_logs_router)
 
-    # Phase-19: trigger policy + Wi-Fi provisioning task (4 routes).
+    # Phase-19 / 86: trigger policy + Wi-Fi provisioning split into
+    # two modules —
+    #   * routers.device_provision        — Wi-Fi provisioning task
+    #                                       (2 routes: POST/GET
+    #                                       /devices/{device_id}/
+    #                                       provision/wifi-task[/{task_id}]).
+    #                                       Hosts the shared
+    #                                       ``_load_device_row_for_task``
+    #                                       helper (re-exported by
+    #                                       device_trigger_policy).
+    #   * routers.device_trigger_policy   — trigger policy CRUD
+    #                                       (2 routes: GET/PUT
+    #                                       /devices/{device_id}/
+    #                                       trigger-policy).
+    # Both share the ``"device-provision"`` tag so the OpenAPI doc
+    # still groups all 4 endpoints together for end users. Order is
+    # critical: register device_provision first so its
+    # ``_load_device_row_for_task`` is importable when
+    # device_trigger_policy loads.
     from routers.device_provision import router as _device_provision_router
+    from routers.device_trigger_policy import (
+        router as _device_trigger_policy_router,
+    )
 
     app.include_router(_device_provision_router)
+    app.include_router(_device_trigger_policy_router)
 
     # Phase-18: alert on/off + self-test + schedule-reboot (5 routes).
     from routers.device_control import router as _device_control_router
