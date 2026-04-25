@@ -427,6 +427,7 @@ registerRoute("devices", async (view, args, routeSeq) => {
       </details>
     </div>` : "";
   mountView(view, `
+    <section class="device-page-v2" aria-label="Device detail">
     <nav class="device-page-back-nav" aria-label="Device navigation">
       <a href="#/devices" class="btn secondary sm btn-tap device-page-back">← Back</a>
     </nav>
@@ -592,7 +593,8 @@ registerRoute("devices", async (view, args, routeSeq) => {
 
     ${rawCommandDrawer}
 
-    ${mqttMsgPanel}`);
+    ${mqttMsgPanel}
+    </section>`);
   const patchDeviceLive = (dev) => {
     const m = deviceLiveModel(dev);
     const onlineBadge = $("#devOnlineBadge", view);
@@ -617,6 +619,22 @@ registerRoute("devices", async (view, args, routeSeq) => {
     syncDevicePageFirmwareHint(view, dev, id);
   };
   patchDeviceLive(d);
+  // Interaction polish: keep drawer interactions tidy by treating device
+  // panels as an accordion (except danger zone, which stays user-controlled).
+  const deviceDrawers = $$("details.card.device-drawer", view);
+  const isDangerDrawer = (el) => !!(el && el.classList && el.classList.contains("danger-zone"));
+  for (const drawer of deviceDrawers) {
+    drawer.addEventListener("toggle", () => {
+      if (!drawer.open) return;
+      if (isDangerDrawer(drawer)) return;
+      for (const other of deviceDrawers) {
+        if (other === drawer) continue;
+        if (isDangerDrawer(other)) continue;
+        if (!other.open) continue;
+        other.open = false;
+      }
+    });
+  }
   scheduleRouteTicker(routeSeq, `device-live-${id}`, async () => {
     if (!isRouteCurrent(routeSeq)) return;
     const latest = await apiGetCached(`/devices/${encodeURIComponent(id)}`, { timeoutMs: 16000 }, 5000);
