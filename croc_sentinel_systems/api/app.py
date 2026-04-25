@@ -30,7 +30,7 @@ from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
 import paho.mqtt.client as mqtt
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from security import (
@@ -878,51 +878,16 @@ def audit_event(actor: str, action: str, target: str = "", detail: Optional[dict
     )
 
 
-def is_device_revoked(device_id: str) -> bool:
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT 1 FROM revoked_devices WHERE device_id = ?", (device_id,))
-        row = cur.fetchone()
-        conn.close()
-    return row is not None
-
-
-def ensure_not_revoked(device_id: str) -> None:
-    if is_device_revoked(device_id):
-        raise HTTPException(status_code=403, detail="device is revoked")
-
-
-def verify_device_signature(public_key_pem: str, nonce: str, signature_b64: str) -> bool:
-    try:
-        pub = serialization.load_pem_public_key(public_key_pem.encode("utf-8"))
-        sig = base64.b64decode(signature_b64)
-        msg = nonce.encode("utf-8")
-        if isinstance(pub, ec.EllipticCurvePublicKey):
-            pub.verify(sig, msg, ec.ECDSA(hashes.SHA256()))
-            return True
-        pub.verify(sig, msg, padding.PKCS1v15(), hashes.SHA256())
-        return True
-    except Exception:
-        return False
-
-
-def verify_qr_signature(qr_code: str) -> bool:
-    if not QR_SIGN_SECRET:
-        return True
-    parts = qr_code.split("|")
-    if len(parts) != 4:
-        return False
-    prefix, device_id, ts_str, sig = parts
-    if prefix != "CROC":
-        return False
-    if not ts_str.isdigit():
-        return False
-    raw = f"{device_id}|{ts_str}"
-    expect = base64.urlsafe_b64encode(
-        hmac.new(QR_SIGN_SECRET.encode("utf-8"), raw.encode("utf-8"), hashlib.sha256).digest()
-    ).decode("ascii").rstrip("=")
-    return hmac.compare_digest(expect, sig)
+# Device-side identity gates (Phase-5 modularization). Both the revoke
+# check and the EC/RSA + QR signature verifiers now live in
+# ``device_security.py`` — re-imported here so legacy callers
+# (``from app import is_device_revoked``) keep working unchanged.
+from device_security import (  # noqa: E402,F401  (re-export for legacy callers)
+    ensure_not_revoked,
+    is_device_revoked,
+    verify_device_signature,
+    verify_qr_signature,
+)
 
 
 def get_manager_admin(username: str) -> str:
