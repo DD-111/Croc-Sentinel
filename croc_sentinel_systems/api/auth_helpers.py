@@ -49,10 +49,14 @@ import time
 from datetime import datetime
 from typing import Optional
 
-from fastapi import HTTPException
+from fastapi import Cookie, Header, HTTPException
 
 from config import (
+    API_TOKEN,
+    JWT_COOKIE_NAME,
     JWT_SECRET,
+    JWT_USE_HTTPONLY_COOKIE,
+    LEGACY_API_TOKEN_ENABLED,
     LOGIN_LOCK_TIER0_FAILS,
     LOGIN_LOCK_TIER0_SECONDS,
     LOGIN_LOCK_TIER1_FAILS,
@@ -69,6 +73,7 @@ from db import db_lock, get_conn
 from email_templates import render_otp_email
 from helpers import utc_now_iso
 from notifier import notifier
+from security import Principal, decode_jwt
 
 
 logger = logging.getLogger("croc-api.auth_helpers")
@@ -420,6 +425,42 @@ def _consume_verification(username: str, channel: str, purpose: str, code: str) 
     return True
 
 
+# ────────────────────────────────────────────────────────────────────
+#  Principal dependency  (Phase-60 extraction from app.py)
+# ────────────────────────────────────────────────────────────────────
+
+
+def require_principal(
+    authorization: Optional[str] = Header(default=None),
+    sentinel_jwt_cookie: Optional[str] = Cookie(default=None, alias=JWT_COOKIE_NAME),
+) -> Principal:
+    """FastAPI dependency: resolve the calling principal from JWT or legacy bearer.
+
+    Accepts an ``Authorization: Bearer <jwt>`` header or, when
+    ``JWT_USE_HTTPONLY_COOKIE`` is set, the ``sentinel_jwt`` HttpOnly cookie.
+    Optional escape hatch: if ``LEGACY_API_TOKEN_ENABLED=1`` and the bearer
+    constant-time matches ``API_TOKEN``, returns a synthetic
+    superadmin principal (``api-legacy``). Otherwise hands the token off
+    to :func:`security.decode_jwt`.
+
+    Raises 401 when no token is present.
+    """
+    token = ""
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.removeprefix("Bearer ").strip()
+    elif JWT_USE_HTTPONLY_COOKIE and sentinel_jwt_cookie:
+        token = str(sentinel_jwt_cookie).strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    if LEGACY_API_TOKEN_ENABLED and API_TOKEN:
+        try:
+            if secrets.compare_digest(token, API_TOKEN):
+                return Principal(username="api-legacy", role="superadmin", zones=["*"])
+        except (TypeError, ValueError):
+            pass
+    return decode_jwt(token)
+
+
 __all__ = [
     "_check_login_ip_lockout",
     "_record_login_failure_ip",
@@ -441,4 +482,5 @@ __all__ = [
     "_EMAIL_RE",
     "_USERNAME_RE",
     "_PHONE_RE",
+    "require_principal",
 ]

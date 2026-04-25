@@ -28,6 +28,7 @@ working — ``app.py`` re-exports them via star-import-equivalent so e.g.
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from datetime import datetime, timezone
 
@@ -37,6 +38,7 @@ __all__ = [
     "default_policy_for_role",
     "contains_insecure_marker",
     "is_hex_16",
+    "_normalize_delete_confirm",
 ]
 
 
@@ -58,6 +60,13 @@ def is_hex_16(value: str) -> bool:
     if len(value) != 16:
         return False
     return all(ch in "0123456789abcdefABCDEF" for ch in value)
+
+
+def _normalize_delete_confirm(raw: str) -> str:
+    """Strip invisible chars / odd spacing so pasted confirmation still matches DELETE."""
+    s = raw or ""
+    s = re.sub(r"[\u200b-\u200d\ufeff]", "", s)
+    return re.sub(r"\s+", " ", s).strip().upper()
 
 
 def _sibling_group_norm(raw: str) -> str:

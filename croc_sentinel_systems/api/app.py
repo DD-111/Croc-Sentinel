@@ -119,11 +119,10 @@ from helpers import (  # noqa: E402,F401  (re-export for legacy callers)
 )
 
 
-def _normalize_delete_confirm(raw: str) -> str:
-    """Strip invisible chars / odd spacing so pasted confirmation still matches DELETE."""
-    s = raw or ""
-    s = re.sub(r"[\u200b-\u200d\ufeff]", "", s)
-    return re.sub(r"\s+", " ", s).strip().upper()
+# Phase-60 modularization: _normalize_delete_confirm moved to helpers.py.
+# Re-exported below alongside contains_insecure_marker / is_hex_16 so legacy
+# `from app import _normalize_delete_confirm` callers (routers/auth_self
+# late-binds via `_app._normalize_delete_confirm`) keep working.
 
 
 # _legacy_unowned_device_scope moved to authz.py (Phase 49) along with
@@ -184,7 +183,11 @@ logger = logging.getLogger("croc-api")
 # _app_lifespan quartet moved to helpers.py + lifespan.py. Re-exported
 # here so legacy `from app import is_hex_16` callers (routers/device_http
 # late-binds via `_app.is_hex_16`) keep working.
-from helpers import contains_insecure_marker, is_hex_16  # noqa: E402,F401
+from helpers import (  # noqa: E402,F401  (re-exports for legacy callers)
+    _normalize_delete_confirm,
+    contains_insecure_marker,
+    is_hex_16,
+)
 
 
 # cache_get / cache_put / cache_invalidate moved to db.py (re-exported below).
@@ -195,15 +198,12 @@ from helpers import contains_insecure_marker, is_hex_16  # noqa: E402,F401
 from schema import init_db  # noqa: E402,F401  (re-export for legacy callers)
 
 
-def zone_sql_suffix(principal: Principal, column: str = "zone") -> tuple[str, list[Any]]:
-    """Extra WHERE fragment for zone-scoped roles."""
-    if principal.is_superadmin() or principal.has_all_zones():
-        return "", []
-    placeholders = ",".join(["?"] * len(principal.zones))
-    frag = (
-        f" AND ({column} IN ({placeholders}) OR IFNULL({column},'') IN ('all','')) "
-    )
-    return frag, list(principal.zones)
+# Phase-60 modularization: zone_sql_suffix moved to authz.py alongside the
+# rest of the per-tenant scope helpers. Re-exported below from
+# `from authz import ...` so legacy `from app import zone_sql_suffix`
+# callers (cmd_keys, routers/device_read, routers/device_commands,
+# routers/dashboard_read, routers/group_cards, routers/audit_logs,
+# routers/telegram - all late-bind via `_app.zone_sql_suffix`) keep working.
 
 
 # ═══════════════════════════════════════════════
@@ -368,6 +368,7 @@ from authz import (
     owner_sql_suffix,
     principal_for_username,
     require_capability,
+    zone_sql_suffix,
 )
 
 
@@ -554,28 +555,11 @@ from mqtt_pipeline import (  # noqa: E402,F401
 )
 
 
-def require_principal(
-    authorization: Optional[str] = Header(default=None),
-    sentinel_jwt_cookie: Optional[str] = Cookie(default=None, alias=JWT_COOKIE_NAME),
-) -> Principal:
-    """
-    JWT: Authorization Bearer, or HttpOnly cookie (when JWT_USE_HTTPONLY_COOKIE).
-    Optional legacy API_TOKEN superadmin bearer when LEGACY_API_TOKEN_ENABLED=1.
-    """
-    token = ""
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization.removeprefix("Bearer ").strip()
-    elif JWT_USE_HTTPONLY_COOKIE and sentinel_jwt_cookie:
-        token = str(sentinel_jwt_cookie).strip()
-    if not token:
-        raise HTTPException(status_code=401, detail="missing bearer token")
-    if LEGACY_API_TOKEN_ENABLED and API_TOKEN:
-        try:
-            if secrets.compare_digest(token, API_TOKEN):
-                return Principal(username="api-legacy", role="superadmin", zones=["*"])
-        except (TypeError, ValueError):
-            pass
-    return decode_jwt(token)
+# Phase-60 modularization: require_principal moved to auth_helpers.py
+# alongside the rest of the auth dependency stack (login lockout, OTP,
+# verification). Re-exported below from `from auth_helpers import ...`
+# so all 28 routers that late-bind `require_principal = _app.require_principal`
+# keep resolving to the same callable.
 
 
 # (CommandRequest, BroadcastCommandRequest, BulkAlertRequest moved to
@@ -744,6 +728,7 @@ from auth_helpers import (  # noqa: E402,F401  (re-exports for legacy callers)
     _send_email_otp,
     _send_sms_otp,
     _verification_resend_wait_seconds,
+    require_principal,
 )
 
 # (3 signup/verify schemas moved to routers/auth_recovery.py — see the

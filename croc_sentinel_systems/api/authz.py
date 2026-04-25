@@ -105,6 +105,7 @@ __all__ = (
     "assert_device_command_actor",
     "owner_sql_suffix",
     "owner_scope_clause_for_device_state",
+    "zone_sql_suffix",
 )
 
 logger = logging.getLogger(__name__)
@@ -115,6 +116,17 @@ def _legacy_unowned_device_scope(principal: Principal) -> bool:
     if principal.is_superadmin():
         return False
     return bool(ALLOW_LEGACY_UNOWNED) and not TENANT_STRICT
+
+
+def zone_sql_suffix(principal: Principal, column: str = "zone") -> tuple[str, list[Any]]:
+    """Extra WHERE fragment for zone-scoped roles."""
+    if principal.is_superadmin() or principal.has_all_zones():
+        return "", []
+    placeholders = ",".join(["?"] * len(principal.zones))
+    frag = (
+        f" AND ({column} IN ({placeholders}) OR IFNULL({column},'') IN ('all','')) "
+    )
+    return frag, list(principal.zones)
 
 
 def get_manager_admin(username: str) -> str:
