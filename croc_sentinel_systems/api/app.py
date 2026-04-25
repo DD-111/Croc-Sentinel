@@ -150,8 +150,11 @@ mqtt_last_disconnect_reason = ""
 api_ready_event = threading.Event()
 api_bootstrap_error: Optional[str] = None
 _bootstrap_thread: Optional[threading.Thread] = None
-scheduler_stop = threading.Event()
-scheduler_thread: Optional[threading.Thread] = None
+# Phase-54 modularization: scheduler_stop / scheduler_thread /
+# scheduler_loop moved to scheduler.py and re-exported below the
+# heavy router / helper extraction block, alongside scheduler_loop.
+# Lifespan hooks call scheduler.start_scheduler() / stop_scheduler()
+# directly so the thread state lives in scheduler.py.
 
 log_dir = os.path.dirname(LOG_FILE_PATH)
 if log_dir:
@@ -1158,9 +1161,7 @@ def _blocking_api_bootstrap_inner() -> None:
     mqtt_worker_thread = threading.Thread(target=_mqtt_ingest_worker, name="mqtt-ingest", daemon=True)
     mqtt_worker_thread.start()
     mqtt_client = start_mqtt_loop()
-    scheduler_stop.clear()
-    scheduler_thread = threading.Thread(target=scheduler_loop, name="cmd-scheduler", daemon=True)
-    scheduler_thread.start()
+    start_scheduler()
     _start_event_redis_bridge()
     logger.info(
         "API started mqtt_host=%s mqtt_port=%s mqtt_tls=%s "
@@ -1177,12 +1178,9 @@ def _blocking_api_bootstrap_inner() -> None:
 
 
 def _shutdown_api() -> None:
-    global mqtt_client, scheduler_thread, mqtt_worker_thread
+    global mqtt_client, mqtt_worker_thread
     _stop_event_redis_bridge()
-    scheduler_stop.set()
-    if scheduler_thread is not None:
-        scheduler_thread.join(timeout=2.0)
-        scheduler_thread = None
+    stop_scheduler()
     if mqtt_client is not None:
         stop_mqtt_loop(mqtt_client)
         mqtt_client = None
@@ -1730,128 +1728,17 @@ from cmd_publish import (
 from cmd_keys import resolve_target_devices  # noqa: E402,F401  (re-export)
 
 
-def scheduler_loop() -> None:
-    next_cleanup_at = time.time() + 60
-    next_probe_at = time.time() + 30  # kick probe worker ~30s after boot
-    next_events_retention_at = time.time() + 300  # first retention pass ~5 min after boot
-    next_pwd_prune_at = time.time() + 900
-    next_pending_claim_prune_at = time.time() + 120
-    while not scheduler_stop.is_set():
-        now_ts = int(time.time())
-        jobs: list[sqlite3.Row] = []
-        with db_lock:
-            conn = get_conn()
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT id, device_id, cmd, params_json, target_id, proto
-                FROM scheduled_commands
-                WHERE status = 'pending' AND execute_at_ts <= ?
-                ORDER BY id ASC
-                LIMIT 50
-                """,
-                (now_ts,),
-            )
-            jobs = cur.fetchall()
-            conn.close()
-
-        for job in jobs:
-            jid = int(job["id"])
-            try:
-                topic = f"{TOPIC_ROOT}/{job['device_id']}/cmd"
-                publish_command(
-                    topic=topic,
-                    cmd=str(job["cmd"]),
-                    params=json.loads(str(job["params_json"])),
-                    target_id=str(job["target_id"]),
-                    proto=int(job["proto"]),
-                    cmd_key=get_cmd_key_for_device(str(job["device_id"])),
-                )
-                with db_lock:
-                    conn = get_conn()
-                    cur = conn.cursor()
-                    cur.execute(
-                        "UPDATE scheduled_commands SET status='done', executed_at=? WHERE id=?",
-                        (utc_now_iso(), jid),
-                    )
-                    conn.commit()
-                    conn.close()
-            except Exception as exc:
-                logger.exception("scheduled command failed id=%s err=%s", jid, exc)
-                with db_lock:
-                    conn = get_conn()
-                    cur = conn.cursor()
-                    cur.execute(
-                        "UPDATE scheduled_commands SET status='failed', executed_at=? WHERE id=?",
-                        (utc_now_iso(), jid),
-                    )
-                    conn.commit()
-                    conn.close()
-
-        try:
-            _fail_stale_scheduled_commands(now_ts)
-        except Exception as exc:
-            logger.warning("stale scheduled_commands cleanup failed: %s", exc)
-        try:
-            _expire_presence_probes_waiting_ack()
-        except Exception as exc:
-            logger.warning("presence probe ack expiry failed: %s", exc)
-        try:
-            _auto_reconcile_tick()
-        except Exception as exc:
-            logger.warning("auto reconcile tick failed: %s", exc)
-        try:
-            _cmd_queue_cleanup_expired()
-        except Exception as exc:
-            logger.warning("cmd_queue cleanup tick failed: %s", exc)
-
-        now = time.time()
-        if now >= next_cleanup_at:
-            cutoff = datetime.fromtimestamp(now - (MESSAGE_RETENTION_DAYS * 86400), tz=timezone.utc).isoformat()
-            with db_lock:
-                conn = get_conn()
-                cur = conn.cursor()
-                cur.execute("DELETE FROM messages WHERE ts_received < ?", (cutoff,))
-                cur.execute(
-                    """
-                    DELETE FROM scheduled_commands
-                    WHERE status IN ('done','failed') AND executed_at IS NOT NULL AND executed_at < ?
-                    """,
-                    (cutoff,),
-                )
-                conn.commit()
-                conn.close()
-            next_cleanup_at = now + 3600
-
-        if now >= next_probe_at:
-            try:
-                _presence_probe_tick()
-            except Exception as exc:
-                logger.warning("presence probe tick failed: %s", exc)
-            next_probe_at = now + max(30, PRESENCE_PROBE_SCAN_SECONDS)
-
-        if now >= next_events_retention_at:
-            try:
-                _events_retention_tick()
-            except Exception as exc:
-                logger.warning("events retention tick failed: %s", exc)
-            next_events_retention_at = now + max(300, EVENT_RETENTION_SCAN_SECONDS)
-
-        if now >= next_pwd_prune_at:
-            try:
-                _prune_password_reset_tokens()
-            except Exception as exc:
-                logger.warning("password reset token prune failed: %s", exc)
-            next_pwd_prune_at = now + 21600  # every 6h
-
-        if now >= next_pending_claim_prune_at:
-            try:
-                _prune_stale_pending_claims()
-            except Exception as exc:
-                logger.warning("pending_claim prune failed: %s", exc)
-            next_pending_claim_prune_at = now + 900
-
-        scheduler_stop.wait(SCHEDULER_POLL_SECONDS)
+# Phase-54 modularization: scheduler_loop, scheduler_stop, scheduler_thread,
+# start_scheduler, stop_scheduler all moved to scheduler.py. Re-exported
+# below so the lifespan hooks can call them and any legacy import still
+# resolves.
+from scheduler import (  # noqa: E402,F401
+    scheduler_loop,
+    scheduler_stop,
+    scheduler_thread,
+    start_scheduler,
+    stop_scheduler,
+)
 
 
 # Phase-29 modularization: the three provision-lifecycle routes
