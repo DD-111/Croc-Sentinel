@@ -35,12 +35,29 @@ __all__ = [
     "utc_now_iso",
     "_sibling_group_norm",
     "default_policy_for_role",
+    "contains_insecure_marker",
+    "is_hex_16",
 ]
 
 
 def utc_now_iso() -> str:
     """UTC ISO string for SQLite storage and lexicographic ordering (canonical ``ts``)."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def contains_insecure_marker(value: str) -> bool:
+    """True when an env value is a CHANGE_ME / placeholder default the
+    production-env check refuses to ship with."""
+    markers = ["CHANGE_ME", "YOUR_", "your.vps.domain", "bootstrap_user", "bootstrap_pass", "mqtt_pass", "mqtt_user"]
+    return any(m in value for m in markers)
+
+
+def is_hex_16(value: str) -> bool:
+    """True when ``value`` is exactly 16 hex characters (the cmd_auth_key /
+    challenge-key shape used across the device protocol)."""
+    if len(value) != 16:
+        return False
+    return all(ch in "0123456789abcdefABCDEF" for ch in value)
 
 
 def _sibling_group_norm(raw: str) -> str:

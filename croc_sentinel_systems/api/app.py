@@ -179,49 +179,12 @@ logger = logging.getLogger("croc-api")
 # keep resolving.
 
 
-def contains_insecure_marker(value: str) -> bool:
-    markers = ["CHANGE_ME", "YOUR_", "your.vps.domain", "bootstrap_user", "bootstrap_pass", "mqtt_pass", "mqtt_user"]
-    return any(m in value for m in markers)
-
-
-def is_hex_16(value: str) -> bool:
-    if len(value) != 16:
-        return False
-    return all(ch in "0123456789abcdefABCDEF" for ch in value)
-
-
-def validate_production_env() -> None:
-    errors: list[str] = []
-    if LEGACY_API_TOKEN_ENABLED and (
-        not API_TOKEN or len(API_TOKEN) < 20 or contains_insecure_marker(API_TOKEN)
-    ):
-        errors.append("API_TOKEN is weak or default (LEGACY_API_TOKEN_ENABLED=1)")
-    if not CMD_AUTH_KEY or not is_hex_16(CMD_AUTH_KEY):
-        errors.append("CMD_AUTH_KEY must be 16 hex chars")
-    if not BOOTSTRAP_BIND_KEY or len(BOOTSTRAP_BIND_KEY) < 16 or contains_insecure_marker(BOOTSTRAP_BIND_KEY):
-        errors.append("BOOTSTRAP_BIND_KEY is default")
-    if len(MQTT_USERNAME) < 4 or len(MQTT_PASSWORD) < 12:
-        errors.append("MQTT credentials too weak")
-    if contains_insecure_marker(MQTT_USERNAME) or contains_insecure_marker(MQTT_PASSWORD):
-        errors.append("MQTT credentials are default/insecure")
-    if contains_insecure_marker(MQTT_HOST):
-        errors.append("MQTT_HOST is placeholder")
-    if MAX_BULK_TARGETS < 1 or MAX_BULK_TARGETS > 5000:
-        errors.append("MAX_BULK_TARGETS out of allowed range")
-    if MESSAGE_RETENTION_DAYS < 1:
-        errors.append("MESSAGE_RETENTION_DAYS must be >= 1")
-    if ENFORCE_DEVICE_CHALLENGE and DEVICE_CHALLENGE_TTL_SECONDS < 30:
-        errors.append("DEVICE_CHALLENGE_TTL_SECONDS must be >= 30 when ENFORCE_DEVICE_CHALLENGE=1")
-    if ENFORCE_DEVICE_CHALLENGE and (not QR_SIGN_SECRET or len(QR_SIGN_SECRET) < 24):
-        errors.append("QR_SIGN_SECRET must be set (>=24 chars) when ENFORCE_DEVICE_CHALLENGE=1")
-    if BOOTSTRAP_DASHBOARD_SUPERADMIN_PASSWORD:
-        if not JWT_SECRET or len(JWT_SECRET) < 32:
-            errors.append("JWT_SECRET must be set (>=32 chars) when BOOTSTRAP_DASHBOARD_SUPERADMIN_PASSWORD is used")
-    if errors:
-        msg = "Invalid production environment: " + "; ".join(errors)
-        if STRICT_STARTUP_ENV_CHECK:
-            raise RuntimeError(msg)
-        logger.warning("%s (startup allowed because STRICT_STARTUP_ENV_CHECK=0)", msg)
+# Phase-59 modularization: contains_insecure_marker, is_hex_16, and the
+# validate_production_env / _blocking_api_bootstrap_inner / _shutdown_api /
+# _app_lifespan quartet moved to helpers.py + lifespan.py. Re-exported
+# here so legacy `from app import is_hex_16` callers (routers/device_http
+# late-binds via `_app.is_hex_16`) keep working.
+from helpers import contains_insecure_marker, is_hex_16  # noqa: E402,F401
 
 
 # cache_get / cache_put / cache_invalidate moved to db.py (re-exported below).
@@ -648,99 +611,20 @@ def require_principal(
 # (3 user-CRUD schemas moved to routers/auth_users.py — see the corresponding
 # `from routers.auth_users import ...` block below.)
 
-def _blocking_api_bootstrap_inner() -> None:
-    """Runs on thread api-bootstrap: DB init, notifier, MQTT ingest, scheduler."""
-    global mqtt_client, scheduler_thread, mqtt_worker_thread, mqtt_ingest_dropped
-    validate_production_env()
-    init_db()
-    try:
-        _ota_enforce_max_stored_bins()
-    except Exception:
-        logger.exception("OTA firmware retention prune at startup failed")
-    notifier.start()
-    try:
-        from telegram_notify import start_telegram_worker
-
-        start_telegram_worker()
-    except Exception:
-        logger.exception("Telegram worker failed to start (check TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_IDS)")
-    try:
-        from fcm_notify import set_invalid_token_handler, start_fcm_worker
-
-        start_fcm_worker()
-        set_invalid_token_handler(_fcm_delete_stale_registration_token)
-    except Exception:
-        logger.exception("FCM worker failed to start (check FCM_SERVICE_ACCOUNT_JSON / FCM_PROJECT_ID)")
-    mqtt_worker_stop.clear()
-    mqtt_ingest_dropped = 0
-    mqtt_worker_thread = threading.Thread(target=_mqtt_ingest_worker, name="mqtt-ingest", daemon=True)
-    mqtt_worker_thread.start()
-    mqtt_client = start_mqtt_loop()
-    start_scheduler()
-    _start_event_redis_bridge()
-    logger.info(
-        "API started mqtt_host=%s mqtt_port=%s mqtt_tls=%s "
-        "mqtt_tls_verify_hostname=%s db=%s notifier_enabled=%s telegram=%s fcm=%s",
-        MQTT_HOST,
-        MQTT_PORT,
-        MQTT_USE_TLS,
-        MQTT_TLS_VERIFY_HOSTNAME,
-        DB_PATH,
-        notifier.enabled(),
-        _telegram_enabled_safe(),
-        _fcm_enabled_safe(),
-    )
-
-
-def _shutdown_api() -> None:
-    global mqtt_client, mqtt_worker_thread
-    _stop_event_redis_bridge()
-    stop_scheduler()
-    if mqtt_client is not None:
-        stop_mqtt_loop(mqtt_client)
-        mqtt_client = None
-    mqtt_worker_stop.set()
-    if mqtt_worker_thread is not None:
-        mqtt_worker_thread.join(timeout=10.0)
-        mqtt_worker_thread = None
-    try:
-        from telegram_notify import stop_telegram_worker
-
-        stop_telegram_worker()
-    except Exception:
-        pass
-    try:
-        from fcm_notify import stop_fcm_worker
-
-        stop_fcm_worker()
-    except Exception:
-        pass
-    notifier.stop()
-
-
-@asynccontextmanager
-async def _app_lifespan(app: FastAPI):
-    """Bind HTTP immediately; heavy sync startup runs on api-bootstrap thread."""
-    global _bootstrap_thread, api_bootstrap_error
-    api_ready_event.clear()
-    api_bootstrap_error = None
-
-    def _run_bootstrap() -> None:
-        global api_bootstrap_error
-        try:
-            _blocking_api_bootstrap_inner()
-        except BaseException as exc:
-            api_bootstrap_error = repr(exc)
-            logger.exception("API bootstrap failed")
-        finally:
-            api_ready_event.set()
-
-    _bootstrap_thread = threading.Thread(target=_run_bootstrap, name="api-bootstrap", daemon=True)
-    _bootstrap_thread.start()
-    yield
-    if _bootstrap_thread is not None and _bootstrap_thread.is_alive():
-        _bootstrap_thread.join(timeout=2.0)
-    _shutdown_api()
+# Phase-59 modularization: validate_production_env,
+# _blocking_api_bootstrap_inner, _shutdown_api and _app_lifespan all
+# moved to lifespan.py. The mutable state vars they touch (mqtt_client,
+# mqtt_worker_thread, mqtt_ingest_dropped, _bootstrap_thread,
+# api_ready_event, api_bootstrap_error) intentionally stay on app.py
+# as the canonical source of truth — every cross-module reader looks
+# them up live via `_app.<name>`. lifespan.py mutates them through the
+# same `_app.<name> = ...` pattern mqtt_pipeline already uses.
+from lifespan import (  # noqa: E402,F401
+    _app_lifespan,
+    _blocking_api_bootstrap_inner,
+    _shutdown_api,
+    validate_production_env,
+)
 
 
 app = FastAPI(title="Croc Sentinel API", version="1.1.0", lifespan=_app_lifespan)
