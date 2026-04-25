@@ -288,20 +288,39 @@ body[data-layout="app"] {
 
 .app-shell {
   display: grid;
-  grid-template-columns: var(--sidebar-w) 1fr;
+  /* minmax(0,1fr) so flex descendants can shrink; avoids invisible overflow squeezing the column. */
+  grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
   min-height: 100dvh;
   background: var(--bg-main);
   align-content: start;
   align-items: stretch;
 }
-/* One primary scroll region: #view. (Old 3-row grid on .main broke with 6+ main children + fixed .tabbar.) */
+/* shell has three children: .sidebar, .sidebar-backdrop, <main> — if we rely on auto-placement,
+   the 3rd item (main) can land in *column 1* under the sidebar (~248px) and the whole app looks
+   "stuck to the left". Fix with explicit areas; backdrop spans the row so it still overlays. */
+.app-shell > .sidebar {
+  grid-column: 1;
+  grid-row: 1;
+  min-width: 0;
+}
 .app-shell > .main {
+  grid-column: 2;
+  grid-row: 1;
   min-width: 0;
   min-height: 0; /* let grid item shrink; inner #view can overflow-scroll */
   align-self: stretch;
   max-height: 100dvh;
   display: flex;
-  flex-direction: column;
+  flex-direction: column; /* one scroll region: #view */
+}
+.app-shell > .sidebar-backdrop {
+  grid-column: 1 / -1;
+  grid-row: 1;
+  z-index: 48;
+  pointer-events: none;
+}
+body[data-nav="open"] .app-shell > .sidebar-backdrop {
+  pointer-events: auto;
 }
 
 .main {
@@ -342,7 +361,15 @@ body[data-layout="app"] .main > .site-footer--shell {
   box-sizing: border-box;
   display: flex;
   flex-direction: column;
+  align-items: stretch;
   gap: var(--sp-5);
+  isolation: isolate; /* clean stacking: sticky columns vs later sections */
+  min-width: 0;
+}
+#view.view > * {
+  min-width: 0;
+  max-width: 100%;
+  flex: 0 0 auto; /* do not let route sections share height like flex:1; avoids crushed/overlapping blocks */
 }
 
 /* Single source of truth for topbar geometry. */
@@ -1209,6 +1236,8 @@ body[data-layout="auth"] {
     var(--bg);
 }
 body[data-layout="auth"] .app-shell { grid-template-columns: 1fr; }
+/* Override desktop .app-shell > .main { grid-column: 2 } so login fits the single track. */
+body[data-layout="auth"] .app-shell > .main { grid-column: 1; grid-row: 1; }
 body[data-layout="auth"] .sidebar,
 body[data-layout="auth"] .topbar,
 body[data-layout="auth"] .tabbar,
@@ -1601,16 +1630,17 @@ body[data-layout="auth"] .main #view {
 
 /* In-flow <details> accordions on device / group pages (same BEM, no fixed layer). */
 details.card.device-drawer {
-  position: static;
+  position: relative;
   inset: auto;
   width: 100%;
   max-width: none;
   height: auto;
   min-height: 0;
   transform: none;
-  z-index: auto;
+  z-index: 1; /* above an earlier row’s sticky right column in the same scrollport */
   display: block;
   overflow: visible;
+  flex: none;
 }
 details.card.device-drawer > summary.device-drawer__summary {
   list-style: none;
@@ -1659,14 +1689,29 @@ details.card.danger-zone.device-drawer > summary.device-drawer__summary {
 }
 
 /* Device detail (focus) — device page. */
-.device-focus-layout {
+/* Must win over `.card { display: flex }` (same element carries both classes). */
+.card.device-focus-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 360px;
+}
+.device-focus-layout {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 360px);
   gap: var(--sp-5);
   align-items: start;
+  min-width: 0;
+  overflow: visible; /* do not clip sticky; children paint in normal order */
 }
 .device-focus-left  { display: flex; flex-direction: column; gap: var(--sp-4); min-width: 0; }
-.device-focus-right { display: flex; flex-direction: column; gap: var(--sp-3); position: sticky; top: calc(var(--topbar-h) + var(--sp-3)); }
+/* Sticky is desktop-only: <1024 uses tab + shorter viewport; sticky can paint over
+   the accordions (details) below the hero — disable there. */
+.device-focus-right {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  min-width: 0;
+  position: sticky;
+  top: calc(var(--topbar-h) + var(--sp-3));
+  z-index: 0;
+}
 
 .device-page-head {
   display: flex;
@@ -1708,10 +1753,13 @@ details.card.danger-zone.device-drawer > summary.device-drawer__summary {
 }
 .device-hero-line--fw { color: var(--text-muted); }
 
+/* One logical row (one .card) — two columns with a single child left 50% empty. */
 .device-quick-split {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--sp-3);
+  width: 100%;
+  min-width: 0;
 }
 
 .device-owner-kv {
@@ -2148,6 +2196,10 @@ body[data-boot-error="1"] .static-boot__retry { display: inline-block; }
 /* 1024px — sidebar collapses to a slide-in drawer, bottom tab bar takes over. */
 @media (max-width: 1023.98px) {
   .app-shell { grid-template-columns: 1fr; }
+  /* One column: stack; keep main full-width (not column 2 from the desktop rules). */
+  .app-shell > .sidebar { grid-column: 1; }
+  .app-shell > .main { grid-column: 1; }
+  .app-shell > .sidebar-backdrop { grid-column: 1; }
   .sidebar {
     position: fixed;
     top: 0; bottom: 0; left: 0;
@@ -2170,6 +2222,8 @@ body[data-boot-error="1"] .static-boot__retry { display: inline-block; }
   .sidebar-rail-toggle { display: none; }
   .menu-btn { display: inline-grid; }
   .tabbar { display: flex; }
+  /* 设备详情等页：与 tab 同视口时取消右侧 sticky，避免与下方 <details> 区域叠在点击层上。 */
+  .device-focus-right { position: static; }
   /* App 路由：为底部 fixed tabbar 让位。登录/注册不显示 tabbar，见下方 auth 覆盖。 */
   body[data-layout="app"] .view,
   body[data-layout="app"] #view {
@@ -2192,7 +2246,6 @@ body[data-boot-error="1"] .static-boot__retry { display: inline-block; }
 /* 768px — 窄视口：单栏、登录侧栏在表单下、设备详情两列→一列、卡片等收紧。 */
 @media (max-width: 767.98px) {
   .device-focus-layout { grid-template-columns: 1fr; }
-  .device-focus-right { position: static; }
   .device-hero-line .device-primary-name { font-size: var(--text-xl); }
   .auth-surface__inner--wide { grid-template-columns: 1fr; }
   .auth-surface--with-aside .auth-surface__side { padding: var(--sp-4); }
@@ -2211,7 +2264,6 @@ body[data-boot-error="1"] .static-boot__retry { display: inline-block; }
   .stats { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
   .device-grid { grid-template-columns: 1fr; }
   .device-drawer--peek { width: 100vw; border-left: 0; }
-  .device-quick-split { grid-template-columns: 1fr; }
   .grp-modal { padding: 0; align-items: flex-end; }
   .grp-modal-card {
     border-radius: var(--rad-xl) var(--rad-xl) 0 0;
