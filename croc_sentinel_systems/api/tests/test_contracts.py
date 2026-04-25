@@ -163,8 +163,13 @@ _CSRF_STATIC_EXEMPT = frozenset(
 
 
 def test_csrf_exempt_prefixes_match_real_routes(app_tree: ast.Module) -> None:
+    # Phase-53: _CSRF_EXEMPT_PREFIXES moved from app.py to csrf.py; accept
+    # either location so the contract follows the canonical definition.
+    csrf_path = API_DIR / "csrf.py"
+    csrf_tree = ast.parse(csrf_path.read_text(encoding="utf-8"))
     exempt = _require_tuple_of_str(
         (app_tree, "app.py"),
+        (csrf_tree, "csrf.py"),
         symbol="_CSRF_EXEMPT_PREFIXES",
     )
     assert exempt, "_CSRF_EXEMPT_PREFIXES must not be empty"

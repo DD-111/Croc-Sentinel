@@ -1259,149 +1259,40 @@ async def _security_headers_middleware(request: Request, call_next):
 # JWT cookie at login; every state-changing request must echo the value via
 # the CSRF_HEADER_NAME header. Because the cookie is NOT HttpOnly, first-party
 # JS can read it; a cross-origin attacker can't — that's the security property.
-
-def _issue_csrf_token() -> str:
-    return secrets.token_urlsafe(32)
-
-
-def _set_csrf_cookie(response: Response, token: Optional[str] = None) -> str:
-    tok = (token or "").strip() or _issue_csrf_token()
-    response.set_cookie(
-        key=CSRF_COOKIE_NAME,
-        value=tok,
-        max_age=int(CSRF_TOKEN_TTL_S),
-        path="/",
-        httponly=False,  # JS must be able to read this one.
-        secure=bool(JWT_COOKIE_SECURE),
-        samesite=JWT_COOKIE_SAMESITE,  # type: ignore[arg-type]
-    )
-    return tok
-
-
-def _clear_csrf_cookie(response: Response) -> None:
-    response.delete_cookie(
-        CSRF_COOKIE_NAME,
-        path="/",
-        secure=bool(JWT_COOKIE_SECURE),
-        httponly=False,
-        samesite=JWT_COOKIE_SAMESITE,  # type: ignore[arg-type]
-    )
-
-
-# Paths that cookie-authenticated browsers are allowed to POST/PUT/PATCH/DELETE
-# without a CSRF token. Auth endpoints issue the token so they can't require it
-# pre-login; device-side paths run over MQTT or per-device HMAC so the cookie
-# flow doesn't apply.
 #
-# Names here MUST mirror the paths the SPA actually calls (see
-# api/dashboard/src/console.raw.js). The previous `/auth/register`,
-# `/auth/forgot-password`, `/auth/account-activate`, `/auth/resend-activation`
-# entries never matched; today the SPA hits `/auth/signup/...`,
-# `/auth/forgot/...`, `/auth/activate`, `/auth/code/resend` instead.
-_CSRF_EXEMPT_PREFIXES: tuple[str, ...] = (
-    "/auth/login",
-    "/auth/logout",
-    "/auth/signup/",       # signup/start, signup/verify, signup/approve, ...
-    "/auth/forgot/",       # forgot/email/start, forgot/start, ...
-    "/auth/activate",      # account activation (mirror SPA route)
-    "/auth/code/resend",   # OTP resend used by signup + activate
-    "/ingest/",            # device ingest; device-signed, no browser cookies
-    "/integrations/telegram/webhook",
-    "/health",
-    "/dashboard/",         # legacy SPA shell mount (pre-/console)
-    "/ui/",                # legacy static UI mount
+# Phase-53 modularization: the CSRF helpers and both middleware
+# bodies (CSRF + readiness) moved to csrf.py. The
+# ``@app.middleware("http")`` decorators must stay here so the
+# registration order (csrf -> readiness -> slow-log) is preserved on
+# the live FastAPI instance; we re-export the helpers and delegate
+# the impl bodies.
+from csrf import (  # noqa: E402,F401  (re-exports for legacy callers)
+    _CSRF_EXEMPT_PREFIXES,
+    _clear_csrf_cookie,
+    _csrf_guard_impl,
+    _csrf_path_exempt,
+    _issue_csrf_token,
+    _readiness_guard_impl,
+    _readiness_public_paths,
+    _set_csrf_cookie,
 )
-
-
-def _csrf_path_exempt(path: str) -> bool:
-    p = str(path or "")
-    if p in ("/", "/favicon.ico", "/openapi.json", "/redoc", "/docs"):
-        return True
-    for pref in _CSRF_EXEMPT_PREFIXES:
-        if p == pref.rstrip("/") or p.startswith(pref):
-            return True
-    # Let the mounted /console SPA serve its static files freely.
-    if p == DASHBOARD_PATH or p.startswith(DASHBOARD_PATH + "/"):
-        return True
-    return False
 
 
 @app.middleware("http")
 async def _csrf_guard(request: Request, call_next):
     """Enforce double-submit CSRF token for cookie-authenticated writes."""
-    if not CSRF_PROTECTION:
-        return await call_next(request)
-    method = str(request.method or "GET").upper()
-    if method in ("GET", "HEAD", "OPTIONS"):
-        return await call_next(request)
-    path = request.url.path
-    if _csrf_path_exempt(path):
-        return await call_next(request)
-    # If the caller is using Authorization: Bearer, CSRF is n/a (token is not
-    # ambient-authed via the browser). Browser-based attacks can't set this
-    # header cross-origin.
-    auth_hdr = str(request.headers.get("authorization") or "")
-    if auth_hdr.lower().startswith("bearer "):
-        return await call_next(request)
-    # Only enforce when the request actually carries our session cookie —
-    # otherwise the request will fail auth anyway and CSRF is moot.
-    jwt_ck = request.cookies.get(JWT_COOKIE_NAME)
-    if not jwt_ck:
-        return await call_next(request)
-    sent = str(request.headers.get(CSRF_HEADER_NAME) or "").strip()
-    expected = str(request.cookies.get(CSRF_COOKIE_NAME) or "").strip()
-    if not sent or not expected or not secrets.compare_digest(sent, expected):
-        return JSONResponse(
-            status_code=403,
-            content={"detail": "csrf token missing or invalid", "code": "csrf_invalid"},
-        )
-    return await call_next(request)
+    return await _csrf_guard_impl(request, call_next)
+
 
 _dash_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard")
 if os.path.isdir(_dash_dir):
     app.mount(DASHBOARD_PATH, StaticFiles(directory=_dash_dir, html=True), name="dashboard")
 
 
-def _readiness_public_paths(path: str) -> bool:
-    """Paths that must never be blocked by startup / bootstrap-failure guard (SPA shell + probes)."""
-    if path == "/health" or path == "/" or path.startswith("/docs") or path in (
-        "/openapi.json",
-        "/redoc",
-        "/favicon.ico",
-    ):
-        return True
-    # Telegram pushes updates during boot; handler returns 503 until DB ready so Telegram retries.
-    if path == "/integrations/telegram/webhook":
-        return True
-    # Mounted dashboard (StaticFiles at DASHBOARD_PATH) — was missing and caused 503 on entire UI.
-    base = DASHBOARD_PATH
-    if path == base or path.startswith(base + "/"):
-        return True
-    # Legacy redirects into the console
-    if path.startswith("/ui"):
-        return True
-    if path == "/dashboard" or path.startswith("/dashboard/"):
-        return True
-    return False
-
-
 @app.middleware("http")
 async def _readiness_guard(request: Request, call_next):
     """503 JSON API routes until deferred bootstrap finishes; never block static dashboard."""
-    path = request.url.path
-    if _readiness_public_paths(path):
-        return await call_next(request)
-    if not api_ready_event.is_set():
-        return JSONResponse(
-            status_code=503,
-            content={"detail": "service starting", "ready": False},
-        )
-    if api_bootstrap_error:
-        return JSONResponse(
-            status_code=503,
-            content={"detail": "bootstrap failed", "ready": False, "error": api_bootstrap_error},
-        )
-    return await call_next(request)
+    return await _readiness_guard_impl(request, call_next)
 
 
 @app.middleware("http")
