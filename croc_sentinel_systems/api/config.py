@@ -241,6 +241,9 @@ EVENT_SUB_QUEUE_SIZE: int = int(os.getenv("EVENT_SUB_QUEUE_SIZE", "500"))
 EVENT_SSE_KEEPALIVE_SECONDS: int = max(3, int(os.getenv("EVENT_SSE_KEEPALIVE_SECONDS", "9")))
 # Hint for browser EventSource automatic reconnect delay (milliseconds).
 EVENT_SSE_RETRY_MS: int = int(os.getenv("EVENT_SSE_RETRY_MS", "4000"))
+# Toggle the WebSocket mirror of /events/stream at /events/ws. Off keeps
+# the route reachable but it closes the connection with code 1008.
+EVENT_WS_ENABLED: bool = os.getenv("EVENT_WS_ENABLED", "1") == "1"
 # Hard cap on concurrent SSE subscribers (cheap, but bound the damage).
 EVENT_MAX_SUBSCRIBERS: int = int(os.getenv("EVENT_MAX_SUBSCRIBERS", "128"))
 # Level-based retention days. Debug rows go first; critical stays for audits.
@@ -330,6 +333,7 @@ __all__ = [
     "EVENT_SSE_KEEPALIVE_SECONDS",
     "EVENT_SSE_RETRY_MS",
     "EVENT_SUB_QUEUE_SIZE",
+    "EVENT_WS_ENABLED",
     "FACTORY_API_TOKEN",
     "FANOUT_WALL_CLOCK_MAX_S",
     "FANOUT_WORKER_POOL_SIZE",
