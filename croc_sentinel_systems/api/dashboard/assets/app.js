@@ -366,7 +366,6 @@
       // Re-arm dependent timers so they pick up the slower cadence immediately.
       try { armHealthPoll(); } catch (_) {}
       try { rearmVisibleRouteTickersForStreamHealth(); } catch (_) {}
-      try { renderHealthPills(); } catch (_) {}
     }
   }
   /** Mark stream unhealthy (close / error / stall). */
@@ -380,7 +379,6 @@
       // Speed up pollers so the UI doesn't go stale while we reconnect.
       try { armHealthPoll(); } catch (_) {}
       try { rearmVisibleRouteTickersForStreamHealth(); } catch (_) {}
-      try { renderHealthPills(); } catch (_) {}
     }
   }
   /** Called on each pushed event so staleness checks can use lastEventMs. */
@@ -389,8 +387,6 @@
   }
 
   let healthPollTimer = null;
-  /** One in-flight /health at a time (stops setInterval + boot piling parallel probes). */
-  let healthIsFetching = false;
   /** Overview device search debounce. */
   let overviewFilterDebounce = null;
   function clearHealthPollTimer() {
@@ -401,7 +397,7 @@
   }
   function tickHealthIfVisible() {
     if (document.visibilityState !== "visible") return;
-    void loadHealth();
+    loadHealth();
   }
 
   /**
@@ -411,8 +407,7 @@
    *   FAST  = MQTT is DOWN → track green-dot reality (don't coast on stale)
    * Stream being healthy is the "we already know live-state in real time" signal.
    */
-  /** When WS/SSE is healthy, rely more on push and poll /health for DB/mail/TG only. */
-  const HEALTH_POLL_IDLE_MS = 35000;
+  const HEALTH_POLL_IDLE_MS = 20000;
   const HEALTH_POLL_SLOW_MS = 8000;
   const HEALTH_POLL_FAST_MS = 3000;
 
@@ -483,52 +478,18 @@
   const ROUTE_RENDER_TIMEOUT_MS = 90000;
 
   /**
-   * fetch() with timeout + optional merge of init.signal. Caller abort and deadline both cancel
-   * the same request. If init.signal is already aborted, rejects immediately. timeoutMs false = no limit.
+   * fetch() with AbortController timeout. opts.timeoutMs: number ms, false = no limit.
    */
   async function fetchWithDeadline(url, init, timeoutMs) {
     const baseInit = Object.assign({ credentials: "include" }, init || {});
-    if (baseInit.signal && baseInit.signal.aborted) {
-      return Promise.reject(new DOMException("Aborted", "AbortError"));
-    }
     const limit = timeoutMs === false ? 0 : (timeoutMs != null ? timeoutMs : DEFAULT_API_TIMEOUT_MS);
-    if (limit <= 0) {
-      return fetch(url, baseInit);
-    }
-    const { signal: ext, ...rest } = baseInit;
-    if (rest.signal) delete rest.signal;
-    const timeoutAc = new AbortController();
-    let tid = 0;
-    const clearTid = () => {
-      if (tid) {
-        clearTimeout(tid);
-        tid = 0;
-      }
-    };
-    tid = setTimeout(() => {
-      if (!timeoutAc.signal.aborted) timeoutAc.abort();
-    }, limit);
-    const useAny = typeof AbortSignal !== "undefined" && typeof AbortSignal.any === "function" && ext;
-    const fetchSig = useAny ? AbortSignal.any([timeoutAc.signal, ext]) : timeoutAc.signal;
-    let extToTimeout = null;
-    if (!useAny && ext) {
-      extToTimeout = () => {
-        clearTid();
-        if (!timeoutAc.signal.aborted) timeoutAc.abort();
-      };
-      if (ext.aborted) extToTimeout();
-      else ext.addEventListener("abort", extToTimeout, { once: true });
-    }
+    if (limit <= 0) return fetch(url, baseInit);
+    const ac = new AbortController();
+    const tid = setTimeout(() => ac.abort(), limit);
     try {
-      if (timeoutAc.signal.aborted) {
-        throw new DOMException("Aborted", "AbortError");
-      }
-      return await fetch(url, Object.assign({}, rest, { signal: fetchSig }));
+      return await fetch(url, Object.assign({}, baseInit, { signal: ac.signal }));
     } catch (e) {
       if (e && e.name === "AbortError") {
-        if (ext && ext.aborted) {
-          throw e;
-        }
         throw new Error(
           `Request timed out after ${limit} ms — API slow or unreachable. Check browser Network tab, ` +
             "Nginx `proxy_connect_timeout` / `proxy_read_timeout`, and upstream service.",
@@ -536,14 +497,7 @@
       }
       throw e;
     } finally {
-      clearTid();
-      if (ext && extToTimeout) {
-        try {
-          ext.removeEventListener("abort", extToTimeout);
-        } catch {
-          /* noop */
-        }
-      }
+      clearTimeout(tid);
     }
   }
   function _sleep(ms) {
@@ -1396,28 +1350,22 @@
   }
 
   async function loadHealth() {
-    if (healthIsFetching) return;
-    healthIsFetching = true;
     try {
-      try {
-        // Public endpoint — do not use api() (no Authorization) so bad/expired JWT
-        // never affects probes and we never trip the global 401 handler here.
-        const r = await fetchWithDeadline(apiBase() + "/health", { method: "GET" }, 12000);
-        if (!r.ok) throw new Error(String(r.status));
-        const h = await r.json();
-        state.mqttConnected = !!h.mqtt_connected;
-        state.health = h;
-        state.healthFetchedAt = Date.now();
-      } catch {
-        state.mqttConnected = false;
-        state.health = null;
-      }
-      renderMqttDot();
-      renderHealthPills();
-      armHealthPoll();
-    } finally {
-      healthIsFetching = false;
+      // Public endpoint — do not use api() (no Authorization) so bad/expired JWT
+      // never affects probes and we never trip the global 401 handler here.
+      const r = await fetchWithDeadline(apiBase() + "/health", { method: "GET" }, 12000);
+      if (!r.ok) throw new Error(String(r.status));
+      const h = await r.json();
+      state.mqttConnected = !!h.mqtt_connected;
+      state.health = h;
+      state.healthFetchedAt = Date.now();
+    } catch {
+      state.mqttConnected = false;
+      state.health = null;
     }
+    renderMqttDot();
+    renderHealthPills();
+    armHealthPoll();
   }
 
   // ------------------------------------------------------------------ layout
@@ -1506,105 +1454,6 @@
       }
     }
     setHtmlIfChanged(nav, `<div class="nav-core">${coreParts.join("")}</div>`);
-    try { renderMobileNav(); } catch (_) { /* mobile nav is best-effort */ }
-  }
-
-  /* Mobile hybrid nav. Under 1024px the sidebar is hidden and this tab bar +
-     "More" drawer drive navigation. Populated from the same NAV_GROUPS as the
-     desktop sidebar so role gating and the active-item contract stay in sync. */
-  function renderMobileNav() {
-    const tabbar = $("#mobileTabbar");
-    const drawerGrid = $("#mobileDrawerGrid");
-    if (!tabbar && !drawerGrid) return;
-    if (!state.me) {
-      if (tabbar) setHtmlIfChanged(tabbar, "");
-      if (drawerGrid) setHtmlIfChanged(drawerGrid, "");
-      try { toggleMobileDrawer(false); } catch (_) {}
-      return;
-    }
-    const hash = location.hash || "#/overview";
-    const hashNoQuery = hash.split("?")[0];
-    const all = [];
-    for (const g of NAV_GROUPS) {
-      for (const n of g.items) {
-        if (!hasRole(n.min)) continue;
-        all.push(n);
-      }
-    }
-    /* Pinned primary tabs — order matters. Falls through if user lacks role. */
-    const preferred = ["overview", "devices", "alerts"];
-    const primary = [];
-    for (const id of preferred) {
-      const n = all.find((x) => x.id === id);
-      if (n) primary.push(n);
-    }
-    const primaryIds = new Set(primary.map((n) => n.id));
-    const overflow = all.filter((n) => !primaryIds.has(n.id));
-    const isActive = (n) => (n.path === "#/devices"
-      ? hashNoQuery === "#/devices"
-      : n.path === "#/site"
-        ? hashNoQuery === "#/site"
-        : hash.startsWith(n.path));
-    const tabItem = (n) => {
-      const active = isActive(n) ? ' aria-current="page"' : "";
-      return `<a href="${n.path}"${active} aria-label="${escapeHtml(n.label)}"><span class="tabbar-ico" aria-hidden="true">${n.ico}</span><span>${escapeHtml(n.label)}</span></a>`;
-    };
-    const moreActive = overflow.some(isActive) ? ' aria-current="page"' : "";
-    if (tabbar) {
-      setHtmlIfChanged(tabbar,
-        primary.map(tabItem).join("") +
-        `<a href="javascript:void(0)" class="tabbar-more" id="tabbarMore"${moreActive} aria-label="More" aria-haspopup="dialog"><span class="tabbar-ico" aria-hidden="true">⋯</span><span>More</span></a>`,
-      );
-      const mb = $("#tabbarMore");
-      if (mb && !mb.__wired) {
-        mb.__wired = true;
-        mb.addEventListener("click", (ev) => {
-          ev.preventDefault();
-          ev.stopPropagation();
-          toggleMobileDrawer();
-        });
-      }
-    }
-    if (drawerGrid) {
-      const drawerItem = (n) => {
-        const active = isActive(n) ? ' aria-current="page"' : "";
-        return `<a href="${n.path}"${active} data-drawer-item="1"><span class="tabbar-ico" aria-hidden="true">${n.ico}</span><span>${escapeHtml(n.label)}</span></a>`;
-      };
-      setHtmlIfChanged(drawerGrid, overflow.map(drawerItem).join(""));
-    }
-  }
-
-  let _drawerOutsideHandler = null;
-  function toggleMobileDrawer(force) {
-    const drawer = $("#mobileDrawer");
-    if (!drawer) return;
-    const isOpen = drawer.getAttribute("data-open") === "1";
-    const next = typeof force === "boolean" ? force : !isOpen;
-    if (next) {
-      drawer.hidden = false;
-      /* requestAnimationFrame so the element paints first; without it the
-         translateY transition doesn't play. */
-      requestAnimationFrame(() => drawer.setAttribute("data-open", "1"));
-      if (!_drawerOutsideHandler) {
-        _drawerOutsideHandler = (ev) => {
-          const t = ev.target;
-          if (!drawer.contains(t) && !t.closest("#tabbarMore")) {
-            toggleMobileDrawer(false);
-          }
-        };
-        /* Schedule next tick so the opening click doesn't trigger close. */
-        setTimeout(() => document.addEventListener("click", _drawerOutsideHandler, true), 0);
-      }
-    } else {
-      drawer.removeAttribute("data-open");
-      setTimeout(() => {
-        if (drawer.getAttribute("data-open") !== "1") drawer.hidden = true;
-      }, 260);
-      if (_drawerOutsideHandler) {
-        document.removeEventListener("click", _drawerOutsideHandler, true);
-        _drawerOutsideHandler = null;
-      }
-    }
   }
 
   function renderHealthPills() {
@@ -1671,21 +1520,7 @@
           : `SQLite reachable (${dbLat}ms).`)
         : `SQLite probe failed${db.error ? `: ${db.error}` : ""}. Admin routes will degrade — check disk/host.`;
     }
-    /* Stream pill: "LIVE" if browser socket is healthy, "…" while reconnecting.
-       Sits to the left of MQTT because this one is about THIS tab's WebSocket/SSE,
-       whereas MQTT is API→broker ingest. The title disambiguates. */
-    const sh = window.__streamHealth || {};
-    const streamOk = !!sh.healthy;
-    const streamTransport = String(sh.transport || "").toUpperCase();
-    const streamAge = sh.lastEventMs ? Math.max(0, Math.round((Date.now() - sh.lastEventMs) / 1000)) : null;
-    const streamPillClass = streamOk ? "ok stream live" : "off stream";
-    const streamLabel = streamOk ? "LIVE" : "…";
-    const streamTitle = streamOk
-      ? `Live event stream connected via ${streamTransport || "?"}${streamAge != null ? ` — last event ${streamAge}s ago` : ""}`
-      : "Live stream not connected — dashboard is polling /health + /dashboard/overview as a fallback";
-
     setHtmlIfChanged(el, `
-      <span class="health-pill ${streamPillClass}" title="${escapeHtml(streamTitle)}">${streamLabel}</span>
       <span class="health-pill ${mqConn ? (mqDrop > 0 ? "warn" : "ok") : "off"}" title="${escapeHtml(mqttTitle)}">MQTT</span>
       <span class="health-pill ${dbPillClass}" title="${escapeHtml(dbTitle)}">DB</span>
       <span class="health-pill ${mailPillClass}" title="${escapeHtml(mailTitle)}">MAIL</span>
@@ -1722,7 +1557,7 @@
   }
 
   function applySidebarRail() {
-    const m = window.matchMedia && window.matchMedia("(min-width: 1024px)");
+    const m = window.matchMedia && window.matchMedia("(min-width: 901px)");
     if (!m || !m.matches) {
       try { document.body.removeAttribute("data-sidebar"); } catch (_) {}
     } else {
@@ -1747,7 +1582,7 @@
   }
 
   function toggleSidebarRail() {
-    if (!window.matchMedia("(min-width: 1024px)").matches) return;
+    if (!window.matchMedia("(min-width: 901px)").matches) return;
     const cur = localStorage.getItem(LS.sidebarCollapsed) === "1";
     try { localStorage.setItem(LS.sidebarCollapsed, cur ? "0" : "1"); } catch (_) {}
     applySidebarRail();
@@ -1756,9 +1591,8 @@
   /** Collapse drawer when viewport is desktop width (e.g. rotate phone / resize). */
   function syncNavForViewport() {
     try {
-      if (window.matchMedia && window.matchMedia("(min-width: 1024px)").matches) {
+      if (window.matchMedia && window.matchMedia("(min-width: 901px)").matches) {
         document.body.dataset.nav = "";
-        try { toggleMobileDrawer(false); } catch (_) {}
       }
     } catch (_) {}
     try { applySidebarRail(); } catch (_) {}
@@ -1967,7 +1801,6 @@
     }
     window.__eventsStreamResume = null;
     toggleNav(false);
-    try { toggleMobileDrawer(false); } catch (_) {}
     if (window.__evSSE) { try { window.__evSSE.close(); } catch {} window.__evSSE = null; }
 
     const publicRoutes = new Set(["login", "register", "account-activate", "forgot-password"]);
@@ -2025,8 +1858,6 @@
       if (!s) return "Request failed. Please try again.";
       const l = s.toLowerCase();
       if (l.includes("401")) return "Username or password is incorrect.";
-      if (l.includes("404") || s.startsWith("404"))
-        return "Not found: API path mismatch. Set meta croc-api-base to \"\" for API at the site root (e.g. :18999) or to \"/api\" when Traefik strips that prefix. Redeploy the dashboard file after changing.";
       if (l.includes("invalid credentials")) return "Username or password is incorrect.";
       if (l.includes("too many login attempts")) return s; /* 429: server already has seconds */
       if (l.includes("session expired")) return "Session expired. Please sign in again.";
@@ -2034,7 +1865,7 @@
       return s.replace(/^error:\s*/i, "");
     };
     mountView(view, `
-      <div class="auth-surface auth-surface--with-aside" role="main">
+      <div class="auth-surface" role="main">
         ${authAsideHtml("login")}
         <div class="auth-surface__body">
           <div class="auth-surface__inner">
@@ -2113,7 +1944,7 @@
       enabled = !!j.enabled;
     } catch { enabled = false; }
     mountView(view, `
-      <div class="auth-surface auth-surface--with-aside" role="main">
+      <div class="auth-surface" role="main">
         ${authAsideHtml("recovery")}
         <div class="auth-surface__body">
           <div class="auth-surface__inner auth-surface__inner--wide">
@@ -2300,7 +2131,7 @@
       return s.replace(/^error:\s*/i, "");
     };
     mountView(view, `
-      <div class="auth-surface auth-surface--with-aside" role="main">
+      <div class="auth-surface" role="main">
         ${authAsideHtml("register")}
         <div class="auth-surface__body">
           <div class="auth-surface__inner">
@@ -2407,7 +2238,7 @@
     setCrumb("Activate account");
     document.body.dataset.auth = "none";
     mountView(view, `
-      <div class="auth-surface auth-surface--with-aside" role="main">
+      <div class="auth-surface" role="main">
         ${authAsideHtml("activate")}
         <div class="auth-surface__body">
           <div class="auth-surface__inner">
@@ -4328,9 +4159,6 @@
           `<span class="badge ${on ? "online" : "offline"}">${on ? "online" : "offline"}</span>` +
           (d.zone ? `<span class="chip device-zone-chip">${escapeHtml(d.zone)}</span>` : "") +
           (d.is_shared ? `<span class="badge accent" title="shared device">shared</span>` : "") +
-          (Number(d.pending_cmds) > 0
-            ? `<span class="chip pending-cmds" title="Server-side commands queued for this device (MQTT replay or HTTP backup pull)">${Number(d.pending_cmds)} pending</span>`
-            : "") +
           `</div>` +
           `${fwBlock}` +
           `</div>` +
@@ -4786,23 +4614,18 @@
         </div>
       </details>
 
-      <details class="card danger-zone danger-zone--compact device-drawer" id="dangerUnbind">
+      <details class="card danger-zone danger-zone--compact device-drawer">
         <summary class="device-drawer__summary">
           <span class="device-drawer__title">Danger zone</span>
-          <span class="device-drawer__hint muted">Unbind, NVS, factory row</span>
+          <span class="device-drawer__hint muted">Unbind &amp; reset</span>
         </summary>
         <div class="device-drawer__body danger-zone-body">
-          <p class="muted danger-zone-compact-lead">Permanently removes this device from the <strong>server</strong> (credentials, state, command queue) and, when the broker can publish, orders the board to run <span class="mono">unclaim_reset</span> so it can listen again on a <strong>fresh</strong> claim. Each attempt sends a <strong>new</strong> MQTT message (retries are not de-duplicated).</p>
-          <ul class="danger-zone-note">
-            <li>若设备曾离线，可能未收到清 NVS；上电联网后如仍连旧云，在 Activate 重绑或再执行一次本操作。</li>
-            <li>Factory registry / 出厂表：有 MAC/序列时同步标为可登记（与 <span class="mono">factory-unregister</span> 等效的数据效果）。</li>
-            ${state.me && state.me.role === "superadmin" ? `<li><strong>Superadmin</strong>：跨租户解绑时同样会下发 <span class="mono">unclaim_reset</span> 并清服务端记录；无需第二条按钮。</li>` : ""}
-          </ul>
+          <p class="muted danger-zone-compact-lead">Removes this device from your tenant and sends <span class="mono">unclaim_reset</span> when online. Re-add from Activate.</p>
           <div class="danger-zone-single-action">
             <button class="btn danger sm danger-zone-unbind-btn" type="button" id="deleteReset" ${can("can_send_command") && !d.is_shared && canOperateThisDevice ? "" : "disabled"} title="${(() => {
               if (!canOperateThisDevice) return "Operate access required";
               if (!can("can_send_command")) return "can_send_command required";
-              if (d.is_shared) return "Not available on shared devices (owner / superadmin only)";
+              if (d.is_shared) return "Not available on shared devices";
               return "";
             })()}">Unbind &amp; reset</button>
           </div>
@@ -4972,7 +4795,7 @@
           const sentNv = dr && (dr.nvs_purge_sent === true);
           const ackNv = dr && (dr.nvs_purge_acked === true);
           toast(
-            `Device removed from account.${ackNv ? " Board confirmed unclaim_reset (NVS/claim cleared; rebooting)." : (sentNv ? " A fresh MQTT unclaim was sent; device ack not confirmed in time (retry unbind or power‑cycle the board)." : " MQTT to broker failed — server data removed; re‑provisioning may need device power‑cycle before Activate.")} Re-add from Activate if needed.`,
+            `Device removed from account.${ackNv ? " Device confirmed unclaim_reset (WiFi+claim cleared, rebooting)." : (sentNv ? " Command was dispatched but device ack not confirmed before unlink." : " Command dispatch failed/offline.")} Re-add from Activate.`,
             ackNv ? "ok" : "err",
           );
           location.hash = "#/devices";
@@ -5973,13 +5796,9 @@
         const ws = new WebSocket(wsUrl);
         window.__evWS = ws;
         let wsOpened = false;
-        // Handshake must complete before the browser fires `onopen`. Slow TLS/proxies
-        // or a cold API can exceed a few seconds; a short timer + ws.close() while still
-        // CONNECTING produces Chrome's "closed before the connection is established".
-        const WS_HANDSHAKE_WAIT_MS = 20000;
         const wsTimer = setTimeout(() => {
           try { ws.close(); } catch (_) {}
-        }, WS_HANDSHAKE_WAIT_MS);
+        }, 4800);
         const shimWs = {
           readyState: EventSource.CONNECTING,
           close() {
@@ -6037,9 +5856,6 @@
             try { window.__streamBus && window.__streamBus.emit(j); } catch (_) {}
           }
         };
-        ws.onerror = () => {
-          clearTimeout(wsTimer);
-        };
         ws.onclose = () => {
           clearTimeout(wsTimer);
           if (evStallTimer) {
@@ -6065,6 +5881,7 @@
             scheduleReconnect();
           }
         };
+        ws.onerror = () => {};
         return;
       }
 
@@ -7356,24 +7173,6 @@
     const refreshBtn = document.getElementById("refreshBtn");
     if (refreshBtn) refreshBtn.addEventListener("click", () => renderRoute());
 
-    /* Mobile drawer: close on item click (after navigation), Esc, or drag-dismiss. */
-    const mobileDrawer = document.getElementById("mobileDrawer");
-    if (mobileDrawer) {
-      mobileDrawer.addEventListener("click", (ev) => {
-        const link = ev.target.closest("a[data-drawer-item]");
-        if (link) setTimeout(() => toggleMobileDrawer(false), 20);
-      });
-    }
-    document.addEventListener("keydown", (ev) => {
-      if (ev.key === "Escape") {
-        try { toggleMobileDrawer(false); } catch (_) {}
-        /* If the slide-in sidebar is open on mobile, close it too. */
-        try {
-          if (document.body.dataset.nav === "open") toggleNav(false);
-        } catch (_) {}
-      }
-    });
-
     document.addEventListener("click", (ev) => {
       const b = ev.target.closest(".btn-tap");
       if (!b || b.disabled) return;
@@ -7411,14 +7210,6 @@
       }
     }
     await loadHealth().catch(() => {});
-    /* SPA has no unmount: clear the interval on real navigation/close; restore on bfcache. */
-    window.addEventListener("pagehide", () => {
-      try { clearHealthPollTimer(); } catch (_) {}
-    });
-    window.addEventListener("pageshow", (ev) => {
-      if (!state.me) return;
-      if (ev && ev.persisted) void loadHealth().catch(() => {});
-    });
     window.addEventListener("online", () => {
       loadHealth().catch(() => {});
       tickHealthIfVisible();
