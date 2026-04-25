@@ -68,6 +68,7 @@ LOG_FILE_PATH: str = os.getenv("LOG_FILE_PATH", "/data/api.log")
 # --- Provisioning / scheduler ----------------------------------------------
 PROVISION_USE_SHARED_MQTT_CREDS: bool = os.getenv("PROVISION_USE_SHARED_MQTT_CREDS", "1") == "1"
 SCHEDULER_POLL_SECONDS: float = float(os.getenv("SCHEDULER_POLL_SECONDS", "1.0"))
+SLOW_REQUEST_LOG_MS: int = int(os.getenv("SLOW_REQUEST_LOG_MS", "0"))
 CLAIM_RESPONSE_INCLUDE_SECRETS: bool = os.getenv("CLAIM_RESPONSE_INCLUDE_SECRETS", "0") == "1"
 MAX_BULK_TARGETS: int = int(os.getenv("MAX_BULK_TARGETS", "500"))
 MESSAGE_RETENTION_DAYS: int = int(os.getenv("MESSAGE_RETENTION_DAYS", "14"))
@@ -398,6 +399,7 @@ __all__ = [
     "SCHEDULER_POLL_SECONDS",
     "SIGNUP_RATE_MAX",
     "SIGNUP_RATE_WINDOW_SECONDS",
+    "SLOW_REQUEST_LOG_MS",
     "SMS_PROVIDER",
     "SSE_ALLOW_QUERY_TOKEN",
     "STRICT_STARTUP_ENV_CHECK",

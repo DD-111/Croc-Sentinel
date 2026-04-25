@@ -272,8 +272,8 @@ def zone_sql_suffix(principal: Principal, column: str = "zone") -> tuple[str, li
 # helpers so the in-module call sites (emit_event() ->
 # _redis_event_forward, lifespan startup -> _start_event_redis_bridge,
 # lifespan shutdown -> _stop_event_redis_bridge) keep working.
-# EVENT_WS_ENABLED moved to config.py and re-imported via `from config import *` above.
-SLOW_REQUEST_LOG_MS = int(os.getenv("SLOW_REQUEST_LOG_MS", "0"))
+# EVENT_WS_ENABLED and SLOW_REQUEST_LOG_MS live in config.py and are
+# pulled in via the ``from config import *`` block above.
 from redis_bridge import (  # noqa: E402,F401  (re-exports for legacy callers)
     BUS_INSTANCE_ID,
     EVENT_BUS_REDIS_CHANNEL,
@@ -747,24 +747,17 @@ app = FastAPI(title="Croc Sentinel API", version="1.1.0", lifespan=_app_lifespan
 app.add_middleware(GZipMiddleware, minimum_size=700)
 
 
+# Phase-58 modularization: the security-headers and slow-request-log
+# middleware bodies moved to middleware.py. The @app.middleware("http")
+# decorators stay here so the registration order (security -> csrf ->
+# readiness -> slow-log) is preserved on the live FastAPI instance.
+from middleware import _security_headers_impl, _slow_request_log_impl  # noqa: E402,F401
+
+
 @app.middleware("http")
 async def _security_headers_middleware(request: Request, call_next):
     """Baseline hardening for dashboard + API responses (CSP allows Google Fonts used by index.html)."""
-    resp = await call_next(request)
-    resp.headers.setdefault("X-Frame-Options", "DENY")
-    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
-    resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
-    resp.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-    resp.headers.setdefault(
-        "Content-Security-Policy",
-        "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; "
-        "img-src 'self' data: https:; "
-        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-        "font-src 'self' https://fonts.gstatic.com; "
-        "script-src 'self' 'unsafe-inline'; "
-        "connect-src 'self'",
-    )
-    return resp
+    return await _security_headers_impl(request, call_next)
 
 
 # ----------------------------------------------------------------- CSRF guard
@@ -810,14 +803,7 @@ async def _readiness_guard(request: Request, call_next):
 
 @app.middleware("http")
 async def _slow_request_log_middleware(request: Request, call_next):
-    if SLOW_REQUEST_LOG_MS <= 0:
-        return await call_next(request)
-    t0 = time.perf_counter()
-    resp = await call_next(request)
-    dt_ms = (time.perf_counter() - t0) * 1000
-    if dt_ms >= float(SLOW_REQUEST_LOG_MS):
-        logger.warning("slow HTTP %s %s %.0fms", request.method, request.url.path, dt_ms)
-    return resp
+    return await _slow_request_log_impl(request, call_next)
 
 
 # Phase-33 modularization: the six tiny SPA-mount redirect routes
