@@ -29,6 +29,7 @@ import pytest
 
 API_DIR = Path(__file__).resolve().parent.parent
 APP_PY = API_DIR / "app.py"
+ROUTERS_DIR = API_DIR / "routers"
 SPA_SRC = API_DIR / "dashboard" / "src" / "console.raw.js"
 
 
@@ -45,6 +46,27 @@ ALLOWED_OUT_OF_BAND: frozenset[str] = frozenset(
 @pytest.fixture(scope="module")
 def app_tree() -> ast.Module:
     return ast.parse(APP_PY.read_text(encoding="utf-8"), filename=str(APP_PY))
+
+
+@pytest.fixture(scope="module")
+def router_trees() -> list[ast.Module]:
+    """Parse every routers/*.py — Phase-7+ extracted ~21 routers out of app.py.
+
+    The SPA contract is "every SPA call hits SOME real backend route", and
+    routes carrying ``@router.<verb>("...")`` decorators in routers/*.py are
+    just as much "real backend routes" as ``@app.<verb>("...")`` ones in
+    app.py — the include_router(...) call wires them onto the same FastAPI
+    surface. Without parsing them, this test would false-positive every
+    time a route gets modularized out of app.py.
+    """
+    out: list[ast.Module] = []
+    if not ROUTERS_DIR.is_dir():
+        return out
+    for py in sorted(ROUTERS_DIR.glob("*.py")):
+        if py.name == "__init__.py":
+            continue
+        out.append(ast.parse(py.read_text(encoding="utf-8"), filename=str(py)))
+    return out
 
 
 @pytest.fixture(scope="module")
@@ -149,9 +171,11 @@ def _spa_calls(src: str) -> set[tuple[str, str]]:
 # Tests
 # --------------------------------------------------------------------------- #
 def test_every_spa_call_hits_a_real_backend_route(
-    app_tree: ast.Module, spa_source: str
+    app_tree: ast.Module, router_trees: list[ast.Module], spa_source: str
 ) -> None:
     routes = _backend_routes(app_tree)
+    for tree in router_trees:
+        routes |= _backend_routes(tree)
     calls = _spa_calls(spa_source)
 
     missing: list[str] = []
