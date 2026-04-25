@@ -171,16 +171,12 @@ logging.basicConfig(
 logger = logging.getLogger("croc-api")
 
 
-def _parse_chat_ids(raw: str) -> set[str]:
-    out: set[str] = set()
-    for part in re.split(r"[\s,;]+", (raw or "").strip()):
-        p = part.strip().strip('"').strip("'")
-        if p:
-            out.add(p)
-    return out
-
-
-TELEGRAM_COMMAND_CHAT_IDS = _parse_chat_ids(TELEGRAM_COMMAND_CHAT_IDS_RAW)
+# Phase-57 modularization: _parse_chat_ids and the
+# TELEGRAM_COMMAND_CHAT_IDS env-derived allowlist moved to
+# superadmin_cache.py alongside the superadmin recogniser + chat
+# fan-out cache. Re-exported below the bootstrap block so legacy
+# `app.TELEGRAM_COMMAND_CHAT_IDS` / `_app._parse_chat_ids` callers
+# keep resolving.
 
 
 def contains_insecure_marker(value: str) -> bool:
@@ -291,83 +287,25 @@ from redis_bridge import (  # noqa: E402,F401  (re-exports for legacy callers)
     _stop_event_redis_bridge,
 )
 
-_superadmin_cache: set[str] = set()
-_superadmin_cache_ts = 0.0
-
-# Cached list of Telegram chat_ids bound to a superadmin dashboard user. Used
-# to fan EVERY event out to superadmin Telegram (filters on env chats still
-# apply normally — see telegram_notify.maybe_enqueue). Cached briefly so we
-# don't hit sqlite once per event on a hot emit_event path.
-_superadmin_tg_chats_cache: list[str] = []
-_superadmin_tg_chats_ts: float = 0.0
-_superadmin_tg_chats_ttl_s: float = 20.0
-
-
-def _is_superadmin_username(username: str) -> bool:
-    u = str(username or "").strip()
-    if not u:
-        return False
-    global _superadmin_cache_ts, _superadmin_cache
-    now = time.time()
-    if (now - _superadmin_cache_ts) > 20.0:
-        if not _db_rw.try_acquire_read():
-            # Avoid lock inversion on hot paths; conservative fallback still hides default superadmin names.
-            return u.lower().startswith("superadmin")
-        try:
-            conn = get_conn()
-            cur = conn.cursor()
-            cur.execute("SELECT username FROM dashboard_users WHERE role = 'superadmin'")
-            _superadmin_cache = {str(r["username"]) for r in cur.fetchall() if r["username"]}
-            conn.close()
-        finally:
-            _db_rw.release_read()
-        _superadmin_cache_ts = now
-    return u in _superadmin_cache
-
-
-def _superadmin_telegram_chat_ids() -> list[str]:
-    """All enabled Telegram chat_ids bound to a superadmin dashboard user.
-
-    Returns an empty list on any DB/config error; callers treat it as
-    "no extras" which is safe. Result is cached for ~20s to avoid hitting
-    sqlite on every emit_event.
-    """
-    global _superadmin_tg_chats_cache, _superadmin_tg_chats_ts
-    now = time.time()
-    if _superadmin_tg_chats_cache and (now - _superadmin_tg_chats_ts) < _superadmin_tg_chats_ttl_s:
-        return list(_superadmin_tg_chats_cache)
-    # Best-effort non-blocking lock to avoid starving the emit_event hot path.
-    if not _db_rw.try_acquire_read():
-        return list(_superadmin_tg_chats_cache)
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT b.chat_id
-            FROM telegram_chat_bindings b
-            JOIN dashboard_users u ON u.username = b.username
-            WHERE b.enabled = 1 AND u.role = 'superadmin'
-            """
-        )
-        chats = [str(r["chat_id"]) for r in cur.fetchall() if r["chat_id"]]
-        conn.close()
-    except Exception as exc:
-        logger.warning("superadmin telegram chat lookup failed: %s", exc)
-        chats = list(_superadmin_tg_chats_cache)
-    finally:
-        _db_rw.release_read()
-    _superadmin_tg_chats_cache = chats
-    _superadmin_tg_chats_ts = now
-    return list(chats)
-
-
-def _invalidate_superadmin_telegram_chats_cache() -> None:
-    """Reset the cached superadmin->chat mapping so the next emit_event
-    picks up a fresh bind/unbind/toggle immediately instead of after TTL."""
-    global _superadmin_tg_chats_cache, _superadmin_tg_chats_ts
-    _superadmin_tg_chats_cache = []
-    _superadmin_tg_chats_ts = 0.0
+# Phase-57 modularization: _is_superadmin_username,
+# _superadmin_telegram_chat_ids, _invalidate_superadmin_telegram_chats_cache,
+# their state vars, _parse_chat_ids, and the TELEGRAM_COMMAND_CHAT_IDS
+# allow-list all live in superadmin_cache.py now. Re-exported here so
+# every late-binder via `_app.<name>` (event_bus, tenant_admin,
+# routers/telegram, routers/superadmin) keeps resolving to the same
+# callable identity.
+from superadmin_cache import (  # noqa: E402,F401
+    TELEGRAM_COMMAND_CHAT_IDS,
+    _invalidate_superadmin_telegram_chats_cache,
+    _is_superadmin_username,
+    _parse_chat_ids,
+    _superadmin_cache,
+    _superadmin_cache_ts,
+    _superadmin_telegram_chat_ids,
+    _superadmin_tg_chats_cache,
+    _superadmin_tg_chats_ts,
+    _superadmin_tg_chats_ttl_s,
+)
 
 
 # Phase-55 modularization: emit_event + event_bus singleton + visibility

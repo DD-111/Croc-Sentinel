@@ -23,16 +23,15 @@ Wiring
 ------
 * Ring + queue sizes are read from ``config`` (``EVENT_RING_SIZE``,
   ``EVENT_MAX_SUBSCRIBERS``, ``EVENT_SUB_QUEUE_SIZE``).
-* Late-binds via ``import app as _app`` for two helpers that still
-  live in ``app.py`` (the superadmin recogniser and the cached
-  superadmin telegram chat list); both are call-time only so the
-  load order is fine.
-* Direct imports for the per-module helpers we already extracted:
+* Direct imports for every helper this module needs:
   ``db.{db_lock,get_conn}``, ``tz_display.iso_timestamp_to_malaysia``,
   ``trigger_policy._notify_subject_prefix``,
   ``redis_bridge._redis_event_forward``,
   ``fcm_dispatch._maybe_dispatch_fcm_for_ev``,
-  ``authz.get_manager_admin``, ``security.Principal``.
+  ``authz.get_manager_admin``, ``security.Principal``,
+  ``superadmin_cache.{_is_superadmin_username,_superadmin_telegram_chat_ids}``.
+  Phase 57 dropped the last two ``_app.*`` late-binders this module
+  used to need — it's now fully import-acyclic with ``app.py``.
 * ``app.py`` re-exports every public symbol back so existing
   ``from app import emit_event`` / ``from app import event_bus``
   call sites in routers and helpers keep working unchanged.
@@ -61,10 +60,9 @@ from db import db_lock, get_conn
 from fcm_dispatch import _maybe_dispatch_fcm_for_ev
 from redis_bridge import _redis_event_forward
 from security import Principal
+from superadmin_cache import _is_superadmin_username, _superadmin_telegram_chat_ids
 from trigger_policy import _notify_subject_prefix
 from tz_display import iso_timestamp_to_malaysia
-
-import app as _app
 
 __all__ = (
     "_VALID_LEVELS",
@@ -168,7 +166,7 @@ def _event_visible(principal: Principal, ev: dict[str, Any]) -> bool:
     owner = str(ev.get("owner_admin") or "")
     actor = str(ev.get("actor") or "")
     target = str(ev.get("target") or "")
-    if _app._is_superadmin_username(actor):
+    if _is_superadmin_username(actor):
         return False
     if principal.role == "admin":
         if owner == principal.username:
@@ -299,7 +297,7 @@ def emit_event(
         "ref_table": ref_table,
         "ref_id": ref_id,
     }
-    ev["_actor_superadmin"] = _app._is_superadmin_username(str(ev.get("actor") or ""))
+    ev["_actor_superadmin"] = _is_superadmin_username(str(ev.get("actor") or ""))
     rid = _insert_event_row(ev)
     ev["id"] = rid
     event_bus.publish(ev)
@@ -310,7 +308,7 @@ def emit_event(
         # Superadmin bindings get the firehose; env TELEGRAM_CHAT_IDS stays
         # filtered as before (signal hygiene for operators).
         try:
-            sa_chats = _app._superadmin_telegram_chat_ids()
+            sa_chats = _superadmin_telegram_chat_ids()
         except Exception:
             sa_chats = []
         maybe_notify_telegram(ev, extra_chat_ids=sa_chats)
