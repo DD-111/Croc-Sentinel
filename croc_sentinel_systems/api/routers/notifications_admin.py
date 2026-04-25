@@ -1,22 +1,36 @@
-"""Notification-channel admin routes (Phase-11 modularization extract from ``app.py``).
+"""Notification-recipient admin routes (Phase-11, trimmed Phase-85).
 
-Ten admin endpoints covering the four outbound channels (email, SMTP,
-Telegram, FCM):
+Surface evolution:
+  Phase 11 — original module: 10 admin routes covering recipient
+              CRUD + 4-channel diagnostics (SMTP/Telegram/FCM)
+              under ``/admin/*``.
+  Phase 85 — extracted the 6 channel-diagnostic routes (SMTP/
+              Telegram/FCM status + test + webhook-info) and
+              their 2 schemas into
+              ``routers/notifications_admin_diagnostics.py``,
+              leaving recipient CRUD here.
 
-  * ``GET    /admin/alert-recipients``        — list per-tenant recipients
-  * ``POST   /admin/alert-recipients``        — add a recipient
-  * ``PATCH  /admin/alert-recipients/{rid}``  — toggle / rename
-  * ``DELETE /admin/alert-recipients/{rid}``  — remove
-  * ``GET    /admin/smtp/status``             — notifier health
-  * ``POST   /admin/smtp/test``               — send canary email
-  * ``GET    /admin/telegram/status``         — Telegram worker health
-  * ``GET    /admin/fcm/status``              — FCM worker health
-  * ``POST   /admin/telegram/test``           — send canary Telegram msg
-  * ``GET    /admin/telegram/webhook-info``   — Telegram getWebhookInfo
+Routes (still here)
+-------------------
+  * ``GET    /admin/alert-recipients``       — list per-tenant recipients.
+  * ``POST   /admin/alert-recipients``       — add a recipient.
+  * ``PATCH  /admin/alert-recipients/{rid}`` — toggle / rename.
+  * ``DELETE /admin/alert-recipients/{rid}`` — remove.
+
+Schemas owned here
+------------------
+  RecipientCreateRequest, RecipientUpdateRequest
+
+The 6 diagnostic routes (SMTP/Telegram/FCM status, test, and
+webhook-info) and their 2 schemas (``SmtpTestRequest``,
+``TelegramTestRequest``) live in
+``routers/notifications_admin_diagnostics.py``. Both routers share
+the ``"notifications-admin"`` OpenAPI tag so the docs group all 10
+endpoints together for end users.
 
 Drive-by: ``_admin_scope_for`` was defined alongside these routes in
 ``app.py`` but never called anywhere in the codebase. Dropped during
-this extract.
+the original Phase-11 extract.
 
 Late-bound dependencies on ``app.py``: ``require_principal`` only.
 The bcrypt-style trap with Depends(lambda: ...) is documented at length
@@ -36,11 +50,8 @@ from pydantic import BaseModel, Field
 import app as _app
 from audit import audit_event
 from db import db_lock, get_conn
-from email_templates import render_smtp_test_email
 from helpers import utc_now_iso
-from notifier import notifier
 from security import Principal, assert_min_role
-from tz_display import malaysia_now_iso
 
 require_principal = _app.require_principal
 get_manager_admin = _app.get_manager_admin
@@ -63,13 +74,10 @@ class RecipientUpdateRequest(BaseModel):
     label: Optional[str] = Field(default=None, max_length=80)
 
 
-class SmtpTestRequest(BaseModel):
-    to: str = Field(min_length=3, max_length=120)
-    subject: Optional[str] = Field(default=None, max_length=200)
-
-
-class TelegramTestRequest(BaseModel):
-    text: str = Field(default="Croc Sentinel Telegram test OK", max_length=3900)
+# Phase-85 split: ``SmtpTestRequest`` and ``TelegramTestRequest`` moved
+# to ``routers/notifications_admin_diagnostics.py`` along with the 6
+# channel-diagnostic routes (SMTP / Telegram / FCM status + test +
+# webhook-info). Both routers share the ``notifications-admin`` tag.
 
 
 # ──────────────────────────────────────────────────── alert recipients ────
@@ -203,110 +211,8 @@ def delete_recipient(rid: int, principal: Principal = Depends(require_principal)
     return {"ok": True}
 
 
-# ──────────────────────────────────────────────────────────────── smtp ────
-
-@router.get("/admin/smtp/status")
-def smtp_status(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_min_role(principal, "admin")
-    return notifier.status()
-
-
-@router.post("/admin/smtp/test")
-def smtp_test(req: SmtpTestRequest, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_min_role(principal, "admin")
-    if "@" not in req.to:
-        raise HTTPException(status_code=400, detail="invalid recipient")
-    subject, text, html_body = render_smtp_test_email(
-        actor_username=principal.username,
-        iso_ts=malaysia_now_iso(),
-        subject_override=req.subject,
-    )
-    try:
-        notifier.send_sync([req.to], subject, text, html_body)
-    except Exception as exc:
-        audit_event(principal.username, "smtp.test.fail", req.to, {"error": str(exc)})
-        raise HTTPException(status_code=502, detail=f"Mail channel error: {exc}")
-    audit_event(principal.username, "smtp.test.ok", req.to, {})
-    return {"ok": True, "status": notifier.status()}
-
-
-# ──────────────────────────────────────── telegram + fcm status/test ────
-
-@router.get("/admin/telegram/status")
-def telegram_admin_status(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_min_role(principal, "admin")
-    try:
-        from telegram_notify import telegram_status
-
-        return telegram_status()
-    except Exception as exc:
-        logging.getLogger(__name__).exception("telegram_admin_status import or call failed")
-        return {
-            "enabled": False,
-            "chats": 0,
-            "min_level": "info",
-            "queue_size": 0,
-            "worker_running": False,
-            "last_error": str(exc),
-            "last_send_ok": False,
-            "token_hint": "",
-            "status_module_error": True,
-        }
-
-
-@router.get("/admin/fcm/status")
-def fcm_admin_status(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_min_role(principal, "admin")
-    try:
-        from fcm_notify import fcm_status
-
-        return fcm_status()
-    except Exception as exc:
-        logging.getLogger(__name__).exception("fcm_admin_status import or call failed")
-        return {
-            "enabled": False,
-            "project_id": "",
-            "detail": str(exc),
-            "last_error": str(exc),
-            "queue_size": 0,
-            "worker_running": False,
-        }
-
-
-@router.post("/admin/telegram/test")
-def telegram_admin_test(
-    req: TelegramTestRequest,
-    principal: Principal = Depends(require_principal),
-) -> dict[str, Any]:
-    assert_min_role(principal, "admin")
-    try:
-        from telegram_notify import send_telegram_text_now, telegram_status
-    except ModuleNotFoundError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="telegram_notify module missing from deployment image (rebuild API with telegram_notify.py)",
-        ) from exc
-
-    ok, detail = send_telegram_text_now(req.text.strip())
-    if not ok:
-        audit_event(principal.username, "telegram.test.fail", "", {"error": detail})
-        raise HTTPException(status_code=502, detail=detail)
-    audit_event(principal.username, "telegram.test.ok", "", {"detail": detail})
-    return {"ok": True, "detail": detail, "telegram": telegram_status()}
-
-
-@router.get("/admin/telegram/webhook-info")
-def telegram_admin_webhook_info(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    """Shows Telegram getWebhookInfo (URL, last_error, pending updates) for debugging /start no-reply."""
-    assert_min_role(principal, "admin")
-    try:
-        from telegram_notify import telegram_get_webhook_info
-    except ModuleNotFoundError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="telegram_notify module missing from deployment image",
-        ) from exc
-    ok, err, info = telegram_get_webhook_info()
-    if not ok:
-        raise HTTPException(status_code=502, detail=err)
-    return {"ok": True, "webhook": info, "expected_path": "/integrations/telegram/webhook"}
+# Phase-85 split: the 6 channel-diagnostic routes (SMTP status + test,
+# Telegram status + test + webhook-info, FCM status) live in
+# ``routers/notifications_admin_diagnostics.py``. Both routers share
+# the ``notifications-admin`` tag so the OpenAPI doc still groups all
+# 10 endpoints together for end users.

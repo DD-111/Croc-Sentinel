@@ -257,10 +257,29 @@ def register_routers(app: FastAPI) -> None:
 
     app.include_router(_alarms_router)
 
-    # Phase-11: 10 admin notification-channel routes (SMTP/Telegram/FCM).
+    # Phase-11 / 85: 10 admin notification-channel routes split into
+    # two modules —
+    #   * routers.notifications_admin             — recipient CRUD
+    #                                               (4 routes:
+    #                                               GET/POST/PATCH/
+    #                                               DELETE on
+    #                                               /admin/alert-recipients).
+    #   * routers.notifications_admin_diagnostics — channel diagnostics
+    #                                               (6 routes: SMTP/
+    #                                               Telegram/FCM
+    #                                               status + test +
+    #                                               webhook-info).
+    # Both share the ``"notifications-admin"`` tag so the OpenAPI doc
+    # still groups all 10 endpoints together for end users. Order is
+    # irrelevant (no cross-module imports); register recipients first
+    # so the OpenAPI route list reads CRUD → diagnostics.
     from routers.notifications_admin import router as _notif_admin_router
+    from routers.notifications_admin_diagnostics import (
+        router as _notif_admin_diag_router,
+    )
 
     app.include_router(_notif_admin_router)
+    app.include_router(_notif_admin_diag_router)
 
     # Phase-12 / 67 / 78: Telegram surface split into three modules —
     #   * routers.telegram           — link-token + bind/unbind/list/toggle
