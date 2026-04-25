@@ -1,5 +1,5 @@
 """
-Static-analysis contract tests for api/app.py.
+Static-analysis contract tests for the api/ package.
 
 Goal: catch regressions of the bugs we already hit once, without booting the
 full FastAPI app (which would need DB / Redis / MQTT / JWT secrets).
@@ -12,7 +12,8 @@ Covered contracts
   tests/README.md).
 
 * `_RESERVED_PREFIXES` — must enumerate every top-level FastAPI router mount
-  so `DASHBOARD_PATH` can never shadow an API root.
+  so `DASHBOARD_PATH` can never shadow an API root. Lives in ``config.py``
+  since the Phase-2 modularization split.
 
 * `Principal` access — no `.get("role"/"sub"/"username"/"zones")` and no
   `["role"/"sub"/"username"/"zones"]` indexing on the result of
@@ -27,7 +28,9 @@ from pathlib import Path
 
 import pytest
 
-APP_PY = Path(__file__).resolve().parent.parent / "app.py"
+API_DIR = Path(__file__).resolve().parent.parent
+APP_PY = API_DIR / "app.py"
+CONFIG_PY = API_DIR / "config.py"
 
 
 # --------------------------------------------------------------------------- #
@@ -43,11 +46,20 @@ def app_tree(app_source: str) -> ast.Module:
     return ast.parse(app_source, filename=str(APP_PY))
 
 
+@pytest.fixture(scope="module")
+def config_tree() -> ast.Module:
+    return ast.parse(CONFIG_PY.read_text(encoding="utf-8"), filename=str(CONFIG_PY))
+
+
 # --------------------------------------------------------------------------- #
 # Extractors
 # --------------------------------------------------------------------------- #
-def _extract_tuple_of_str(tree: ast.Module, name: str) -> tuple[str, ...]:
-    """Find `NAME: ... = (...)` or `NAME = (...)` at module top level."""
+def _extract_tuple_of_str(tree: ast.Module, name: str) -> tuple[str, ...] | None:
+    """Find `NAME: ... = (...)` or `NAME = (...)` at module top level.
+
+    Returns ``None`` when the tuple is not present in this tree (so the caller
+    can fall back to scanning sibling modules).
+    """
     for node in tree.body:
         targets = []
         value = None
@@ -66,7 +78,25 @@ def _extract_tuple_of_str(tree: ast.Module, name: str) -> tuple[str, ...]:
                     if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
                         out.append(elt.value)
                 return tuple(out)
-    raise AssertionError(f"tuple `{name}` not found at module level in app.py")
+    return None
+
+
+def _require_tuple_of_str(*trees_and_names: tuple[ast.Module, str], symbol: str) -> tuple[str, ...]:
+    """Search several (tree, label) pairs and return the first tuple found.
+
+    Used because some constants (e.g. ``_RESERVED_PREFIXES``) moved from
+    ``app.py`` to ``config.py`` during modularization. Either location is
+    accepted, but at least one must hold the canonical definition.
+    """
+    seen_in: list[str] = []
+    for tree, label in trees_and_names:
+        seen_in.append(label)
+        result = _extract_tuple_of_str(tree, symbol)
+        if result is not None:
+            return result
+    raise AssertionError(
+        f"tuple `{symbol}` not found at module level in any of: {seen_in}"
+    )
 
 
 _DECORATOR_METHODS = {"get", "post", "put", "patch", "delete", "head", "options"}
@@ -111,7 +141,10 @@ _CSRF_STATIC_EXEMPT = frozenset(
 
 
 def test_csrf_exempt_prefixes_match_real_routes(app_tree: ast.Module) -> None:
-    exempt = _extract_tuple_of_str(app_tree, "_CSRF_EXEMPT_PREFIXES")
+    exempt = _require_tuple_of_str(
+        (app_tree, "app.py"),
+        symbol="_CSRF_EXEMPT_PREFIXES",
+    )
     assert exempt, "_CSRF_EXEMPT_PREFIXES must not be empty"
 
     routes = _route_paths(app_tree)
@@ -159,8 +192,20 @@ _EXPECTED_RESERVED = frozenset(
 )
 
 
-def test_reserved_prefixes_cover_known_mounts(app_tree: ast.Module) -> None:
-    reserved = set(_extract_tuple_of_str(app_tree, "_RESERVED_PREFIXES"))
+def test_reserved_prefixes_cover_known_mounts(
+    app_tree: ast.Module, config_tree: ast.Module
+) -> None:
+    # Phase-2 modularization moved _RESERVED_PREFIXES from app.py into
+    # config.py; we accept either location so the guard keeps working
+    # while individual call sites still spell `_RESERVED_PREFIXES` the
+    # same way.
+    reserved = set(
+        _require_tuple_of_str(
+            (config_tree, "config.py"),
+            (app_tree, "app.py"),
+            symbol="_RESERVED_PREFIXES",
+        )
+    )
     missing = _EXPECTED_RESERVED - reserved
     assert not missing, (
         "DASHBOARD_PATH guard (_RESERVED_PREFIXES) is missing known mounts: "

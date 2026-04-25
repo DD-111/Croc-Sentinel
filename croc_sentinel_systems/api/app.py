@@ -76,8 +76,16 @@ from db import (
     init_db_pragmas,
 )
 
-# Re-export for any third party that already does ``from app import ...``;
-# the names below are kept stable across the db.py extraction.
+# Env-derived configuration (Phase-2 modularization). ``from config import *``
+# re-binds every previously module-level constant under its original name so
+# every call site below is unchanged. Kept as a star-import on purpose:
+# config.py defines ``__all__`` to gate exposure, and listing 100+ names here
+# would just be noise that drifts from config.py.
+from config import *  # noqa: E402,F401,F403  (re-export for app.py call sites)
+
+# Stable re-export surface for any third party that already does
+# ``from app import ...`` — these names round-trip through db.py / config.py
+# but their identity is unchanged.
 __all_db_reexports__ = (
     "CACHE_TTL_SECONDS",
     "DB_PATH",
@@ -112,243 +120,11 @@ def _normalize_delete_confirm(raw: str) -> str:
     return re.sub(r"\s+", " ", s).strip().upper()
 
 
-MQTT_HOST = os.getenv("MQTT_HOST", "mosquitto")
-MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
-# Paho CONNECT keepalive (seconds). Higher values reduce control traffic and help some NATs;
-# must stay below broker / firewall idle cuts; typical 45–120.
-MQTT_KEEPALIVE = max(10, min(600, int(os.getenv("MQTT_KEEPALIVE", "60"))))
-MQTT_USERNAME = os.getenv("MQTT_USERNAME", "")
-MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
-# Broker listener is TLS-only (see mosquitto.conf.template): API must use TLS too.
-MQTT_USE_TLS = os.getenv("MQTT_USE_TLS", "1") == "1"
-MQTT_CLIENT_CA = os.getenv("MQTT_CLIENT_CA", "/etc/sentinel/mqtt-ca.crt")
-# When 0 (default): skip TLS hostname check; broker cert CN/SAN usually matches public
-# hostname, not the Docker DNS name (e.g. mosquitto). Chain is still verified via CA.
-MQTT_TLS_VERIFY_HOSTNAME = os.getenv("MQTT_TLS_VERIFY_HOSTNAME", "0") == "1"
-TOPIC_ROOT = os.getenv("TOPIC_ROOT", "sentinel")
-CMD_AUTH_KEY = os.getenv("CMD_AUTH_KEY", "")
-BOOTSTRAP_BIND_KEY = os.getenv("BOOTSTRAP_BIND_KEY", "")
-CMD_PROTO = int(os.getenv("CMD_PROTO", "2"))
-API_TOKEN = os.getenv("API_TOKEN", "")
-# When 0 (default), the long-lived API_TOKEN bearer is not accepted — use JWT login only.
-LEGACY_API_TOKEN_ENABLED = os.getenv("LEGACY_API_TOKEN_ENABLED", "0") == "1"
-# DB_PATH / SQLITE_CONNECT_TIMEOUT_S / SQLITE_BUSY_TIMEOUT_MS now live in db.py
-# and are re-exported below; see ``from db import ...`` block.
-LOG_FILE_PATH = os.getenv("LOG_FILE_PATH", "/data/api.log")
-PROVISION_USE_SHARED_MQTT_CREDS = os.getenv("PROVISION_USE_SHARED_MQTT_CREDS", "1") == "1"
-SCHEDULER_POLL_SECONDS = float(os.getenv("SCHEDULER_POLL_SECONDS", "1.0"))
-CLAIM_RESPONSE_INCLUDE_SECRETS = os.getenv("CLAIM_RESPONSE_INCLUDE_SECRETS", "0") == "1"
-MAX_BULK_TARGETS = int(os.getenv("MAX_BULK_TARGETS", "500"))
-# CACHE_TTL_SECONDS now lives in db.py (re-exported below).
-MESSAGE_RETENTION_DAYS = int(os.getenv("MESSAGE_RETENTION_DAYS", "14"))
-STRICT_STARTUP_ENV_CHECK = os.getenv("STRICT_STARTUP_ENV_CHECK", "0") == "1"
-JWT_SECRET = os.getenv("JWT_SECRET", "")
-# Dashboard session: HttpOnly cookie (preferred) + optional JSON access_token for scripts.
-JWT_USE_HTTPONLY_COOKIE = os.getenv("JWT_USE_HTTPONLY_COOKIE", "1") == "1"
-JWT_COOKIE_NAME = (os.getenv("JWT_COOKIE_NAME", "sentinel_jwt").strip() or "sentinel_jwt")
-JWT_COOKIE_SECURE = os.getenv("JWT_COOKIE_SECURE", "0") == "1"
-_ss = (os.getenv("JWT_COOKIE_SAMESITE", "lax") or "lax").strip().lower()
-JWT_COOKIE_SAMESITE: str = "strict" if _ss == "strict" else "lax"
-JWT_RETURN_BODY_TOKEN = os.getenv("JWT_RETURN_BODY_TOKEN", "0") == "1"
-# CSRF protection (double-submit token). Turned ON by default whenever the
-# session lives in an HttpOnly cookie — a cross-site request that sneaks the
-# cookie along still can't guess the CSRF token because the browser won't let
-# the other origin read `document.cookie` for our host. When auth is done via
-# Authorization: Bearer (e.g., mobile apps, CI), CSRF is not applicable and
-# the guard skips automatically.
-CSRF_PROTECTION = os.getenv("CSRF_PROTECTION", "1") == "1"
-CSRF_COOKIE_NAME = (os.getenv("CSRF_COOKIE_NAME", "sentinel_csrf").strip() or "sentinel_csrf")
-CSRF_HEADER_NAME = (os.getenv("CSRF_HEADER_NAME", "X-CSRF-Token").strip() or "X-CSRF-Token")
-# Match JWT session lifetime so the CSRF cookie doesn't expire while the user
-# is still signed in (would force a silent re-login). Falls back to 1 day.
-CSRF_TOKEN_TTL_S = int(os.getenv("CSRF_TOKEN_TTL_S", str(int(JWT_EXPIRE_S) if int(JWT_EXPIRE_S) > 0 else 86400)))
-# SSE: ?token= leaks via logs; disable unless legacy clients need it.
-SSE_ALLOW_QUERY_TOKEN = os.getenv("SSE_ALLOW_QUERY_TOKEN", "0") == "1"
-# Public /health: set 1 only if load balancers need broker/smtp detail without auth.
-HEALTH_PUBLIC_DETAIL = os.getenv("HEALTH_PUBLIC_DETAIL", "0") == "1"
-BOOTSTRAP_DASHBOARD_SUPERADMIN_USERNAME = os.getenv("BOOTSTRAP_DASHBOARD_SUPERADMIN_USERNAME", "superadmin").strip()
-BOOTSTRAP_DASHBOARD_SUPERADMIN_PASSWORD = os.getenv("BOOTSTRAP_DASHBOARD_SUPERADMIN_PASSWORD", "")
-ENFORCE_PER_DEVICE_CREDS = os.getenv("ENFORCE_PER_DEVICE_CREDS", "0") == "1"
-ENFORCE_DEVICE_CHALLENGE = os.getenv("ENFORCE_DEVICE_CHALLENGE", "0") == "1"
-DEVICE_CHALLENGE_TTL_SECONDS = int(os.getenv("DEVICE_CHALLENGE_TTL_SECONDS", "300"))
-DEVICE_ID_REGEX = os.getenv("DEVICE_ID_REGEX", r"^SN-[A-Z2-7]{16}$")
-QR_CODE_REGEX = os.getenv("QR_CODE_REGEX", r"^CROC\|SN-[A-Z2-7]{16}\|\d{10}\|[A-Za-z0-9_-]{20,120}$")
-QR_SIGN_SECRET = os.getenv("QR_SIGN_SECRET", "")
-ALLOW_LEGACY_UNOWNED = os.getenv("ALLOW_LEGACY_UNOWNED", "1") == "1"
-# When true (default), admins/users never see "unowned" devices in list/API scope unless they are
-# the owning tenant — prevents cross-tenant leakage. Set TENANT_STRICT=0 for legacy lab behavior.
-TENANT_STRICT = os.getenv("TENANT_STRICT", "1") == "1"
-
-
 def _legacy_unowned_device_scope(principal: "Principal") -> bool:
     """Whether unowned device_state rows appear in non-superadmin device queries."""
     if principal.is_superadmin():
         return False
     return bool(ALLOW_LEGACY_UNOWNED) and not TENANT_STRICT
-# Default: repo `croc_sentinel_systems/firmware` (alongside this package). Docker sets OTA_FIRMWARE_DIR=/opt/sentinel/firmware.
-_API_DIR = os.path.dirname(os.path.abspath(__file__))
-_DEFAULT_OTA_FIRMWARE_DIR = os.path.normpath(os.path.join(_API_DIR, "..", "firmware"))
-OTA_FIRMWARE_DIR = os.path.abspath(os.getenv("OTA_FIRMWARE_DIR", _DEFAULT_OTA_FIRMWARE_DIR))
-OTA_PUBLIC_BASE_URL = os.getenv("OTA_PUBLIC_BASE_URL", "").rstrip("/")
-# Required for API uploads (dashboard Upload & verify, POST /ota/firmware/upload, /ota/campaigns/from-upload).
-# Use a long random secret. If unset, uploads are rejected.
-OTA_UPLOAD_PASSWORD = (os.getenv("OTA_UPLOAD_PASSWORD") or os.getenv("FIRMWARE_UPLOAD_PASSWORD") or "").strip()
-# How many .bin files to keep under OTA_FIRMWARE_DIR; oldest mtime is removed first when over limit.
-OTA_MAX_FIRMWARE_BINS = max(1, int(os.getenv("OTA_MAX_FIRMWARE_BINS", "10")))
-# Optional: base URL used only for server-side HEAD/GET checks (same /fw/ path as public).
-# Use when devices resolve https://ota.example.com but the API container cannot (hairpin NAT),
-# or before public TLS is ready: e.g. http://ota-nginx:9231 on the Docker network.
-OTA_VERIFY_BASE_URL = os.getenv("OTA_VERIFY_BASE_URL", "").rstrip("/")
-OTA_TOKEN = os.getenv("OTA_TOKEN", "")
-MAX_OTA_UPLOAD_BYTES = int(os.getenv("MAX_OTA_UPLOAD_BYTES", str(16 * 1024 * 1024)))
-DEFAULT_REMOTE_FANOUT_MS = int(os.getenv("DEFAULT_REMOTE_FANOUT_MS", "180000"))
-DEFAULT_PANIC_FANOUT_MS = int(os.getenv("DEFAULT_PANIC_FANOUT_MS", "300000"))
-ALARM_FANOUT_DURATION_MS = int(os.getenv("ALARM_FANOUT_DURATION_MS", str(DEFAULT_REMOTE_FANOUT_MS)))
-ALARM_FANOUT_MAX_TARGETS = int(os.getenv("ALARM_FANOUT_MAX_TARGETS", "200"))
-# Max wall-clock seconds the ingest thread will spend on a single fan-out round
-# (workers are daemon threads; unfinished publishes still complete in paho).
-FANOUT_WALL_CLOCK_MAX_S = max(0.5, min(10.0, float(os.getenv("FANOUT_WALL_CLOCK_MAX_S", "1.5"))))
-# Cap parallel MQTT publishes per fan-out round. Paho's single writer means too
-# many concurrent publishes only add thread overhead; 8–16 is plenty for QoS 1.
-FANOUT_WORKER_POOL_SIZE = max(1, min(64, int(os.getenv("FANOUT_WORKER_POOL_SIZE", "12"))))
-ALARM_FANOUT_SELF = os.getenv("ALARM_FANOUT_SELF", "0") == "1"
-# QoS1 can redeliver duplicate event frames after reconnect; suppress repeated
-# sibling fan-out for the same logical alarm event in this short window.
-ALARM_EVENT_DEDUP_WINDOW_SEC = int(os.getenv("ALARM_EVENT_DEDUP_WINDOW_SEC", "8"))
-AUTO_RECONCILE_ENABLED = os.getenv("AUTO_RECONCILE_ENABLED", "1") == "1"
-AUTO_RECONCILE_COOLDOWN_SEC = int(os.getenv("AUTO_RECONCILE_COOLDOWN_SEC", "180"))
-AUTO_RECONCILE_MAX_PER_TICK = max(1, int(os.getenv("AUTO_RECONCILE_MAX_PER_TICK", "2")))
-PENDING_CLAIM_STALE_SECONDS = int(os.getenv("PENDING_CLAIM_STALE_SECONDS", str(24 * 3600)))
-# Per-IP login lockout (replaces old sliding-window LOGIN_RATE_* on /auth/login only).
-# Tier 0: FAILS wrong → lock LOCK0 s; tier 1: FAILS → lock LOCK1; tier 2+: FAILS → lock LOCK2. Success clears IP state.
-LOGIN_LOCK_TIER0_FAILS = max(1, int(os.getenv("LOGIN_LOCK_TIER0_FAILS", "5")))
-LOGIN_LOCK_TIER0_SECONDS = max(1, int(os.getenv("LOGIN_LOCK_TIER0_SECONDS", "60")))
-LOGIN_LOCK_TIER1_FAILS = max(1, int(os.getenv("LOGIN_LOCK_TIER1_FAILS", "3")))
-LOGIN_LOCK_TIER1_SECONDS = max(1, int(os.getenv("LOGIN_LOCK_TIER1_SECONDS", "180")))
-LOGIN_LOCK_TIER2_FAILS = max(1, int(os.getenv("LOGIN_LOCK_TIER2_FAILS", "3")))
-LOGIN_LOCK_TIER2_SECONDS = max(1, int(os.getenv("LOGIN_LOCK_TIER2_SECONDS", "600")))
-
-# --- Signup / user activation ---
-# If 1, a superadmin must approve each admin signup before they can log in. Default 0: self-serve.
-ADMIN_SIGNUP_REQUIRE_APPROVAL = os.getenv("ADMIN_SIGNUP_REQUIRE_APPROVAL", "0") == "1"
-# If 0, new public admin signups are refused entirely (for private deployments).
-ALLOW_PUBLIC_ADMIN_SIGNUP = os.getenv("ALLOW_PUBLIC_ADMIN_SIGNUP", "1") == "1"
-REQUIRE_EMAIL_VERIFICATION = os.getenv("REQUIRE_EMAIL_VERIFICATION", "1") == "1"
-REQUIRE_PHONE_VERIFICATION = os.getenv("REQUIRE_PHONE_VERIFICATION", "0") == "1"
-SIGNUP_RATE_MAX = int(os.getenv("SIGNUP_RATE_MAX", "5"))
-SIGNUP_RATE_WINDOW_SECONDS = int(os.getenv("SIGNUP_RATE_WINDOW_SECONDS", "3600"))
-OTP_TTL_SECONDS = int(os.getenv("OTP_TTL_SECONDS", "900"))
-OTP_RESEND_COOLDOWN_SECONDS = int(os.getenv("OTP_RESEND_COOLDOWN_SECONDS", "60"))
-# SMS: by default we run in email-only mode. If your VPS wires up a provider
-# (Twilio / Aliyun / Tencent / Bandwidth), set SMS_PROVIDER to its name and
-# implement the corresponding handler in notifier_sms.py. Absent that, phone
-# verifications are a no-op and REQUIRE_PHONE_VERIFICATION must stay 0.
-SMS_PROVIDER = os.getenv("SMS_PROVIDER", "none").strip().lower()
-
-# --- Factory device registry (unguessable serial model) ---
-# When ENFORCE_FACTORY_REGISTRATION=1 the API will refuse to record a
-# pending_claims row for any device whose (serial, mac_nocolon) pair is not
-# already listed in factory_devices. This is what makes serials truly
-# unguessable in production.
-ENFORCE_FACTORY_REGISTRATION = os.getenv("ENFORCE_FACTORY_REGISTRATION", "0") == "1"
-FACTORY_API_TOKEN = os.getenv("FACTORY_API_TOKEN", "")
-TELEGRAM_COMMAND_SECRET = os.getenv("TELEGRAM_COMMAND_SECRET", "").strip()
-TELEGRAM_COMMAND_CHAT_IDS_RAW = os.getenv("TELEGRAM_COMMAND_CHAT_IDS", "").strip()
-TELEGRAM_COMMAND_MAX_LOG = int(os.getenv("TELEGRAM_COMMAND_MAX_LOG", "20"))
-TELEGRAM_COMMAND_MAX_DEVICES = int(os.getenv("TELEGRAM_COMMAND_MAX_DEVICES", "30"))
-TELEGRAM_BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "").strip().lstrip("@")
-TELEGRAM_LINK_TOKEN_TTL_SECONDS = int(os.getenv("TELEGRAM_LINK_TOKEN_TTL_SECONDS", "900"))
-
-# --- Presence probe (last-resort liveness check) ---
-# Devices in HYBRID mode should publish a keepalive every ~60s (see firmware
-# HEARTBEAT_IDLE_KEEPALIVE_MS). OFFLINE_THRESHOLD_SECONDS (90s) marks a device
-# offline in the UI. If the device is still silent after IDLE_SECONDS the
-# server publishes a single `ping` so we can distinguish "TCP quietly dropped"
-# from "device genuinely dead". Keep this >> OFFLINE_THRESHOLD_SECONDS so we
-# don't probe-spam devices that are merely momentarily late with a keepalive.
-# Default 600s (10 min) = 10 missed keepalives, which is clearly abnormal.
-PRESENCE_PROBE_IDLE_SECONDS = int(os.getenv("PRESENCE_PROBE_IDLE_SECONDS", "600"))
-# How often the background worker scans for stale devices. Keep moderate so
-# we don't hammer the DB; 120s is comfortably < IDLE_SECONDS/4.
-PRESENCE_PROBE_SCAN_SECONDS = int(os.getenv("PRESENCE_PROBE_SCAN_SECONDS", "120"))
-# Rate limit: don't probe the same device more than once per this window.
-PRESENCE_PROBE_COOLDOWN_SECONDS = int(os.getenv("PRESENCE_PROBE_COOLDOWN_SECONDS", "900"))
-# After N consecutive failed probes, the device is flagged offline and we back
-# off to stop spamming the broker for obviously dead hardware.
-PRESENCE_PROBE_MAX_CONSECUTIVE = int(os.getenv("PRESENCE_PROBE_MAX_CONSECUTIVE", "3"))
-# A probe row stays outcome=sent until any device channel counts as an ack; if
-# still sent after this many seconds, mark timeout (clears the outstanding row).
-PRESENCE_PROBE_ACK_TIMEOUT_SEC = int(os.getenv("PRESENCE_PROBE_ACK_TIMEOUT_SEC", "480"))
-# scheduled_commands still pending this long after execute_at_ts → mark failed.
-SCHEDULED_CMD_STALE_PENDING_SEC = int(os.getenv("SCHEDULED_CMD_STALE_PENDING_SEC", "480"))
-
-# --- OTA campaigns (superadmin -> admin approve -> per-device rollout) ---
-# Per-device URL HEAD check timeout.
-OTA_URL_VERIFY_TIMEOUT_SECONDS = float(os.getenv("OTA_URL_VERIFY_TIMEOUT_SECONDS", "10"))
-# Max time we wait for a device to ack ota.result before marking it failed.
-OTA_DEVICE_ACK_TIMEOUT_SECONDS = int(os.getenv("OTA_DEVICE_ACK_TIMEOUT_SECONDS", str(15 * 60)))
-# If set, any device failure in a campaign auto-rolls-back the whole admin fleet.
-OTA_AUTO_ROLLBACK_ON_FAILURE = os.getenv("OTA_AUTO_ROLLBACK_ON_FAILURE", "1") == "1"
-
-# --- Event center (global log + SSE stream) ---
-# In-memory ring buffer size. ~500 B × N ≈ RAM footprint. 2000 ≈ 1 MB.
-EVENT_RING_SIZE = int(os.getenv("EVENT_RING_SIZE", "2000"))
-# Per-SSE-subscriber queue. Slow client → oldest events dropped with warning.
-EVENT_SUB_QUEUE_SIZE = int(os.getenv("EVENT_SUB_QUEUE_SIZE", "500"))
-# SSE keepalive: comment + named `ping` event so proxies that strip `:`
-# comments still see traffic. Keep well below your reverse-proxy read_timeout (often 60s).
-# Default 9s works better than 12s with strict proxies / mobile networks.
-EVENT_SSE_KEEPALIVE_SECONDS = max(3, int(os.getenv("EVENT_SSE_KEEPALIVE_SECONDS", "9")))
-# Hint for browser EventSource automatic reconnect delay (milliseconds).
-EVENT_SSE_RETRY_MS = int(os.getenv("EVENT_SSE_RETRY_MS", "4000"))
-# Hard cap on concurrent SSE subscribers (cheap, but bound the damage).
-EVENT_MAX_SUBSCRIBERS = int(os.getenv("EVENT_MAX_SUBSCRIBERS", "128"))
-# Level-based retention days. Debug rows go first; critical stays for audits.
-EVENT_RETAIN_DAYS_DEBUG = int(os.getenv("EVENT_RETAIN_DAYS_DEBUG", "3"))
-EVENT_RETAIN_DAYS_INFO = int(os.getenv("EVENT_RETAIN_DAYS_INFO", "14"))
-EVENT_RETAIN_DAYS_WARN = int(os.getenv("EVENT_RETAIN_DAYS_WARN", "30"))
-EVENT_RETAIN_DAYS_ERROR = int(os.getenv("EVENT_RETAIN_DAYS_ERROR", "90"))
-EVENT_RETAIN_DAYS_CRITICAL = int(os.getenv("EVENT_RETAIN_DAYS_CRITICAL", "365"))
-# Absolute backstop: delete any event older than this regardless of level.
-EVENT_RETAIN_DAYS_MAX = int(os.getenv("EVENT_RETAIN_DAYS_MAX", "400"))
-# How often the retention worker runs.
-EVENT_RETENTION_SCAN_SECONDS = int(os.getenv("EVENT_RETENTION_SCAN_SECONDS", "3600"))
-# MQTT → bounded RAM queue → single ingest worker (DB + emit_event + fan-out threads).
-# Callback must stay O(1): only decode + put_nowait; never parse business JSON there.
-MQTT_INGEST_QUEUE_MAX = int(os.getenv("MQTT_INGEST_QUEUE_MAX", "1000"))
-
-# --- Offline password recovery (RSA public on server, private key only in
-#     password_recovery_offline/ on the operator's air-gapped machine) ---
-PASSWORD_RECOVERY_PUBLIC_KEY_PATH = os.getenv("PASSWORD_RECOVERY_PUBLIC_KEY_PATH", "").strip()
-PASSWORD_RECOVERY_PUBLIC_KEY_PEM = os.getenv("PASSWORD_RECOVERY_PUBLIC_KEY_PEM", "").strip()
-# Fixed-size inner plaintext so every blob is the same length (anti user-enumeration).
-PASSWORD_RECOVERY_PLAINTEXT_PAD = int(os.getenv("PASSWORD_RECOVERY_PLAINTEXT_PAD", "512"))
-FORGOT_PASSWORD_TOKEN_TTL_SECONDS = int(os.getenv("FORGOT_PASSWORD_TOKEN_TTL_SECONDS", str(24 * 3600)))
-FORGOT_PASSWORD_IP_WINDOW_SECONDS = int(os.getenv("FORGOT_PASSWORD_IP_WINDOW_SECONDS", "3600"))
-FORGOT_PASSWORD_IP_MAX = int(os.getenv("FORGOT_PASSWORD_IP_MAX", "12"))
-# Magic header on the binary blob before hex-encoding for the dashboard.
-PASSWORD_RECOVERY_BLOB_MAGIC = b"CRPW"
-PASSWORD_RECOVERY_BLOB_VERSION = 1
-DASHBOARD_PATH = os.getenv("DASHBOARD_PATH", "/console").strip() or "/console"
-if not DASHBOARD_PATH.startswith("/"):
-    DASHBOARD_PATH = "/" + DASHBOARD_PATH
-DASHBOARD_PATH = DASHBOARD_PATH.rstrip("/") or "/console"
-# Guard: refuse to mount over known API prefixes. `/api` is included so an
-# operator cannot accidentally point DASHBOARD_PATH at `/api`-style locations
-# and shadow `/api/group-cards/*` (the dashboard's `/api/...` alias surface).
-_RESERVED_PREFIXES = ("/auth", "/devices", "/commands", "/alerts", "/admin",
-                      "/provision", "/health", "/dashboard", "/logs", "/audit",
-                      "/ui", "/api", "/events", "/ota", "/factory",
-                      "/integrations", "/ingest")
-if any(DASHBOARD_PATH == p or DASHBOARD_PATH.startswith(p + "/") for p in _RESERVED_PREFIXES):
-    # Fallback silently to /console to avoid shadowing API routes.
-    DASHBOARD_PATH = "/console"
-
-TOPIC_HEARTBEAT = f"{TOPIC_ROOT}/+/heartbeat"
-TOPIC_STATUS = f"{TOPIC_ROOT}/+/status"
-TOPIC_EVENT = f"{TOPIC_ROOT}/+/event"
-TOPIC_ACK = f"{TOPIC_ROOT}/+/ack"
-TOPIC_BOOTSTRAP_REGISTER = f"{TOPIC_ROOT}/bootstrap/register"
 
 
 # DB locks (`_SqliteRWLock`, `_DbLockContext`, `_db_rw`, `db_lock`,
@@ -373,7 +149,6 @@ api_bootstrap_error: Optional[str] = None
 _bootstrap_thread: Optional[threading.Thread] = None
 scheduler_stop = threading.Event()
 scheduler_thread: Optional[threading.Thread] = None
-# cache_lock + api_cache moved to db.py and re-exported below.
 
 log_dir = os.path.dirname(LOG_FILE_PATH)
 if log_dir:
