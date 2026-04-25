@@ -1,34 +1,41 @@
-"""Admin/user CRUD routes (Phase-21 modularization).
+"""Admin-managed user CRUD routes (Phase-21, trimmed in Phase-69).
 
-Seven endpoints owned by admins (and superadmins) that manage other
-accounts in the tenant — listing, creating, deleting, fetching/saving
-the per-user policy, plus the superadmin-only "close another admin
-tenant" hatch.
+The Phase-21 module covered both admin tenant management
+(superadmin-only) and admin-managed user CRUD in a single 479-line
+file. Phase 69 split the two superadmin endpoints
+(``GET /auth/admins`` and ``POST /auth/admins/{username}/close``)
+into ``routers/auth_admins.py`` so this file now hosts only the
+five admin-facing user CRUD routes.
 
 Routes
 ------
-  GET  /auth/admins
-  POST /auth/admins/{username}/close
-  GET  /auth/users
-  POST /auth/users
-  DELETE /auth/users/{username}
-  GET  /auth/users/{username}/policy
-  PUT  /auth/users/{username}/policy
+  GET    /auth/users                           — list users in tenant
+  POST   /auth/users                           — create user (sends OTP)
+  DELETE /auth/users/{username}                — remove user
+  GET    /auth/users/{username}/policy         — fetch effective policy
+  PUT    /auth/users/{username}/policy         — update policy fields
 
-Schemas moved with the routes
------------------------------
-  AdminTenantCloseRequest, UserCreateRequest, UserPolicyUpdateRequest
+Schemas owned here
+------------------
+  UserCreateRequest, UserPolicyUpdateRequest
 
 Late-binding strategy
 ---------------------
 Cross-feature helpers come from app.py:
 
-  early-bound (defined < line ~3500 in app.py):
+  early-bound (defined before this module's import):
     require_principal, require_capability,
     _looks_like_email, _normalize_phone, _issue_verification
 
-  call-time wrappers (defined > line ~4300 in app.py):
-    _delete_user_auxiliary_cur, _close_admin_tenant_cur
+  call-time wrapper (defined later in app.py):
+    _delete_user_auxiliary_cur
+
+Cross-router note
+-----------------
+``DELETE /auth/users/{username}`` rejects role=admin with the message
+"use POST /auth/admins/{username}/close to remove an admin tenant" —
+that close endpoint now lives in ``routers/auth_admins.py``. The
+rejection text and behaviour are unchanged.
 """
 
 from __future__ import annotations
@@ -65,23 +72,11 @@ def _delete_user_auxiliary_cur(*args: Any, **kwargs: Any) -> Any:
     return _app._delete_user_auxiliary_cur(*args, **kwargs)
 
 
-def _close_admin_tenant_cur(*args: Any, **kwargs: Any) -> Any:
-    return _app._close_admin_tenant_cur(*args, **kwargs)
-
-
 logger = logging.getLogger("croc-api.routers.auth_users")
-
 router = APIRouter(tags=["auth-users"])
 
 
 # ---- Schemas ---------------------------------------------------------------
-
-class AdminTenantCloseRequest(BaseModel):
-    """Superadmin closes another admin tenant; optional device transfer instead of unclaim."""
-
-    confirm_text: str = Field(min_length=8, max_length=64)
-    transfer_devices_to: Optional[str] = Field(default=None, max_length=64)
-
 
 class UserCreateRequest(BaseModel):
     # NOTE: superadmin is NEVER creatable through the API. It is seeded once
@@ -111,47 +106,6 @@ class UserPolicyUpdateRequest(BaseModel):
 
 
 # ---- Routes ----------------------------------------------------------------
-
-@router.get("/auth/admins")
-def auth_list_admins(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    """For superadmin only. Returns admins usable as manager_admin."""
-    assert_min_role(principal, "superadmin")
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT username FROM dashboard_users WHERE role IN ('admin','superadmin') ORDER BY username ASC"
-        )
-        rows = [str(r["username"]) for r in cur.fetchall()]
-        conn.close()
-    return {"items": rows}
-
-
-@router.post("/auth/admins/{username}/close")
-def auth_close_admin_tenant(
-    username: str,
-    body: AdminTenantCloseRequest,
-    principal: Principal = Depends(require_principal),
-) -> dict[str, Any]:
-    """Superadmin: close an admin tenant — unclaim devices (or transfer to another admin) and delete the admin."""
-    assert_min_role(principal, "superadmin")
-    if body.confirm_text.strip() != "CLOSE TENANT":
-        raise HTTPException(status_code=400, detail="confirm_text must be exactly: CLOSE TENANT")
-    target = username.strip()
-    if secrets.compare_digest(target, principal.username):
-        raise HTTPException(status_code=400, detail="use Account page to close your own tenant if you are an admin")
-    transfer_to = (body.transfer_devices_to or "").strip() or None
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        summary = _close_admin_tenant_cur(cur, target, transfer_to, principal.username)
-        conn.commit()
-        conn.close()
-    cache_invalidate("devices")
-    cache_invalidate("overview")
-    audit_event(principal.username, "auth.admin.tenant.close", target, summary)
-    return {"ok": True, **summary}
-
 
 @router.get("/auth/users")
 def auth_list_users(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
@@ -477,3 +431,10 @@ def auth_set_user_policy(
         conn.close()
     audit_event(principal.username, "user.policy.update", username, base)
     return {"ok": True, "username": username, "policy": base}
+
+
+__all__ = (
+    "router",
+    "UserCreateRequest",
+    "UserPolicyUpdateRequest",
+)

@@ -90,9 +90,17 @@ def register_routers(app: FastAPI) -> None:
 
     app.include_router(_auth_self_router)
 
-    # Phase-21: admin/user CRUD /auth/admins, /auth/users (7 routes + 3 schemas).
+    # Phase-21 / 69: admin+user CRUD split into two halves —
+    #   * routers.auth_admins  — superadmin-only admin tenant management
+    #                            (GET /auth/admins, POST /auth/admins/{u}/close)
+    #   * routers.auth_users   — admin-managed user CRUD + per-user policy
+    #                            (5 routes under /auth/users)
+    # Order is irrelevant (no cross-module imports). Register admins
+    # first so /auth/admins/* paths group naturally in the route list.
+    from routers.auth_admins import router as _auth_admins_router
     from routers.auth_users import router as _auth_users_router
 
+    app.include_router(_auth_admins_router)
     app.include_router(_auth_users_router)
 
     # Phase-25: admin DB backup (encrypted export / import).
