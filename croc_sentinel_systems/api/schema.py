@@ -1,13 +1,18 @@
 """SQLite schema bootstrap (Phase-3 modularization extract from ``app.py``).
 
-This module owns:
+This module owns the **DDL-only** half of database initialization:
   * ``CREATE TABLE IF NOT EXISTS`` statements for every persistent table.
   * Companion ``CREATE INDEX IF NOT EXISTS`` declarations for hot-path reads.
-  * The ``ensure_column`` migration block that retro-fits new columns onto
-    older databases (additive only — see db.ensure_column).
-  * The cheap one-shot ``trigger_policies`` normalization migration.
-  * The one-time bootstrap superadmin seeding (driven by
-    ``BOOTSTRAP_DASHBOARD_SUPERADMIN_*``).
+
+The other two halves of ``init_db`` live in sibling modules so each
+concern reads in isolation (Phase 74 split):
+
+  * ``schema_migrations.py``  — additive ``ensure_column`` block + the
+                                one-shot ``trigger_policies`` and
+                                ``dashboard_users.status`` data fixes.
+  * ``schema_seed.py``        — bootstrap superadmin insert (when the
+                                user table is empty) + role_policies
+                                backfill across every existing user.
 
 What is *not* here:
   * Connection management / locking → ``db.py``.
@@ -18,34 +23,22 @@ Phase-4 follow-up: the seed-time helpers (``utc_now_iso``,
 ``default_policy_for_role``, ``_sibling_group_norm``) used to live in
 ``app.py`` and were lazy-imported inside ``init_db`` to dodge an
 ``app → schema → app`` cycle. They now live in ``helpers.py`` (a true
-leaf module), so this file imports them at module top — no in-function
-imports needed and the dependency graph stays acyclic at load time.
+leaf module). After Phase 74 they're imported by their actual users
+(``schema_migrations``, ``schema_seed``); this file no longer needs
+them at all.
 """
 from __future__ import annotations
 
-import json
 import logging
-import sqlite3
-from typing import Any
 
-from config import (
-    BOOTSTRAP_DASHBOARD_SUPERADMIN_PASSWORD,
-    BOOTSTRAP_DASHBOARD_SUPERADMIN_USERNAME,
-    DEFAULT_PANIC_FANOUT_MS,
-)
 from db import (
     cache_invalidate,
     db_lock,
-    ensure_column,
     get_conn,
     init_db_pragmas,
 )
-from helpers import (
-    _sibling_group_norm,
-    default_policy_for_role,
-    utc_now_iso,
-)
-from security import hash_password
+from schema_migrations import run_migrations
+from schema_seed import seed_bootstrap
 
 logger = logging.getLogger("croc-api.schema")
 
@@ -661,103 +654,19 @@ def init_db() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS ix_audit_target_created ON audit_events(target, created_at DESC)")
         # provisioned_credentials: MAC lookups during bootstrap/claim.
         cur.execute("CREATE INDEX IF NOT EXISTS ix_provcreds_mac ON provisioned_credentials(mac_nocolon)")
-        ensure_column(conn, "device_state", "chip_target", "TEXT")
-        ensure_column(conn, "device_state", "board_profile", "TEXT")
-        ensure_column(conn, "device_state", "net_type", "TEXT")
-        ensure_column(conn, "device_state", "provisioned", "INTEGER")
-        ensure_column(conn, "device_state", "display_label", "TEXT")
-        ensure_column(conn, "device_state", "notification_group", "TEXT")
-        ensure_column(conn, "dashboard_users", "manager_admin", "TEXT")
-        ensure_column(conn, "dashboard_users", "tenant", "TEXT")
-        ensure_column(conn, "dashboard_users", "email", "TEXT")
-        ensure_column(conn, "dashboard_users", "phone", "TEXT")
-        ensure_column(conn, "dashboard_users", "email_verified_at", "TEXT")
-        ensure_column(conn, "dashboard_users", "phone_verified_at", "TEXT")
-        # status ∈ pending | active | disabled | awaiting_approval
-        ensure_column(conn, "dashboard_users", "status", "TEXT")
-        ensure_column(conn, "dashboard_users", "welcome_email_sent", "INTEGER NOT NULL DEFAULT 0")
-        ensure_column(conn, "dashboard_users", "alarm_push_style", "TEXT NOT NULL DEFAULT 'fullscreen'")
-        ensure_column(conn, "dashboard_users", "avatar_url", "TEXT")
-        ensure_column(conn, "role_policies", "tg_view_logs", "INTEGER NOT NULL DEFAULT 0")
-        ensure_column(conn, "role_policies", "tg_view_devices", "INTEGER NOT NULL DEFAULT 0")
-        ensure_column(conn, "role_policies", "tg_siren_on", "INTEGER NOT NULL DEFAULT 0")
-        ensure_column(conn, "role_policies", "tg_siren_off", "INTEGER NOT NULL DEFAULT 0")
-        ensure_column(conn, "role_policies", "tg_test_single", "INTEGER NOT NULL DEFAULT 0")
-        ensure_column(conn, "role_policies", "tg_test_bulk", "INTEGER NOT NULL DEFAULT 0")
-        ensure_column(conn, "trigger_policies", "panic_link_enabled", "INTEGER NOT NULL DEFAULT 1")
-        ensure_column(conn, "trigger_policies", "panic_fanout_duration_ms", f"INTEGER NOT NULL DEFAULT {DEFAULT_PANIC_FANOUT_MS}")
+        # Phase-74 split: idempotent column adds + one-shot data fixes
+        # live in schema_migrations.py. Run them now that every CREATE
+        # TABLE is in place — these migrations may read columns that
+        # were just created above.
+        run_migrations(conn)
 
-        # One-shot migration: collapse trigger_policies rows that differ only
-        # in group-string casing/whitespace so they match the sibling match
-        # normalization (_sibling_group_norm). Newest updated_at wins, older
-        # variants are deleted. Runs cheaply on every startup because it
-        # only works on rows that would actually collide.
-        try:
-            cur.execute(
-                "SELECT rowid, owner_admin, scope_group, updated_at "
-                "FROM trigger_policies"
-            )
-            rows = cur.fetchall()
-            buckets: dict[tuple[str, str], list[sqlite3.Row]] = {}
-            for r in rows:
-                key = (str(r["owner_admin"] or ""), _sibling_group_norm(str(r["scope_group"] or "")))
-                buckets.setdefault(key, []).append(r)
-            for (owner, norm_key), group_rows in buckets.items():
-                if len(group_rows) <= 1 and (len(group_rows) == 0 or str(group_rows[0]["scope_group"] or "") == norm_key):
-                    continue
-                winner = max(group_rows, key=lambda x: str(x["updated_at"] or ""))
-                winner_rowid = int(winner["rowid"])
-                for r in group_rows:
-                    if int(r["rowid"]) == winner_rowid:
-                        continue
-                    cur.execute("DELETE FROM trigger_policies WHERE rowid = ?", (int(r["rowid"]),))
-                if str(winner["scope_group"] or "") != norm_key:
-                    cur.execute(
-                        "UPDATE trigger_policies SET scope_group = ? WHERE rowid = ?",
-                        (norm_key, winner_rowid),
-                    )
-            conn.commit()
-        except Exception as exc:
-            logger.warning("trigger_policies normalization migration skipped: %s", exc)
-        cur.execute("UPDATE dashboard_users SET status='active' WHERE status IS NULL OR status = ''")
-        cur.execute("SELECT mac_nocolon, COUNT(*) AS c FROM provisioned_credentials GROUP BY mac_nocolon HAVING c > 1")
-        dup = cur.fetchone()
-        if not dup:
-            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_provisioned_mac_nocolon ON provisioned_credentials(mac_nocolon)")
-        cur.execute("SELECT COUNT(*) AS c FROM dashboard_users")
-        n_users = int(cur.fetchone()["c"])
-        if n_users == 0 and BOOTSTRAP_DASHBOARD_SUPERADMIN_PASSWORD:
-            cur.execute(
-                """
-                INSERT INTO dashboard_users (username, password_hash, role, allowed_zones_json, created_at)
-                VALUES (?, ?, 'superadmin', ?, ?)
-                """,
-                (
-                    BOOTSTRAP_DASHBOARD_SUPERADMIN_USERNAME or "superadmin",
-                    hash_password(BOOTSTRAP_DASHBOARD_SUPERADMIN_PASSWORD),
-                    json.dumps(["*"], ensure_ascii=True),
-                    utc_now_iso(),
-                ),
-            )
-        cur.execute("SELECT username, role FROM dashboard_users")
-        for ur in cur.fetchall():
-            pol = default_policy_for_role(str(ur["role"]))
-            cur.execute(
-                """
-                INSERT OR IGNORE INTO role_policies
-                (username, can_alert, can_send_command, can_claim_device, can_manage_users, can_backup_restore, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(ur["username"]),
-                    pol["can_alert"],
-                    pol["can_send_command"],
-                    pol["can_claim_device"],
-                    pol["can_manage_users"],
-                    pol["can_backup_restore"],
-                    utc_now_iso(),
-                ),
-            )
+        # Phase-74 split: bootstrap superadmin (when empty) +
+        # role_policies backfill live in schema_seed.py. Run them
+        # after migrations because the role_policies INSERTs depend
+        # on every user (including a freshly bootstrapped superadmin)
+        # being visible.
+        seed_bootstrap(conn)
+
         conn.commit()
         conn.close()
     cache_invalidate("devices")
@@ -767,8 +676,3 @@ def init_db() -> None:
 
 
 __all__ = ["init_db"]
-
-
-# Suppress "imported but unused" on Any when this module is run with a
-# strict linter that doesn't see the runtime cur.execute(...) typing.
-_unused_typing_marker: Any = None
