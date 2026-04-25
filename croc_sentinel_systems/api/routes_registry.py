@@ -57,7 +57,15 @@ def register_routers(app: FastAPI) -> None:
 
     app.include_router(_ui_mounts_router)
 
-    # Phase-17: signup + password recovery (14 routes + 7 schemas + 6 helpers).
+    # Phase-64: split into two halves —
+    #   * routers.auth_signup (7 signup/activate/approval routes + 3 schemas)
+    #   * routers.auth_recovery (7 forgot-password routes + 4 schemas + 6 helpers)
+    # Both are unauthenticated-by-default; signup goes first to keep the
+    # original /auth/signup/* registration order from Phase-17.
+    from routers.auth_signup import router as _auth_signup_router
+
+    app.include_router(_auth_signup_router)
+
     # Re-export _prune_password_reset_tokens onto app so scheduler.py late-binds.
     from routers.auth_recovery import _prune_password_reset_tokens
     from routers.auth_recovery import router as _auth_recovery_router

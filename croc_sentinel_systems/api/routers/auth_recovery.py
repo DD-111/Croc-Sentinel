@@ -1,19 +1,13 @@
-"""Auth signup + password-recovery routes (Phase-17 modularization).
+"""Auth password-recovery routes (Phase-17, trimmed in Phase-64).
 
-Carved out of ``app.py`` so the gnarly OTP / RSA-blob recovery flows
-live next to their schemas and crypto helpers instead of being
-sandwiched between the JWT-issuing core and the user-management
-admin endpoints.
+Originally this module covered both signup and password recovery.
+Phase 64 split the signup half into ``routers/auth_signup.py`` so
+each file stays under ~500 lines and reflects a single concern. The
+remaining contents — the offline-RSA recovery blob path, the
+email-OTP path, and their shared helpers — are kept here.
 
-Routes (all unauthenticated except the two superadmin approval calls)
----------------------------------------------------------------------
-  POST  /auth/signup/start
-  POST  /auth/signup/verify
-  POST  /auth/activate
-  POST  /auth/code/resend
-  GET   /auth/signup/pending             [superadmin]
-  POST  /auth/signup/approve/{username}  [superadmin]
-  POST  /auth/signup/reject/{username}   [superadmin]
+Routes (all unauthenticated)
+----------------------------
   GET   /auth/forgot/enabled
   GET   /auth/forgot/email/enabled
   POST  /auth/forgot/email/check
@@ -22,23 +16,28 @@ Routes (all unauthenticated except the two superadmin approval calls)
   POST  /auth/forgot/start
   POST  /auth/forgot/complete
 
-Helpers and schemas (moved with routes)
----------------------------------------
-- 7 Pydantic schemas (3 signup + 4 forgot)
+Helpers and schemas
+-------------------
+- 4 Pydantic schemas (ForgotStartRequest / ForgotEmailStartRequest /
+  ForgotEmailCompleteRequest / ForgotCompleteRequest)
 - ``_password_recovery_load_public`` + 3 RSA helpers
+  (``_password_recovery_blob_byte_len``,
+  ``_encrypt_password_recovery_payload``,
+  ``_fake_password_recovery_hex``)
 - ``_check_forgot_ip_rate``, ``_prune_password_reset_tokens``
 
-The recovery prune helper is re-exported back into ``app.py`` so the
-scheduler thread (which still lives in app.py) can call it without
-caring about the move.
+The ``_prune_password_reset_tokens`` helper is re-exported back into
+``app.py`` (``routes_registry.register_routers`` binds it onto
+``_app._prune_password_reset_tokens``) so the scheduler thread can
+call it without depending on this module's full import surface.
 
 Late binding
 ------------
-Validation/rate-limit helpers (``_USERNAME_RE``, ``_looks_like_email``,
-``_check_signup_rate``, ``_issue_verification`` etc.) all stay in
-``app.py`` for now and are late-bound here. ``emit_event`` and
-``get_manager_admin`` are also late-bound to avoid pulling the entire
-app module at import time.
+Validation/rate-limit helpers (``_looks_like_email``,
+``_consume_verification``, ``_clear_login_failures`` etc.) live in
+``auth_helpers.py`` / ``app.py`` and are late-bound here via
+``import app as _app``. ``emit_event`` / ``get_manager_admin`` /
+``_client_ip`` are likewise resolved at call time off ``app``.
 """
 
 from __future__ import annotations
@@ -57,14 +56,12 @@ from typing import Any, Optional
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 import app as _app
 from audit import audit_event
 from config import (
-    ADMIN_SIGNUP_REQUIRE_APPROVAL,
-    ALLOW_PUBLIC_ADMIN_SIGNUP,
     FORGOT_PASSWORD_IP_MAX,
     FORGOT_PASSWORD_IP_WINDOW_SECONDS,
     FORGOT_PASSWORD_TOKEN_TTL_SECONDS,
@@ -75,19 +72,14 @@ from config import (
     PASSWORD_RECOVERY_PLAINTEXT_PAD,
     PASSWORD_RECOVERY_PUBLIC_KEY_PATH,
     PASSWORD_RECOVERY_PUBLIC_KEY_PEM,
-    REQUIRE_EMAIL_VERIFICATION,
-    REQUIRE_PHONE_VERIFICATION,
 )
 from db import db_lock, get_conn
-from helpers import default_policy_for_role, utc_now_iso
+from helpers import utc_now_iso
 from notifier import notifier
-from security import Principal, assert_min_role, hash_password
-
-require_principal = _app.require_principal
+from security import hash_password
 
 
-# ----- late-bound, captured lazily so the order of definition in app.py
-# does not matter. Each call goes through ``_app.<name>``. ------------------
+# ----- Late-bound helpers (resolved at call time off ``app``) -------------
 def _emit_event(*args: Any, **kwargs: Any) -> Any:
     return _app.emit_event(*args, **kwargs)
 
@@ -100,24 +92,8 @@ def _client_ip(request: Request) -> str:
     return _app._client_ip(request)
 
 
-def _looks_like_email(s: str) -> bool:
-    return _app._looks_like_email(s)
-
-
-def _normalize_phone(s: Optional[str]) -> Optional[str]:
-    return _app._normalize_phone(s)
-
-
-def _check_signup_rate(ip: str, email: str) -> None:
-    _app._check_signup_rate(ip, email)
-
-
-def _record_signup_attempt(ip: str, email: str) -> None:
-    _app._record_signup_attempt(ip, email)
-
-
-def _issue_verification(*args: Any, **kwargs: Any) -> Any:
-    return _app._issue_verification(*args, **kwargs)
+def _looks_like_email(value: str) -> bool:
+    return _app._looks_like_email(value)
 
 
 def _consume_verification(username: str, channel: str, purpose: str, code: str) -> bool:
@@ -132,6 +108,17 @@ def _generate_sha_code() -> str:
     return _app._generate_sha_code()
 
 
+def _issue_verification(
+    username: str,
+    channel: str,
+    target: str,
+    purpose: str = "activate",
+    *,
+    explicit_code: Optional[str] = None,
+) -> int:
+    return _app._issue_verification(username, channel, target, purpose, explicit_code=explicit_code)
+
+
 def _clear_login_failures(username: str) -> None:
     _app._clear_login_failures(username)
 
@@ -140,41 +127,13 @@ def _clear_login_ip_state(ip: str) -> None:
     _app._clear_login_ip_state(ip)
 
 
-# Late-bind the username regex by attribute access so app.py can rebuild it.
-def _username_re_match(username: str) -> Any:
-    return _app._USERNAME_RE.match(username)
-
-
-# sqlite3 IntegrityError is referenced inline; import lazily-style for safety.
-import sqlite3  # noqa: E402
-
 logger = logging.getLogger("croc-api.routers.auth_recovery")
-
 router = APIRouter(tags=["auth-recovery"])
 
 
 # ===========================================================================
 # Pydantic request schemas
 # ===========================================================================
-
-class SignupStartRequest(BaseModel):
-    username: str = Field(min_length=2, max_length=64)
-    password: str = Field(min_length=8, max_length=128)
-    email: str = Field(min_length=3, max_length=254)
-    phone: Optional[str] = Field(default=None, min_length=4, max_length=32)
-
-
-class VerifyCodeRequest(BaseModel):
-    username: str = Field(min_length=2, max_length=64)
-    email_code: Optional[str] = Field(default=None, min_length=4, max_length=12)
-    phone_code: Optional[str] = Field(default=None, min_length=4, max_length=12)
-
-
-class ResendCodeRequest(BaseModel):
-    username: str = Field(min_length=2, max_length=64)
-    channel: str = Field(pattern="^(email|phone)$")
-    purpose: str = Field(default="activate", pattern="^(signup|activate|reset)$")
-
 
 class ForgotStartRequest(BaseModel):
     username: str = Field(min_length=1, max_length=64)
@@ -312,284 +271,6 @@ def _prune_password_reset_tokens() -> None:
         cur.execute("DELETE FROM password_reset_tokens WHERE expires_at_ts < ?", (cut,))
         conn.commit()
         conn.close()
-
-
-# ===========================================================================
-# Signup / activation / approval routes
-# ===========================================================================
-
-@router.post("/auth/signup/start")
-def auth_signup_start(body: SignupStartRequest, request: Request) -> dict[str, Any]:
-    """Public admin self-signup (role=admin only, never superadmin).
-
-    Creates a `dashboard_users` row in status='pending' and emails an OTP.
-    The account becomes usable only after /auth/signup/verify succeeds AND,
-    When ADMIN_SIGNUP_REQUIRE_APPROVAL=1, a superadmin must approve after OTP.
-    """
-    if not ALLOW_PUBLIC_ADMIN_SIGNUP:
-        raise HTTPException(status_code=403, detail="public signup disabled")
-    ip = _client_ip(request)
-    username = body.username.strip()
-    if not _username_re_match(username):
-        raise HTTPException(status_code=400, detail="username must be 2–64 chars of [A-Za-z0-9_.-]")
-    email_norm = body.email.strip().lower()
-    if not _looks_like_email(email_norm):
-        raise HTTPException(status_code=400, detail="email format invalid")
-    phone_norm = _normalize_phone(body.phone)
-    if REQUIRE_PHONE_VERIFICATION and not phone_norm:
-        raise HTTPException(status_code=400, detail="phone is required")
-    _check_signup_rate(ip, email_norm)
-    _record_signup_attempt(ip, email_norm)
-    initial_status = "pending"
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT username, status FROM dashboard_users WHERE username = ?", (username,))
-        existing = cur.fetchone()
-        if existing:
-            conn.close()
-            raise HTTPException(status_code=409, detail="username not available")
-        cur.execute("SELECT username FROM dashboard_users WHERE LOWER(email) = ?", (email_norm,))
-        if cur.fetchone():
-            conn.close()
-            raise HTTPException(status_code=409, detail="email already registered")
-        try:
-            cur.execute(
-                """INSERT INTO dashboard_users (
-                       username, password_hash, role, allowed_zones_json,
-                       manager_admin, tenant, email, phone, status, created_at
-                   ) VALUES (?, ?, 'admin', '["*"]', '', ?, ?, ?, ?, ?)""",
-                (
-                    username,
-                    hash_password(body.password),
-                    username,
-                    email_norm,
-                    phone_norm,
-                    initial_status,
-                    utc_now_iso(),
-                ),
-            )
-            pol = default_policy_for_role("admin")
-            cur.execute(
-                """INSERT OR IGNORE INTO role_policies
-                   (username, can_alert, can_send_command, can_claim_device,
-                    can_manage_users, can_backup_restore, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    username,
-                    pol["can_alert"], pol["can_send_command"], pol["can_claim_device"],
-                    pol["can_manage_users"], pol["can_backup_restore"], utc_now_iso(),
-                ),
-            )
-            conn.commit()
-        except sqlite3.IntegrityError:
-            conn.close()
-            raise HTTPException(status_code=409, detail="username not available")
-        conn.close()
-    try:
-        _issue_verification(username, "email", email_norm, purpose="signup")
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.warning("signup email OTP failed for %s: %s", username, exc)
-        raise HTTPException(status_code=502, detail=f"failed to send email verification: {exc}")
-    if phone_norm and REQUIRE_PHONE_VERIFICATION:
-        try:
-            _issue_verification(username, "phone", phone_norm, purpose="signup")
-        except Exception as exc:
-            logger.warning("signup phone OTP failed for %s: %s", username, exc)
-            raise HTTPException(status_code=502, detail=f"failed to send SMS verification: {exc}")
-    audit_event(username, "signup.start", username, {"email": email_norm, "phone": bool(phone_norm), "ip": ip})
-    return {
-        "ok": True,
-        "username": username,
-        "email_otp_sent": True,
-        "phone_otp_sent": bool(phone_norm and REQUIRE_PHONE_VERIFICATION),
-        "ttl_seconds": OTP_TTL_SECONDS,
-        "requires_approval": ADMIN_SIGNUP_REQUIRE_APPROVAL,
-    }
-
-
-@router.post("/auth/signup/verify")
-def auth_signup_verify(body: VerifyCodeRequest) -> dict[str, Any]:
-    username = body.username.strip()
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT username, role, status, email, phone, email_verified_at, phone_verified_at "
-            "FROM dashboard_users WHERE username = ?",
-            (username,),
-        )
-        u = cur.fetchone()
-        conn.close()
-    if not u:
-        raise HTTPException(status_code=404, detail="user not found")
-    if u["role"] != "admin":
-        raise HTTPException(status_code=400, detail="wrong verification route for this user")
-    if str(u["status"]) in ("active", "disabled"):
-        return {"ok": True, "already_verified": True, "status": str(u["status"])}
-    if REQUIRE_EMAIL_VERIFICATION:
-        if not body.email_code:
-            raise HTTPException(status_code=400, detail="email_code required")
-        if not _consume_verification(username, "email", "signup", body.email_code):
-            raise HTTPException(status_code=401, detail="invalid or expired email code")
-    if REQUIRE_PHONE_VERIFICATION and u["phone"]:
-        if not body.phone_code:
-            raise HTTPException(status_code=400, detail="phone_code required")
-        if not _consume_verification(username, "phone", "signup", body.phone_code):
-            raise HTTPException(status_code=401, detail="invalid or expired phone code")
-    next_status = "awaiting_approval" if ADMIN_SIGNUP_REQUIRE_APPROVAL else "active"
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """UPDATE dashboard_users
-               SET email_verified_at = ?,
-                   phone_verified_at = CASE WHEN phone IS NOT NULL AND phone <> '' AND ? <> '' THEN ? ELSE phone_verified_at END,
-                   status = ?
-               WHERE username = ?""",
-            (
-                utc_now_iso(),
-                (body.phone_code or ""),
-                utc_now_iso(),
-                next_status,
-                username,
-            ),
-        )
-        conn.commit()
-        conn.close()
-    audit_event(username, "signup.verify", username, {"next_status": next_status})
-    return {"ok": True, "status": next_status, "requires_approval": ADMIN_SIGNUP_REQUIRE_APPROVAL}
-
-
-@router.post("/auth/activate")
-def auth_activate_user(body: VerifyCodeRequest) -> dict[str, Any]:
-    """Admin-created users activate themselves with the OTP the admin triggered."""
-    username = body.username.strip()
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT username, role, status, email, phone FROM dashboard_users WHERE username = ?",
-            (username,),
-        )
-        u = cur.fetchone()
-        conn.close()
-    if not u:
-        raise HTTPException(status_code=404, detail="user not found")
-    if str(u["status"]) == "active":
-        return {"ok": True, "already_active": True}
-    if REQUIRE_EMAIL_VERIFICATION:
-        if not body.email_code:
-            raise HTTPException(status_code=400, detail="email_code required")
-        if not _consume_verification(username, "email", "activate", body.email_code):
-            raise HTTPException(status_code=401, detail="invalid or expired email code")
-    if REQUIRE_PHONE_VERIFICATION and u["phone"]:
-        if not body.phone_code:
-            raise HTTPException(status_code=400, detail="phone_code required")
-        if not _consume_verification(username, "phone", "activate", body.phone_code):
-            raise HTTPException(status_code=401, detail="invalid or expired phone code")
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """UPDATE dashboard_users
-               SET email_verified_at = ?, status = 'active'
-               WHERE username = ?""",
-            (utc_now_iso(), username),
-        )
-        conn.commit()
-        conn.close()
-    audit_event(username, "account.activate", username, {})
-    return {"ok": True, "status": "active"}
-
-
-@router.post("/auth/code/resend")
-def auth_code_resend(body: ResendCodeRequest) -> dict[str, Any]:
-    username = body.username.strip()
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT role, status, email, phone FROM dashboard_users WHERE username = ?",
-            (username,),
-        )
-        u = cur.fetchone()
-        conn.close()
-    if not u:
-        raise HTTPException(status_code=404, detail="user not found")
-    if str(u["status"]) == "active" and body.purpose != "reset":
-        return {"ok": True, "already_active": True}
-    target = str(u["email"] or "") if body.channel == "email" else str(u["phone"] or "")
-    if not target:
-        raise HTTPException(status_code=400, detail=f"{body.channel} not on file")
-    try:
-        _issue_verification(username, body.channel, target, purpose=body.purpose)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.warning("resend verification failed for %s %s: %s", username, body.channel, exc)
-        raise HTTPException(status_code=502, detail=f"failed to send code: {exc}") from exc
-    return {"ok": True, "ttl_seconds": OTP_TTL_SECONDS}
-
-
-@router.get("/auth/signup/pending")
-def auth_signup_pending(principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    """Superadmin queue: admins who passed OTP but await approval."""
-    assert_min_role(principal, "superadmin")
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """SELECT username, email, phone, created_at, email_verified_at
-               FROM dashboard_users
-               WHERE role = 'admin' AND status = 'awaiting_approval'
-               ORDER BY created_at ASC"""
-        )
-        items = [dict(r) for r in cur.fetchall()]
-        conn.close()
-    return {"items": items}
-
-
-@router.post("/auth/signup/approve/{username}")
-def auth_signup_approve(username: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_min_role(principal, "superadmin")
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE dashboard_users SET status='active' WHERE username = ? AND role='admin' AND status='awaiting_approval'",
-            (username,),
-        )
-        n = cur.rowcount
-        conn.commit()
-        conn.close()
-    if n == 0:
-        raise HTTPException(status_code=404, detail="no pending admin with that username")
-    audit_event(principal.username, "signup.approve", username, {})
-    return {"ok": True, "username": username}
-
-
-@router.post("/auth/signup/reject/{username}")
-def auth_signup_reject(username: str, principal: Principal = Depends(require_principal)) -> dict[str, Any]:
-    assert_min_role(principal, "superadmin")
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "DELETE FROM dashboard_users WHERE username = ? AND role='admin' AND status='awaiting_approval'",
-            (username,),
-        )
-        n = cur.rowcount
-        cur.execute("DELETE FROM role_policies WHERE username = ?", (username,))
-        cur.execute("DELETE FROM verifications WHERE username = ?", (username,))
-        conn.commit()
-        conn.close()
-    if n == 0:
-        raise HTTPException(status_code=404, detail="no pending admin with that username")
-    audit_event(principal.username, "signup.reject", username, {})
-    return {"ok": True}
 
 
 # ===========================================================================
@@ -899,3 +580,18 @@ def auth_forgot_complete(body: ForgotCompleteRequest, request: Request) -> dict[
         detail={"ip": ip},
     )
     return {"ok": True}
+
+
+__all__ = (
+    "router",
+    "ForgotStartRequest",
+    "ForgotEmailStartRequest",
+    "ForgotEmailCompleteRequest",
+    "ForgotCompleteRequest",
+    "_password_recovery_load_public",
+    "_password_recovery_blob_byte_len",
+    "_encrypt_password_recovery_payload",
+    "_fake_password_recovery_hex",
+    "_check_forgot_ip_rate",
+    "_prune_password_reset_tokens",
+)
