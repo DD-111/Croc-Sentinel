@@ -6941,6 +6941,9 @@ def _try_mqtt_unclaim_reset(device_id: str) -> tuple[bool, bool]:
     except Exception:
         online_hint = False
     try:
+        # No dedupe: a prior attempt may have deleted server-side creds while
+        # the device never got MQTT; retries must publish a fresh frame. Firmware
+        # treats unclaim_reset idempotently.
         cmd_id = publish_command(
             f"{TOPIC_ROOT}/{device_id}/cmd",
             "unclaim_reset",
@@ -6948,7 +6951,6 @@ def _try_mqtt_unclaim_reset(device_id: str) -> tuple[bool, bool]:
             device_id,
             CMD_PROTO,
             get_cmd_key_for_device(device_id),
-            dedupe_key=f"unclaim_reset:{device_id}",
         )
     except HTTPException as exc:
         # 503 = broker disconnected → no MQTT, don't wait.
@@ -6999,17 +7001,19 @@ def _device_delete_reset_impl(
         del_state = int(cur.rowcount or 0)
         cur.execute("DELETE FROM scheduled_commands WHERE device_id = ?", (device_id,))
         del_sched = int(cur.rowcount or 0)
-        if super_unclaim:
-            if mac_nocolon:
-                cur.execute(
-                    "UPDATE factory_devices SET status='unclaimed', updated_at=? WHERE mac_nocolon = ?",
-                    (utc_now_iso(), mac_nocolon),
-                )
-            else:
-                cur.execute(
-                    "UPDATE factory_devices SET status='unclaimed', updated_at=? WHERE serial = ?",
-                    (utc_now_iso(), device_id),
-                )
+        # Keep factory registry aligned whenever this serial/MAC is known (same as
+        # "factory-unregister" — also applies to normal tenant unbind so ops lists
+        # and identify flows stay consistent after unlink).
+        if mac_nocolon:
+            cur.execute(
+                "UPDATE factory_devices SET status='unclaimed', updated_at=? WHERE mac_nocolon = ?",
+                (utc_now_iso(), mac_nocolon),
+            )
+        else:
+            cur.execute(
+                "UPDATE factory_devices SET status='unclaimed', updated_at=? WHERE serial = ?",
+                (utc_now_iso(), device_id),
+            )
         conn.commit()
         conn.close()
     cache_invalidate("devices")
@@ -9525,9 +9529,9 @@ def publish_command(
 
     ``dedupe_key`` makes the publish idempotent over a short TTL: if the same key is
     re-used within the TTL, the previously generated ``cmd_id`` is returned and
-    **no new MQTT message is published**. This lets callers that represent
-    irreversible operations (unclaim_reset, factory-unregister, reboot) absorb
-    double-clicks and accidental retries without sending two commands to the device.
+    **no new MQTT message is published** (e.g. double-clicks on OTA/reboot).
+    ``unclaim_reset`` is sent **without** dedupe so a repeated unlink can publish
+    a fresh frame; firmware handles it idempotently.
     """
     global mqtt_client
     if dedupe_key:

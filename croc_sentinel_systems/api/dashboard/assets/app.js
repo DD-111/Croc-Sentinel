@@ -4786,18 +4786,23 @@
         </div>
       </details>
 
-      <details class="card danger-zone danger-zone--compact device-drawer">
+      <details class="card danger-zone danger-zone--compact device-drawer" id="dangerUnbind">
         <summary class="device-drawer__summary">
           <span class="device-drawer__title">Danger zone</span>
-          <span class="device-drawer__hint muted">Unbind &amp; reset</span>
+          <span class="device-drawer__hint muted">Unbind, NVS, factory row</span>
         </summary>
         <div class="device-drawer__body danger-zone-body">
-          <p class="muted danger-zone-compact-lead">Removes this device from your tenant and sends <span class="mono">unclaim_reset</span> when online. Re-add from Activate.</p>
+          <p class="muted danger-zone-compact-lead">Permanently removes this device from the <strong>server</strong> (credentials, state, command queue) and, when the broker can publish, orders the board to run <span class="mono">unclaim_reset</span> so it can listen again on a <strong>fresh</strong> claim. Each attempt sends a <strong>new</strong> MQTT message (retries are not de-duplicated).</p>
+          <ul class="danger-zone-note">
+            <li>若设备曾离线，可能未收到清 NVS；上电联网后如仍连旧云，在 Activate 重绑或再执行一次本操作。</li>
+            <li>Factory registry / 出厂表：有 MAC/序列时同步标为可登记（与 <span class="mono">factory-unregister</span> 等效的数据效果）。</li>
+            ${state.me && state.me.role === "superadmin" ? `<li><strong>Superadmin</strong>：跨租户解绑时同样会下发 <span class="mono">unclaim_reset</span> 并清服务端记录；无需第二条按钮。</li>` : ""}
+          </ul>
           <div class="danger-zone-single-action">
             <button class="btn danger sm danger-zone-unbind-btn" type="button" id="deleteReset" ${can("can_send_command") && !d.is_shared && canOperateThisDevice ? "" : "disabled"} title="${(() => {
               if (!canOperateThisDevice) return "Operate access required";
               if (!can("can_send_command")) return "can_send_command required";
-              if (d.is_shared) return "Not available on shared devices";
+              if (d.is_shared) return "Not available on shared devices (owner / superadmin only)";
               return "";
             })()}">Unbind &amp; reset</button>
           </div>
@@ -4967,7 +4972,7 @@
           const sentNv = dr && (dr.nvs_purge_sent === true);
           const ackNv = dr && (dr.nvs_purge_acked === true);
           toast(
-            `Device removed from account.${ackNv ? " Device confirmed unclaim_reset (WiFi+claim cleared, rebooting)." : (sentNv ? " Command was dispatched but device ack not confirmed before unlink." : " Command dispatch failed/offline.")} Re-add from Activate.`,
+            `Device removed from account.${ackNv ? " Board confirmed unclaim_reset (NVS/claim cleared; rebooting)." : (sentNv ? " A fresh MQTT unclaim was sent; device ack not confirmed in time (retry unbind or power‑cycle the board)." : " MQTT to broker failed — server data removed; re‑provisioning may need device power‑cycle before Activate.")} Re-add from Activate if needed.`,
             ackNv ? "ok" : "err",
           );
           location.hash = "#/devices";

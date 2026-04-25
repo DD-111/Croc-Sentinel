@@ -106,17 +106,17 @@ html[data-theme="light"] {
   --bg-elev:   #fff;
   --bg-muted:  var(--tone-2);
   --bg-sidebar: var(--tone-05);
-  --bg-main:   linear-gradient(165deg, oklch(97% 0.008 225) 0%, oklch(98.5% 0.006 220) 50%, oklch(97% 0.008 230) 100%);
+  --bg-main:   linear-gradient(160deg, oklch(97% 0.01 220) 0%, oklch(98.2% 0.007 215) 48%, oklch(96.8% 0.01 230) 100%);
   --border:       var(--tone-3);
   --border-strong: var(--tone-4);
   --text:         var(--tone-8);
   --text-muted:   var(--tone-6);
   --text-dim:     var(--tone-5);
 
-  /* Signal teal — base accent. */
-  --accent:        oklch(62% 0.155 195);
-  --accent-weak:   oklch(94% 0.055 195);
-  --accent-strong: oklch(48% 0.160 195);
+  /* Accent: cool cyan (Sentinel / telemetry) — a few ° bluer than pure teal. */
+  --accent:        oklch(61% 0.152 202);
+  --accent-weak:   oklch(94% 0.050 202);
+  --accent-strong: oklch(46% 0.152 202);
   --accent-contrast: #fff;
 
   /* Semantic colour set. All OKLCH so chroma + lightness move together. */
@@ -134,10 +134,10 @@ html[data-theme="light"] {
   --shadow:    0 4px 14px oklch(22% 0.03 250 / 0.10), 0 1px 3px oklch(22% 0.03 250 / 0.06);
   --shadow-lg: 0 22px 60px oklch(22% 0.03 250 / 0.22), 0 6px 18px oklch(22% 0.03 250 / 0.12);
 
-  --ring: oklch(62% 0.155 195 / 0.32);
+  --ring: oklch(61% 0.152 202 / 0.32);
 
   /* Glow used on pending / live indicators. */
-  --pulse-accent: oklch(62% 0.155 195 / 0.45);
+  --pulse-accent: oklch(61% 0.152 202 / 0.45);
   --pulse-danger: oklch(60% 0.195 25  / 0.45);
 }
 
@@ -160,17 +160,17 @@ html[data-theme="dark"] {
   --bg-elev:   var(--tone-1);
   --bg-muted:  var(--tone-05);
   --bg-sidebar: var(--tone-05);
-  --bg-main:   linear-gradient(168deg, oklch(14% 0.014 245) 0%, oklch(18% 0.016 250) 55%, oklch(13% 0.014 245) 100%);
+  --bg-main:   linear-gradient(168deg, oklch(13% 0.012 250) 0%, oklch(17% 0.014 255) 52%, oklch(12% 0.012 245) 100%);
   --border:       var(--tone-3);
   --border-strong: var(--tone-4);
   --text:         var(--tone-8);
   --text-muted:   var(--tone-6);
   --text-dim:     var(--tone-5);
 
-  --accent:        oklch(74% 0.160 195);
-  --accent-weak:   oklch(30% 0.075 195);
-  --accent-strong: oklch(82% 0.140 195);
-  --accent-contrast: oklch(12% 0.020 195);
+  --accent:        oklch(72% 0.155 202);
+  --accent-weak:   oklch(30% 0.072 202);
+  --accent-strong: oklch(80% 0.138 202);
+  --accent-contrast: oklch(12% 0.018 202);
 
   --ok:        oklch(72% 0.170 160);
   --ok-weak:   oklch(28% 0.085 160);
@@ -185,9 +185,9 @@ html[data-theme="dark"] {
   --shadow:    0 8px 24px #0009, 0 2px 6px #0008;
   --shadow-lg: 0 32px 80px #000b, 0 8px 22px #0009;
 
-  --ring: oklch(74% 0.160 195 / 0.45);
+  --ring: oklch(72% 0.155 202 / 0.45);
 
-  --pulse-accent: oklch(74% 0.160 195 / 0.6);
+  --pulse-accent: oklch(72% 0.155 202 / 0.6);
   --pulse-danger: oklch(72% 0.195 25  / 0.6);
 }
 
@@ -195,8 +195,8 @@ html[data-theme="dark"] {
 html[data-theme="hc"],
 @media (prefers-contrast: more) {
   :root {
-    --accent:        oklch(48% 0.200 195);
-    --accent-strong: oklch(34% 0.200 195);
+    --accent:        oklch(48% 0.200 202);
+    --accent-strong: oklch(34% 0.200 202);
     --border:        oklch(60% 0.010 250);
     --border-strong: oklch(40% 0.010 250);
   }
@@ -1988,8 +1988,16 @@ details.card.danger-zone.device-drawer > summary.device-drawer__summary {
 details.card.danger-zone.danger-zone--compact.device-drawer > summary.device-drawer__summary {
   padding: var(--sp-2) var(--sp-3);
 }
-.danger-zone-compact-lead { color: var(--text-muted); font-size: var(--text-xs); }
-.danger-zone-single-action { margin-top: var(--sp-2); }
+.danger-zone-compact-lead { color: var(--text-muted); font-size: var(--text-xs); line-height: var(--leading-snug); }
+.danger-zone-note {
+  margin: var(--sp-3) 0 0;
+  padding: 0 0 0 1.15em;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  line-height: var(--leading-snug);
+}
+.danger-zone-note li { margin: 0.35em 0; }
+.danger-zone-single-action { margin-top: var(--sp-4); }
 .danger-zone-unbind-btn { width: fit-content; }
 
 /* ─── 16. Activate flow (provisioning wizard) ──────────────────────────── */
