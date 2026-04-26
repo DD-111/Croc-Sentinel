@@ -151,7 +151,13 @@ def _start_event_redis_bridge() -> None:
         logger.error("REDIS_URL set but redis package missing; install redis or unset REDIS_URL")
         return
     try:
-        _redis_sync_client = redis_lib.Redis.from_url(REDIS_URL, decode_responses=True)
+        _redis_sync_client = redis_lib.Redis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            socket_connect_timeout=2.0,
+            socket_timeout=2.0,
+            health_check_interval=30,
+        )
         _redis_sync_client.ping()
     except Exception as exc:
         logger.error("redis connect failed (event bus): %s", exc)

@@ -50,7 +50,7 @@ import tempfile
 import urllib.request
 import os
 import gzip
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from config import (
@@ -153,23 +153,34 @@ def _db_backup_tick(now: float, next_backup_at: float) -> float:
     return now + max(60, DB_BACKUP_INTERVAL_SECONDS)
 
 
+_UNBIND_RESET_PENDING_TIMEOUT_DAYS = 7
+
+
 def _unbind_reset_compensation_tick(limit: int = 10) -> None:
     """Retry device reset for server-unbound jobs waiting for device ACK.
 
-    Phase 95 Part 2 (post-fix): jobs in ``device_reset_pending`` are
-    re-published using the snapshotted ``cmd_key`` persisted in
-    ``detail_json`` (the legacy DB-driven helper cannot work here because
-    ``provisioned_credentials`` was deleted by the unbind transaction).
-    Once the device ACKs ``unclaim_reset``, the job is promoted to
-    ``completed``. ``_try_mqtt_unclaim_reset`` is still tried as a fallback
-    for legacy rows that pre-date the snapshot field.
+    Production hardening (Phase 98):
+      * Jobs older than ``_UNBIND_RESET_PENDING_TIMEOUT_DAYS`` collapse to
+        ``completed`` with a ``timeout`` reason — server-side is already
+        unbound, so leaving the job pending forever bloats the table and
+        leaves UI badges stuck.
+      * Legacy rows without ``snapshot_cmd_key`` cannot signal the device
+        any more (``provisioned_credentials`` was already deleted by the
+        unbind transaction), so they are also collapsed to ``completed``
+        with reason ``no_snapshot``. The single ``_try_mqtt_unclaim_reset``
+        fallback would always return ``(False, False)``.
+      * Compensation publish runs with ``wait_for_ack=False``; the
+        regular ``cmd_ack`` MQTT pipeline still flips ``command_acked``
+        when the device finally checks in. Avoids tying up the scheduler
+        thread waiting for offline devices.
     """
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT request_id, device_id, IFNULL(detail_json,'{}') AS detail_json
+            SELECT request_id, device_id, created_at,
+                   IFNULL(detail_json,'{}') AS detail_json
             FROM device_unbind_jobs
             WHERE state = 'device_reset_pending'
             ORDER BY updated_at ASC
@@ -179,6 +190,7 @@ def _unbind_reset_compensation_tick(limit: int = 10) -> None:
         )
         rows = cur.fetchall()
         conn.close()
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=_UNBIND_RESET_PENDING_TIMEOUT_DAYS)
     for row in rows:
         req_id = str(row["request_id"])
         did = str(row["device_id"])
@@ -187,27 +199,62 @@ def _unbind_reset_compensation_tick(limit: int = 10) -> None:
             detail = json.loads(raw_detail) if raw_detail else {}
         except Exception:
             detail = {}
-        attempts = int(detail.get("reset_retry_attempts", 0) or 0) + 1
-        sent = False
-        acked = False
+        created_raw = str(row["created_at"] or "").strip()
+        created_dt = None
+        if created_raw:
+            try:
+                created_dt = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+                if created_dt.tzinfo is None:
+                    created_dt = created_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                created_dt = None
         snapshot_key = str(detail.get("snapshot_cmd_key") or "").strip()
         snapshot_seen = str(detail.get("snapshot_last_seen") or "").strip()
+        attempts = int(detail.get("reset_retry_attempts", 0) or 0) + 1
+
+        if created_dt is not None and created_dt < cutoff:
+            detail["reset_retry_attempts"] = attempts
+            detail["last_reset_retry_at"] = utc_now_iso()
+            detail["completion_reason"] = "timeout"
+            detail["completion_note"] = (
+                f"server-unbound; device-side reset not acknowledged within "
+                f"{_UNBIND_RESET_PENDING_TIMEOUT_DAYS} days"
+            )
+            _finalize_unbind_job(req_id, "completed", detail)
+            logger.warning(
+                "unbind job timed out req=%s dev=%s after %sd",
+                req_id, did, _UNBIND_RESET_PENDING_TIMEOUT_DAYS,
+            )
+            continue
+
+        if not snapshot_key:
+            detail["reset_retry_attempts"] = attempts
+            detail["last_reset_retry_at"] = utc_now_iso()
+            detail["completion_reason"] = "no_snapshot"
+            detail["completion_note"] = (
+                "legacy job without snapshot_cmd_key; provisioned_credentials "
+                "already deleted, device-side reset cannot be signed"
+            )
+            _finalize_unbind_job(req_id, "completed", detail)
+            logger.warning(
+                "unbind job collapsed (no snapshot) req=%s dev=%s",
+                req_id, did,
+            )
+            continue
+
+        sent = False
+        acked = False
         try:
-            if snapshot_key:
-                sent, acked = _app._try_mqtt_unclaim_reset_with_snapshot(
-                    did,
-                    snapshot_key,
-                    last_seen=snapshot_seen,
-                    wait_for_ack=True,
-                )
-            else:
-                sent, acked = _app._try_mqtt_unclaim_reset(did)
-        except Exception as exc:
-            logger.debug(
-                "unbind compensation dispatch failed req=%s dev=%s err=%s",
-                req_id,
+            sent, acked = _app._try_mqtt_unclaim_reset_with_snapshot(
                 did,
-                exc,
+                snapshot_key,
+                last_seen=snapshot_seen,
+                wait_for_ack=False,
+            )
+        except Exception as exc:
+            logger.warning(
+                "unbind compensation dispatch failed req=%s dev=%s err=%s",
+                req_id, did, exc,
             )
         detail["reset_retry_attempts"] = attempts
         detail["last_reset_retry_at"] = utc_now_iso()
@@ -238,6 +285,28 @@ def _unbind_reset_compensation_tick(limit: int = 10) -> None:
             )
             conn.commit()
             conn.close()
+
+
+def _finalize_unbind_job(req_id: str, new_state: str, detail: dict) -> None:
+    """Idempotent terminal-state update for ``device_unbind_jobs``."""
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE device_unbind_jobs
+            SET state = ?, detail_json = ?, updated_at = ?
+            WHERE request_id = ?
+            """,
+            (
+                new_state,
+                json.dumps(detail, ensure_ascii=True),
+                utc_now_iso(),
+                req_id,
+            ),
+        )
+        conn.commit()
+        conn.close()
 
 
 def scheduler_loop() -> None:

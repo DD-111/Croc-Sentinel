@@ -102,9 +102,6 @@
 
   // ------------------------------------------------------------------ boot
   async function boot() {
-    // #region agent log
-    fetch('http://127.0.0.1:7580/ingest/13cc4f55-c163-4556-b72d-19f8aaadec22',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'ba8b41'},body:JSON.stringify({sessionId:'ba8b41',runId:'r1',hypothesisId:'A',location:'console.raw.js:boot',message:'boot start',data:{hash:location.hash,hasHash:!!location.hash,bundleVer:'v=85',userAgent:(navigator&&navigator.userAgent||'').slice(0,80)},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion
     initTheme();
 
     $("#menuBtn").addEventListener("click", () => toggleNav());
