@@ -1001,6 +1001,41 @@ void loadProvisioningRuntime() {
   }
 }
 
+// Server authority path:
+// If /device/boot-sync says "unprovisioned" while local NVS still says prov=y,
+// demote this unit back to bootstrap mode (without touching WiFi) so it can
+// publish bootstrap.register again and become claimable in the dashboard.
+static void forceBootstrapModeFromServerUnprovisioned() {
+  bool wasProv = isProvisioned;
+  prefs.begin(NVS_NAMESPACE, false);
+  prefs.putBool("prov", false);
+  // Keep serial/dev_id and WiFi, but clear claim-issued credentials so runtime
+  // can't keep using stale tenant keys after server has no matching row.
+  prefs.remove("mqtt_u");
+  prefs.remove("mqtt_p");
+  prefs.remove("cmd_key");
+  prefs.end();
+
+  isProvisioned = false;
+  strlcpy(mqttUser, BOOTSTRAP_MQTT_USERNAME, sizeof(mqttUser));
+  strlcpy(mqttPass, BOOTSTRAP_MQTT_PASSWORD, sizeof(mqttPass));
+  strlcpy(cmdAuthKey, CMD_AUTH_KEY, sizeof(cmdAuthKey));
+  generateBootstrapNonce();
+
+  if (wasProv) {
+    logLine("[sync] server unprovisioned -> fallback to bootstrap mode");
+  } else {
+    logLine("[sync] bootstrap mode reaffirmed by server");
+  }
+
+  // Ensure we leave tenant MQTT topics immediately; next ensureMqtt() cycle will
+  // reconnect with bootstrap credentials, subscribe bootstrap.assign, and publish
+  // bootstrap.register (see ensureMqtt connected branch).
+  if (mqttClient.connected()) {
+    mqttClient.disconnect();
+  }
+}
+
 bool saveProvisioningFromClaim(JsonVariant doc) {
   const char *macHex = doc["mac_nocolon"] | "";
   const char *nonce = doc["claim_nonce"] | "";
@@ -2502,6 +2537,7 @@ void performDeviceBootSyncHttp(bool quickTimeout) {
   }
   if (strcmp(st, "unprovisioned") == 0) {
     logLine("[sync] server: unprovisioned");
+    forceBootstrapModeFromServerUnprovisioned();
     return;
   }
   if (strcmp(st, "resync") == 0) {
