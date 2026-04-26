@@ -223,3 +223,181 @@ html[data-theme="dark"] a:not([class]),
 html[data-theme="dark"] .auth-link {
   color: var(--accent);
 }
+
+/* ===========================================================================
+ * Phase 99 — sticky footer + device detail compaction.
+ *
+ * Fix #1: footer scrolls away from the bottom on long pages.
+ *   Pin .site-footer--shell to the bottom of the .main scroll container with
+ *   `position: sticky` (mirrors the existing sticky topbar).
+ *
+ * Fix #2: device detail cards take too much room and font/spacing isn't
+ *   consistent across the page sections (Quick actions, Sharing, Wi-Fi,
+ *   Danger zone, Trigger policy, Raw command, MQTT msgs).
+ *   Tighten card padding, hero meta line height, drawer summary height,
+ *   primary-name font size, and unify all .row gaps.
+ * ===========================================================================*/
+
+body[data-layout="app"] .site-footer--shell {
+  position: sticky;
+  bottom: 0;
+  z-index: 12;
+  background: color-mix(in srgb, var(--bg-elev) 92%, transparent);
+  -webkit-backdrop-filter: blur(10px) saturate(1.1);
+  backdrop-filter: blur(10px) saturate(1.1);
+}
+@supports not (backdrop-filter: blur(1px)) {
+  body[data-layout="app"] .site-footer--shell {
+    background: var(--bg-elev);
+  }
+}
+
+/* --- Device detail page compaction ------------------------------------- */
+
+.device-page-v2 {
+  font-size: 13.5px;
+  line-height: 1.5;
+  gap: 10px;
+}
+.device-page-v2 .card {
+  padding: 12px 14px;
+}
+.device-page-v2 .device-focus-layout {
+  padding: 12px;
+  gap: 12px;
+  border-radius: 14px;
+}
+.device-page-v2 .device-page-head .device-primary-name {
+  font-size: 1.18rem;
+  letter-spacing: -0.018em;
+  line-height: 1.25;
+}
+.device-page-v2 .device-id-sub {
+  font-size: 11px;
+  margin-top: 2px;
+  letter-spacing: 0;
+  color: var(--text-dim);
+}
+.device-page-v2 .device-hero-card {
+  padding: 10px 12px;
+  margin-top: 8px;
+  gap: 10px;
+  border-radius: 12px;
+}
+.device-page-v2 .device-hero-meta {
+  gap: 4px 12px;
+}
+.device-page-v2 .device-hero-line {
+  padding: 5px 8px;
+  font-size: 12.5px;
+  line-height: 1.4;
+  border-radius: 8px;
+}
+.device-page-v2 .device-hero-line .muted {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 600;
+}
+.device-page-v2 .device-thumb {
+  width: 44px;
+  height: 44px;
+  font-size: 1.1rem;
+  border-radius: 12px;
+}
+
+/* Right column (Ownership + Notifications): tighter cards */
+.device-page-v2 .device-focus-right > .card {
+  padding: 11px 13px;
+}
+.device-page-v2 .device-focus-right > .card h3 {
+  font-size: 13px;
+  margin: 0 0 6px;
+  letter-spacing: -0.01em;
+}
+.device-page-v2 .device-owner-kv > div {
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.device-page-v2 .device-owner-kv .muted {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* Quick actions / split row: tighter */
+.device-page-v2 .device-quick-split > .card {
+  padding: 12px 14px;
+}
+.device-page-v2 .device-quick-split h3 {
+  font-size: 13px;
+  margin: 0 0 8px;
+  letter-spacing: -0.01em;
+}
+.device-page-v2 .device-quick-split .row {
+  gap: 8px;
+  margin-top: 6px;
+}
+.device-page-v2 .device-quick-split .btn {
+  min-height: 34px;
+  padding: 6px 12px;
+  font-size: 13px;
+}
+
+/* Drawer (Sharing / Wi-Fi / Danger / Trigger / Raw): consistent compact summary */
+.device-page-v2 details.card.device-drawer {
+  margin-top: 0;
+  border-radius: 12px;
+}
+.device-page-v2 details.card.device-drawer > summary.device-drawer__summary {
+  min-height: 40px;
+  padding: 9px 14px;
+  font-size: 13.5px;
+}
+.device-page-v2 details.card.device-drawer > summary .device-drawer__title {
+  font-size: 13.5px;
+  font-weight: 650;
+  letter-spacing: -0.005em;
+}
+.device-page-v2 details.card.device-drawer > summary .device-drawer__hint {
+  font-size: 11.5px;
+  letter-spacing: 0;
+}
+.device-page-v2 .device-drawer__body {
+  padding: 12px 14px 14px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* Inline forms inside drawers: calmer rhythm */
+.device-page-v2 .inline-form {
+  gap: 8px 12px;
+}
+.device-page-v2 .inline-form .field > span {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+/* Back nav button: less heavy */
+.device-page-v2 .device-page-back-nav {
+  margin-bottom: 4px;
+}
+.device-page-v2 .device-page-back {
+  min-height: 30px;
+  padding: 4px 10px;
+  font-size: 12.5px;
+  border-radius: 8px;
+}
+
+/* Mobile: keep the same compact look but a bit more padding for tap area */
+@media (max-width: 760px) {
+  .device-page-v2 .device-quick-split .btn {
+    min-height: 40px;
+    font-size: 13.5px;
+  }
+  .device-page-v2 details.card.device-drawer > summary.device-drawer__summary {
+    min-height: 44px;
+  }
+}

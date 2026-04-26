@@ -45,8 +45,16 @@ from pydantic import BaseModel, Field
 
 import app as _app
 from audit import audit_event
-from config import FACTORY_API_TOKEN
+from config import (
+    CMD_PROTO,
+    ENFORCE_FACTORY_REGISTRATION,
+    FACTORY_API_TOKEN,
+    FACTORY_VERIFY_QR_ON_REGISTER,
+    QR_CODE_REGEX,
+    QR_SIGN_SECRET,
+)
 from db import db_lock, get_conn
+from device_security import verify_qr_signature
 from helpers import utc_now_iso
 from security import Principal, assert_min_role, decode_jwt
 
@@ -98,41 +106,108 @@ def factory_register_bulk(body: FactoryBulkRequest, request: Request) -> dict[st
 
     Authenticate as superadmin (JWT) **or** supply X-Factory-Token equal to
     FACTORY_API_TOKEN. Existing rows are updated in place.
+
+    When ``QR_SIGN_SECRET`` is configured AND
+    ``FACTORY_VERIFY_QR_ON_REGISTER=1`` (default), each item's ``qr_code`` is
+    HMAC-verified BEFORE insertion. Any item whose signature is wrong is
+    rejected up-front with the failing serial in the response — this catches
+    forged or legacy unsigned QR payloads at upload time instead of letting
+    them sit in ``factory_devices`` until a tenant tries to claim.
     """
     actor = _require_factory_auth(request)
     now = utc_now_iso()
+    verify_qr = bool(QR_SIGN_SECRET) and FACTORY_VERIFY_QR_ON_REGISTER
+    qr_re = re.compile(QR_CODE_REGEX)
+
+    rejected: list[dict[str, str]] = []
+    valid_items: list[FactoryDeviceItem] = []
+    for it in body.items:
+        mac = (it.mac_nocolon or "").upper() or None
+        if mac and (len(mac) != 12 or not re.fullmatch(r"^[0-9A-F]{12}$", mac)):
+            rejected.append({"serial": it.serial, "reason": "invalid mac"})
+            continue
+        if verify_qr:
+            qr = (it.qr_code or "").strip()
+            if not qr:
+                rejected.append({"serial": it.serial, "reason": "qr_code missing"})
+                continue
+            if not qr_re.fullmatch(qr):
+                rejected.append({"serial": it.serial, "reason": "qr_code policy"})
+                continue
+            if not verify_qr_signature(qr):
+                rejected.append({"serial": it.serial, "reason": "qr_code signature"})
+                continue
+        valid_items.append(it)
+
     written = 0
-    with db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        for it in body.items:
-            mac = (it.mac_nocolon or "").upper() or None
-            if mac and (len(mac) != 12 or not re.fullmatch(r"^[0-9A-F]{12}$", mac)):
-                conn.close()
-                raise HTTPException(status_code=400, detail=f"invalid mac for {it.serial}")
-            cur.execute(
-                """INSERT INTO factory_devices (serial, mac_nocolon, qr_code, batch, status, note, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, 'unclaimed', ?, ?, ?)
-                   ON CONFLICT(serial) DO UPDATE SET
-                       mac_nocolon = COALESCE(excluded.mac_nocolon, factory_devices.mac_nocolon),
-                       qr_code     = COALESCE(excluded.qr_code,     factory_devices.qr_code),
-                       batch       = COALESCE(excluded.batch,       factory_devices.batch),
-                       note        = COALESCE(excluded.note,        factory_devices.note),
-                       updated_at  = excluded.updated_at""",
-                (it.serial, mac, it.qr_code, it.batch, it.note, now, now),
-            )
-            written += 1
-        conn.commit()
-        conn.close()
-    audit_event(actor, "factory.register.bulk", f"count={written}", {"batch": body.items[0].batch if body.items else ""})
-    return {"ok": True, "written": written}
+    if valid_items:
+        with db_lock:
+            conn = get_conn()
+            cur = conn.cursor()
+            for it in valid_items:
+                mac = (it.mac_nocolon or "").upper() or None
+                cur.execute(
+                    """INSERT INTO factory_devices (serial, mac_nocolon, qr_code, batch, status, note, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, 'unclaimed', ?, ?, ?)
+                       ON CONFLICT(serial) DO UPDATE SET
+                           mac_nocolon = COALESCE(excluded.mac_nocolon, factory_devices.mac_nocolon),
+                           qr_code     = COALESCE(excluded.qr_code,     factory_devices.qr_code),
+                           batch       = COALESCE(excluded.batch,       factory_devices.batch),
+                           note        = COALESCE(excluded.note,        factory_devices.note),
+                           updated_at  = excluded.updated_at""",
+                    (it.serial, mac, it.qr_code, it.batch, it.note, now, now),
+                )
+                written += 1
+            conn.commit()
+            conn.close()
+
+    audit_event(
+        actor,
+        "factory.register.bulk",
+        f"count={written}",
+        {
+            "batch": body.items[0].batch if body.items else "",
+            "rejected": len(rejected),
+            "qr_verified": verify_qr,
+        },
+    )
+    if rejected and not valid_items:
+        # Whole batch rejected — surface as 400 so the UI/CLI fails loudly
+        # instead of silently writing zero rows with a 200.
+        raise HTTPException(
+            status_code=400,
+            detail={"ok": False, "written": 0, "rejected": rejected, "qr_verified": verify_qr},
+        )
+    return {
+        "ok": True,
+        "written": written,
+        "rejected": rejected,
+        "qr_verified": verify_qr,
+    }
 
 
 @router.get("/factory/ping")
 def factory_ping(request: Request) -> dict[str, Any]:
-    """No-op auth probe for factory UIs / scripts (same auth as POST /factory/devices)."""
-    _require_factory_auth(request)
-    return {"ok": True, "factory_auth": True}
+    """Auth + environment probe for factory UIs / scripts.
+
+    Returns the runtime knobs the UI needs to display "what server am I
+    talking to?" — QR-sign requirement, factory-registration enforcement,
+    cmd protocol version, and current server time. Lets the operator
+    confirm they connected to the right deployment before generating a
+    batch of serials.
+    """
+    actor = _require_factory_auth(request)
+    return {
+        "ok": True,
+        "factory_auth": True,
+        "actor": actor,
+        "server_time": utc_now_iso(),
+        "qr_sign_required": bool(QR_SIGN_SECRET),
+        "qr_verify_on_register": bool(QR_SIGN_SECRET) and FACTORY_VERIFY_QR_ON_REGISTER,
+        "enforce_factory_registration": bool(ENFORCE_FACTORY_REGISTRATION),
+        "cmd_proto": int(CMD_PROTO),
+        "qr_code_regex": QR_CODE_REGEX,
+    }
 
 
 @router.get("/factory/devices")

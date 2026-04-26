@@ -200,6 +200,12 @@ SMS_PROVIDER: str = os.getenv("SMS_PROVIDER", "none").strip().lower()
 # unguessable in production.
 ENFORCE_FACTORY_REGISTRATION: bool = os.getenv("ENFORCE_FACTORY_REGISTRATION", "0") == "1"
 FACTORY_API_TOKEN: str = os.getenv("FACTORY_API_TOKEN", "")
+# When true (default ON whenever QR_SIGN_SECRET is set), POST /factory/devices
+# verifies the HMAC tag baked into each item's qr_code before inserting into
+# factory_devices. This catches forged/legacy unsigned QR payloads at upload
+# time instead of waiting until /provision/claim. Set to "0" to allow legacy
+# batches that pre-date the QR signing rollout.
+FACTORY_VERIFY_QR_ON_REGISTER: bool = os.getenv("FACTORY_VERIFY_QR_ON_REGISTER", "1") == "1"
 
 # --- Telegram command bot --------------------------------------------------
 TELEGRAM_COMMAND_SECRET: str = os.getenv("TELEGRAM_COMMAND_SECRET", "").strip()
@@ -350,6 +356,7 @@ __all__ = [
     "EVENT_SUB_QUEUE_SIZE",
     "EVENT_WS_ENABLED",
     "FACTORY_API_TOKEN",
+    "FACTORY_VERIFY_QR_ON_REGISTER",
     "FANOUT_WALL_CLOCK_MAX_S",
     "FANOUT_WORKER_POOL_SIZE",
     "FORGOT_PASSWORD_IP_MAX",

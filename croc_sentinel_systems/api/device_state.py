@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 from typing import Any, Optional
 
 from config import ENFORCE_FACTORY_REGISTRATION
@@ -36,6 +38,66 @@ from db import cache_invalidate, db_lock, get_conn
 from helpers import utc_now_iso
 
 logger = logging.getLogger("crocapi.device_state")
+
+# --- Deprovisioned-resurrection guard --------------------------------------
+# A device that has been ``unbind & reset``-ed has its row removed from
+# ``device_state`` and ``provisioned_credentials``, AND a ``UNBOUND`` row in
+# ``device_lifecycle``. If that device is still online with the old cmd_key
+# in its NVS (because ``unclaim_reset`` did not reach it / has not been
+# acked), every heartbeat / status / ack / event would silently
+# ``upsert_device_state`` and re-create the row — making the device look
+# "alive again" in the dashboard immediately after the operator deletes it.
+#
+# The guard: any caller (today only ``mqtt_pipeline._dispatch_mqtt_payload``)
+# that goes through ``upsert_device_state`` will short-circuit when the
+# lifecycle says ``UNBOUND`` AND there is no provisioned_credentials row.
+# We additionally throttle a "reaffirm" warning log so the operator sees
+# WHY the device keeps publishing — and so they can confirm whether the
+# scheduler is still retrying the snapshot ``unclaim_reset`` publish.
+
+_DEPROV_LOG_LOCK = threading.Lock()
+_DEPROV_LAST_LOG_AT: dict[str, float] = {}
+_DEPROV_LOG_COOLDOWN_S = 60.0
+
+
+def _is_deprovisioned(cur, device_id: str) -> bool:
+    """True iff lifecycle is UNBOUND and no provisioned_credentials row exists.
+
+    Pure read; uses the caller's cursor (no transaction boundary change).
+    """
+    if not device_id:
+        return False
+    try:
+        cur.execute(
+            "SELECT lifecycle_state FROM device_lifecycle WHERE device_id = ? LIMIT 1",
+            (device_id,),
+        )
+        row = cur.fetchone()
+        state = str(row["lifecycle_state"] if row and row["lifecycle_state"] is not None else "").upper()
+        if state != "UNBOUND":
+            return False
+        cur.execute("SELECT 1 FROM provisioned_credentials WHERE device_id = ? LIMIT 1", (device_id,))
+        return cur.fetchone() is None
+    except Exception:
+        # If the lifecycle table or columns aren't ready (older DB), do
+        # NOT block. The guard is best-effort and must never block legit
+        # writers.
+        return False
+
+
+def _maybe_log_deprov_blocked(device_id: str, channel: str) -> None:
+    """Throttled warning so operators can see WHY the device keeps publishing."""
+    now = time.monotonic()
+    with _DEPROV_LOG_LOCK:
+        last = _DEPROV_LAST_LOG_AT.get(device_id, 0.0)
+        if now - last < _DEPROV_LOG_COOLDOWN_S:
+            return
+        _DEPROV_LAST_LOG_AT[device_id] = now
+    logger.warning(
+        "device_state.upsert blocked: device_id=%s lifecycle=UNBOUND, no provisioned_credentials. "
+        "Channel=%s. Device still has old cmd_key in NVS — scheduler will keep retrying unclaim_reset.",
+        device_id, channel,
+    )
 
 
 def upsert_pending_claim(payload: dict[str, Any]) -> None:
@@ -133,6 +195,10 @@ def upsert_device_state(device_id: str, channel: str, payload: dict[str, Any]) -
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
+        if _is_deprovisioned(cur, device_id):
+            conn.close()
+            _maybe_log_deprov_blocked(device_id, channel)
+            return None
         cur.execute("SELECT zone FROM device_zone_overrides WHERE device_id = ?", (device_id,))
         zov = cur.fetchone()
         if zov and zov["zone"] is not None:
