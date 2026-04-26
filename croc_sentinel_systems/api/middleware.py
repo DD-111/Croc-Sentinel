@@ -23,6 +23,7 @@ behaviour byte-identical while letting the actual logic move out.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any, Awaitable, Callable
 
@@ -42,12 +43,23 @@ CallNext = Callable[[Request], Awaitable[Any]]
 
 
 async def _security_headers_impl(request: Request, call_next: CallNext):
-    """Baseline hardening for dashboard + API responses (CSP allows Google Fonts used by index.html)."""
+    """Baseline hardening for dashboard + API responses (CSP allows Google Fonts used by index.html).
+
+    Optional debug knob: when env ``DEBUG_INGEST_ORIGIN`` is set (e.g. to
+    ``http://127.0.0.1:7580``), its value is appended to the ``connect-src``
+    CSP directive. This lets browser-side instrumentation POST diagnostic
+    payloads to a developer's local Cursor ingest server during a debug
+    session. Read at request time so a plain ``docker compose restart api``
+    flips it without rebuilding the image; default empty = identical strict
+    CSP as before.
+    """
     resp = await call_next(request)
     resp.headers.setdefault("X-Frame-Options", "DENY")
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
     resp.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    extra_connect = (os.getenv("DEBUG_INGEST_ORIGIN") or "").strip()
+    connect_src = "connect-src 'self'" + (f" {extra_connect}" if extra_connect else "")
     resp.headers.setdefault(
         "Content-Security-Policy",
         "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; "
@@ -55,7 +67,7 @@ async def _security_headers_impl(request: Request, call_next: CallNext):
         "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
         "font-src 'self' https://fonts.gstatic.com; "
         "script-src 'self' 'unsafe-inline'; "
-        "connect-src 'self'",
+        + connect_src,
     )
     return resp
 
