@@ -101,9 +101,16 @@ def register_routers(app: FastAPI) -> None:
     app.include_router(_auth_core_router)
 
     # Phase-15: device-side HTTP fallback (4 /device/* endpoints + schemas + auth helpers).
+    # Phase-69: also mount under /api/* so firmware builds with the legacy
+    # DEVICE_SYNC_*_PATH default (which prefixes /api/) keep working when
+    # the reverse-proxy doesn't strip /api before forwarding to the API
+    # container. Both prefixes resolve to the same handlers — the bare
+    # /device/* paths remain canonical, /api/* is the back-compat alias.
     from routers.device_http import router as _device_http_router
+    from routers.device_http import alias_router as _device_http_alias_router
 
     app.include_router(_device_http_router)
+    app.include_router(_device_http_alias_router)
 
     # Phase-20 / 83: self-service /auth/me/* split into two modules —
     #   * routers.auth_self          — identity/account (5 routes:

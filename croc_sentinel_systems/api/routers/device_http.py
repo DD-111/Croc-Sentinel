@@ -331,3 +331,27 @@ def device_commands_ack(body: DeviceCommandAckRequest) -> dict[str, Any]:
     did = str(row["device_id"])
     updated = _cmd_queue_mark_acked(body.cmd_id, ok=bool(body.ok), detail=body.detail or "")
     return {"ok": True, "settled": bool(updated), "device_id": did}
+
+
+# ─────────────────────────────────── /api/* alias router ────
+#
+# Some shipped firmware builds (config.h DEVICE_SYNC_BOOT_PATH default,
+# pre-Phase-69) hard-code the four device endpoints under an ``/api``
+# prefix because a Traefik / nginx reverse-proxy was assumed to strip
+# it before forwarding. Operators that point ``DEVICE_SYNC_API_BASE``
+# straight at the API container (no ``/api → /`` rewrite at the proxy)
+# would otherwise see ``HTTP 404`` on every boot-sync, which silently
+# blocks the cmd_key self-heal path → MQTT cmd auth then fails with
+# ``key mismatch`` until the device is re-claimed.
+#
+# Mounting the same handlers a second time under ``/api`` is the
+# zero-flash, zero-downtime fix: both ``POST /device/boot-sync`` and
+# ``POST /api/device/boot-sync`` resolve to the same function, so old
+# and new firmware both work, and the cmd_key resync payload reaches
+# every device on the next boot. The new prefix-less paths remain the
+# canonical surface — keep new firmware aligned with config.h.example.
+alias_router = APIRouter(prefix="/api", tags=["device-http-api-alias"])
+alias_router.add_api_route("/device/boot-sync", device_boot_sync, methods=["POST"], name="device_boot_sync_api_alias")
+alias_router.add_api_route("/device/ota/report", device_ota_report, methods=["POST"], name="device_ota_report_api_alias")
+alias_router.add_api_route("/device/commands/pending", device_commands_pending, methods=["POST"], name="device_commands_pending_api_alias")
+alias_router.add_api_route("/device/commands/ack", device_commands_ack, methods=["POST"], name="device_commands_ack_api_alias")

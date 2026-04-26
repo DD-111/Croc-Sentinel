@@ -16,8 +16,11 @@ Carved out of ``app.py``. Owns:
 * :func:`emit_event` — single shared entry-point used by every
   audit / alarm / ota / presence / provision / device / system /
   auth path. Inserts the row, publishes to local fan-out, mirrors
-  to the Redis bridge, kicks Telegram (with the cached superadmin
-  chat-id firehose) and FCM dispatch.
+  to the Redis bridge, kicks Telegram (with a tier-isolated chat-id
+  list computed by ``telegram_visibility.telegram_chat_ids_for_event``
+  — superadmin firehose, admin sees own-tenant + managed-user
+  events, user sees own actor/target events in their manager's
+  tenant) and FCM dispatch.
 
 Wiring
 ------
@@ -29,9 +32,13 @@ Wiring
   ``redis_bridge._redis_event_forward``,
   ``fcm_dispatch._maybe_dispatch_fcm_for_ev``,
   ``authz.get_manager_admin``, ``security.Principal``,
-  ``superadmin_cache.{_is_superadmin_username,_superadmin_telegram_chat_ids}``.
+  ``superadmin_cache._is_superadmin_username``,
+  ``telegram_visibility.telegram_chat_ids_for_event``.
   Phase 57 dropped the last two ``_app.*`` late-binders this module
-  used to need — it's now fully import-acyclic with ``app.py``.
+  used to need; Phase 69 swapped the superadmin-only Telegram
+  firehose for ``telegram_visibility.telegram_chat_ids_for_event``
+  so admin/user bindings receive their tier-appropriate slice. Still
+  fully import-acyclic with ``app.py``.
 * ``app.py`` re-exports every public symbol back so existing
   ``from app import emit_event`` / ``from app import event_bus``
   call sites in routers and helpers keep working unchanged.
@@ -60,7 +67,8 @@ from db import db_lock, get_conn
 from fcm_dispatch import _maybe_dispatch_fcm_for_ev
 from redis_bridge import _redis_event_forward
 from security import Principal
-from superadmin_cache import _is_superadmin_username, _superadmin_telegram_chat_ids
+from superadmin_cache import _is_superadmin_username
+from telegram_visibility import telegram_chat_ids_for_event
 from trigger_policy import _notify_subject_prefix
 from tz_display import iso_timestamp_to_malaysia
 
@@ -305,13 +313,18 @@ def emit_event(
     try:
         from telegram_notify import maybe_notify_telegram
 
-        # Superadmin bindings get the firehose; env TELEGRAM_CHAT_IDS stays
-        # filtered as before (signal hygiene for operators).
+        # Phase-69: per-binding tier-isolated fan-out. Superadmin gets
+        # the full firehose; admins receive their tenant + their
+        # actor/target self events + events whose actor/target is one
+        # of their managed users; users receive only events involving
+        # them in their manager_admin's tenant (auth.* muted).
+        # The env TELEGRAM_CHAT_IDS channel is independent and still
+        # walks the level filter (signal hygiene for operators).
         try:
-            sa_chats = _superadmin_telegram_chat_ids()
+            tier_chats = telegram_chat_ids_for_event(ev)
         except Exception:
-            sa_chats = []
-        maybe_notify_telegram(ev, extra_chat_ids=sa_chats)
+            tier_chats = []
+        maybe_notify_telegram(ev, extra_chat_ids=tier_chats)
     except Exception as exc:
         # Avoid silent failures when Telegram module/env is misconfigured (default log level INFO).
         logger.warning("telegram_notify skipped: %s", exc)

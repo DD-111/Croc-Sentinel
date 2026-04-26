@@ -151,7 +151,22 @@ def _superadmin_telegram_chat_ids() -> list[str]:
 
 def _invalidate_superadmin_telegram_chats_cache() -> None:
     """Reset the cached superadmin->chat mapping so the next emit_event
-    picks up a fresh bind/unbind/toggle immediately instead of after TTL."""
+    picks up a fresh bind/unbind/toggle immediately instead of after TTL.
+
+    Phase-69: also busts the per-binding directory cache used by
+    :mod:`telegram_visibility` so the tier-isolated fan-out (admin /
+    user / superadmin) reflects the change on the very next event.
+    Imported lazily to keep this module free of any compile-time
+    dependency on ``telegram_visibility`` (preserves the import
+    order: ``superadmin_cache`` < ``telegram_visibility`` <
+    ``event_bus``).
+    """
     global _superadmin_tg_chats_cache, _superadmin_tg_chats_ts
     _superadmin_tg_chats_cache = []
     _superadmin_tg_chats_ts = 0.0
+    try:
+        from telegram_visibility import invalidate_telegram_recipient_directory
+
+        invalidate_telegram_recipient_directory()
+    except Exception:
+        pass
