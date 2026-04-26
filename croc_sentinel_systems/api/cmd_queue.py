@@ -36,10 +36,42 @@ import time
 from typing import Any, Optional
 
 from config import CMD_PROTO
+from cmd_keys import get_cmd_key_for_device
 from db import db_lock, db_read_lock, get_conn
 from helpers import utc_now_iso
 
 logger = logging.getLogger("crocapi.cmd_queue")
+
+
+def _effective_cmd_key_for_delivery(device_id: str, stored_key: str, *, ctx: str) -> str:
+    """Return the cmd_key that should sign a (re)delivered /cmd frame.
+
+    Rows in ``cmd_queue`` snapshot the key at enqueue time.  After a
+    boot-sync resync, reclaim, or manual credential rotation the live
+    ``provisioned_credentials.cmd_key`` moves forward while pending
+    rows still carry the old hex.  Replaying or HTTP-serving the stale
+    value guarantees firmware ``verifyKey`` failures.
+
+    Policy: always prefer :func:`get_cmd_key_for_device` at delivery
+    time; log once per row when the ledger snapshot diverges so
+    operators can correlate with rotation events.
+    """
+    did = str(device_id or "").strip()
+    live = str(get_cmd_key_for_device(did) or "").strip().upper()
+    snap = str(stored_key or "").strip().upper()
+    if snap and live and snap != live:
+        logger.warning(
+            "cmd_queue %s: cmd_key drift for %s (ledger=%s…%s live=%s…%s) — using live key",
+            ctx,
+            did or "?",
+            snap[:4],
+            snap[-4:],
+            live[:4],
+            live[-4:],
+        )
+    if live:
+        return live
+    return snap
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -191,6 +223,7 @@ def _cmd_queue_pending_for_device(device_id: str, limit: int = 32) -> list[dict[
                     params = json.loads(r["params_json"] or "{}")
                 except Exception:
                     params = {}
+                snap_key = r["cmd_key"] or ""
                 out.append({
                     "cmd_id": r["cmd_id"],
                     "device_id": r["device_id"],
@@ -198,7 +231,11 @@ def _cmd_queue_pending_for_device(device_id: str, limit: int = 32) -> list[dict[
                     "params": params,
                     "target_id": r["target_id"] or "",
                     "proto": int(r["proto"] or 0),
-                    "cmd_key": r["cmd_key"] or "",
+                    "cmd_key": _effective_cmd_key_for_delivery(
+                        str(r["device_id"] or ""),
+                        snap_key,
+                        ctx=f"pending({r['cmd_id']})",
+                    ),
                     "created_at": r["created_at"],
                     "delivered_via": r["delivered_via"] or "",
                     "delivered_at": r["delivered_at"] or "",
@@ -307,13 +344,18 @@ def _maybe_replay_queue_on_reconnect(device_id: str, prev_updated_at: Optional[s
     topic_root = getattr(_app, "TOPIC_ROOT", "croc")
     for entry in pending:
         try:
+            eff_key = _effective_cmd_key_for_delivery(
+                device_id,
+                str(entry.get("cmd_key") or ""),
+                ctx=f"replay({entry.get('cmd_id')})",
+            )
             _app.publish_command(
                 topic=f"{topic_root}/{device_id}/cmd",
                 cmd=str(entry["cmd"]),
                 params=entry.get("params") or {},
                 target_id=str(entry.get("target_id") or device_id),
                 proto=int(entry.get("proto") or CMD_PROTO),
-                cmd_key=str(entry.get("cmd_key") or ""),
+                cmd_key=eff_key,
                 wait_publish=False,
                 persist=False,
             )

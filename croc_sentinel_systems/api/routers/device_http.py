@@ -292,10 +292,16 @@ def device_commands_pending(body: DeviceCommandsPendingRequest) -> dict[str, Any
 
     Contract (so firmware and server stay in lockstep):
       * Server returns ``{"commands": [...]}`` — oldest first.
-      * Each entry is the exact /cmd payload the device would have seen
-        over MQTT (cmd, cmd_id, target_id, proto, params, cmd_key). The
-        firmware handler must be idempotent per cmd_id because the same
-        entry can be served again on the next pull until ACK'd.
+      * Each entry mirrors the MQTT ``/cmd`` JSON shape (``cmd``,
+        ``cmd_id``, ``target_id``, ``proto``, ``params``, ``key``).
+        The signing ``key`` is always the **live**
+        ``get_cmd_key_for_device(device_id)`` at pull time — if the
+        device's credentials rotated after the command was originally
+        published, the ledger row may still carry an older snapshot, but
+        the HTTP response must never resurrect a stale key or the device
+        will reject the frame even though its NVS is already current.
+      * The firmware handler must be idempotent per ``cmd_id`` because the
+        same entry can be served again on the next pull until ACK'd.
       * The server does NOT mark anything delivered on pull. Delivery is
         confirmed only when the device POSTs /device/commands/ack — MQTT
         remains the source of truth for delivery semantics.
