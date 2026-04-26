@@ -212,6 +212,44 @@ def _unbind_reset_compensation_tick(limit: int = 10) -> None:
         snapshot_seen = str(detail.get("snapshot_last_seen") or "").strip()
         attempts = int(detail.get("reset_retry_attempts", 0) or 0) + 1
 
+        # Hard stop for re-claimed devices: once a device is ACTIVE again and
+        # has a live provisioned_credentials row, any historical unbind-reset
+        # compensation becomes stale and must not keep publishing unclaim_reset.
+        with db_lock:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT dl.lifecycle_state AS lifecycle_state,
+                       EXISTS (
+                         SELECT 1 FROM provisioned_credentials pc
+                         WHERE UPPER(pc.device_id) = UPPER(?)
+                       ) AS has_prov
+                FROM device_lifecycle dl
+                WHERE UPPER(dl.device_id) = UPPER(?)
+                LIMIT 1
+                """,
+                (did, did),
+            )
+            st_row = cur.fetchone()
+            conn.close()
+        lifecycle_state = str(st_row["lifecycle_state"] or "").upper() if st_row else ""
+        has_prov = bool(int(st_row["has_prov"] or 0)) if st_row else False
+        if lifecycle_state == "ACTIVE" and has_prov:
+            detail["reset_retry_attempts"] = attempts
+            detail["last_reset_retry_at"] = utc_now_iso()
+            detail["completion_reason"] = "reclaimed"
+            detail["completion_note"] = (
+                "device is ACTIVE with provisioned credentials; "
+                "stale unbind compensation cancelled"
+            )
+            _finalize_unbind_job(req_id, "completed", detail)
+            logger.info(
+                "unbind compensation cancelled req=%s dev=%s (already reclaimed)",
+                req_id, did,
+            )
+            continue
+
         if created_dt is not None and created_dt < cutoff:
             detail["reset_retry_attempts"] = attempts
             detail["last_reset_retry_at"] = utc_now_iso()

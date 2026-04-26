@@ -233,6 +233,39 @@ def claim_device(req: ClaimDeviceRequest, principal: Principal = Depends(require
             "UPDATE device_state SET display_label = '', notification_group = '' WHERE device_id = ?",
             (did_norm,),
         )
+        # Claim succeeded: tear down stale unbind/reset compensation state from
+        # prior delete-reset cycles so scheduler/queue cannot keep replaying
+        # historical unclaim_reset commands against the newly claimed device.
+        cur.execute(
+            """
+            UPDATE cmd_queue
+            SET acked_at = ?, ack_ok = 0,
+                ack_detail = 'settled on re-claim: stale unclaim_reset'
+            WHERE device_id = ?
+              AND cmd = 'unclaim_reset'
+              AND acked_at IS NULL
+            """,
+            (utc_now_iso(), did_norm),
+        )
+        cur.execute(
+            """
+            UPDATE device_unbind_jobs
+            SET state = 'completed',
+                command_acked = 0,
+                detail_json = json_set(
+                    CASE
+                      WHEN IFNULL(detail_json,'') = '' THEN '{}'
+                      ELSE detail_json
+                    END,
+                    '$.completion_reason', 'reclaimed',
+                    '$.completion_note', 'device re-claimed; stale unbind compensation cancelled'
+                ),
+                updated_at = ?
+            WHERE device_id = ?
+              AND state NOT IN ('completed', 'failed', 'aborted', 'cancelled')
+            """,
+            (utc_now_iso(), did_norm),
+        )
         conn.commit()
         conn.close()
         cache_invalidate("devices")
