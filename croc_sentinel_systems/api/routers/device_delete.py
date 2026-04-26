@@ -42,6 +42,7 @@ from pydantic import BaseModel, Field
 import app as _app
 from audit import audit_event
 from db import cache_invalidate, db_lock, get_conn
+from device_lifecycle import LIFECYCLE_UNBOUND, transition_device_lifecycle_cur
 from helpers import utc_now_iso
 from security import Principal, assert_min_role
 
@@ -49,6 +50,7 @@ require_principal = _app.require_principal
 require_capability = _app.require_capability
 assert_device_owner = _app.assert_device_owner
 _try_mqtt_unclaim_reset = _app._try_mqtt_unclaim_reset
+_mqtt_unsubscribe_device_topics = _app._mqtt_unsubscribe_device_topics
 
 
 logger = logging.getLogger("croc-api.routers.device_delete")
@@ -85,66 +87,102 @@ def _device_delete_reset_impl(
     req_id = str(uuid.uuid4())
     mode = "factory_unclaim" if super_unclaim else "delete_reset"
     now = utc_now_iso()
-    # Phase 95 Part 0: lifecycle row starts at requested.
+    mac_nocolon = ""
+    del_cred = del_owner = del_acl = del_revoked = del_state = del_sched = 0
+    # DB-first atomic phase: requested -> server_unbound + ownership/data unlink + lifecycle bump.
     with db_lock:
         conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO device_unbind_jobs (
-                request_id, device_id, requested_by, mode, state,
-                command_sent, command_acked, detail_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'requested', 0, 0, ?, ?, ?)
-            """,
-            (req_id, device_id, principal.username, mode, "{}", now, now),
-        )
-        conn.commit()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO device_unbind_jobs (
+                    request_id, device_id, requested_by, mode, state,
+                    command_sent, command_acked, detail_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'requested', 0, 0, ?, ?, ?)
+                """,
+                (req_id, device_id, principal.username, mode, "{}", now, now),
+            )
+            cur.execute("SELECT mac_nocolon FROM provisioned_credentials WHERE device_id = ?", (device_id,))
+            p = cur.fetchone()
+            mac_nocolon = str(p["mac_nocolon"]) if p and p["mac_nocolon"] else ""
+            cur.execute("DELETE FROM provisioned_credentials WHERE device_id = ?", (device_id,))
+            del_cred = int(cur.rowcount or 0)
+            cur.execute("DELETE FROM device_ownership WHERE device_id = ?", (device_id,))
+            del_owner = int(cur.rowcount or 0)
+            cur.execute("DELETE FROM device_acl WHERE device_id = ?", (device_id,))
+            del_acl = int(cur.rowcount or 0)
+            cur.execute("DELETE FROM revoked_devices WHERE device_id = ?", (device_id,))
+            del_revoked = int(cur.rowcount or 0)
+            cur.execute("DELETE FROM device_state WHERE device_id = ?", (device_id,))
+            del_state = int(cur.rowcount or 0)
+            cur.execute("DELETE FROM scheduled_commands WHERE device_id = ?", (device_id,))
+            del_sched = int(cur.rowcount or 0)
+            if mac_nocolon:
+                cur.execute(
+                    "UPDATE factory_devices SET status='unclaimed', updated_at=? WHERE mac_nocolon = ?",
+                    (utc_now_iso(), mac_nocolon),
+                )
+            else:
+                cur.execute(
+                    "UPDATE factory_devices SET status='unclaimed', updated_at=? WHERE serial = ?",
+                    (utc_now_iso(), device_id),
+                )
+            lifecycle_version = transition_device_lifecycle_cur(
+                cur,
+                device_id,
+                LIFECYCLE_UNBOUND,
+                owner_admin="",
+                bump_version=True,
+            )
+            cur.execute(
+                """
+                UPDATE device_unbind_jobs
+                SET state='server_unbound',
+                    detail_json=?,
+                    updated_at=?
+                WHERE request_id=?
+                """,
+                (
+                    json.dumps(
+                        {
+                            "deleted_credentials": del_cred,
+                            "deleted_owner": del_owner,
+                            "deleted_acl": del_acl,
+                            "deleted_revoked": del_revoked,
+                            "deleted_state": del_state,
+                            "deleted_scheduled": del_sched,
+                            "factory_unclaimed": bool(super_unclaim),
+                            "lifecycle_state": LIFECYCLE_UNBOUND,
+                            "lifecycle_version": int(lifecycle_version),
+                        },
+                        ensure_ascii=True,
+                    ),
+                    utc_now_iso(),
+                    req_id,
+                ),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            conn.close()
+            raise
         conn.close()
-    nvs_purge_sent, nvs_purge_acked = _try_mqtt_unclaim_reset(device_id)
+    # Non-blocking side effect phase: dispatch reset without waiting for ACK.
+    nvs_purge_sent, nvs_purge_acked = _try_mqtt_unclaim_reset(device_id, wait_for_ack=False)
+    unbind_state = "completed" if nvs_purge_acked else ("device_reset_pending" if nvs_purge_sent else "server_unbound")
+    mqtt_unsubscribed = _mqtt_unsubscribe_device_topics(device_id)
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
-        # requested -> server_unbound
-        cur.execute(
-            """
-            UPDATE device_unbind_jobs
-            SET state='server_unbound',
-                command_sent=?,
-                command_acked=?,
-                updated_at=?
-            WHERE request_id=?
-            """,
-            (1 if nvs_purge_sent else 0, 1 if nvs_purge_acked else 0, utc_now_iso(), req_id),
-        )
-        cur.execute("SELECT mac_nocolon FROM provisioned_credentials WHERE device_id = ?", (device_id,))
-        p = cur.fetchone()
-        mac_nocolon = str(p["mac_nocolon"]) if p and p["mac_nocolon"] else ""
-        cur.execute("DELETE FROM provisioned_credentials WHERE device_id = ?", (device_id,))
-        del_cred = int(cur.rowcount or 0)
-        cur.execute("DELETE FROM device_ownership WHERE device_id = ?", (device_id,))
-        del_owner = int(cur.rowcount or 0)
-        cur.execute("DELETE FROM device_acl WHERE device_id = ?", (device_id,))
-        del_acl = int(cur.rowcount or 0)
-        cur.execute("DELETE FROM revoked_devices WHERE device_id = ?", (device_id,))
-        del_revoked = int(cur.rowcount or 0)
-        cur.execute("DELETE FROM device_state WHERE device_id = ?", (device_id,))
-        del_state = int(cur.rowcount or 0)
-        cur.execute("DELETE FROM scheduled_commands WHERE device_id = ?", (device_id,))
-        del_sched = int(cur.rowcount or 0)
-        # Keep factory registry aligned whenever this serial/MAC is known (same as
-        # "factory-unregister" — also applies to normal tenant unbind so ops lists
-        # and identify flows stay consistent after unlink).
-        if mac_nocolon:
-            cur.execute(
-                "UPDATE factory_devices SET status='unclaimed', updated_at=? WHERE mac_nocolon = ?",
-                (utc_now_iso(), mac_nocolon),
-            )
-        else:
-            cur.execute(
-                "UPDATE factory_devices SET status='unclaimed', updated_at=? WHERE serial = ?",
-                (utc_now_iso(), device_id),
-            )
-        final_state = "completed" if nvs_purge_acked else "device_reset_pending"
+        cur.execute("SELECT IFNULL(detail_json,'{}') AS detail_json FROM device_unbind_jobs WHERE request_id = ?", (req_id,))
+        row = cur.fetchone()
+        try:
+            detail = json.loads(str(row["detail_json"] if row else "{}") or "{}")
+        except Exception:
+            detail = {}
+        detail["mqtt_unsubscribed"] = bool(mqtt_unsubscribed)
+        detail["post_commit_dispatched_at"] = utc_now_iso()
         cur.execute(
             """
             UPDATE device_unbind_jobs
@@ -156,21 +194,10 @@ def _device_delete_reset_impl(
             WHERE request_id=?
             """,
             (
-                final_state,
+                unbind_state,
                 1 if nvs_purge_sent else 0,
                 1 if nvs_purge_acked else 0,
-                json.dumps(
-                    {
-                        "deleted_credentials": del_cred,
-                        "deleted_owner": del_owner,
-                        "deleted_acl": del_acl,
-                        "deleted_revoked": del_revoked,
-                        "deleted_state": del_state,
-                        "deleted_scheduled": del_sched,
-                        "factory_unclaimed": bool(super_unclaim),
-                    },
-                    ensure_ascii=True,
-                ),
+                json.dumps(detail, ensure_ascii=True),
                 utc_now_iso(),
                 req_id,
             ),
@@ -190,6 +217,7 @@ def _device_delete_reset_impl(
             "mac_nocolon": mac_nocolon or "",
             "nvs_purge_mqtt": nvs_purge_sent,
             "nvs_purge_ack": nvs_purge_acked,
+            "mqtt_unsubscribed": mqtt_unsubscribed,
             "deleted_credentials": del_cred,
             "deleted_owner": del_owner,
             "deleted_acl": del_acl,
@@ -201,6 +229,7 @@ def _device_delete_reset_impl(
     )
     return {
         "ok": True,
+        "status": "queued",
         "device_id": device_id,
         "request_id": req_id,
         "mode": mode,

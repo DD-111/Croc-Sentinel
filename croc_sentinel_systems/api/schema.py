@@ -264,6 +264,18 @@ def init_db() -> None:
         )
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS device_lifecycle (
+                device_id TEXT PRIMARY KEY,
+                lifecycle_state TEXT NOT NULL DEFAULT 'ACTIVE',
+                lifecycle_version INTEGER NOT NULL DEFAULT 1,
+                owner_admin TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_device_lifecycle_state ON device_lifecycle(lifecycle_state, updated_at DESC)")
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS device_acl (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 device_id TEXT NOT NULL,

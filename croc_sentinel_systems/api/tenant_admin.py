@@ -69,6 +69,7 @@ from fastapi import HTTPException
 import app as _app
 from config import CMD_PROTO, TOPIC_ROOT
 from db import db_lock, get_conn
+from device_lifecycle import LIFECYCLE_ACTIVE, LIFECYCLE_UNBOUND, transition_device_lifecycle_cur
 from helpers import utc_now_iso
 
 __all__ = (
@@ -77,6 +78,7 @@ __all__ = (
     "_close_admin_tenant_cur",
     "_wait_cmd_ack",
     "_try_mqtt_unclaim_reset",
+    "_mqtt_unsubscribe_device_topics",
 )
 
 logger = logging.getLogger(__name__)
@@ -118,6 +120,13 @@ def _apply_device_factory_unclaim_cur(cur: Any, device_id: str) -> None:
             "UPDATE factory_devices SET status='unclaimed', updated_at=? WHERE serial = ?",
             (utc_now_iso(), device_id),
         )
+    transition_device_lifecycle_cur(
+        cur,
+        device_id,
+        LIFECYCLE_UNBOUND,
+        owner_admin="",
+        bump_version=True,
+    )
 
 
 def _close_admin_tenant_cur(
@@ -170,6 +179,14 @@ def _close_admin_tenant_cur(
                 f"UPDATE device_state SET display_label = '', notification_group = '' WHERE device_id IN ({ph})",
                 transfer_ids,
             )
+            for did in transfer_ids:
+                transition_device_lifecycle_cur(
+                    cur,
+                    did,
+                    LIFECYCLE_ACTIVE,
+                    owner_admin=transfer_to,
+                    bump_version=True,
+                )
     else:
         cur.execute("SELECT device_id FROM device_ownership WHERE owner_admin = ?", (admin_username,))
         for r in cur.fetchall():
@@ -218,7 +235,7 @@ def _wait_cmd_ack(device_id: str, cmd: str, timeout_s: float = 2.5, cmd_id: Opti
     return False
 
 
-def _try_mqtt_unclaim_reset(device_id: str) -> tuple[bool, bool]:
+def _try_mqtt_unclaim_reset(device_id: str, *, wait_for_ack: bool = True) -> tuple[bool, bool]:
     """Best-effort dispatch + short ack wait for unclaim_reset before DB unlink.
 
     Returns (sent, acked). Fails fast (no blocking) when the broker is down or
@@ -270,6 +287,24 @@ def _try_mqtt_unclaim_reset(device_id: str) -> tuple[bool, bool]:
     except Exception as exc:
         logger.warning("unclaim_reset MQTT error for %s: %s", device_id, exc)
         return False, False
-    if not online_hint:
+    if (not wait_for_ack) or (not online_hint):
         return True, False
     return True, _wait_cmd_ack(device_id, "unclaim_reset", timeout_s=2.2, cmd_id=cmd_id)
+
+
+def _mqtt_unsubscribe_device_topics(device_id: str) -> bool:
+    """Best-effort MQTT topic cleanup after unbind/reset."""
+    did = str(device_id or "").strip()
+    if not did:
+        return False
+    c = getattr(_app, "mqtt_client", None)
+    if c is None:
+        return False
+    ok = False
+    for topic in (f"{TOPIC_ROOT}/{did}/#", f"{TOPIC_ROOT}/{did}/cmd"):
+        try:
+            c.unsubscribe(topic)
+            ok = True
+        except Exception as exc:
+            logger.debug("mqtt unsubscribe failed topic=%s err=%s", topic, exc)
+    return ok

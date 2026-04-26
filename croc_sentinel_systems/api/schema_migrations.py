@@ -36,6 +36,7 @@ import sqlite3
 
 from config import DEFAULT_PANIC_FANOUT_MS
 from db import ensure_column
+from helpers import utc_now_iso
 from helpers import _sibling_group_norm
 
 logger = logging.getLogger("croc-api.schema.migrations")
@@ -225,6 +226,23 @@ def _backfill_device_ownership_cmd_key_shadow(conn: sqlite3.Connection) -> None:
     )
 
 
+def _backfill_device_lifecycle(conn: sqlite3.Connection) -> None:
+    """Backfill lifecycle table for existing ownership rows."""
+    cur = conn.cursor()
+    now = utc_now_iso()
+    cur.execute(
+        """
+        INSERT INTO device_lifecycle (device_id, lifecycle_state, lifecycle_version, owner_admin, updated_at)
+        SELECT o.device_id, 'ACTIVE', 1, o.owner_admin, ?
+        FROM device_ownership o
+        WHERE NOT EXISTS (
+            SELECT 1 FROM device_lifecycle dl WHERE dl.device_id = o.device_id
+        )
+        """,
+        (now,),
+    )
+
+
 def run_migrations(conn: sqlite3.Connection) -> None:
     """Run every idempotent migration step.
 
@@ -241,6 +259,7 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     _normalize_trigger_policies(conn)
     _backfill_dashboard_users_status(conn)
     _backfill_device_ownership_cmd_key_shadow(conn)
+    _backfill_device_lifecycle(conn)
     _ensure_provisioned_credentials_unique_index(conn)
 
 

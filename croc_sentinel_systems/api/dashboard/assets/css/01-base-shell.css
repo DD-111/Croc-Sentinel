@@ -125,15 +125,17 @@ body:has(.auth-surface) .topbar {
   display: none !important;
 }
 body[data-layout="auth"].app-shell {
-  height: auto;
-  max-height: none;
-  overflow: auto;
+  height: 100vh;
+  height: 100dvh;
+  max-height: 100dvh;
+  overflow: hidden;
 }
 body:has(.auth-surface).app-shell {
   grid-template-columns: 1fr;
-  height: auto;
-  max-height: none;
-  overflow: auto;
+  height: 100vh;
+  height: 100dvh;
+  max-height: 100dvh;
+  overflow: hidden;
 }
 body[data-layout="auth"] .main {
   min-height: 100dvh;
@@ -166,7 +168,7 @@ body[data-layout="auth"] .view {
   display: flex;
   flex-direction: column;
   overflow-x: hidden;
-  overflow-y: auto;
+  overflow-y: hidden;
   -webkit-overflow-scrolling: touch;
 }
 

@@ -1438,6 +1438,17 @@ ${curFw} \u2192 ${fw}`)) return;
   function toggleNav(open) {
     if (open == null) open = document.body.dataset.nav !== "open";
     document.body.dataset.nav = open ? "open" : "";
+    const bd = document.getElementById("sidebarBackdrop");
+    if (!bd) return;
+    const mobile = !!(window.matchMedia && window.matchMedia("(max-width: 900px)").matches);
+    const show = !!open && mobile;
+    if (show) {
+      bd.removeAttribute("hidden");
+      bd.style.display = "";
+    } else {
+      bd.setAttribute("hidden", "");
+      bd.style.display = "none";
+    }
   }
   function applySidebarRail() {
     const m = window.matchMedia && window.matchMedia("(min-width: 901px)");
@@ -1480,9 +1491,7 @@ ${curFw} \u2192 ${fw}`)) return;
   }
   function syncNavForViewport() {
     try {
-      if (window.matchMedia && window.matchMedia("(min-width: 901px)").matches) {
-        document.body.dataset.nav = "";
-      }
+      if (window.matchMedia && window.matchMedia("(min-width: 901px)").matches) toggleNav(false);
     } catch (_) {
     }
     try {
@@ -1624,7 +1633,7 @@ ${curFw} \u2192 ${fw}`)) return;
       const topbar = document.querySelector(".topbar");
       const sidebar = document.querySelector(".sidebar");
       const sidebarBackdrop = document.querySelector(".sidebar-backdrop");
-      for (const el of [topbar, sidebar, sidebarBackdrop]) {
+      for (const el of [topbar, sidebar]) {
         if (!el) continue;
         if (isAuthRoute) {
           el.setAttribute("hidden", "");
@@ -1632,6 +1641,21 @@ ${curFw} \u2192 ${fw}`)) return;
         } else {
           el.removeAttribute("hidden");
           el.style.display = "";
+        }
+      }
+      if (sidebarBackdrop) {
+        if (isAuthRoute) {
+          sidebarBackdrop.setAttribute("hidden", "");
+          sidebarBackdrop.style.display = "none";
+        } else {
+          const navOpen = document.body.dataset.nav === "open";
+          if (navOpen) {
+            sidebarBackdrop.removeAttribute("hidden");
+            sidebarBackdrop.style.display = "";
+          } else {
+            sidebarBackdrop.setAttribute("hidden", "");
+            sidebarBackdrop.style.display = "none";
+          }
         }
       }
     } catch (_2) {

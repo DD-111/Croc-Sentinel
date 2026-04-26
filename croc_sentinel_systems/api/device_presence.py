@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from typing import Any
+from helpers import normalize_timestamp
 
 __all__ = (
     "_parse_iso",
@@ -51,9 +52,12 @@ __all__ = (
 )
 
 
-def _parse_iso(ts: str) -> float:
+def _parse_iso(ts: Any) -> float:
+    dt = normalize_timestamp(ts)
+    if not dt:
+        return 0.0
     try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        return float(dt.timestamp())
     except Exception:
         return 0.0
 

@@ -43,6 +43,7 @@ from config import (
     QR_SIGN_SECRET,
 )
 from db import cache_invalidate, db_lock, get_conn
+from device_lifecycle import LIFECYCLE_ACTIVE, transition_device_lifecycle_cur
 from device_security import ensure_not_revoked, verify_qr_signature
 from helpers import utc_now_iso
 from security import Principal, assert_min_role
@@ -220,6 +221,13 @@ def claim_device(req: ClaimDeviceRequest, principal: Principal = Depends(require
             """,
             (did_norm, owner_admin, principal.username, utc_now_iso(), cmd_key),
         )
+        lifecycle_version = transition_device_lifecycle_cur(
+            cur,
+            did_norm,
+            LIFECYCLE_ACTIVE,
+            owner_admin=owner_admin,
+            bump_version=True,
+        )
         # Stale device_state from a previous tenant/owner: clear profile fields on (re)claim
         cur.execute(
             "UPDATE device_state SET display_label = '', notification_group = '' WHERE device_id = ?",
@@ -261,6 +269,8 @@ def claim_device(req: ClaimDeviceRequest, principal: Principal = Depends(require
         "mqtt_username": mqtt_username if CLAIM_RESPONSE_INCLUDE_SECRETS else "***",
         "mqtt_password": mqtt_password if CLAIM_RESPONSE_INCLUDE_SECRETS else "***",
         "cmd_key": cmd_key if CLAIM_RESPONSE_INCLUDE_SECRETS else "***",
+        "lifecycle_state": LIFECYCLE_ACTIVE,
+        "lifecycle_version": lifecycle_version,
     }
     audit_event(
         principal.username,

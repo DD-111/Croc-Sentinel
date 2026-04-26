@@ -158,6 +158,18 @@ function initTheme() {
 function toggleNav(open) {
   if (open == null) open = document.body.dataset.nav !== "open";
   document.body.dataset.nav = open ? "open" : "";
+  // Keep backdrop visibility in sync with nav state across desktop/mobile.
+  const bd = document.getElementById("sidebarBackdrop");
+  if (!bd) return;
+  const mobile = !!(window.matchMedia && window.matchMedia("(max-width: 900px)").matches);
+  const show = !!open && mobile;
+  if (show) {
+    bd.removeAttribute("hidden");
+    bd.style.display = "";
+  } else {
+    bd.setAttribute("hidden", "");
+    bd.style.display = "none";
+  }
 }
 
 function applySidebarRail() {
@@ -195,9 +207,7 @@ function toggleSidebarRail() {
 /** Collapse drawer when viewport is desktop width (e.g. rotate phone / resize). */
 function syncNavForViewport() {
   try {
-    if (window.matchMedia && window.matchMedia("(min-width: 901px)").matches) {
-      document.body.dataset.nav = "";
-    }
+    if (window.matchMedia && window.matchMedia("(min-width: 901px)").matches) toggleNav(false);
   } catch (_) {}
   try { applySidebarRail(); } catch (_) {}
 }

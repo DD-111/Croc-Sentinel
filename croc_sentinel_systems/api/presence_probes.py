@@ -68,6 +68,8 @@ __all__ = (
 )
 
 logger = logging.getLogger(__name__)
+_presence_probe_failures = 0
+_presence_probe_backoff_until = 0.0
 
 
 def _insert_presence_probe(
@@ -171,8 +173,8 @@ def _find_stale_devices(
         last_probe = str(r["last_probe_ts"] or "")
         if last_probe and last_probe > cooldown_cutoff_iso:
             continue
-        updated = _app._parse_iso(str(r["updated_at"] or ""))
-        idle_actual = int(time.time() - (updated.timestamp() if updated else 0))
+        updated = float(_app._parse_iso(str(r["updated_at"] or "")) or 0.0)
+        idle_actual = max(0, int(time.time() - updated))
         results.append((str(r["device_id"]), (str(r["owner_admin"]) if r["owner_admin"] else None), idle_actual))
     return results
 
@@ -243,10 +245,19 @@ def _events_retention_tick() -> None:
 
 def _presence_probe_tick() -> None:
     """One pass of the stale-device scanner. Called from scheduler_loop."""
+    global _presence_probe_failures, _presence_probe_backoff_until
+    now = time.time()
+    if now < _presence_probe_backoff_until:
+        return
     try:
         stale = _find_stale_devices(PRESENCE_PROBE_IDLE_SECONDS, PRESENCE_PROBE_COOLDOWN_SECONDS, limit=200)
+        _presence_probe_failures = 0
+        _presence_probe_backoff_until = 0.0
     except Exception as exc:
-        logger.warning("presence probe scan failed: %s", exc)
+        _presence_probe_failures = min(_presence_probe_failures + 1, 8)
+        backoff_s = min(300, max(5, 5 * (2 ** (_presence_probe_failures - 1))))
+        _presence_probe_backoff_until = now + float(backoff_s)
+        logger.warning("presence probe scan failed: %s (backoff=%ss)", exc, backoff_s)
         return
     for device_id, owner_admin, idle_seconds in stale:
         _send_presence_probe(device_id, owner_admin, idle_seconds)

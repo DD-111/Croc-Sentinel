@@ -121,7 +121,7 @@ async function renderRoute() {
     const topbar = document.querySelector(".topbar");
     const sidebar = document.querySelector(".sidebar");
     const sidebarBackdrop = document.querySelector(".sidebar-backdrop");
-    for (const el of [topbar, sidebar, sidebarBackdrop]) {
+    for (const el of [topbar, sidebar]) {
       if (!el) continue;
       if (isAuthRoute) {
         el.setAttribute("hidden", "");
@@ -129,6 +129,22 @@ async function renderRoute() {
       } else {
         el.removeAttribute("hidden");
         el.style.display = "";
+      }
+    }
+    if (sidebarBackdrop) {
+      if (isAuthRoute) {
+        sidebarBackdrop.setAttribute("hidden", "");
+        sidebarBackdrop.style.display = "none";
+      } else {
+        // Backdrop should only appear when mobile nav is opened.
+        const navOpen = document.body.dataset.nav === "open";
+        if (navOpen) {
+          sidebarBackdrop.removeAttribute("hidden");
+          sidebarBackdrop.style.display = "";
+        } else {
+          sidebarBackdrop.setAttribute("hidden", "");
+          sidebarBackdrop.style.display = "none";
+        }
       }
     }
   } catch (_) {}

@@ -31,9 +31,11 @@ from __future__ import annotations
 import re
 import unicodedata
 from datetime import datetime, timezone
+from typing import Any
 
 __all__ = [
     "utc_now_iso",
+    "normalize_timestamp",
     "_sibling_group_norm",
     "default_policy_for_role",
     "contains_insecure_marker",
@@ -45,6 +47,35 @@ __all__ = [
 def utc_now_iso() -> str:
     """UTC ISO string for SQLite storage and lexicographic ordering (canonical ``ts``)."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def normalize_timestamp(value: Any) -> datetime | None:
+    """Best-effort timestamp normalization for mixed float/datetime/ISO inputs.
+
+    Returns ``datetime`` when conversion is possible, otherwise ``None``.
+    Never raises.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except Exception:
+            return None
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except Exception:
+            try:
+                return datetime.fromtimestamp(float(s), tz=timezone.utc)
+            except Exception:
+                return None
+    return None
 
 
 def contains_insecure_marker(value: str) -> bool:
