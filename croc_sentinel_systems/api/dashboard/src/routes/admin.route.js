@@ -84,8 +84,8 @@ registerRoute("admin", async (view) => {
     <div class="card">
       <h3>Alert email recipients</h3>
       <p class="muted">Inbox list for alarm emails when mail channel is configured on the server.</p>
-      <div id="smtpStatus" class="row" style="gap:6px"></div>
-      <div class="divider"></div>
+      ${isSuper ? `<div id="smtpStatus" class="row" style="gap:6px"></div>
+      <div class="divider"></div>` : ""}
       <div class="inline-form">
         <label class="field wide"><span>Email</span><input id="r_email" type="email" autocomplete="off" placeholder="you@company.com"/></label>
         <label class="field"><span>Label</span><input id="r_label" autocomplete="off" placeholder="on-call"/></label>
@@ -412,6 +412,7 @@ registerRoute("admin", async (view) => {
 
   // SMTP status + recipients
   const loadSmtpStatus = async () => {
+    if (!isSuper) return;
     try {
       const s = await api("/admin/smtp/status", { timeoutMs: 16000 });
       const smtpEl = $v("#smtpStatus");

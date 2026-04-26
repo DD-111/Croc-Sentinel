@@ -401,3 +401,106 @@ body[data-layout="app"] .site-footer--shell {
     min-height: 44px;
   }
 }
+
+/* ─────────────────────────────────────────────────────────────
+   Phase-101 — sidebar brand: typographic ESA hero
+   The sidebar brand was a 3-line stack ("ESA" / "Croc Sentinel" /
+   "Fleet console"). Per request, we collapse it to a single, large,
+   gradient-tinted "ESA" wordmark so the brand reads as a clean hero
+   instead of a small label group.
+   ───────────────────────────────────────────────────────────── */
+body[data-layout="app"] .sidebar .brand--hero {
+  padding: 4px 6px 14px 8px;
+}
+body[data-layout="app"] .sidebar .brand--hero .brand-mark {
+  align-items: center;
+  gap: 0;
+  min-height: 48px;
+}
+body[data-layout="app"] .sidebar .brand--hero .brand-text {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  flex: 1;
+  min-width: 0;
+}
+body[data-layout="app"] .sidebar .brand--hero .brand-co {
+  font-family: var(--font-display);
+  font-size: clamp(1.7rem, 2.05vw, 2.15rem);
+  font-weight: 800;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  line-height: 1;
+  margin: 0;
+  padding: 2px 0 1px;
+  background: linear-gradient(
+    135deg,
+    var(--accent-strong) 0%,
+    var(--accent) 50%,
+    color-mix(in srgb, var(--accent) 55%, #ffffff) 100%
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  filter: drop-shadow(0 1px 0 color-mix(in srgb, var(--accent) 22%, transparent));
+}
+@supports not (background-clip: text) {
+  body[data-layout="app"] .sidebar .brand--hero .brand-co {
+    color: var(--accent-strong);
+    background: none;
+    -webkit-text-fill-color: currentColor;
+  }
+}
+/* Collapsed rail: keep ESA visible, just smaller and centred. */
+body[data-layout="app"][data-sidebar="collapsed"] .sidebar .brand--hero .brand-text {
+  display: flex !important;
+  justify-content: center;
+}
+body[data-layout="app"][data-sidebar="collapsed"] .sidebar .brand--hero .brand-co {
+  font-size: clamp(1.05rem, 1.4vw, 1.25rem);
+  letter-spacing: 0.18em;
+  padding: 0;
+}
+
+/* ─────────────────────────────────────────────────────────────
+   Phase-102 — site footer that blends into the page
+   The footer was an elevated, blurred panel with a top divider.
+   Per request, it now visually dissolves into the main background:
+     • transparent background (no `bg-elev`, no backdrop blur)
+     • no top border / shadow / rule
+     • single low-contrast "Croc" wordmark + © legal line
+   Sticky-to-bottom behaviour (Phase-99) is intentionally preserved
+   so it never drifts up while scrolling.
+   ───────────────────────────────────────────────────────────── */
+body[data-layout="app"] .site-footer--shell.site-footer--blend {
+  background: transparent !important;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  border-top: 0;
+  box-shadow: none;
+  padding-top: 6px;
+  padding-bottom: max(8px, env(safe-area-inset-bottom, 0px));
+}
+@supports not (backdrop-filter: blur(1px)) {
+  body[data-layout="app"] .site-footer--shell.site-footer--blend {
+    background: transparent !important;
+  }
+}
+body[data-layout="app"] .site-footer--blend .site-footer__row--main {
+  align-items: center;
+  gap: 4px 14px;
+}
+body[data-layout="app"] .site-footer--blend .site-footer__brandmark {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 0.82rem;
+  letter-spacing: 0.04em;
+  color: color-mix(in srgb, var(--text-muted) 80%, transparent);
+  user-select: none;
+}
+body[data-layout="app"] .site-footer--blend .site-footer__legal {
+  color: color-mix(in srgb, var(--text-dim) 85%, transparent);
+  font-size: 0.66rem;
+  margin-left: auto;
+}

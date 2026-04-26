@@ -183,10 +183,17 @@ registerRoute("overview", async (view, _args, routeSeq) => {
     }
   };
 
+  const isSuper = !!(state.me && state.me.role === "superadmin");
+  const serverHeadline = () => {
+    if (isSuper) {
+      return `${httpOk ? "HTTP OK" : "HTTP DOWN"} · ${mqConnected ? "MQTT UP" : "MQTT DOWN"}`;
+    }
+    return httpOk && mqConnected ? "Status ok" : "Status down";
+  };
+
   mountView(view, `
     <header class="page-head">
       <h2>Overview</h2>
-      <p class="muted">Fleet snapshot, group cards, and MQTT health for your scope.</p>
     </header>
     <section class="stats">
       <div class="stat"><div class="k">Server</div><div class="v" id="ovServerV">—</div><div class="sub">HTTP + MQTT realtime</div></div>
@@ -225,7 +232,6 @@ registerRoute("overview", async (view, _args, routeSeq) => {
       <details class="share-fold" id="grpShareFold">
         <summary class="share-fold__summary">
           <span>Global sharing</span>
-          <span class="muted">Device ACL only</span>
         </summary>
         <div class="share-global-panel">
           <div class="share-global-head">
@@ -318,7 +324,7 @@ registerRoute("overview", async (view, _args, routeSeq) => {
       </div>
     </div>`);
   patchOverviewHeader({
-    server: `${httpOk ? "HTTP OK" : "HTTP DOWN"} · ${mqConnected ? "MQTT UP" : "MQTT DOWN"}`,
+    server: serverHeadline(),
     devices: totalDevices,
     online: onlineDevices,
     offline: offlineDevices,
@@ -1198,8 +1204,11 @@ registerRoute("overview", async (view, _args, routeSeq) => {
       };
       const mqStatus = !mqConnected ? "Disconnected" : (mqDropped > 0 || mqQDepth >= 300 ? "Warning" : "Healthy");
       const mqClass = !mqConnected ? "revoked" : (mqStatus === "Warning" ? "offline" : "online");
+      const serverHeadlineLive = isSuper
+        ? `${httpOk ? "HTTP OK" : "HTTP DOWN"} · ${mqConnected ? "MQTT UP" : "MQTT DOWN"}`
+        : (httpOk && mqConnected ? "Status ok" : "Status down");
       patchOverviewHeader({
-        server: `${httpOk ? "HTTP OK" : "HTTP DOWN"} · ${mqConnected ? "MQTT UP" : "MQTT DOWN"}`,
+        server: serverHeadlineLive,
         devices: totalDevices,
         online: onlineDevices,
         offline: offlineDevices,

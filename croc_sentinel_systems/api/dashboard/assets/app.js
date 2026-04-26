@@ -2360,8 +2360,8 @@ ${curFw} \u2192 ${fw}`)) return;
     <div class="card">
       <h3>Alert email recipients</h3>
       <p class="muted">Inbox list for alarm emails when mail channel is configured on the server.</p>
-      <div id="smtpStatus" class="row" style="gap:6px"></div>
-      <div class="divider"></div>
+      ${isSuper ? `<div id="smtpStatus" class="row" style="gap:6px"></div>
+      <div class="divider"></div>` : ""}
       <div class="inline-form">
         <label class="field wide"><span>Email</span><input id="r_email" type="email" autocomplete="off" placeholder="you@company.com"/></label>
         <label class="field"><span>Label</span><input id="r_label" autocomplete="off" placeholder="on-call"/></label>
@@ -2733,6 +2733,7 @@ ${curFw} \u2192 ${fw}`)) return;
       });
     }
     const loadSmtpStatus = async () => {
+      if (!isSuper) return;
       try {
         const s = await api("/admin/smtp/status", { timeoutMs: 16e3 });
         const smtpEl = $v("#smtpStatus");
@@ -2993,7 +2994,6 @@ ${curFw} \u2192 ${fw}`)) return;
     mountView(view, `
     <div class="card">
       <h2>Bulk siren</h2>
-      <p class="muted">MQTT <span class="mono">siren_on</span> / <span class="mono">siren_off</span>. Requires <span class="mono">can_alert</span>.</p>
       ${enabled ? "" : `<p class="badge revoked">No can_alert \u2014 ask admin (Policies).</p>`}
       <p id="alertsLoadMsg" class="muted" aria-live="polite">Loading device list\u2026</p>
       <div class="inline-form inline-form--bulk-siren" style="margin-top:12px">
@@ -3269,7 +3269,6 @@ ${curFw} \u2192 ${fw}`)) return;
       mountView(view, `
       <header class="page-head">
         <h2>All devices</h2>
-        <p class="muted">Thumbnails and quick status. Multi-select for production bulk updates.</p>
       </header>
       <div class="card" style="margin:0 0 12px">
         <div class="inline-form" style="margin-top:4px">
@@ -5449,10 +5448,16 @@ ${id}`) || "").trim();
         if (risk.className !== want) risk.className = want;
       }
     };
+    const isSuper = !!(state.me && state.me.role === "superadmin");
+    const serverHeadline = () => {
+      if (isSuper) {
+        return `${httpOk ? "HTTP OK" : "HTTP DOWN"} \xB7 ${mqConnected ? "MQTT UP" : "MQTT DOWN"}`;
+      }
+      return httpOk && mqConnected ? "Status ok" : "Status down";
+    };
     mountView(view, `
     <header class="page-head">
       <h2>Overview</h2>
-      <p class="muted">Fleet snapshot, group cards, and MQTT health for your scope.</p>
     </header>
     <section class="stats">
       <div class="stat"><div class="k">Server</div><div class="v" id="ovServerV">\u2014</div><div class="sub">HTTP + MQTT realtime</div></div>
@@ -5491,7 +5496,6 @@ ${id}`) || "").trim();
       <details class="share-fold" id="grpShareFold">
         <summary class="share-fold__summary">
           <span>Global sharing</span>
-          <span class="muted">Device ACL only</span>
         </summary>
         <div class="share-global-panel">
           <div class="share-global-head">
@@ -5584,7 +5588,7 @@ ${id}`) || "").trim();
       </div>
     </div>`);
     patchOverviewHeader({
-      server: `${httpOk ? "HTTP OK" : "HTTP DOWN"} \xB7 ${mqConnected ? "MQTT UP" : "MQTT DOWN"}`,
+      server: serverHeadline(),
       devices: totalDevices,
       online: onlineDevices,
       offline: offlineDevices,
@@ -5627,11 +5631,11 @@ ${id}`) || "").trim();
       const key = canonicalGroupKey(g);
       if (!key) return [];
       const t = String(tenantOwner || "").trim();
-      const isSuper = state.me && state.me.role === "superadmin";
+      const isSuper2 = state.me && state.me.role === "superadmin";
       const out = [];
       for (const d of devices) {
         if (!d || canonicalGroupKey(d.notification_group) !== key) continue;
-        if (isSuper) {
+        if (isSuper2) {
           const o = String(d.owner_admin || "").trim();
           if (t === "") {
             if (o) continue;
@@ -6472,8 +6476,9 @@ ${id}`) || "").trim();
         };
         const mqStatus2 = !mqConnected2 ? "Disconnected" : mqDropped2 > 0 || mqQDepth2 >= 300 ? "Warning" : "Healthy";
         const mqClass2 = !mqConnected2 ? "revoked" : mqStatus2 === "Warning" ? "offline" : "online";
+        const serverHeadlineLive = isSuper ? `${httpOk2 ? "HTTP OK" : "HTTP DOWN"} \xB7 ${mqConnected2 ? "MQTT UP" : "MQTT DOWN"}` : httpOk2 && mqConnected2 ? "Status ok" : "Status down";
         patchOverviewHeader({
-          server: `${httpOk2 ? "HTTP OK" : "HTTP DOWN"} \xB7 ${mqConnected2 ? "MQTT UP" : "MQTT DOWN"}`,
+          server: serverHeadlineLive,
           devices: totalDevices2,
           online: onlineDevices2,
           offline: offlineDevices2,

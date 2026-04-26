@@ -171,7 +171,6 @@ registerRoute("devices", async (view, args, routeSeq) => {
     mountView(view, `
       <header class="page-head">
         <h2>All devices</h2>
-        <p class="muted">Thumbnails and quick status. Multi-select for production bulk updates.</p>
       </header>
       <div class="card" style="margin:0 0 12px">
         <div class="inline-form" style="margin-top:4px">

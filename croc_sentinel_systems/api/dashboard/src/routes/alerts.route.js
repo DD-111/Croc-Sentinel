@@ -20,7 +20,6 @@ registerRoute("alerts", async (view) => {
   mountView(view, `
     <div class="card">
       <h2>Bulk siren</h2>
-      <p class="muted">MQTT <span class="mono">siren_on</span> / <span class="mono">siren_off</span>. Requires <span class="mono">can_alert</span>.</p>
       ${enabled ? "" : `<p class="badge revoked">No can_alert — ask admin (Policies).</p>`}
       <p id="alertsLoadMsg" class="muted" aria-live="polite">Loading device list…</p>
       <div class="inline-form inline-form--bulk-siren" style="margin-top:12px">
