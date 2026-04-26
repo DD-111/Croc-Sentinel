@@ -6,7 +6,8 @@ Phase-100 wizard rewrite
 Re-organised into a 4-step guided flow so a factory operator can run the
 happy path top-to-bottom without hunting for buttons:
 
-  Step 1 — Connection: load .env, edit API root + Factory Token,
+  Step 1 — Connection: load ``croc_sentinel_systems/factory.env`` (manufacturing-only),
+           Factory Token (API host/port fixed in code),
            [Test connection]. Server metadata (qr_sign_required,
            cmd_proto, server_time, …) is shown so the operator can
            confirm they hit the right deployment.
@@ -122,7 +123,6 @@ class FactoryApp(tk.Tk):
 
         # ----- State vars -----
         self._dotenv_path = tk.StringVar(value=str(default_dotenv_path()))
-        self._api_base = tk.StringVar(value=DEFAULT_FACTORY_UI_API_BASE)
         self._factory_token = tk.StringVar()
         self._batch = tk.StringVar(value=f"GUI_{int(time.time())}")
         # Default to 1 unit per run (operators scale up explicitly when batching).
@@ -142,18 +142,15 @@ class FactoryApp(tk.Tk):
         self._step1_status = tk.StringVar(value="未测试")
         self._server_meta = tk.StringVar(value="（连接前不显示服务器信息）")
         self._step3_progress = tk.IntVar(value=0)
-        self._resolved_url = tk.StringVar(value="")
 
         self._apply_style()
         self._build_layout()
 
         self._ping_lock = threading.Lock()
-        self._api_base.trace_add("write", lambda *_: self.after(60, self._refresh_resolved_url))
         self._local_only.trace_add("write", lambda *_: self._refresh_step_locks())
 
         self._load_env()
         self._refresh_step_locks()
-        self._refresh_resolved_url()
         # Try a silent ping if env supplied both pieces — saves one click.
         if self._has_connection_inputs():
             self.after(400, self._ping_async)
@@ -265,28 +262,18 @@ class FactoryApp(tk.Tk):
         f.grid(row=row, column=0, sticky="ew", pady=(0, 8))
         f.grid_columnconfigure(1, weight=1)
 
-        # .env path
-        ttk.Label(f, text=".env", style="Card.TLabel", width=12).grid(row=0, column=0, sticky="w", pady=2)
+        # factory.env path (manufacturing-only; not the full server .env)
+        ttk.Label(f, text="factory.env", style="Card.TLabel", width=12).grid(row=0, column=0, sticky="w", pady=2)
         e_env = ttk.Entry(f, textvariable=self._dotenv_path)
         e_env.grid(row=0, column=1, sticky="ew", padx=6, pady=2)
         ttk.Button(f, text="浏览", command=self._browse_dotenv, width=6).grid(row=0, column=2, padx=(0, 4))
         ttk.Button(f, text="重新加载", command=self._load_env, width=8).grid(row=0, column=3)
 
-        # API base
-        ttk.Label(f, text="API 根地址", style="Card.TLabel").grid(row=1, column=0, sticky="w", pady=2)
-        self._api_presets = (
-            DEFAULT_FACTORY_UI_API_BASE,
-            f"http://127.0.0.1:{FACTORY_PUBLIC_HTTP_PORT}",
-            "https://esasecure.com/api",
+        # API: fixed shipping default in code; UI shows port only (no full URL).
+        ttk.Label(f, text="API", style="Card.TLabel").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Label(f, text=f":{FACTORY_PUBLIC_HTTP_PORT}", style="Card.TLabel").grid(
+            row=1, column=1, columnspan=3, sticky="w", padx=6, pady=2
         )
-        self._api_combo = ttk.Combobox(f, textvariable=self._api_base, values=self._api_presets)
-        self._api_combo.grid(row=1, column=1, sticky="ew", padx=6, pady=2)
-        ttk.Button(
-            f,
-            text=f"修正 :8088 → :{FACTORY_PUBLIC_HTTP_PORT}",
-            command=self._swap_compose_port,
-            width=22,
-        ).grid(row=1, column=2, columnspan=2, sticky="w", pady=2)
 
         # Factory token
         ttk.Label(f, text="Factory Token", style="Card.TLabel").grid(row=2, column=0, sticky="w", pady=2)
@@ -299,14 +286,9 @@ class FactoryApp(tk.Tk):
             command=self._toggle_token_visible,
         ).grid(row=2, column=2, sticky="w")
 
-        # Resolved request line
-        ttk.Label(f, textvariable=self._resolved_url, style="Mono.TLabel").grid(
-            row=3, column=0, columnspan=4, sticky="w", padx=(0, 0), pady=(8, 2)
-        )
-
         # Test connection action + status
         action = ttk.Frame(f)
-        action.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        action.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         action.grid_columnconfigure(2, weight=1)
         self._btn_test = ttk.Button(action, text="测试连接 / Test", style="Primary.TButton", command=self._ping_async)
         self._btn_test.grid(row=0, column=0, padx=(0, 8))
@@ -315,7 +297,7 @@ class FactoryApp(tk.Tk):
 
         # Server metadata line
         meta = ttk.Frame(f)
-        meta.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        meta.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(6, 0))
         meta.grid_columnconfigure(0, weight=1)
         ttk.Label(meta, textvariable=self._server_meta, style="Sub.TLabel", wraplength=1120, justify="left").grid(
             row=0, column=0, sticky="ew"
@@ -326,7 +308,7 @@ class FactoryApp(tk.Tk):
             f,
             text="仅本地导出 PNG（跳过服务器登记） / Local export only (skip register)",
             variable=self._local_only,
-        ).grid(row=6, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
         self._step1_frame = f
 
@@ -355,8 +337,8 @@ class FactoryApp(tk.Tk):
         ttk.Label(
             f,
             text=(
-                "导出位置：repo/factory_serial_exports/output_<时间戳>/"
-                "（含 manifest.csv · png/ · factory_devices_bulk.json）"
+                "导出：factory_serial_exports/output_<时间戳>/ "
+                "（manifest.csv · sn_qr.tsv · png/ 含 S/N 印于码下 · factory_devices_bulk.json）"
             ),
             style="Sub.TLabel",
         ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
@@ -414,7 +396,7 @@ class FactoryApp(tk.Tk):
 
         ttk.Label(
             f,
-            text="批次激活链接（每行一条，可直接发给操作员） · Activation links",
+            text="S/N + 激活链接（Tab 分隔，每行一条）· SN + activation link per line",
             style="Sub.TLabel",
         ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 2))
 
@@ -433,7 +415,7 @@ class FactoryApp(tk.Tk):
         self._links_text.grid(row=0, column=0, sticky="ew")
         self._links_text.configure(state="disabled")
         self._btn_copy_links = ttk.Button(
-            f, text="复制全部激活链接", command=self._copy_all_links, width=18
+            f, text="复制全部 S/N+链接", command=self._copy_all_links, width=18
         )
         self._btn_copy_links.grid(row=3, column=2, sticky="e", pady=(6, 0))
 
@@ -545,65 +527,39 @@ class FactoryApp(tk.Tk):
     # Helpers
     # -----------------------------------------------------------------------
 
-    def _effective_api_base(self, dot: Path) -> str:
-        raw_ui = self._api_base.get().strip()
-        env = read_dotenv_keys(dot, ("FACTORY_UI_API_BASE",))
-        env_b = (env.get("FACTORY_UI_API_BASE") or "").strip()
-        merged = raw_ui or env_b
-        return normalize_factory_api_base(merged)
-
-    def _refresh_resolved_url(self) -> None:
-        cur = self._api_base.get().strip()
-        vals = list(self._api_presets)
-        if cur and cur not in vals:
-            vals.append(cur)
-        try:
-            self._api_combo.configure(values=tuple(vals))
-        except tk.TclError:
-            pass
-        api = self._effective_api_base(Path(self._dotenv_path.get()))
-        if api:
-            mis = ":8088" in api and "127.0.0.1" not in api and "localhost" not in api.lower()
-            warn = "  ← 注意 :8088 不是宿主机映射端口" if mis else ""
-            self._resolved_url.set(f"实际请求 → GET {api}/factory/ping{warn}")
-        else:
-            self._resolved_url.set("实际请求 → （请先填写 API 根或 .env 中 FACTORY_UI_API_BASE）")
-
-    def _swap_compose_port(self) -> None:
-        raw = self._api_base.get()
-        if ":8088" not in raw:
-            messagebox.showinfo(
-                "提示",
-                "当前地址里没有 :8088。\n"
-                f"如连不上，请改成宿主机映射端口 :{FACTORY_PUBLIC_HTTP_PORT}（compose 默认）。",
-            )
-            return
-        self._api_base.set(raw.replace(":8088", f":{FACTORY_PUBLIC_HTTP_PORT}", 1))
-        self._refresh_resolved_url()
-        self._line(f"[ui] :8088 → :{FACTORY_PUBLIC_HTTP_PORT}")
+    def _effective_api_base(self, _dot: Path) -> str:
+        """Single fixed API root from ``factory_core`` (host hidden in UI; port shown as :18999)."""
+        return normalize_factory_api_base(DEFAULT_FACTORY_UI_API_BASE)
 
     def _browse_dotenv(self) -> None:
-        p = filedialog.askopenfilename(title="选择 .env", filetypes=[("env", "*.env"), ("All", "*.*")])
+        p = filedialog.askopenfilename(
+            title="选择出厂密钥文件 (factory.env)",
+            filetypes=[("factory env", "*.env"), ("All", "*.*")],
+        )
         if p:
             self._dotenv_path.set(p)
 
     def _load_env(self) -> None:
         dot = Path(self._dotenv_path.get())
-        env = read_dotenv_keys(dot, ("QR_SIGN_SECRET", "FACTORY_API_TOKEN", "FACTORY_UI_API_BASE"))
-        if env.get("FACTORY_UI_API_BASE", "").strip():
-            self._api_base.set(normalize_factory_api_base(env["FACTORY_UI_API_BASE"].strip()))
+        if not dot.is_file():
+            self._line(
+                f"[env] 未找到 {dot} — 请复制 croc_sentinel_systems/factory.env.example "
+                "为 factory.env，填入与服务器一致的 QR_SIGN_SECRET 与 FACTORY_API_TOKEN。"
+            )
+        env = read_dotenv_keys(dot, ("QR_SIGN_SECRET", "FACTORY_API_TOKEN"))
         if env.get("FACTORY_API_TOKEN") and not self._factory_token.get().strip():
             self._factory_token.set(env["FACTORY_API_TOKEN"].strip())
         qs = "yes" if env.get("QR_SIGN_SECRET") else "NO"
         ft = env.get("FACTORY_API_TOKEN") or ""
-        ab = "yes" if (env.get("FACTORY_UI_API_BASE") or "").strip() else "NO"
         self._line(f"[env] path={dot}")
-        self._line(f"[env] QR_SIGN_SECRET={qs}  FACTORY_API_TOKEN={'yes' if ft.strip() else 'NO'} (len={len(ft.strip())})  FACTORY_UI_API_BASE={ab}")
+        self._line(
+            f"[env] QR_SIGN_SECRET={qs}  FACTORY_API_TOKEN={'yes' if ft.strip() else 'NO'} "
+            f"(len={len(ft.strip())})  api=:{FACTORY_PUBLIC_HTTP_PORT} (fixed)"
+        )
         self._step1_status.set("已从 .env 加载，请测试连接")
         self._banner_text.set("已加载配置 / Loaded")
         self._banner_color = PALETTE["warn"]
         self._banner_dot.configure(fg=self._banner_color)
-        self._refresh_resolved_url()
 
     # -----------------------------------------------------------------------
     # Log
@@ -646,10 +602,9 @@ class FactoryApp(tk.Tk):
             api = self._effective_api_base(dot)
             tok = self._factory_token.get().strip() or env.get("FACTORY_API_TOKEN", "").strip()
             if not api or not tok:
-                ui(self._set_connected, False, body="缺少 API 根或 Factory Token")
-                ui(self._line, "[ping] 缺少 API 根或 Factory Token")
+                ui(self._set_connected, False, body="缺少 Factory Token")
+                ui(self._line, "[ping] 缺少 Factory Token")
                 return
-            ui(self._refresh_resolved_url)
             ui(self._step1_status.set, "测试中…")
             ui(self._line, f"[ping] GET {api}/factory/ping  token_len={len(tok)}")
             code, body = get_factory_ping(api, tok, insecure_ssl=self._insecure.get())
@@ -689,7 +644,7 @@ class FactoryApp(tk.Tk):
         self._busy = True
         try:
             dot = Path(self._dotenv_path.get())
-            env = read_dotenv_keys(dot, ("QR_SIGN_SECRET", "FACTORY_API_TOKEN", "FACTORY_UI_API_BASE"))
+            env = read_dotenv_keys(dot, ("QR_SIGN_SECRET", "FACTORY_API_TOKEN"))
             secret = (env.get("QR_SIGN_SECRET") or "").strip()
             if not secret:
                 ui(messagebox.showerror, "错误", "未找到 QR_SIGN_SECRET，请在 .env 中配置。")
@@ -721,8 +676,8 @@ class FactoryApp(tk.Tk):
             api = self._effective_api_base(dot)
             tok = self._factory_token.get().strip() or env.get("FACTORY_API_TOKEN", "").strip()
             if not api or not tok:
-                ui(self._set_progress, 100, "登记跳过 · 缺少 API 或 Token")
-                ui(messagebox.showwarning, "未登记", "缺少 API 根或 FACTORY_API_TOKEN，仅本地导出。")
+                ui(self._set_progress, 100, "登记跳过 · 缺少 Token")
+                ui(messagebox.showwarning, "未登记", "缺少 FACTORY_API_TOKEN，仅本地导出。")
                 ui(self._render_links, items, api_base="", local_only=True)
                 return
 
@@ -814,19 +769,30 @@ class FactoryApp(tk.Tk):
         try:
             self._links_text.configure(state="normal")
             self._links_text.delete("1.0", tk.END)
-            if local_only or not api_base:
+            if local_only:
+                for it in items[:200]:
+                    sn = str(it.get("serial") or "")
+                    q = str(it.get("qr_code") or "")
+                    self._links_text.insert(tk.END, f"{sn}\t{q}\n")
+                if len(items) > 200:
+                    self._links_text.insert(
+                        tk.END,
+                        f"… ({len(items) - 200} more — 全量见 sn_qr.tsv / manifest.csv)\n",
+                    )
+            elif not api_base:
                 self._links_text.insert(
                     tk.END,
-                    "（仅本地导出，未生成激活链接。指定 API 根并启用「立即登记」后会显示）\n",
+                    "（未生成链接：缺少 API 或未登记）\n",
                 )
             else:
                 for it in items[:200]:
                     link = self._activation_link(it, api_base)
-                    self._links_text.insert(tk.END, link + "\n")
+                    sn = str(it.get("serial") or "")
+                    self._links_text.insert(tk.END, f"{sn}\t{link}\n")
                 if len(items) > 200:
                     self._links_text.insert(
                         tk.END,
-                        f"… ({len(items) - 200} more — 全量见 manifest.csv 自行批处理)\n",
+                        f"… ({len(items) - 200} more — 全量见 sn_qr.tsv / manifest.csv)\n",
                     )
         finally:
             self._links_text.configure(state="disabled")
@@ -838,11 +804,11 @@ class FactoryApp(tk.Tk):
         finally:
             self._links_text.configure(state="disabled")
         if not txt or txt.startswith("（"):
-            messagebox.showinfo("提示", "尚无激活链接可复制。")
+            messagebox.showinfo("提示", "尚无 S/N+链接可复制。")
             return
         self.clipboard_clear()
         self.clipboard_append(txt)
-        self._line(f"[clipboard] 已复制 {len(txt.splitlines())} 条激活链接")
+        self._line(f"[clipboard] 已复制 {len(txt.splitlines())} 行（S/N + 链接或二维码）")
 
     def _open_last_export(self) -> None:
         if not self._last_out or not self._last_out.is_dir():

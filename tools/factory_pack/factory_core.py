@@ -47,7 +47,13 @@ def repo_root() -> Path:
 
 
 def default_dotenv_path() -> Path:
-    return repo_root() / "croc_sentinel_systems" / ".env"
+    """Dedicated manufacturing secrets file (gitignored).
+
+    Keeps ``croc_sentinel_systems/.env`` (full server stack) off factory laptops.
+    Copy ``factory.env.example`` → ``factory.env`` and paste only
+    ``QR_SIGN_SECRET`` + ``FACTORY_API_TOKEN`` aligned with the API container.
+    """
+    return repo_root() / "croc_sentinel_systems" / "factory.env"
 
 
 def read_dotenv_keys(path: Path, keys: tuple[str, ...]) -> dict[str, str]:
@@ -145,11 +151,13 @@ def write_batch_files(
     qr_secret: str = "",
 ) -> None:
     import qrcode  # local import so verify-only tools can skip PIL
+    from PIL import Image, ImageDraw, ImageFont
 
     out.mkdir(parents=True, exist_ok=True)
     png_dir = out / "png"
     png_dir.mkdir(parents=True, exist_ok=True)
     csv_lines = ["serial,mac_nocolon,qr_code,batch"]
+    tsv_lines = ["serial\tqr_code"]
     for it in items:
         serial = str(it["serial"])
         qr = str(it["qr_code"] or "")
@@ -159,10 +167,34 @@ def write_batch_files(
             raise ValueError(f"QR signature check failed for {serial}")
         b = str(it.get("batch") or batch)
         csv_lines.append(f"{serial},,{qr},{b}")
-        img = qrcode.make(qr, border=2)
-        img.save(png_dir / f"{serial}.png")
+        tsv_lines.append(f"{serial}\t{qr}")
+
+        qr_img = qrcode.make(qr, border=2)
+        if hasattr(qr_img, "convert"):
+            qr_img = qr_img.convert("RGB")
+        w, h = qr_img.size
+        cap_h = 44
+        canvas = Image.new("RGB", (w, h + cap_h), (255, 255, 255))
+        canvas.paste(qr_img, (0, 0))
+        draw = ImageDraw.Draw(canvas)
+        try:
+            font = ImageFont.load_default()
+        except Exception:
+            font = None  # type: ignore[assignment]
+        try:
+            if font is not None:
+                bbox = draw.textbbox((0, 0), serial, font=font)
+                tw = int(bbox[2] - bbox[0])
+            else:
+                tw = len(serial) * 7
+        except Exception:
+            tw = len(serial) * 7
+        x = max(6, (w - tw) // 2)
+        draw.text((x, h + 10), serial, fill=(16, 24, 40), font=font)
+        canvas.save(png_dir / f"{serial}.png", format="PNG")
 
     (out / "manifest.csv").write_text("\n".join(csv_lines) + "\n", encoding="utf-8")
+    (out / "sn_qr.tsv").write_text("\n".join(tsv_lines) + "\n", encoding="utf-8")
     (out / "factory_devices_bulk.json").write_text(
         json.dumps({"items": items}, ensure_ascii=True, indent=2), encoding="utf-8"
     )
@@ -173,6 +205,11 @@ def write_batch_files(
                 "",
                 "QR: CROC|<serial>|<unix_ts>|<HMAC>",
                 "Server verifies with QR_SIGN_SECRET (see api verify_qr_signature).",
+                "",
+                "Files:",
+                "  manifest.csv      — CSV (serial, mac, qr_code, batch)",
+                "  sn_qr.tsv         — Tab-separated serial + full qr_code (easy copy)",
+                "  png/<serial>.png  — QR image with serial printed under the code",
                 "",
             ]
         ),

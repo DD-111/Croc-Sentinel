@@ -1,4 +1,5 @@
 .env
+factory.env
 api/__pycache__/
 data/
 mosquitto/passwd

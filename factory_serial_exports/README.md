@@ -1,6 +1,6 @@
 # 出厂序列号 / 二维码导出目录
 
-本目录用于存放 **`tools/factory_pack`** 脚本生成的批次文件（CSV + PNG 二维码），方便你**单独拷贝到 U 盘**带去产线。
+本目录用于存放 **`tools/factory_pack`** 脚本生成的批次文件（CSV + **`sn_qr.tsv`**（S/N 与整段 `CROC|…` 同列）+ PNG 二维码下方叠印 S/N），方便你**单独拷贝到 U 盘**带去产线。
 
 ## 自动生成两条密钥（贴进服务器 `.env`）
 
@@ -16,7 +16,7 @@ python tools/factory_pack/gen_factory_secrets.py
 
 在仓库根目录执行（需先 `pip install -r tools/factory_pack/requirements.txt`）：
 
-**推荐（密钥不写进 shell 历史）：** 在 `croc_sentinel_systems/.env` 里配置好 `QR_SIGN_SECRET`，然后不传 `--qr-secret`，脚本会**自动读取**该文件：
+**推荐（密钥不写进 shell 历史）：** 在 `croc_sentinel_systems/factory.env`（出厂专用，见 `factory.env.example`）里配置好 `QR_SIGN_SECRET`，然后不传 `--qr-secret`，脚本会**自动读取**该文件：
 
 ```bash
 python tools/factory_pack/generate_serial_qr.py --count 5 --batch TEST001
@@ -25,7 +25,7 @@ python tools/factory_pack/generate_serial_qr.py --count 5 --batch TEST001
 或显式指定 env 路径：
 
 ```bash
-python tools/factory_pack/generate_serial_qr.py --count 5 --dotenv croc_sentinel_systems/.env --batch TEST001
+python tools/factory_pack/generate_serial_qr.py --count 5 --dotenv croc_sentinel_systems/factory.env --batch TEST001
 ```
 
 或临时传入（与服务器 **必须** 一致）：

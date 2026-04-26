@@ -12,6 +12,36 @@
     ],
     "reason": "HTTP 400: {\"detail\":{\"ok\":false,\"written\":0,\"rejected\":[{\"serial\":\"SN-TDWW2SMRJYNN5CNB\",\"reason\":\"qr_code signature\"}],\"qr_verified\":true}}",
     "queued_at": "2026-04-26T07:31:51Z",
+    "retry_count": 2
+  },
+  {
+    "batch": "GUI_1777189376",
+    "items": [
+      {
+        "serial": "SN-DT2JYRDJCGXJPJK3",
+        "mac_nocolon": null,
+        "qr_code": "CROC|SN-DT2JYRDJCGXJPJK3|1777189478|aIqUQyUEP7Qw6yatAndedLjSA6uK4f5F2oe4god2Fzk",
+        "batch": "GUI_1777189376",
+        "note": ""
+      }
+    ],
+    "reason": "HTTP 400: {\"detail\":{\"ok\":false,\"written\":0,\"rejected\":[{\"serial\":\"SN-DT2JYRDJCGXJPJK3\",\"reason\":\"qr_code signature\"}],\"qr_verified\":true}}",
+    "queued_at": "2026-04-26T07:44:38Z",
+    "retry_count": 1
+  },
+  {
+    "batch": "GUI_1777189376",
+    "items": [
+      {
+        "serial": "SN-UQC3SWN2BSXTA3L4",
+        "mac_nocolon": null,
+        "qr_code": "CROC|SN-UQC3SWN2BSXTA3L4|1777190196|7-kF0L3Wmw_BTnnSsyCminMrYJs2M8ELZjJEAFgenGw",
+        "batch": "GUI_1777189376",
+        "note": ""
+      }
+    ],
+    "reason": "HTTP 400: {\"detail\":{\"ok\":false,\"written\":0,\"rejected\":[{\"serial\":\"SN-UQC3SWN2BSXTA3L4\",\"reason\":\"qr_code signature\"}],\"qr_verified\":true}}",
+    "queued_at": "2026-04-26T07:56:37Z",
     "retry_count": 0
   }
 ]

@@ -35,12 +35,12 @@ def main() -> None:
         description="Factory serials + HMAC QR; optional push to server /factory/devices."
     )
     ap.add_argument("--count", type=int, default=10)
-    ap.add_argument("--qr-secret", default="", help="Override QR_SIGN_SECRET (else read from .env)")
+    ap.add_argument("--qr-secret", default="", help="Override QR_SIGN_SECRET (else read from factory.env)")
     ap.add_argument(
         "--dotenv",
         default="",
         metavar="PATH",
-        help="Env file for QR_SIGN_SECRET / FACTORY_* (default: croc_sentinel_systems/.env)",
+        help="Env file for QR_SIGN_SECRET / FACTORY_* (default: croc_sentinel_systems/factory.env)",
     )
     ap.add_argument("--batch", default="", help="Batch label")
     ap.add_argument("--out", default="", help="Output directory")
@@ -59,7 +59,7 @@ def main() -> None:
     ap.add_argument(
         "--api-base",
         default="",
-        help="API root: e.g. https://esasecure.com/api (Traefik) or http://127.0.0.1:8088 (direct); else .env FACTORY_UI_API_BASE",
+        help="API root: e.g. https://esasecure.com/api (Traefik) or http://127.0.0.1:8088 (direct); else factory.env FACTORY_UI_API_BASE",
     )
     ap.add_argument(
         "--insecure-ssl",
@@ -84,14 +84,14 @@ def main() -> None:
         api_base = (args.api_base or env["FACTORY_UI_API_BASE"] or DEFAULT_FACTORY_UI_API_BASE).strip().rstrip("/")
         token = (env["FACTORY_API_TOKEN"] or "").strip()
         if not api_base or not token:
-            print("Error: --ping needs FACTORY_API_TOKEN in .env and API base (--api-base, FACTORY_UI_API_BASE, or default host)", file=sys.stderr)
+            print("Error: --ping needs FACTORY_API_TOKEN in factory.env and API base (--api-base, FACTORY_UI_API_BASE, or default host)", file=sys.stderr)
             sys.exit(4)
         code, body = get_factory_ping(api_base, token, insecure_ssl=args.insecure_ssl)
         print(f"GET /factory/ping -> HTTP {code}\n{body}")
         sys.exit(0 if code == 200 else 7)
     secret = (args.qr_secret or env["QR_SIGN_SECRET"] or "").strip()
     if not secret:
-        print("Error: set QR_SIGN_SECRET in .env or pass --qr-secret", file=sys.stderr)
+        print("Error: set QR_SIGN_SECRET in factory.env or pass --qr-secret", file=sys.stderr)
         sys.exit(2)
     if len(secret) < 24:
         print("[warn] QR_SIGN_SECRET < 24 chars may break ENFORCE_DEVICE_CHALLENGE=1", file=sys.stderr)
@@ -125,7 +125,7 @@ def main() -> None:
             print("Error: push needs API base (--api-base, FACTORY_UI_API_BASE, or built-in default)", file=sys.stderr)
             sys.exit(4)
         if not token:
-            print("Error: push needs FACTORY_API_TOKEN in .env", file=sys.stderr)
+            print("Error: push needs FACTORY_API_TOKEN in factory.env", file=sys.stderr)
             sys.exit(5)
         queued_before = len(load_pending_push_queue(queue_path))
         if queued_before:
