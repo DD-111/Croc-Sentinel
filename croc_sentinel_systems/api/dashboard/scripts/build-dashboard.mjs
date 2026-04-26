@@ -112,8 +112,21 @@ const result = await esbuild.build({
   platform: "browser",
   format: "iife",
   legalComments: "none",
+  // Linked sourcemap → DevTools shows the original src/routes/*.route.js,
+  // src/shell/*.shell.js, and src/lib/*.js paths instead of one giant
+  // assets/app.js. This is the single most effective fix for "I edited
+  // something and the change didn't show up" — open DevTools → Sources and
+  // you can confirm exactly which source file is live.
+  sourcemap: "linked",
   banner: {
-    js: "/* Croc Sentinel Console — IIFE bundle; edit src/ + npm run build */",
+    js: [
+      "/* ============================================================",
+      " * Croc Sentinel Console — BUILD OUTPUT (do NOT hand-edit).",
+      " * Source of truth lives under dashboard/src/ and dashboard/assets/css/.",
+      " * Rebuild:   cd croc_sentinel_systems/api/dashboard && npm run build",
+      " * Cheat sheet: see dashboard/README.md (top of file).",
+      " * ============================================================ */",
+    ].join("\n"),
   },
 });
 

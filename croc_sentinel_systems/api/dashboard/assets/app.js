@@ -1,4 +1,9 @@
-/* Croc Sentinel Console — IIFE bundle; edit src/ + npm run build */
+/* ============================================================
+ * Croc Sentinel Console — BUILD OUTPUT (do NOT hand-edit).
+ * Source of truth lives under dashboard/src/ and dashboard/assets/css/.
+ * Rebuild:   cd croc_sentinel_systems/api/dashboard && npm run build
+ * Cheat sheet: see dashboard/README.md (top of file).
+ * ============================================================ */
 "use strict";
 (() => {
   // src/routes/manifest.js
@@ -6943,3 +6948,4 @@ ${id}`) || "").trim();
     loadMine();
   });
 })();
+//# sourceMappingURL=app.js.map
