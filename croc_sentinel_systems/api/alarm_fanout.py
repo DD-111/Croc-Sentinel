@@ -49,7 +49,6 @@ from config import (
     ALARM_EVENT_DEDUP_WINDOW_SEC,
     ALARM_FANOUT_DURATION_MS,
     ALARM_FANOUT_MAX_TARGETS,
-    CMD_AUTH_KEY,
     CMD_PROTO,
     DEFAULT_PANIC_FANOUT_MS,
     FANOUT_WALL_CLOCK_MAX_S,
@@ -170,7 +169,6 @@ def _fan_out_alarm(device_id: str, payload: dict[str, Any]) -> None:
     failures: list[str] = []
     loud_ms = int(policy.get("remote_loud_duration_ms", ALARM_FANOUT_DURATION_MS))
     panic_ms = int(policy.get("panic_fanout_duration_ms", DEFAULT_PANIC_FANOUT_MS))
-    default_cmd_key = str(CMD_AUTH_KEY or "").strip().upper()
     cmd_key_map = _app.get_cmd_keys_for_devices([did for did, _ in targets]) if targets else {}
 
     def _fanout_publish_one(did: str, ckey: str) -> None:
@@ -204,7 +202,20 @@ def _fan_out_alarm(device_id: str, payload: dict[str, Any]) -> None:
 
         def _worker(did: str) -> None:
             nonlocal sent
-            ck = cmd_key_map.get(did.strip().upper(), default_cmd_key)
+            ck = cmd_key_map.get(did.strip().upper(), "")
+            # Never fall back to CMD_AUTH_KEY for a concrete device_id: every
+            # provisioned unit signs /cmd with its own 16-hex cmd_key from
+            # provisioned_credentials.  If we cannot resolve that key, the
+            # target is either de-provisioned, DB-drifting, or still mid-claim —
+            # publishing with the global compile-time key would *always* fail
+            # verifyKey() on the firmware and spam ``[auth] rejected: key
+            # mismatch`` on every sibling in the notification_group.
+            if not ck:
+                logger.warning(
+                    "alarm fan-out skipped %s: no provisioned_credentials.cmd_key (cannot sign /cmd)",
+                    did,
+                )
+                return
             with sem:
                 try:
                     _fanout_publish_one(did, ck)
