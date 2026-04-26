@@ -281,6 +281,7 @@ def _try_mqtt_unclaim_reset(device_id: str, *, wait_for_ack: bool = True) -> tup
             device_id,
             CMD_PROTO,
             _app.get_cmd_key_for_device(device_id),
+            cred_version=_app.get_cmd_cred_version_for_device(device_id),
         )
     except HTTPException as exc:
         # 503 = broker disconnected -> no MQTT, don't wait.
@@ -295,7 +296,7 @@ def _try_mqtt_unclaim_reset(device_id: str, *, wait_for_ack: bool = True) -> tup
 
 
 def _snapshot_unclaim_payload_for_device(device_id: str) -> dict[str, str]:
-    """Snapshot the publish material (cmd_key + mac + last_seen) BEFORE the
+    """Snapshot the publish material (cmd_key + mac + last_seen + cred_version) BEFORE the
     delete-reset DB transaction wipes ``provisioned_credentials``.
 
     Why this exists: ``_try_mqtt_unclaim_reset`` and ``get_cmd_key_for_device``
@@ -309,7 +310,7 @@ def _snapshot_unclaim_payload_for_device(device_id: str) -> dict[str, str]:
     """
     raw = str(device_id or "").strip()
     if not raw:
-        return {"cmd_key": "", "mac_nocolon": "", "last_seen": ""}
+        return {"cmd_key": "", "mac_nocolon": "", "last_seen": "", "cred_version": "0"}
     with db_lock:
         conn = get_conn()
         cur = conn.cursor()
@@ -317,6 +318,7 @@ def _snapshot_unclaim_payload_for_device(device_id: str) -> dict[str, str]:
             """
             SELECT IFNULL(pc.cmd_key,'')      AS cmd_key,
                    IFNULL(pc.mac_nocolon,'')  AS mac_nocolon,
+                   IFNULL(pc.cred_version,0)   AS cred_version,
                    IFNULL((SELECT updated_at FROM device_state
                            WHERE device_id = pc.device_id),'') AS last_seen
             FROM provisioned_credentials pc
@@ -327,11 +329,12 @@ def _snapshot_unclaim_payload_for_device(device_id: str) -> dict[str, str]:
         row = cur.fetchone()
         conn.close()
     if not row:
-        return {"cmd_key": "", "mac_nocolon": "", "last_seen": ""}
+        return {"cmd_key": "", "mac_nocolon": "", "last_seen": "", "cred_version": "0"}
     return {
         "cmd_key": str(row["cmd_key"] or "").strip().upper(),
         "mac_nocolon": str(row["mac_nocolon"] or "").strip(),
         "last_seen": str(row["last_seen"] or "").strip(),
+        "cred_version": str(int(row["cred_version"] or 0)),
     }
 
 
@@ -339,6 +342,7 @@ def _try_mqtt_unclaim_reset_with_snapshot(
     device_id: str,
     cmd_key: str,
     *,
+    cred_version: int = 0,
     last_seen: str = "",
     wait_for_ack: bool = False,
 ) -> tuple[bool, bool]:
@@ -376,6 +380,7 @@ def _try_mqtt_unclaim_reset_with_snapshot(
             did,
             CMD_PROTO,
             key,
+            cred_version=int(cred_version or 1),
         )
     except HTTPException as exc:
         logger.warning(

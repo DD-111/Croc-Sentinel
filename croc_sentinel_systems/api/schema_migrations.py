@@ -80,6 +80,10 @@ def _run_ensure_columns(conn: sqlite3.Connection) -> None:
     # Phase 93: ownership-side cmd_key shadow for cross-table consistency checks.
     # Keep default empty so legacy rows remain valid until backfilled.
     ensure_column(conn, "device_ownership", "cmd_key_shadow", "TEXT NOT NULL DEFAULT ''")
+    # Command credential generation isolation (cred_version/epoch).
+    ensure_column(conn, "provisioned_credentials", "cred_version", "INTEGER NOT NULL DEFAULT 1")
+    ensure_column(conn, "cmd_queue", "cred_version", "INTEGER NOT NULL DEFAULT 1")
+    ensure_column(conn, "device_unbind_jobs", "target_cred_version", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(
         conn,
         "trigger_policies",

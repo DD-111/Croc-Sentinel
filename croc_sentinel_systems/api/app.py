@@ -749,6 +749,7 @@ from ota_catalog import (  # noqa: E402,F401  (re-exports for legacy callers)
 # security / db.
 from cmd_keys import (
     generate_device_credentials,
+    get_cmd_cred_version_for_device,
     get_cmd_key_for_device,
     get_cmd_keys_for_devices,
     publish_bootstrap_claim,

@@ -318,6 +318,7 @@ def device_commands_pending(body: DeviceCommandsPendingRequest) -> dict[str, Any
         commands.append({
             "proto": int(r["proto"] or CMD_PROTO),
             "key": r["cmd_key"] or "",
+            "cred_version": int(r.get("cred_version") or 1),
             "target_id": r["target_id"] or did,
             "cmd": r["cmd"],
             "params": r["params"] or {},

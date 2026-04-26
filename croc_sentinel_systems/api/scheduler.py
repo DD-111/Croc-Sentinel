@@ -210,6 +210,7 @@ def _unbind_reset_compensation_tick(limit: int = 10) -> None:
                 created_dt = None
         snapshot_key = str(detail.get("snapshot_cmd_key") or "").strip()
         snapshot_seen = str(detail.get("snapshot_last_seen") or "").strip()
+        snapshot_cred_version = int(detail.get("snapshot_cred_version", 0) or 0)
         attempts = int(detail.get("reset_retry_attempts", 0) or 0) + 1
 
         # Hard stop for re-claimed devices: once a device is ACTIVE again and
@@ -286,6 +287,7 @@ def _unbind_reset_compensation_tick(limit: int = 10) -> None:
             sent, acked = _app._try_mqtt_unclaim_reset_with_snapshot(
                 did,
                 snapshot_key,
+                cred_version=int(snapshot_cred_version),
                 last_seen=snapshot_seen,
                 wait_for_ack=False,
             )

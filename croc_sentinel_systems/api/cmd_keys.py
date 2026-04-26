@@ -86,6 +86,7 @@ from security import Principal
 __all__ = (
     "generate_device_credentials",
     "get_cmd_key_for_device",
+    "get_cmd_cred_version_for_device",
     "get_cmd_keys_for_devices",
     "publish_bootstrap_claim",
     "resolve_target_devices",
@@ -147,6 +148,39 @@ def get_cmd_keys_for_devices(device_ids: list[str]) -> dict[str, str]:
                 out[str(r["u"])] = ck
         conn.close()
     return out
+
+
+def get_cmd_cred_version_for_device(device_id: str) -> int:
+    """Resolve current credential generation for one device.
+
+    Source of truth is ``provisioned_credentials.cred_version``; when
+    absent we fall back to ``device_lifecycle.lifecycle_version`` so
+    legacy rows (or in-flight migrations) still get a deterministic epoch.
+    """
+    raw = str(device_id or "").strip()
+    if not raw:
+        return 1
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT IFNULL(pc.cred_version, 0) AS pc_ver,
+                   IFNULL(dl.lifecycle_version, 0) AS lc_ver
+            FROM (SELECT 1) t
+            LEFT JOIN provisioned_credentials pc ON UPPER(pc.device_id) = UPPER(?)
+            LEFT JOIN device_lifecycle dl ON UPPER(dl.device_id) = UPPER(?)
+            LIMIT 1
+            """,
+            (raw, raw),
+        )
+        row = cur.fetchone()
+        conn.close()
+    if not row:
+        return 1
+    pc_ver = int(row["pc_ver"] or 0)
+    lc_ver = int(row["lc_ver"] or 0)
+    return max(1, pc_ver, lc_ver)
 
 
 def publish_bootstrap_claim(

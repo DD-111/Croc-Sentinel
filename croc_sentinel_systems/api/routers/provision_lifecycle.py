@@ -152,6 +152,16 @@ def claim_device(req: ClaimDeviceRequest, principal: Principal = Depends(require
         if existing:
             conn.close()
             raise HTTPException(status_code=409, detail="device already claimed")
+        cur.execute(
+            """
+            SELECT IFNULL((SELECT cred_version FROM provisioned_credentials WHERE UPPER(device_id)=UPPER(?) LIMIT 1), 0) AS pc_ver,
+                   IFNULL((SELECT lifecycle_version FROM device_lifecycle WHERE UPPER(device_id)=UPPER(?) LIMIT 1), 0) AS lc_ver
+            """,
+            (did_norm, did_norm),
+        )
+        vers = cur.fetchone()
+        base_ver = max(int(vers["pc_ver"] or 0), int(vers["lc_ver"] or 0)) if vers else 0
+        next_cred_version = max(1, base_ver + 1)
 
         claim_nonce = str(pending["claim_nonce"])
         qr_code = req.qr_code if req.qr_code else (str(pending["qr_code"] or "") or f"CROC-{mac_nocolon}")
@@ -181,13 +191,14 @@ def claim_device(req: ClaimDeviceRequest, principal: Principal = Depends(require
         cur.execute(
             """
             INSERT INTO provisioned_credentials (
-                device_id, mac_nocolon, mqtt_username, mqtt_password, cmd_key, zone, qr_code, claimed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                device_id, mac_nocolon, mqtt_username, mqtt_password, cmd_key, cred_version, zone, qr_code, claimed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(device_id) DO UPDATE SET
                 mac_nocolon = excluded.mac_nocolon,
                 mqtt_username = excluded.mqtt_username,
                 mqtt_password = excluded.mqtt_password,
                 cmd_key = excluded.cmd_key,
+                cred_version = excluded.cred_version,
                 zone = excluded.zone,
                 qr_code = excluded.qr_code,
                 claimed_at = excluded.claimed_at
@@ -198,6 +209,7 @@ def claim_device(req: ClaimDeviceRequest, principal: Principal = Depends(require
                 mqtt_username,
                 mqtt_password,
                 cmd_key,
+                int(next_cred_version),
                 req.zone,
                 qr_code,
                 utc_now_iso(),
@@ -302,6 +314,7 @@ def claim_device(req: ClaimDeviceRequest, principal: Principal = Depends(require
         "mqtt_username": mqtt_username if CLAIM_RESPONSE_INCLUDE_SECRETS else "***",
         "mqtt_password": mqtt_password if CLAIM_RESPONSE_INCLUDE_SECRETS else "***",
         "cmd_key": cmd_key if CLAIM_RESPONSE_INCLUDE_SECRETS else "***",
+        "cred_version": int(next_cred_version),
         "lifecycle_state": LIFECYCLE_ACTIVE,
         "lifecycle_version": lifecycle_version,
     }

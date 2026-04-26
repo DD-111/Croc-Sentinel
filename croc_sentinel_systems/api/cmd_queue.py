@@ -36,7 +36,7 @@ import time
 from typing import Any, Optional
 
 from config import CMD_PROTO
-from cmd_keys import get_cmd_key_for_device
+from cmd_keys import get_cmd_cred_version_for_device, get_cmd_key_for_device
 from db import db_lock, db_read_lock, get_conn
 from helpers import utc_now_iso
 
@@ -111,6 +111,7 @@ def _cmd_queue_enqueue(
     target_id: str,
     proto: int,
     cmd_key: str,
+    cred_version: int,
     delivered_via: str,
     delivered_at: Optional[str],
 ) -> None:
@@ -141,12 +142,13 @@ def _cmd_queue_enqueue(
             cur.execute(
                 """
                 INSERT OR REPLACE INTO cmd_queue (
-                    cmd_id, device_id, cmd, params_json, target_id, proto, cmd_key,
+                    cmd_id, device_id, cmd, params_json, target_id, proto, cmd_key, cred_version,
                     created_at, expires_at, delivered_via, delivered_at, acked_at, ack_ok, ack_detail
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
                 """,
                 (
                     cmd_id, device_id, cmd, payload, target_id, int(proto or 0), cmd_key or "",
+                    int(cred_version or 1),
                     now, expires_at, delivered_via, delivered_at,
                 ),
             )
@@ -201,6 +203,7 @@ def _cmd_queue_pending_for_device(device_id: str, limit: int = 32) -> list[dict[
         return []
     now = utc_now_iso()
     out: list[dict[str, Any]] = []
+    cur_ver = int(get_cmd_cred_version_for_device(device_id))
     with db_read_lock():
         conn = get_conn()
         cur = conn.cursor()
@@ -208,6 +211,7 @@ def _cmd_queue_pending_for_device(device_id: str, limit: int = 32) -> list[dict[
             cur.execute(
                 """
                 SELECT cmd_id, device_id, cmd, params_json, target_id, proto, cmd_key,
+                       IFNULL(cred_version,1) AS cred_version,
                        created_at, delivered_via, delivered_at
                 FROM cmd_queue
                 WHERE device_id = ?
@@ -223,6 +227,10 @@ def _cmd_queue_pending_for_device(device_id: str, limit: int = 32) -> list[dict[
                     params = json.loads(r["params_json"] or "{}")
                 except Exception:
                     params = {}
+                row_ver = int(r["cred_version"] or 1)
+                if row_ver != cur_ver:
+                    # Stale generation row (before/after re-claim). Do not serve it.
+                    continue
                 snap_key = r["cmd_key"] or ""
                 out.append({
                     "cmd_id": r["cmd_id"],
@@ -231,6 +239,7 @@ def _cmd_queue_pending_for_device(device_id: str, limit: int = 32) -> list[dict[
                     "params": params,
                     "target_id": r["target_id"] or "",
                     "proto": int(r["proto"] or 0),
+                    "cred_version": row_ver,
                     "cmd_key": _effective_cmd_key_for_delivery(
                         str(r["device_id"] or ""),
                         snap_key,
@@ -349,6 +358,7 @@ def _maybe_replay_queue_on_reconnect(device_id: str, prev_updated_at: Optional[s
                 str(entry.get("cmd_key") or ""),
                 ctx=f"replay({entry.get('cmd_id')})",
             )
+            eff_ver = int(entry.get("cred_version") or 1)
             _app.publish_command(
                 topic=f"{topic_root}/{device_id}/cmd",
                 cmd=str(entry["cmd"]),
@@ -358,6 +368,7 @@ def _maybe_replay_queue_on_reconnect(device_id: str, prev_updated_at: Optional[s
                 cmd_key=eff_key,
                 wait_publish=False,
                 persist=False,
+                cred_version=eff_ver,
             )
         except Exception as exc:
             logger.warning(
@@ -381,6 +392,19 @@ def _cmd_queue_cleanup_expired(max_rows: int = 500) -> int:
         conn = get_conn()
         cur = conn.cursor()
         try:
+            # Generation isolation: rows enqueued under an older credential epoch
+            # are stale after re-claim/rotation and must never replay.
+            cur.execute(
+                """
+                DELETE FROM cmd_queue
+                WHERE acked_at IS NULL
+                  AND EXISTS (
+                    SELECT 1 FROM device_lifecycle dl
+                    WHERE UPPER(dl.device_id) = UPPER(cmd_queue.device_id)
+                      AND IFNULL(cmd_queue.cred_version,1) < IFNULL(dl.lifecycle_version,1)
+                  )
+                """
+            )
             cur.execute(
                 "DELETE FROM cmd_queue WHERE expires_at IS NOT NULL AND expires_at < ?",
                 (now,),

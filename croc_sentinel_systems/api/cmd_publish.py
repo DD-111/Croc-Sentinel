@@ -125,6 +125,7 @@ def publish_command(
     dedupe_key: Optional[str] = None,
     dedupe_ttl_s: Optional[float] = None,
     persist: bool = True,
+    cred_version: Optional[int] = None,
 ) -> str:
     """Publish a /cmd frame. Returns generated ``cmd_id`` (so callers can wait on ACK by id).
 
@@ -150,9 +151,18 @@ def publish_command(
     if not _app.mqtt_connected:
         raise HTTPException(status_code=503, detail="mqtt broker disconnected")
     cmd_id = str(uuid.uuid4())
+    cred_v = int(cred_version or 0)
+    if cred_v <= 0:
+        try:
+            cred_v = int(_app.get_cmd_cred_version_for_device(str(target_id or "")))
+        except Exception:
+            cred_v = 1
+    if cred_v <= 0:
+        cred_v = 1
     payload = {
         "proto": proto,
         "key": cmd_key,
+        "cred_version": cred_v,
         "target_id": target_id,
         "cmd": cmd,
         "params": params,
@@ -195,6 +205,7 @@ def publish_command(
             target_id=target_id,
             proto=proto,
             cmd_key=cmd_key or "",
+            cred_version=cred_v,
             delivered_via="mqtt",
             delivered_at=publish_delivered_at,
         )

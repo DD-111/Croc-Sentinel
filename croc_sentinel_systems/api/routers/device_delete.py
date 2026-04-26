@@ -98,6 +98,7 @@ def _device_delete_reset_impl(
     snapshot = _snapshot_unclaim_payload_for_device(device_id)
     snapshot_cmd_key = str(snapshot.get("cmd_key") or "")
     snapshot_last_seen = str(snapshot.get("last_seen") or "")
+    snapshot_cred_version = int(str(snapshot.get("cred_version") or "0") or 0)
     mac_nocolon = str(snapshot.get("mac_nocolon") or "")
     del_cred = del_owner = del_acl = del_revoked = del_state = del_sched = 0
     # Phase 1 (DB atomic): requested -> server_unbound + ownership/data unlink + lifecycle bump.
@@ -169,6 +170,7 @@ def _device_delete_reset_impl(
                             "snapshot_cmd_key": snapshot_cmd_key,
                             "snapshot_mac_nocolon": mac_nocolon,
                             "snapshot_last_seen": snapshot_last_seen,
+                            "snapshot_cred_version": int(snapshot_cred_version),
                         },
                         ensure_ascii=True,
                     ),
@@ -189,6 +191,7 @@ def _device_delete_reset_impl(
         nvs_purge_sent, nvs_purge_acked = _try_mqtt_unclaim_reset_with_snapshot(
             device_id,
             snapshot_cmd_key,
+            cred_version=int(snapshot_cred_version),
             last_seen=snapshot_last_seen,
             wait_for_ack=False,
         )
