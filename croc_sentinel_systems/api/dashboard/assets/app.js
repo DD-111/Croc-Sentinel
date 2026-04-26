@@ -3714,12 +3714,15 @@ ${curFw} \u2192 ${fw}`)) return;
       }
       for (const ctl of $$("button, input, textarea, select", view)) {
         if (!(ctl instanceof HTMLElement)) continue;
+        if (ctl.id === "deleteReset") continue;
         if (_offlineLocked) {
-          if (!ctl.disabled) ctl.dataset.offlineLockRestore = "1";
+          if (ctl.dataset.offlinePrevDisabled === void 0) {
+            ctl.dataset.offlinePrevDisabled = ctl.disabled ? "1" : "0";
+          }
           ctl.disabled = true;
-        } else if (ctl.dataset.offlineLockRestore === "1") {
-          ctl.disabled = false;
-          delete ctl.dataset.offlineLockRestore;
+        } else if (ctl.dataset.offlinePrevDisabled !== void 0) {
+          ctl.disabled = ctl.dataset.offlinePrevDisabled === "1";
+          delete ctl.dataset.offlinePrevDisabled;
         }
       }
     };
@@ -3781,6 +3784,7 @@ ${curFw} \u2192 ${fw}`)) return;
       const tgt = ev.target && ev.target.closest ? ev.target.closest("button") : null;
       if (!tgt) return;
       if (tgt.closest(".device-page-back-nav")) return;
+      if (tgt.id === "deleteReset") return;
       if (!_offlineHinted.shown) {
         _offlineHinted.shown = true;
         toast("Device offline: view-only mode; actions are disabled.", "warn");
