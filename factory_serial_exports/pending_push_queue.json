@@ -1,1 +1,17 @@
-[]
+[
+  {
+    "batch": "GUI_1777188592",
+    "items": [
+      {
+        "serial": "SN-TDWW2SMRJYNN5CNB",
+        "mac_nocolon": null,
+        "qr_code": "CROC|SN-TDWW2SMRJYNN5CNB|1777188710|DH2SKNHPBleyK7htUPV4hzjy7Re7dJWmxD3zHt_MZIA",
+        "batch": "GUI_1777188592",
+        "note": ""
+      }
+    ],
+    "reason": "HTTP 400: {\"detail\":{\"ok\":false,\"written\":0,\"rejected\":[{\"serial\":\"SN-TDWW2SMRJYNN5CNB\",\"reason\":\"qr_code signature\"}],\"qr_verified\":true}}",
+    "queued_at": "2026-04-26T07:31:51Z",
+    "retry_count": 0
+  }
+]

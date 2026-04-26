@@ -23,6 +23,7 @@ GUI remain wire-compatible with each other AND with the server.
 """
 from __future__ import annotations
 
+from collections import Counter
 import json
 import os
 import subprocess
@@ -76,6 +77,14 @@ PALETTE = {
     "step_locked_fg": "#9099a8",
 }
 
+# Human hints for POST /factory/devices per-item rejects (see routers/factory.py).
+_FACTORY_REJECT_HINTS: dict[str, str] = {
+    "invalid mac": "MAC 须为 12 位十六进制（无冒号）。",
+    "qr_code missing": "服务器开启签名校验时，每条必须有 qr_code。",
+    "qr_code policy": "二维码字符串不符合服务器 QR_CODE_REGEX（以 /factory/ping 返回为准）。",
+    "qr_code signature": "HMAC 与服务器 QR_SIGN_SECRET 不一致：本地生成 .env 的 QR_SIGN_SECRET 必须与 API 容器一致。",
+}
+
 
 def _open_path_in_os(path: Path) -> None:
     path = path.resolve()
@@ -106,8 +115,9 @@ class FactoryApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Croc Sentinel · 出厂工具 · Factory Console")
-        self.geometry("1040x820")
-        self.minsize(880, 660)
+        # Slightly larger default window so labels + log remain readable at bumped font sizes.
+        self.geometry("1200x900")
+        self.minsize(960, 700)
         self.configure(bg=PALETTE["bg"])
 
         # ----- State vars -----
@@ -115,7 +125,8 @@ class FactoryApp(tk.Tk):
         self._api_base = tk.StringVar(value=DEFAULT_FACTORY_UI_API_BASE)
         self._factory_token = tk.StringVar()
         self._batch = tk.StringVar(value=f"GUI_{int(time.time())}")
-        self._count = tk.IntVar(value=10)
+        # Default to 1 unit per run (operators scale up explicitly when batching).
+        self._count = tk.IntVar(value=1)
         self._auto_push = tk.BooleanVar(value=True)
         self._insecure = tk.BooleanVar(value=False)
         self._local_only = tk.BooleanVar(value=False)
@@ -153,7 +164,7 @@ class FactoryApp(tk.Tk):
 
     def _apply_style(self) -> None:
         try:
-            self.call("tk", "scaling", 1.10)
+            self.call("tk", "scaling", 1.22)
         except tk.TclError:
             pass
         s = ttk.Style(self)
@@ -163,44 +174,44 @@ class FactoryApp(tk.Tk):
             s.theme_use("clam")
         s.configure("App.TFrame", background=PALETTE["bg"])
         s.configure("Card.TFrame", background=PALETTE["card_bg"], relief="solid", borderwidth=1)
-        s.configure("Card.TLabel", background=PALETTE["card_bg"], foreground=PALETTE["title"])
+        s.configure("Card.TLabel", background=PALETTE["card_bg"], foreground=PALETTE["title"], font=("Segoe UI", 12))
         s.configure(
             "Step.TLabel",
             background=PALETTE["card_bg"],
             foreground=PALETTE["title"],
-            font=("Segoe UI", 11, "bold"),
+            font=("Segoe UI", 14, "bold"),
         )
         s.configure(
             "StepLocked.TLabel",
             background=PALETTE["step_locked_bg"],
             foreground=PALETTE["step_locked_fg"],
-            font=("Segoe UI", 11, "bold"),
+            font=("Segoe UI", 14, "bold"),
         )
         s.configure(
             "Sub.TLabel",
             background=PALETTE["card_bg"],
             foreground=PALETTE["muted"],
-            font=("Segoe UI", 9),
+            font=("Segoe UI", 11),
         )
         s.configure(
             "Banner.TLabel",
             background=PALETTE["bg"],
-            font=("Segoe UI", 12, "bold"),
+            font=("Segoe UI", 15, "bold"),
         )
         s.configure(
             "Mono.TLabel",
             background=PALETTE["card_bg"],
             foreground=PALETTE["muted"],
-            font=("Consolas", 9),
+            font=("Consolas", 11),
         )
-        s.configure("Primary.TButton", padding=(14, 8), font=("Segoe UI", 10, "bold"))
-        s.configure("TButton", padding=(10, 6))
+        s.configure("Primary.TButton", padding=(16, 10), font=("Segoe UI", 12, "bold"))
+        s.configure("TButton", padding=(12, 8))
         s.configure("TLabelframe", background=PALETTE["card_bg"], padding=(12, 10))
         s.configure(
             "TLabelframe.Label",
             background=PALETTE["card_bg"],
             foreground=PALETTE["title"],
-            font=("Segoe UI", 10, "bold"),
+            font=("Segoe UI", 12, "bold"),
         )
         s.configure("TCheckbutton", background=PALETTE["card_bg"])
         s.configure("TRadiobutton", background=PALETTE["card_bg"])
@@ -238,7 +249,7 @@ class FactoryApp(tk.Tk):
         self._banner_dot = tk.Label(
             bar,
             text="●",
-            font=("Segoe UI", 14, "bold"),
+            font=("Segoe UI", 16, "bold"),
             fg=self._banner_color,
             bg=PALETTE["bg"],
         )
@@ -306,7 +317,7 @@ class FactoryApp(tk.Tk):
         meta = ttk.Frame(f)
         meta.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(6, 0))
         meta.grid_columnconfigure(0, weight=1)
-        ttk.Label(meta, textvariable=self._server_meta, style="Sub.TLabel", wraplength=940, justify="left").grid(
+        ttk.Label(meta, textvariable=self._server_meta, style="Sub.TLabel", wraplength=1120, justify="left").grid(
             row=0, column=0, sticky="ew"
         )
 
@@ -412,9 +423,9 @@ class FactoryApp(tk.Tk):
         link_wrap.grid_columnconfigure(0, weight=1)
         self._links_text = tk.Text(
             link_wrap,
-            height=4,
+            height=5,
             wrap=tk.NONE,
-            font=("Consolas", 9),
+            font=("Consolas", 11),
             background="#fafbfd",
             relief="solid",
             borderwidth=1,
@@ -444,9 +455,9 @@ class FactoryApp(tk.Tk):
         xs = ttk.Scrollbar(wrap, orient=tk.HORIZONTAL)
         self._log = tk.Text(
             wrap,
-            height=10,
+            height=12,
             wrap=tk.NONE,
-            font=("Consolas", 9),
+            font=("Consolas", 11),
             yscrollcommand=ys.set,
             xscrollcommand=xs.set,
             undo=False,
@@ -742,7 +753,15 @@ class FactoryApp(tk.Tk):
                 ui(self._set_progress, 100, f"完成 · 登记 {written}/{len(items)}")
                 ui(self._render_links, items, api_base=api, local_only=False)
                 if rejected:
-                    msg = "\n".join(f"{r.get('serial')}: {r.get('reason')}" for r in rejected[:30])
+                    rc = Counter(str(r.get("reason") or "?") for r in rejected)
+                    ui(self._line, f"[push] rejected_count={len(rejected)} by_reason={dict(rc)}")
+                    lines = []
+                    for r in rejected[:30]:
+                        rs = str(r.get("serial") or "")
+                        rr = str(r.get("reason") or "")
+                        hint = _FACTORY_REJECT_HINTS.get(rr, "")
+                        lines.append(f"{rs}: {rr}" + (f" — {hint}" if hint else ""))
+                    msg = "\n".join(lines)
                     ui(messagebox.showwarning, "部分拒绝", f"已登记 {written} 条。\n被拒绝 {len(rejected)} 条：\n{msg}")
                 else:
                     ui(messagebox.showinfo, "完成", f"已登记 {len(items)} 条。\n{out}")
@@ -757,7 +776,13 @@ class FactoryApp(tk.Tk):
                 if code == 403:
                     hint = "\n\n403：核对服务器 FACTORY_API_TOKEN；改 .env 后 docker compose restart api。"
                 elif code == 400 and rejected:
-                    sample = "\n".join(f"  {r.get('serial')}: {r.get('reason')}" for r in rejected[:30])
+                    lines400 = []
+                    for r in rejected[:30]:
+                        rs = str(r.get("serial") or "")
+                        rr = str(r.get("reason") or "")
+                        h = _FACTORY_REJECT_HINTS.get(rr, "")
+                        lines400.append(f"  {rs}: {rr}" + (f" — {h}" if h else ""))
+                    sample = "\n".join(lines400)
                     hint = f"\n\n服务器拒绝 {len(rejected)} 条：\n{sample}"
                 ui(messagebox.showerror, "登记失败", f"HTTP {code}\n{body[:800]}{hint}")
                 ui(self._render_links, items, api_base=api, local_only=False)
@@ -845,7 +870,7 @@ class FactoryApp(tk.Tk):
         d.geometry("680x280")
         d.minsize(520, 220)
         ttk.Label(d, text="粘贴整行 CROC|... 进行 HMAC 校验").pack(anchor=tk.W, padx=12, pady=(10, 4))
-        txt = tk.Text(d, height=5, wrap=tk.NONE, font=("Consolas", 10))
+        txt = tk.Text(d, height=5, wrap=tk.NONE, font=("Consolas", 12))
         txt.pack(fill=tk.BOTH, expand=True, padx=12, pady=4)
         out = tk.StringVar(value="")
         ttk.Label(d, textvariable=out, foreground=PALETTE["accent"]).pack(anchor=tk.W, padx=12, pady=(0, 6))
