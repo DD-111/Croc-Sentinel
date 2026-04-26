@@ -3690,6 +3690,40 @@ ${curFw} \u2192 ${fw}`)) return;
 
     ${mqttMsgPanel}
     </section>`);
+    let _offlineLocked = false;
+    const _offlineHinted = { shown: false };
+    const setOfflineInteractionLock = (isOnlineNow) => {
+      _offlineLocked = !isOnlineNow;
+      const existing = $("#offlineLockMsg", view);
+      if (_offlineLocked) {
+        if (!existing) {
+          const left = $(".device-focus-left", view);
+          if (left) {
+            const p = document.createElement("p");
+            p.id = "offlineLockMsg";
+            p.className = "badge offline";
+            p.style.margin = "0 0 8px";
+            p.textContent = "Device offline \xB7 view-only mode";
+            left.insertBefore(p, left.firstChild || null);
+          }
+        } else {
+          existing.style.display = "inline-flex";
+        }
+      } else if (existing) {
+        existing.style.display = "none";
+      }
+      for (const ctl of $$("button, input, textarea, select", view)) {
+        if (!(ctl instanceof HTMLElement)) continue;
+        if (_offlineLocked) {
+          if (!ctl.disabled) ctl.dataset.offlineLockRestore = "1";
+          ctl.disabled = true;
+        } else if (ctl.dataset.offlineLockRestore === "1") {
+          ctl.disabled = false;
+          delete ctl.dataset.offlineLockRestore;
+        }
+      }
+    };
+    const refreshOfflineInteractionLock = () => setOfflineInteractionLock(!_offlineLocked);
     const patchDeviceLive = (dev) => {
       const m = deviceLiveModel(dev);
       const onlineBadge = $("#devOnlineBadge", view);
@@ -3718,6 +3752,7 @@ ${curFw} \u2192 ${fw}`)) return;
       setText("#devHeap", m.s.free_heap ? `${m.s.free_heap} B (min ${m.s.min_free_heap || "?"} B)` : "\u2014");
       setText("#devUpdated", `${fmtTs(dev.updated_at)} (${fmtRel(dev.updated_at)})`);
       syncDevicePageFirmwareHint(view, dev, id);
+      setOfflineInteractionLock(m.on);
     };
     patchDeviceLive(d);
     const deviceDrawers = $$("details.card.device-drawer", view);
@@ -3741,6 +3776,21 @@ ${curFw} \u2192 ${fw}`)) return;
       d = latest;
       patchDeviceLive(latest);
     }, 12e3);
+    view.addEventListener("click", (ev) => {
+      if (!_offlineLocked) return;
+      const tgt = ev.target && ev.target.closest ? ev.target.closest("button") : null;
+      if (!tgt) return;
+      if (tgt.closest(".device-page-back-nav")) return;
+      if (!_offlineHinted.shown) {
+        _offlineHinted.shown = true;
+        toast("Device offline: view-only mode; actions are disabled.", "warn");
+        setTimeout(() => {
+          _offlineHinted.shown = false;
+        }, 2200);
+      }
+      ev.preventDefault();
+      ev.stopPropagation();
+    }, true);
     if (isSuperViewer) {
       const det = $("#mqttMsgDetails", view);
       const box = $("#devMsgsList", view);
@@ -3763,6 +3813,10 @@ ${curFw} \u2192 ${fw}`)) return;
       }
     }
     $("#saveProfile").addEventListener("click", async () => {
+      if (_offlineLocked) {
+        toast("Device offline: actions are disabled.", "warn");
+        return;
+      }
       try {
         const body = { display_label: ($("#dispLabel").value || "").trim() };
         if (!d.is_shared) {
@@ -3781,6 +3835,10 @@ ${curFw} \u2192 ${fw}`)) return;
       }
     });
     const withDev = (fn) => async () => {
+      if (_offlineLocked) {
+        toast("Device offline: actions are disabled.", "warn");
+        return;
+      }
       try {
         await fn();
         toast("Sent", "ok");
@@ -4032,6 +4090,10 @@ ${id}`) || "").trim();
         );
         $$(".shareRevokeBtn", shareListEl).forEach((btn) => {
           btn.addEventListener("click", async () => {
+            if (_offlineLocked) {
+              toast("Device offline: actions are disabled.", "warn");
+              return;
+            }
             const u = btn.getAttribute("data-user") || "";
             if (!u) return;
             if (!confirm(`Revoke share for ${u}?`)) return;
@@ -4044,13 +4106,19 @@ ${id}`) || "").trim();
             }
           });
         });
+        refreshOfflineInteractionLock();
       } catch (e) {
         setChildMarkup(shareListEl, `<p class="badge revoked">${escapeHtml(e.message || e)}</p>`);
+        refreshOfflineInteractionLock();
       }
     };
     const shareGrantBtn = $("#shareGrant");
     if (shareGrantBtn) {
       shareGrantBtn.addEventListener("click", async () => {
+        if (_offlineLocked) {
+          toast("Device offline: actions are disabled.", "warn");
+          return;
+        }
         const grantee = ($("#shareUser").value || "").trim();
         const canView = !!$("#shareCanView").checked;
         const canOperate = !!$("#shareCanOperate").checked;
