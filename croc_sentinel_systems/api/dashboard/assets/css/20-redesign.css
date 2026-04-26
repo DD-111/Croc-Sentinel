@@ -238,18 +238,40 @@ html[data-theme="dark"] .auth-link {
  *   primary-name font size, and unify all .row gaps.
  * ===========================================================================*/
 
-body[data-layout="app"] .site-footer--shell {
-  position: sticky;
-  bottom: 0;
-  z-index: 12;
-  background: color-mix(in srgb, var(--bg-elev) 92%, transparent);
-  -webkit-backdrop-filter: blur(10px) saturate(1.1);
-  backdrop-filter: blur(10px) saturate(1.1);
+/* Footer drift fix v2 — make .main a 3-row grid so the footer is structurally
+   pinned to the last row instead of relying on `margin-top:auto + position:sticky`.
+   The previous flex+margin-auto+sticky combo was unstable on long pages
+   (content scrolled and the footer "drifted" out of view).
+   Rules:
+     .main          → grid: auto / 1fr / auto, no scroll itself
+     .main > .topbar → row 1 (no longer needs sticky — it's structurally fixed)
+     #view          → row 2, owns the scroll
+     .site-footer--shell → row 3, static, never drifts
+*/
+body[data-layout="app"] .main {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr);
+  overflow: hidden;
 }
-@supports not (backdrop-filter: blur(1px)) {
-  body[data-layout="app"] .site-footer--shell {
-    background: var(--bg-elev);
-  }
+body[data-layout="app"] .main > .topbar {
+  position: static;
+  grid-row: 1;
+}
+body[data-layout="app"] .main > #view,
+body[data-layout="app"] #view {
+  grid-row: 2;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+}
+body[data-layout="app"] .main > .site-footer--shell,
+body[data-layout="app"] .site-footer--shell {
+  position: static !important;
+  grid-row: 3;
+  margin-top: 0;
+  z-index: auto;
 }
 
 /* --- Device detail page compaction ------------------------------------- */
