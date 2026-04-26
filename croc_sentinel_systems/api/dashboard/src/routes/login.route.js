@@ -13,6 +13,9 @@
  */
 
 registerRoute("login", async (view) => {
+  // #region agent log
+  fetch('http://127.0.0.1:7580/ingest/13cc4f55-c163-4556-b72d-19f8aaadec22',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'ba8b41'},body:JSON.stringify({sessionId:'ba8b41',runId:'r1',hypothesisId:'B,C',location:'login.route.js:enter',message:'login handler entered',data:{viewExists:!!view,viewChildBefore:view?view.children.length:-1,asideHtmlType:typeof authAsideHtml,footerHtmlType:typeof authSiteFooterHtml,bodyDataLayout:document.body.dataset.layout},timestamp:Date.now()})}).catch(()=>{});
+  // #endregion
   setCrumb("Sign in");
   document.body.dataset.auth = "none";
   const cleanAuthMessage = (raw) => {
@@ -60,6 +63,16 @@ registerRoute("login", async (view) => {
         </div>
       </div>
     </div>`);
+  // #region agent log
+  try {
+    var _f = view.querySelector('#loginForm');
+    var _c = view.querySelector('[data-auth-card]');
+    var _aside = view.querySelector('.auth-surface__side');
+    var _body = view.querySelector('.auth-surface__body');
+    var _inner = view.querySelector('.auth-surface__inner');
+    fetch('http://127.0.0.1:7580/ingest/13cc4f55-c163-4556-b72d-19f8aaadec22',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'ba8b41'},body:JSON.stringify({sessionId:'ba8b41',runId:'r1',hypothesisId:'C,D',location:'login.route.js:after-mountView',message:'login form mounted',data:{viewChildCount:view.children.length,viewFirstChildClass:(view.firstElementChild&&view.firstElementChild.className||''),loginFormExists:!!_f,authCardExists:!!_c,authCardDisplay:_c?getComputedStyle(_c).display:null,authCardVisibility:_c?getComputedStyle(_c).visibility:null,authCardOpacity:_c?getComputedStyle(_c).opacity:null,authCardRect:_c?(function(r){return{w:Math.round(r.width),h:Math.round(r.height)};})(_c.getBoundingClientRect()):null,asideRect:_aside?(function(r){return{w:Math.round(r.width),h:Math.round(r.height)};})(_aside.getBoundingClientRect()):null,bodyRect:_body?(function(r){return{w:Math.round(r.width),h:Math.round(r.height)};})(_body.getBoundingClientRect()):null,innerRect:_inner?(function(r){return{w:Math.round(r.width),h:Math.round(r.height)};})(_inner.getBoundingClientRect()):null},timestamp:Date.now()})}).catch(()=>{});
+  } catch(_) {}
+  // #endregion
   const form = $("#loginForm", view);
   const card = view.querySelector("[data-auth-card]");
   form.addEventListener("submit", async (ev) => {

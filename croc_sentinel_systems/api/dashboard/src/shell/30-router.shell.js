@@ -53,6 +53,9 @@ function scheduleRouteTicker(routeSeq, key, fn, intervalMs) {
 
 async function renderRoute() {
   const view = $("#view");
+  // #region agent log
+  fetch('http://127.0.0.1:7580/ingest/13cc4f55-c163-4556-b72d-19f8aaadec22',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'ba8b41'},body:JSON.stringify({sessionId:'ba8b41',runId:'r1',hypothesisId:'B,E',location:'30-router.shell.js:renderRoute-entry',message:'renderRoute entry',data:{hash:location.hash,viewExists:!!view,bodyClass:document.body&&document.body.className||'',bodyDataLayout:document.body&&document.body.dataset.layout||'',hasToken:!!(typeof getToken==='function'?getToken():null),hasMe:!!(typeof state!=='undefined'&&state&&state.me)},timestamp:Date.now()})}).catch(()=>{});
+  // #endregion
   if (!view) return;
   let hashFull = location.hash || "#/overview";
   let routeQuery = new URLSearchParams("");
@@ -150,6 +153,14 @@ async function renderRoute() {
   } catch (_) {}
   try { applySidebarRail(); } catch (_) {}
   const handler = routes[routeId] || routes["overview"];
+  // #region agent log
+  try {
+    var _tb = document.querySelector('.topbar');
+    var _sb = document.querySelector('.sidebar');
+    var _au = document.querySelector('.auth-surface');
+    fetch('http://127.0.0.1:7580/ingest/13cc4f55-c163-4556-b72d-19f8aaadec22',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'ba8b41'},body:JSON.stringify({sessionId:'ba8b41',runId:'r1',hypothesisId:'B,D,E',location:'30-router.shell.js:hard-guard-done',message:'after hard-guard, before handler',data:{routeId:routeId,isAuthRoute:isAuthRoute,handlerKnown:routeId in routes,handlerKey:(routes[routeId]?routeId:'(fallback overview)'),bodyDataLayout:document.body.dataset.layout,bodyClass:document.body.className,topbarDisplay:_tb?getComputedStyle(_tb).display:'none(missing)',sidebarDisplay:_sb?getComputedStyle(_sb).display:'none(missing)',hasAuthSurface:!!_au,viewChildCount:view.children.length},timestamp:Date.now()})}).catch(()=>{});
+  } catch(_) {}
+  // #endregion
   try {
     mountView(view, `<div class="route-loading card" aria-busy="true" role="status">
       <span class="sr-only">Loading page</span>
@@ -175,7 +186,18 @@ async function renderRoute() {
     ]);
     renderNav();
     renderHealthPills();
+    // #region agent log
+    try {
+      var _au2 = document.querySelector('.auth-surface');
+      var _card = document.querySelector('[data-auth-card]');
+      var _form = document.getElementById('loginForm');
+      fetch('http://127.0.0.1:7580/ingest/13cc4f55-c163-4556-b72d-19f8aaadec22',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'ba8b41'},body:JSON.stringify({sessionId:'ba8b41',runId:'r1',hypothesisId:'B,C,D',location:'30-router.shell.js:handler-done',message:'after handler success',data:{routeId:routeId,viewChildCount:view.children.length,viewFirstChildClass:(view.firstElementChild&&view.firstElementChild.className||''),authSurfaceFound:!!_au2,authCardFound:!!_card,authCardDisplay:_card?getComputedStyle(_card).display:'(none)',authCardRect:_card?(function(r){return{w:Math.round(r.width),h:Math.round(r.height)};})(_card.getBoundingClientRect()):null,loginFormFound:!!_form},timestamp:Date.now()})}).catch(()=>{});
+    } catch(_) {}
+    // #endregion
   } catch (e) {
+    // #region agent log
+    fetch('http://127.0.0.1:7580/ingest/13cc4f55-c163-4556-b72d-19f8aaadec22',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'ba8b41'},body:JSON.stringify({sessionId:'ba8b41',runId:'r1',hypothesisId:'B',location:'30-router.shell.js:handler-catch',message:'handler threw',data:{routeId:routeId,error:String(e&&e.message||e),stack:String(e&&e.stack||'').slice(0,400)},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
     mountView(view, hx`<div class="card"><h2>Load failed</h2><p class="muted">${e.message || e}</p></div>`);
   }
 }

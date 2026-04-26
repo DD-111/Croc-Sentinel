@@ -491,6 +491,8 @@
 
   // src/virtual-console.js
   async function boot() {
+    fetch("http://127.0.0.1:7580/ingest/13cc4f55-c163-4556-b72d-19f8aaadec22", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "ba8b41" }, body: JSON.stringify({ sessionId: "ba8b41", runId: "r1", hypothesisId: "A", location: "console.raw.js:boot", message: "boot start", data: { hash: location.hash, hasHash: !!location.hash, bundleVer: "v=85", userAgent: (navigator && navigator.userAgent || "").slice(0, 80) }, timestamp: Date.now() }) }).catch(() => {
+    });
     initTheme();
     $("#menuBtn").addEventListener("click", () => toggleNav());
     $("#sidebarBackdrop").addEventListener("click", () => toggleNav(false));
@@ -1561,6 +1563,8 @@ ${curFw} \u2192 ${fw}`)) return;
   }
   async function renderRoute() {
     const view = $("#view");
+    fetch("http://127.0.0.1:7580/ingest/13cc4f55-c163-4556-b72d-19f8aaadec22", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "ba8b41" }, body: JSON.stringify({ sessionId: "ba8b41", runId: "r1", hypothesisId: "B,E", location: "30-router.shell.js:renderRoute-entry", message: "renderRoute entry", data: { hash: location.hash, viewExists: !!view, bodyClass: document.body && document.body.className || "", bodyDataLayout: document.body && document.body.dataset.layout || "", hasToken: !!(typeof getToken === "function" ? getToken() : null), hasMe: !!(typeof state !== "undefined" && state && state.me) }, timestamp: Date.now() }) }).catch(() => {
+    });
     if (!view) return;
     let hashFull = location.hash || "#/overview";
     let routeQuery = new URLSearchParams("");
@@ -1671,6 +1675,14 @@ ${curFw} \u2192 ${fw}`)) return;
     }
     const handler = routes[routeId] || routes["overview"];
     try {
+      var _tb = document.querySelector(".topbar");
+      var _sb = document.querySelector(".sidebar");
+      var _au = document.querySelector(".auth-surface");
+      fetch("http://127.0.0.1:7580/ingest/13cc4f55-c163-4556-b72d-19f8aaadec22", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "ba8b41" }, body: JSON.stringify({ sessionId: "ba8b41", runId: "r1", hypothesisId: "B,D,E", location: "30-router.shell.js:hard-guard-done", message: "after hard-guard, before handler", data: { routeId, isAuthRoute, handlerKnown: routeId in routes, handlerKey: routes[routeId] ? routeId : "(fallback overview)", bodyDataLayout: document.body.dataset.layout, bodyClass: document.body.className, topbarDisplay: _tb ? getComputedStyle(_tb).display : "none(missing)", sidebarDisplay: _sb ? getComputedStyle(_sb).display : "none(missing)", hasAuthSurface: !!_au, viewChildCount: view.children.length }, timestamp: Date.now() }) }).catch(() => {
+      });
+    } catch (_2) {
+    }
+    try {
       mountView(view, `<div class="route-loading card" aria-busy="true" role="status">
       <span class="sr-only">Loading page</span>
       <div class="route-loading__head"></div>
@@ -1691,7 +1703,19 @@ ${curFw} \u2192 ${fw}`)) return;
       ]);
       renderNav();
       renderHealthPills();
+      try {
+        var _au2 = document.querySelector(".auth-surface");
+        var _card = document.querySelector("[data-auth-card]");
+        var _form = document.getElementById("loginForm");
+        fetch("http://127.0.0.1:7580/ingest/13cc4f55-c163-4556-b72d-19f8aaadec22", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "ba8b41" }, body: JSON.stringify({ sessionId: "ba8b41", runId: "r1", hypothesisId: "B,C,D", location: "30-router.shell.js:handler-done", message: "after handler success", data: { routeId, viewChildCount: view.children.length, viewFirstChildClass: view.firstElementChild && view.firstElementChild.className || "", authSurfaceFound: !!_au2, authCardFound: !!_card, authCardDisplay: _card ? getComputedStyle(_card).display : "(none)", authCardRect: _card ? (function(r) {
+          return { w: Math.round(r.width), h: Math.round(r.height) };
+        })(_card.getBoundingClientRect()) : null, loginFormFound: !!_form }, timestamp: Date.now() }) }).catch(() => {
+        });
+      } catch (_2) {
+      }
     } catch (e) {
+      fetch("http://127.0.0.1:7580/ingest/13cc4f55-c163-4556-b72d-19f8aaadec22", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "ba8b41" }, body: JSON.stringify({ sessionId: "ba8b41", runId: "r1", hypothesisId: "B", location: "30-router.shell.js:handler-catch", message: "handler threw", data: { routeId, error: String(e && e.message || e), stack: String(e && e.stack || "").slice(0, 400) }, timestamp: Date.now() }) }).catch(() => {
+      });
       mountView(view, hx`<div class="card"><h2>Load failed</h2><p class="muted">${e.message || e}</p></div>`);
     }
   }
@@ -4968,6 +4992,8 @@ ${id}`) || "").trim();
     scheduleRouteTicker(routeSeq, `group-live-${g}`, refreshGroupLive, 1e4);
   });
   registerRoute("login", async (view) => {
+    fetch("http://127.0.0.1:7580/ingest/13cc4f55-c163-4556-b72d-19f8aaadec22", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "ba8b41" }, body: JSON.stringify({ sessionId: "ba8b41", runId: "r1", hypothesisId: "B,C", location: "login.route.js:enter", message: "login handler entered", data: { viewExists: !!view, viewChildBefore: view ? view.children.length : -1, asideHtmlType: typeof authAsideHtml, footerHtmlType: typeof authSiteFooterHtml, bodyDataLayout: document.body.dataset.layout }, timestamp: Date.now() }) }).catch(() => {
+    });
     setCrumb("Sign in");
     document.body.dataset.auth = "none";
     const cleanAuthMessage = (raw) => {
@@ -5015,6 +5041,24 @@ ${id}`) || "").trim();
         </div>
       </div>
     </div>`);
+    try {
+      var _f = view.querySelector("#loginForm");
+      var _c = view.querySelector("[data-auth-card]");
+      var _aside = view.querySelector(".auth-surface__side");
+      var _body = view.querySelector(".auth-surface__body");
+      var _inner = view.querySelector(".auth-surface__inner");
+      fetch("http://127.0.0.1:7580/ingest/13cc4f55-c163-4556-b72d-19f8aaadec22", { method: "POST", headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "ba8b41" }, body: JSON.stringify({ sessionId: "ba8b41", runId: "r1", hypothesisId: "C,D", location: "login.route.js:after-mountView", message: "login form mounted", data: { viewChildCount: view.children.length, viewFirstChildClass: view.firstElementChild && view.firstElementChild.className || "", loginFormExists: !!_f, authCardExists: !!_c, authCardDisplay: _c ? getComputedStyle(_c).display : null, authCardVisibility: _c ? getComputedStyle(_c).visibility : null, authCardOpacity: _c ? getComputedStyle(_c).opacity : null, authCardRect: _c ? (function(r) {
+        return { w: Math.round(r.width), h: Math.round(r.height) };
+      })(_c.getBoundingClientRect()) : null, asideRect: _aside ? (function(r) {
+        return { w: Math.round(r.width), h: Math.round(r.height) };
+      })(_aside.getBoundingClientRect()) : null, bodyRect: _body ? (function(r) {
+        return { w: Math.round(r.width), h: Math.round(r.height) };
+      })(_body.getBoundingClientRect()) : null, innerRect: _inner ? (function(r) {
+        return { w: Math.round(r.width), h: Math.round(r.height) };
+      })(_inner.getBoundingClientRect()) : null }, timestamp: Date.now() }) }).catch(() => {
+      });
+    } catch (_) {
+    }
     const form = $("#loginForm", view);
     const card = view.querySelector("[data-auth-card]");
     form.addEventListener("submit", async (ev) => {
