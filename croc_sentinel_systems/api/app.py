@@ -675,7 +675,9 @@ from tenant_admin import (
     _close_admin_tenant_cur,
     _delete_user_auxiliary_cur,
     _mqtt_unsubscribe_device_topics,
+    _snapshot_unclaim_payload_for_device,
     _try_mqtt_unclaim_reset,
+    _try_mqtt_unclaim_reset_with_snapshot,
     _wait_cmd_ack,
 )
 

@@ -24,7 +24,12 @@ def test_claim_flow_updates_lifecycle_and_version():
 
 def test_unbind_flow_is_non_blocking_and_unsubscribes():
     src = _read("routers/device_delete.py")
-    assert "_try_mqtt_unclaim_reset(device_id, wait_for_ack=False)" in src
+    # Phase 95 fix: post-commit dispatch uses the snapshot helper because the
+    # transaction already deleted provisioned_credentials. The legacy helper
+    # would no-op (no row -> False, False), trapping the job in
+    # ``server_unbound`` forever.
+    assert "_try_mqtt_unclaim_reset_with_snapshot(" in src
+    assert "wait_for_ack=False" in src
     assert "_mqtt_unsubscribe_device_topics(device_id)" in src
     assert '"status": "queued"' in src
 
@@ -33,4 +38,6 @@ def test_tenant_helper_exposes_unsubscribe_and_wait_toggle():
     src = _read("tenant_admin.py")
     assert "def _mqtt_unsubscribe_device_topics(" in src
     assert "def _try_mqtt_unclaim_reset(device_id: str, *, wait_for_ack: bool = True)" in src
+    assert "def _try_mqtt_unclaim_reset_with_snapshot(" in src
+    assert "def _snapshot_unclaim_payload_for_device(" in src
 

@@ -156,9 +156,13 @@ def _db_backup_tick(now: float, next_backup_at: float) -> float:
 def _unbind_reset_compensation_tick(limit: int = 10) -> None:
     """Retry device reset for server-unbound jobs waiting for device ACK.
 
-    Phase 95 Part 2: jobs in ``device_reset_pending`` are retried
-    periodically. Once ``_try_mqtt_unclaim_reset`` observes ACK, job is
-    promoted to ``completed``.
+    Phase 95 Part 2 (post-fix): jobs in ``device_reset_pending`` are
+    re-published using the snapshotted ``cmd_key`` persisted in
+    ``detail_json`` (the legacy DB-driven helper cannot work here because
+    ``provisioned_credentials`` was deleted by the unbind transaction).
+    Once the device ACKs ``unclaim_reset``, the job is promoted to
+    ``completed``. ``_try_mqtt_unclaim_reset`` is still tried as a fallback
+    for legacy rows that pre-date the snapshot field.
     """
     with db_lock:
         conn = get_conn()
@@ -186,8 +190,18 @@ def _unbind_reset_compensation_tick(limit: int = 10) -> None:
         attempts = int(detail.get("reset_retry_attempts", 0) or 0) + 1
         sent = False
         acked = False
+        snapshot_key = str(detail.get("snapshot_cmd_key") or "").strip()
+        snapshot_seen = str(detail.get("snapshot_last_seen") or "").strip()
         try:
-            sent, acked = _app._try_mqtt_unclaim_reset(did)
+            if snapshot_key:
+                sent, acked = _app._try_mqtt_unclaim_reset_with_snapshot(
+                    did,
+                    snapshot_key,
+                    last_seen=snapshot_seen,
+                    wait_for_ack=True,
+                )
+            else:
+                sent, acked = _app._try_mqtt_unclaim_reset(did)
         except Exception as exc:
             logger.debug(
                 "unbind compensation dispatch failed req=%s dev=%s err=%s",

@@ -50,6 +50,8 @@ require_principal = _app.require_principal
 require_capability = _app.require_capability
 assert_device_owner = _app.assert_device_owner
 _try_mqtt_unclaim_reset = _app._try_mqtt_unclaim_reset
+_try_mqtt_unclaim_reset_with_snapshot = _app._try_mqtt_unclaim_reset_with_snapshot
+_snapshot_unclaim_payload_for_device = _app._snapshot_unclaim_payload_for_device
 _mqtt_unsubscribe_device_topics = _app._mqtt_unsubscribe_device_topics
 
 
@@ -87,9 +89,18 @@ def _device_delete_reset_impl(
     req_id = str(uuid.uuid4())
     mode = "factory_unclaim" if super_unclaim else "delete_reset"
     now = utc_now_iso()
-    mac_nocolon = ""
+    # Phase 0 (pre-DB): snapshot publish material BEFORE the DB transaction
+    # wipes ``provisioned_credentials``. Without this, every post-commit
+    # ``unclaim_reset`` publish would either hit a missing row or sign with
+    # the fallback CMD_AUTH_KEY (which the device's NVS rejects), leaving
+    # the device locked in "server_unbound" forever and the operator stuck
+    # watching a "pending" toast.
+    snapshot = _snapshot_unclaim_payload_for_device(device_id)
+    snapshot_cmd_key = str(snapshot.get("cmd_key") or "")
+    snapshot_last_seen = str(snapshot.get("last_seen") or "")
+    mac_nocolon = str(snapshot.get("mac_nocolon") or "")
     del_cred = del_owner = del_acl = del_revoked = del_state = del_sched = 0
-    # DB-first atomic phase: requested -> server_unbound + ownership/data unlink + lifecycle bump.
+    # Phase 1 (DB atomic): requested -> server_unbound + ownership/data unlink + lifecycle bump.
     with db_lock:
         conn = get_conn()
         try:
@@ -103,9 +114,6 @@ def _device_delete_reset_impl(
                 """,
                 (req_id, device_id, principal.username, mode, "{}", now, now),
             )
-            cur.execute("SELECT mac_nocolon FROM provisioned_credentials WHERE device_id = ?", (device_id,))
-            p = cur.fetchone()
-            mac_nocolon = str(p["mac_nocolon"]) if p and p["mac_nocolon"] else ""
             cur.execute("DELETE FROM provisioned_credentials WHERE device_id = ?", (device_id,))
             del_cred = int(cur.rowcount or 0)
             cur.execute("DELETE FROM device_ownership WHERE device_id = ?", (device_id,))
@@ -155,6 +163,12 @@ def _device_delete_reset_impl(
                             "factory_unclaimed": bool(super_unclaim),
                             "lifecycle_state": LIFECYCLE_UNBOUND,
                             "lifecycle_version": int(lifecycle_version),
+                            # Persist publish material so post-commit dispatch
+                            # AND the scheduler compensation tick can keep
+                            # retrying ``unclaim_reset`` until the device ACKs.
+                            "snapshot_cmd_key": snapshot_cmd_key,
+                            "snapshot_mac_nocolon": mac_nocolon,
+                            "snapshot_last_seen": snapshot_last_seen,
                         },
                         ensure_ascii=True,
                     ),
@@ -168,9 +182,36 @@ def _device_delete_reset_impl(
             conn.close()
             raise
         conn.close()
-    # Non-blocking side effect phase: dispatch reset without waiting for ACK.
-    nvs_purge_sent, nvs_purge_acked = _try_mqtt_unclaim_reset(device_id, wait_for_ack=False)
-    unbind_state = "completed" if nvs_purge_acked else ("device_reset_pending" if nvs_purge_sent else "server_unbound")
+    # Phase 2 (post-commit): non-blocking dispatch using the snapshotted
+    # cmd_key — we deleted the credentials row above, so the legacy
+    # ``_try_mqtt_unclaim_reset`` (which re-queries the DB) cannot work here.
+    if snapshot_cmd_key:
+        nvs_purge_sent, nvs_purge_acked = _try_mqtt_unclaim_reset_with_snapshot(
+            device_id,
+            snapshot_cmd_key,
+            last_seen=snapshot_last_seen,
+            wait_for_ack=False,
+        )
+    else:
+        # No credentials existed (unknown / already-wiped device). Mark the
+        # job completed so the scheduler doesn't retry forever, and audit.
+        nvs_purge_sent = False
+        nvs_purge_acked = False
+    if nvs_purge_acked:
+        unbind_state = "completed"
+    elif nvs_purge_sent:
+        # Command reached broker but no ACK yet. Scheduler will retry the
+        # snapshot publish until the device confirms or operator gives up.
+        unbind_state = "device_reset_pending"
+    elif not snapshot_cmd_key:
+        # Nothing to publish (no creds existed); server unlink is the final
+        # state. Mark completed so no compensation tick chases a ghost.
+        unbind_state = "completed"
+    else:
+        # Snapshot existed but broker was down. Schedule retries via
+        # ``device_reset_pending`` so the compensation tick replays the
+        # snapshot publish when the broker comes back.
+        unbind_state = "device_reset_pending"
     mqtt_unsubscribed = _mqtt_unsubscribe_device_topics(device_id)
     with db_lock:
         conn = get_conn()
@@ -183,6 +224,8 @@ def _device_delete_reset_impl(
             detail = {}
         detail["mqtt_unsubscribed"] = bool(mqtt_unsubscribed)
         detail["post_commit_dispatched_at"] = utc_now_iso()
+        detail["post_commit_publish_sent"] = bool(nvs_purge_sent)
+        detail["post_commit_publish_acked"] = bool(nvs_purge_acked)
         cur.execute(
             """
             UPDATE device_unbind_jobs
@@ -213,7 +256,7 @@ def _device_delete_reset_impl(
         device_id,
         {
             "request_id": req_id,
-            "unbind_state": "completed" if nvs_purge_acked else "device_reset_pending",
+            "unbind_state": unbind_state,
             "mac_nocolon": mac_nocolon or "",
             "nvs_purge_mqtt": nvs_purge_sent,
             "nvs_purge_ack": nvs_purge_acked,
@@ -225,6 +268,7 @@ def _device_delete_reset_impl(
             "deleted_state": del_state,
             "deleted_scheduled": del_sched,
             "factory_unclaimed": super_unclaim,
+            "snapshot_present": bool(snapshot_cmd_key),
         },
     )
     return {
@@ -233,14 +277,15 @@ def _device_delete_reset_impl(
         "device_id": device_id,
         "request_id": req_id,
         "mode": mode,
-        "unbind_state": "completed" if nvs_purge_acked else "device_reset_pending",
+        "unbind_state": unbind_state,
         "factory_unclaimed": super_unclaim,
         "nvs_purge_sent": nvs_purge_sent,
         "nvs_purge_acked": nvs_purge_acked,
         "nvs_purge_note": (
             "sent=true means command reached broker; "
             "acked=true means device confirmed unclaim_reset. "
-            "acked=false means server unlink is done but device reset is pending."
+            "acked=false means server unlink is done but device reset is pending; "
+            "scheduler will keep retrying the snapshot publish until the device acks."
         ),
     }
 

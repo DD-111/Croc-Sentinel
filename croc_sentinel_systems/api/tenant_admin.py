@@ -78,6 +78,8 @@ __all__ = (
     "_close_admin_tenant_cur",
     "_wait_cmd_ack",
     "_try_mqtt_unclaim_reset",
+    "_try_mqtt_unclaim_reset_with_snapshot",
+    "_snapshot_unclaim_payload_for_device",
     "_mqtt_unsubscribe_device_topics",
 )
 
@@ -290,6 +292,104 @@ def _try_mqtt_unclaim_reset(device_id: str, *, wait_for_ack: bool = True) -> tup
     if (not wait_for_ack) or (not online_hint):
         return True, False
     return True, _wait_cmd_ack(device_id, "unclaim_reset", timeout_s=2.2, cmd_id=cmd_id)
+
+
+def _snapshot_unclaim_payload_for_device(device_id: str) -> dict[str, str]:
+    """Snapshot the publish material (cmd_key + mac + last_seen) BEFORE the
+    delete-reset DB transaction wipes ``provisioned_credentials``.
+
+    Why this exists: ``_try_mqtt_unclaim_reset`` and ``get_cmd_key_for_device``
+    both query ``provisioned_credentials`` to resolve the per-device cmd_key.
+    Once the unbind transaction commits the DELETE, every subsequent publish
+    attempt either fails the row lookup or signs with the fallback
+    ``CMD_AUTH_KEY`` (which the device's NVS rejects). Persisting the snapshot
+    in the unbind-job ``detail_json`` lets both the immediate post-commit
+    dispatch *and* the scheduler compensation tick re-publish ``unclaim_reset``
+    with the right key until the device ACKs.
+    """
+    raw = str(device_id or "").strip()
+    if not raw:
+        return {"cmd_key": "", "mac_nocolon": "", "last_seen": ""}
+    with db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT IFNULL(pc.cmd_key,'')      AS cmd_key,
+                   IFNULL(pc.mac_nocolon,'')  AS mac_nocolon,
+                   IFNULL((SELECT updated_at FROM device_state
+                           WHERE device_id = pc.device_id),'') AS last_seen
+            FROM provisioned_credentials pc
+            WHERE pc.device_id = ?
+            """,
+            (raw,),
+        )
+        row = cur.fetchone()
+        conn.close()
+    if not row:
+        return {"cmd_key": "", "mac_nocolon": "", "last_seen": ""}
+    return {
+        "cmd_key": str(row["cmd_key"] or "").strip().upper(),
+        "mac_nocolon": str(row["mac_nocolon"] or "").strip(),
+        "last_seen": str(row["last_seen"] or "").strip(),
+    }
+
+
+def _try_mqtt_unclaim_reset_with_snapshot(
+    device_id: str,
+    cmd_key: str,
+    *,
+    last_seen: str = "",
+    wait_for_ack: bool = False,
+) -> tuple[bool, bool]:
+    """Publish ``unclaim_reset`` using a previously snapshotted cmd_key.
+
+    Used by:
+      * the post-commit phase in ``_device_delete_reset_impl`` (credentials
+        already deleted, so the original DB-driven helper would no-op);
+      * the scheduler compensation tick (retries until ACK or operator-bound
+        timeout, replaying the same snapshot from ``detail_json``).
+
+    Returns ``(sent, acked)``. Fails fast on broker outages so HTTP/scheduler
+    callers never hang. ``wait_for_ack=True`` only waits when ``last_seen``
+    indicates the device has been seen recently (within
+    ``OFFLINE_THRESHOLD_SECONDS``).
+    """
+    did = str(device_id or "").strip()
+    key = str(cmd_key or "").strip().upper()
+    if not did or not key:
+        return False, False
+    online_hint = False
+    seen = (last_seen or "").strip()
+    if seen:
+        try:
+            last_ts = _app._parse_iso(seen)
+            if last_ts > 0:
+                online_hint = (time.time() - last_ts) < max(60, int(_app.OFFLINE_THRESHOLD_SECONDS))
+        except Exception:
+            online_hint = False
+    try:
+        cmd_id = _app.publish_command(
+            f"{TOPIC_ROOT}/{did}/cmd",
+            "unclaim_reset",
+            {},
+            did,
+            CMD_PROTO,
+            key,
+        )
+    except HTTPException as exc:
+        logger.warning(
+            "unclaim_reset MQTT (snapshot) not delivered for %s: %s",
+            did,
+            getattr(exc, "detail", exc),
+        )
+        return False, False
+    except Exception as exc:
+        logger.warning("unclaim_reset MQTT (snapshot) error for %s: %s", did, exc)
+        return False, False
+    if (not wait_for_ack) or (not online_hint):
+        return True, False
+    return True, _wait_cmd_ack(did, "unclaim_reset", timeout_s=2.2, cmd_id=cmd_id)
 
 
 def _mqtt_unsubscribe_device_topics(device_id: str) -> bool:

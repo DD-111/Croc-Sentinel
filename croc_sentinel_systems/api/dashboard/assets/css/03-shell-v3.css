@@ -2497,12 +2497,33 @@ body[data-layout="auth"] .site-footer--auth .site-footer__product-pill {
     -webkit-overflow-scrolling: touch;
     display: flex;
     justify-content: center;
+    /* Anchor the inner column to the top of the body so the form card sits
+       at a predictable optical center while the footer pins to the bottom
+       (see auth-surface__inner flex column below). */
+    align-items: stretch;
   }
   .auth-surface__inner {
     width: min(100%, 30rem);
     max-width: 30rem;
     margin: 0 auto;
     padding: max(2.5rem, 5vh) 1.5rem 2.5rem;
+    /* Phase-96 anti-drift: turn the inner column into a flex column so
+       the existing ``.site-footer--auth { margin-top: auto }`` rule
+       (around line ~2400) can actually push the footer to the bottom of
+       the viewport instead of riding along with auth-card content height
+       changes (msg lines, error shake, etc.). */
+    display: flex;
+    flex-direction: column;
+    min-height: 100%;
+    box-sizing: border-box;
+  }
+  .auth-surface__inner > .auth-card,
+  .auth-surface__inner > [data-auth-card] {
+    flex: 0 0 auto;
+  }
+  .auth-surface__inner > .site-footer--auth {
+    flex: 0 0 auto;
+    margin-top: auto;
   }
 }
 .auth-surface__inner--wide {

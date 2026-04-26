@@ -52,14 +52,34 @@ def test_delete_reset_records_lifecycle(delete_src: str) -> None:
     assert "device_reset_pending" in fn, "Must report pending when no ACK."
     assert "completed" in fn, "Must report completed when reset ACKed."
     assert '"request_id": req_id' in fn, "API response must expose request_id."
-    assert '"unbind_state": "completed" if nvs_purge_acked else "device_reset_pending"' in fn
+    # Phase 95 fix: cmd_key must be snapshotted BEFORE the DB delete wipes
+    # provisioned_credentials, otherwise post-commit publish silently fails
+    # because get_cmd_key_for_device falls back to CMD_AUTH_KEY (rejected by
+    # the device's NVS) and the job rots in "server_unbound" forever.
+    assert "_snapshot_unclaim_payload_for_device(device_id)" in fn, (
+        "Must snapshot cmd_key/mac/last_seen before DB delete."
+    )
+    assert "snapshot_cmd_key" in fn, "Must persist snapshot_cmd_key in detail_json."
+    assert "_try_mqtt_unclaim_reset_with_snapshot(" in fn, (
+        "Post-commit publish must use the snapshotted helper "
+        "(legacy helper re-queries deleted credentials and always fails)."
+    )
+    # The new unbind_state machine has three branches: completed (acked),
+    # device_reset_pending (sent but no ack OR snapshot but broker down),
+    # completed (no creds existed at all — nothing to chase).
+    assert 'unbind_state = "completed"' in fn
+    assert 'unbind_state = "device_reset_pending"' in fn
 
 
 def test_scheduler_retries_pending_unbind_reset(scheduler_src: str) -> None:
     fn = _fn_source(SCHEDULER_PY, scheduler_src, "_unbind_reset_compensation_tick")
     loop = _fn_source(SCHEDULER_PY, scheduler_src, "scheduler_loop")
     assert "WHERE state = 'device_reset_pending'" in fn
-    assert "_app._try_mqtt_unclaim_reset(did)" in fn
+    # Compensation tick MUST replay the snapshotted cmd_key — calling the
+    # legacy DB-driven helper on its own cannot work because the unbind
+    # transaction already deleted provisioned_credentials.
+    assert "_app._try_mqtt_unclaim_reset_with_snapshot(" in fn
+    assert "snapshot_cmd_key" in fn
     assert "new_state = \"completed\" if acked else \"device_reset_pending\"" in fn
     assert "next_unbind_reset_retry_at" in loop
     assert "_unbind_reset_compensation_tick(limit=10)" in loop
