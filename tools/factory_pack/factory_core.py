@@ -1,6 +1,7 @@
 """Shared factory serial / signed QR generation + optional server registration."""
 from __future__ import annotations
 
+import os
 import base64
 import hashlib
 import hmac
@@ -49,11 +50,23 @@ def repo_root() -> Path:
 def default_dotenv_path() -> Path:
     """Dedicated manufacturing secrets file (gitignored).
 
-    Keeps ``croc_sentinel_systems/.env`` (full server stack) off factory laptops.
-    Copy ``factory.env.example`` → ``factory.env`` and paste only
-    ``QR_SIGN_SECRET`` + ``FACTORY_API_TOKEN`` aligned with the API container.
+    Resolution order:
+
+    1. ``FACTORY_DOTENV_PATH`` environment variable (absolute path to ``factory.env``).
+       Use when you copy ``tools/factory_pack/*.py`` + ``factory.env`` into one folder.
+    2. ``<repo>/factory_portable/factory.env`` — portable bundle inside the repo clone.
+    3. ``<repo>/croc_sentinel_systems/factory.env`` — legacy path.
+
+    Values must match the API container: ``QR_SIGN_SECRET`` + ``FACTORY_API_TOKEN``.
     """
-    return repo_root() / "croc_sentinel_systems" / "factory.env"
+    raw = (os.environ.get("FACTORY_DOTENV_PATH") or "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    root = repo_root()
+    portable = root / "factory_portable" / "factory.env"
+    if portable.is_file():
+        return portable
+    return root / "croc_sentinel_systems" / "factory.env"
 
 
 def read_dotenv_keys(path: Path, keys: tuple[str, ...]) -> dict[str, str]:

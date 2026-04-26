@@ -4,6 +4,9 @@ config.h
 # Generated factory bundles (serials + QR PNGs) — copy out of repo for production use
 factory_serial_exports/output_*/
 
+# Portable factory secrets (copy folder off-repo; never commit)
+factory_portable/factory.env
+
 # Traefik ACME account data (Let's Encrypt)
 croc_sentinel_systems/traefik/acme.json
 
